@@ -1,0 +1,5 @@
+/target/
+**/*.tmp
+/examples/assets/levels/
+.DS_Store
+Thumbs.db

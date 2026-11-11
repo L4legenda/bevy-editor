@@ -1,0 +1,39 @@
+[package]
+name = "bevy-editor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+description = "A lightweight, configurable 3D level editor for Bevy"
+repository = "https://github.com/L4legenda/bevy-editor"
+publish = false
+default-run = "bevy-editor"
+
+[features]
+default = ["editor"]
+editor = [
+    "bevy/3d_bevy_render",
+    "bevy/bevy_winit",
+    "bevy/default_app",
+    "bevy/jpeg",
+    "bevy/keyboard",
+    "bevy/mouse",
+    "bevy/multi_threaded",
+    "bevy/ui",
+    "bevy/x11",
+]
+
+[[bin]]
+name = "bevy-editor"
+path = "src/main.rs"
+required-features = ["editor"]
+test = false
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = ["bevy_world_serialization"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.dev]
+opt-level = 1
+debug = 0
+incremental = false
