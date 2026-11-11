@@ -12,7 +12,7 @@
       "cameras": [
         {
           "id": "main",
-          "label": "Общий план",
+          "label": "Главная камера",
           "placement": {
             "pose": {
               "position": [
@@ -47,7 +47,7 @@
       "cameras": [
         {
           "id": "main",
-          "label": "Общий план",
+          "label": "Главная камера",
           "placement": {
             "pose": {
               "position": [

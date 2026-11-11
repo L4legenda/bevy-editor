@@ -112,6 +112,10 @@ pub struct LevelEdits<K: Ord = String> {
     pub cameras: BTreeMap<K, CameraPlacement>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<PlacedModel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lights: Vec<crate::lighting::SceneLight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lighting: Option<crate::lighting::SceneLighting>,
 }
 
 impl<K: Ord> Default for LevelEdits<K> {
@@ -120,6 +124,8 @@ impl<K: Ord> Default for LevelEdits<K> {
             nodes: BTreeMap::new(),
             cameras: BTreeMap::new(),
             models: Vec::new(),
+            lights: Vec::new(),
+            lighting: None,
         }
     }
 }
@@ -135,7 +141,12 @@ impl<K: Ord> LevelEdits<K> {
                 "Invalid document path",
             ));
         }
-        let path = root.join(file);
+        let resolved = match crate::asset_paths::resolve_asset_path(root, file) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let path = root.join(resolved);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -153,6 +164,17 @@ impl<K: Ord> LevelEdits<K> {
 
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        let redirects = crate::asset_paths::Redirects::read(root)?;
+        if let Some(settings) = &self.lighting {
+            settings.validate()?;
+        }
+        let mut light_ids = HashSet::new();
+        for light in &self.lights {
+            light.validate()?;
+            if !light_ids.insert(light.id) {
+                return Err(invalid(format!("Duplicate light ID #{}", light.id)));
+            }
+        }
         for (name, edit) in &self.nodes {
             if name.is_empty() || !edit.original.valid() || !edit.pose.valid() {
                 return Err(invalid(format!("Invalid transform for {name}")));
@@ -166,7 +188,9 @@ impl<K: Ord> LevelEdits<K> {
         let mut ids = HashSet::new();
         for model in &self.models {
             if !relative_path(&model.asset, "glb")
-                || !root.join(&model.asset).is_file()
+                || !redirects
+                    .resolve(&model.asset)
+                    .is_ok_and(|path| root.join(path).is_file())
                 || !ids.insert(model.id)
                 || !model.pose.valid()
                 || model.bounds.is_some_and(|bounds| !bounds.valid())
@@ -193,7 +217,8 @@ impl<K: Ord> LevelEdits<K> {
                 "Invalid document path",
             ));
         }
-        let path = root.join(file);
+        fs::create_dir_all(root)?;
+        let path = root.join(crate::asset_paths::resolve_asset_path(root, file)?);
         fs::create_dir_all(path.parent().expect("room file has a parent"))?;
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
         let mut file = fs::OpenOptions::new()

@@ -41,6 +41,7 @@ impl EditorProject {
             .unwrap_or(Path::new("."))
             .join(&project.asset_root)
             .canonicalize()?;
+        crate::asset_paths::apply_project_paths(&mut project)?;
         project.validate()?;
         Ok(project)
     }

@@ -70,7 +70,7 @@ glb(ROOT / 'assets/scenes/small_room.glb', [0.12, 0.4, 0.72, 1], [[0, 0.5, 0]])
 yaw, pitch = math.atan2(6, 7), -math.atan2(4, math.hypot(6, 7))
 rotation = [math.cos(yaw / 2) * math.sin(pitch / 2), math.sin(yaw / 2) * math.cos(pitch / 2),
             -math.sin(yaw / 2) * math.sin(pitch / 2), math.cos(yaw / 2) * math.cos(pitch / 2)]
-camera = {'id': 'main', 'label': 'Общий план', 'placement': {
+camera = {'id': 'main', 'label': 'Главная камера', 'placement': {
     'pose': {'position': [6, 4, 7], 'rotation': rotation, 'scale': [1, 1, 1]}, 'lens': 45}}
 project = {'title': 'Bevy Editor', 'asset_root': 'assets', 'scenes': [
     {'label': label, 'asset': f'scenes/{name}.glb', 'file': f'levels/{name}.json', 'groups': ['Props'], 'cameras': [camera]}

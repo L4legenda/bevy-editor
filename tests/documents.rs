@@ -36,6 +36,36 @@ enum GameCamera {
 }
 
 #[test]
+fn missing_roots_read_as_empty_and_are_created_by_the_first_save() {
+    let scratch = Scratch::new();
+    let root = scratch.0.join("new-root/nested");
+    assert!(!root.exists());
+    assert_eq!(
+        LevelEdits::<GameCamera>::read(&root, "levels/example.json").unwrap(),
+        LevelEdits::default()
+    );
+    assert!(
+        !root.exists(),
+        "Reading a missing document must not create files"
+    );
+
+    let mut edits = LevelEdits::<GameCamera>::default();
+    edits.cameras.insert(
+        GameCamera::Main,
+        CameraPlacement {
+            pose: Transform::IDENTITY.into(),
+            lens: 60.0,
+        },
+    );
+    edits.write(&root, "levels/example.json").unwrap();
+    assert!(root.join("levels/example.json").is_file());
+    assert_eq!(
+        LevelEdits::<GameCamera>::read(&root, "levels/example.json").unwrap(),
+        edits
+    );
+}
+
+#[test]
 fn saves_replace_documents_and_preserve_typed_runtime_camera_keys() {
     let scratch = Scratch::new();
     let mut edits = LevelEdits::<GameCamera>::default();

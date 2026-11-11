@@ -1,19 +1,21 @@
 use bevy::{
     anti_alias::taa::TemporalAntiAliasing,
-    camera::{ImageRenderTarget, RenderTarget, ScalingMode},
-    gizmos::config::{GizmoConfigGroup, GizmoConfigStore},
+    camera::{ImageRenderTarget, RenderTarget, ScalingMode, Viewport, visibility::RenderLayers},
+    gizmos::config::{DefaultGizmoConfigGroup, GizmoConfigGroup, GizmoConfigStore},
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit},
+    input_focus::InputFocus,
     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceTransmission},
     picking::mesh_picking::ray_cast::{MeshRayCast, MeshRayCastSettings},
     prelude::*,
     render::render_resource::{Extent3d, TextureFormat},
     shape::Ray3d,
+    ui_widgets::TextInput,
     window::PrimaryWindow,
 };
 
 use crate::{data::LevelEdits as RoomEdits, project::LensKind};
 
-use super::{Editor, Field, Scene, Selection, Tool, ui};
+use super::{Editor, Field, Scene, Selection, Shot, Tool, ui};
 
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
 const AXIS_COLORS: [Color; 3] = [
@@ -24,6 +26,8 @@ const AXIS_COLORS: [Color; 3] = [
 const HIGHLIGHT: Color = Color::srgb(1.0, 0.81, 0.38);
 const CAMERA_COLOR: Color = Color::srgba(0.49, 0.72, 1.0, 0.72);
 const EDITOR_FOV: f32 = 58.0_f32.to_radians();
+pub(super) const CAMERA_ASPECT: f32 = 16.0 / 9.0;
+pub(super) const EDITOR_GIZMO_LAYER: usize = 3;
 
 #[derive(Component)]
 pub(super) struct EditorCamera;
@@ -55,6 +59,8 @@ enum Navigation {
 #[derive(Resource, Default)]
 pub(super) struct PointerState {
     nav: Option<Navigation>,
+    pilot: Option<Shot>,
+    pivot: Vec3,
     drag: Option<Drag>,
     hover: Option<usize>,
 }
@@ -62,6 +68,11 @@ pub(super) struct PointerState {
 impl PointerState {
     pub(super) fn dragging(&self) -> bool {
         self.drag.is_some()
+    }
+
+    pub(super) fn stop_navigation(&mut self) {
+        self.nav = None;
+        self.pilot = None;
     }
 }
 
@@ -79,7 +90,12 @@ struct Drag {
 }
 
 pub(super) fn setup(mut config: ResMut<GizmoConfigStore>) {
+    config
+        .config_mut::<DefaultGizmoConfigGroup>()
+        .0
+        .render_layers = RenderLayers::layer(EDITOR_GIZMO_LAYER);
     let (config, _) = config.config_mut::<TransformGizmos>();
+    config.render_layers = RenderLayers::layer(EDITOR_GIZMO_LAYER);
     config.depth_bias = -1.0;
     config.line.width = 2.5;
 }
@@ -92,7 +108,9 @@ pub(super) fn spawn_camera(
 ) {
     let mut camera = commands.spawn((
         EditorCamera,
+        bevy::camera::ShadowLodOrigin,
         Camera3d::default(),
+        RenderLayers::from_layers(&[0, EDITOR_GIZMO_LAYER]),
         pose,
         ScreenSpaceTransmission::default(),
         RenderTarget::Image(surface.0.clone().into()),
@@ -102,8 +120,17 @@ pub(super) fn spawn_camera(
         ..default()
     });
     if let Some(setup) = editor.project.camera_setup {
-        setup(&mut camera, &editor.definition().asset);
+        let logical =
+            crate::asset_paths::original_asset_path(&editor.root, &editor.definition().asset)
+                .unwrap_or_else(|_| editor.definition().asset.clone());
+        setup(&mut camera, &logical);
     }
+    camera.entry::<RenderLayers>().and_modify(|mut layers| {
+        *layers = layers
+            .clone()
+            .with(EDITOR_GIZMO_LAYER)
+            .without(super::selection_outline::LAYER);
+    });
     // A stable image matters when tracking a small handle with the pointer.
     camera.remove::<(TemporalAntiAliasing, ScreenSpaceAmbientOcclusion)>();
 }
@@ -128,6 +155,11 @@ pub(super) fn navigate(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time>,
+    drawer: Res<ui::DrawerMotion>,
+    focus: Res<InputFocus>,
+    text_inputs: Query<(), With<TextInput>>,
+    asset_drag: Option<Res<ui::AssetDrag>>,
+    lighting: Option<Res<ui::LightingUi>>,
 ) {
     let Ok((mut camera, mut target, mut pose, mut lens)) = camera.single_mut() else {
         return;
@@ -136,7 +168,7 @@ pub(super) fn navigate(
     if camera.order != -1 {
         camera.order = -1;
     }
-    let rect = ui::viewport_rect(&window, editor.drawer);
+    let rect = ui::viewport_rect(&window);
     let physical = (rect.size() * scale).round().max(Vec2::ONE).as_uvec2();
     let size = Extent3d {
         width: physical.x,
@@ -156,16 +188,21 @@ pub(super) fn navigate(
             scale_factor: scale,
         });
     }
-    if let Some(Selection::Camera(shot)) = editor.selection
-        && editor.pilot
-    {
+    let shot = editor.selection.and_then(|selection| match selection {
+        Selection::Camera(shot) if editor.pilot => Some(shot),
+        _ => None,
+    });
+    camera.viewport = shot.map(|_| frame_viewport(physical));
+    if state.pilot != shot {
+        editor.finish_camera_navigation();
         state.nav = None;
-        let placement = editor.camera(shot);
-        *pose = placement.pose.transform();
-        *lens = projection(editor.definition().cameras[shot].projection, placement.lens);
-        return;
+        state.pilot = shot;
+        if let Some(shot) = shot {
+            let view = editor.camera(shot).pose.transform();
+            state.pivot = view.translation + *view.forward() * 3.0;
+        }
     }
-    if std::mem::take(&mut editor.focus) {
+    if shot.is_none() && std::mem::take(&mut editor.focus) {
         editor.pivot = editor
             .selection
             .and_then(|target| editor.pose(target))
@@ -175,13 +212,45 @@ pub(super) fn navigate(
             editor.pivot + back * if editor.selection.is_some() { 3.0 } else { 8.0 };
     }
 
-    let inside = window
-        .cursor_position()
-        .is_some_and(|cursor| rect.contains(cursor));
+    let typing = focus
+        .get()
+        .is_some_and(|entity| text_inputs.contains(entity));
+    let command = keys.any_pressed([
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+    ]);
+    let enabled = window.focused
+        && editor.ready
+        && editor.pending.is_none()
+        && !typing
+        && !command
+        && !drawer.resizing
+        && !asset_drag.as_ref().is_some_and(|drag| drag.active());
+    let enabled = enabled
+        && !lighting
+            .as_ref()
+            .is_some_and(|lighting| lighting.blocks_scene_input());
+    let preview_visible =
+        editor.ready && !editor.pilot && matches!(editor.selection, Some(Selection::Camera(_)));
+    let inside = enabled
+        && window.cursor_position().is_some_and(|cursor| {
+            ui::scene_input_rect(&window, &drawer).contains(cursor)
+                && !(preview_visible && ui::camera_preview_rect(&window, &drawer).contains(cursor))
+        });
     let orbit_key = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
-    if !window.focused {
+    let held = match state.nav {
+        Some(Navigation::Fly) => mouse.pressed(MouseButton::Right),
+        Some(Navigation::Pan) => mouse.pressed(MouseButton::Middle),
+        Some(Navigation::Orbit) => mouse.pressed(MouseButton::Left),
+        None => false,
+    };
+    if !enabled || !held {
         state.nav = None;
-    } else if inside && !state.dragging() {
+        editor.finish_camera_navigation();
+    }
+    if inside && !state.dragging() {
         if mouse.just_pressed(MouseButton::Right) {
             state.nav = Some(Navigation::Fly);
         } else if mouse.just_pressed(MouseButton::Middle) {
@@ -190,8 +259,14 @@ pub(super) fn navigate(
             state.nav = Some(Navigation::Orbit);
         }
     }
-    let mut pivot = editor.pivot;
-    let view = &mut editor.view;
+    let mut placement = shot.map(|shot| editor.camera(shot));
+    let mut view = placement.map_or(editor.view, |placement| placement.pose.transform());
+    let start = view;
+    let mut pivot = if shot.is_some() {
+        state.pivot
+    } else {
+        editor.pivot
+    };
     let mut distance = view.translation.distance(pivot).max(0.3);
     let delta = motion.delta;
     match state.nav {
@@ -225,11 +300,13 @@ pub(super) fn navigate(
             pivot += shift;
         }
         Some(Navigation::Orbit) if mouse.pressed(MouseButton::Left) => {
-            let direction = (view.translation - pivot).normalize_or_zero();
-            let yaw = direction.x.atan2(direction.z) - delta.x * 0.006;
-            let pitch = (direction.y.asin() + delta.y * 0.006).clamp(-1.5, 1.5);
-            let offset = Quat::from_euler(EulerRot::YXZ, yaw, -pitch, 0.0) * Vec3::Z * distance;
-            *view = Transform::from_translation(pivot + offset).looking_at(pivot, Vec3::Y);
+            if delta != Vec2::ZERO {
+                let direction = (view.translation - pivot).normalize_or_zero();
+                let yaw = direction.x.atan2(direction.z) - delta.x * 0.006;
+                let pitch = (direction.y.asin() + delta.y * 0.006).clamp(-1.5, 1.5);
+                let offset = Quat::from_euler(EulerRot::YXZ, yaw, -pitch, 0.0) * Vec3::Z * distance;
+                view = Transform::from_translation(pivot + offset).looking_at(pivot, Vec3::Y);
+            }
         }
         _ => state.nav = None,
     }
@@ -239,17 +316,64 @@ pub(super) fn navigate(
         } else {
             0.002
         };
-        let next = (distance * (-scroll.delta.y * factor).exp()).clamp(0.35, 80.0);
-        view.translation += *view.forward() * (distance - next);
-        distance = next;
-        pivot = view.translation + *view.forward() * distance;
+        if let Some(placement) = placement.as_mut()
+            && shot.is_some_and(|shot| {
+                editor.definition().cameras[shot].projection == LensKind::Orthographic
+            })
+        {
+            placement.lens = (placement.lens * (-scroll.delta.y * factor).exp()).clamp(0.05, 20.0);
+        } else {
+            let next = (distance * (-scroll.delta.y * factor).exp()).clamp(0.35, 80.0);
+            view.translation += *view.forward() * (distance - next);
+            distance = next;
+            pivot = view.translation + *view.forward() * distance;
+        }
     }
-    *pose = *view;
-    editor.pivot = pivot;
-    *lens = projection(LensKind::Perspective, EDITOR_FOV.to_degrees());
+    if let Some(shot) = shot {
+        if let Some(mut placement) = placement {
+            let moved = view != start;
+            let zoomed = placement.lens != editor.camera(shot).lens;
+            if moved || zoomed {
+                if moved {
+                    placement.pose = view.into();
+                }
+                if placement.pose.valid() {
+                    editor.begin_camera_navigation();
+                    editor.set_camera(shot, placement);
+                }
+            }
+            let placement = editor.camera(shot);
+            *pose = placement.pose.transform();
+            *lens = projection(editor.definition().cameras[shot].projection, placement.lens);
+        }
+        state.pivot = pivot;
+        if state.nav.is_none() {
+            editor.finish_camera_navigation();
+        }
+    } else {
+        editor.view = view;
+        editor.pivot = pivot;
+        *pose = view;
+        *lens = projection(LensKind::Perspective, EDITOR_FOV.to_degrees());
+    }
 }
 
-fn projection(kind: LensKind, lens: f32) -> Projection {
+pub(super) fn frame_viewport(size: UVec2) -> Viewport {
+    let size = size.max(UVec2::ONE);
+    let frame = if size.x as f32 / size.y.max(1) as f32 > CAMERA_ASPECT {
+        UVec2::new((size.y as f32 * CAMERA_ASPECT) as u32, size.y)
+    } else {
+        UVec2::new(size.x, (size.x as f32 / CAMERA_ASPECT) as u32)
+    }
+    .max(UVec2::ONE);
+    Viewport {
+        physical_position: size.saturating_sub(frame) / 2,
+        physical_size: frame,
+        ..default()
+    }
+}
+
+pub(super) fn projection(kind: LensKind, lens: f32) -> Projection {
     if kind == LensKind::Orthographic {
         Projection::Orthographic(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
@@ -269,7 +393,7 @@ fn projection(kind: LensKind, lens: f32) -> Projection {
     }
 }
 
-fn length(camera: &Camera, view: &Transform, pivot: Vec3) -> f32 {
+pub(super) fn length(camera: &Camera, view: &Transform, pivot: Vec3) -> f32 {
     let height = camera
         .logical_viewport_size()
         .map_or(500.0, |size| size.y)
@@ -368,10 +492,25 @@ pub(super) fn manipulate(
     keys: Res<ButtonInput<KeyCode>>,
     parents: Query<&ChildOf>,
     mut meshes: MeshRayCast,
+    drawer: Res<ui::DrawerMotion>,
+    asset_drag: Option<Res<ui::AssetDrag>>,
+    lighting: Option<Res<ui::LightingUi>>,
 ) {
     let Ok((camera, view)) = camera.single() else {
         return;
     };
+    if editor.pending.is_some()
+        || asset_drag.as_ref().is_some_and(|drag| drag.active())
+        || lighting
+            .as_ref()
+            .is_some_and(|lighting| lighting.blocks_scene_input())
+    {
+        if let Some(drag) = pointer.drag.take() {
+            editor.finish_edit(drag.before);
+        }
+        pointer.stop_navigation();
+        return;
+    }
     let global = GlobalTransform::from(*view);
     let cursor = window
         .cursor_position()
@@ -430,6 +569,13 @@ pub(super) fn manipulate(
     if !editor.ready || editor.pilot || pointer.nav.is_some() || !window.focused {
         return;
     }
+    if !window.cursor_position().is_some_and(|cursor| {
+        ui::scene_input_rect(&window, &drawer).contains(cursor)
+            && !(matches!(editor.selection, Some(Selection::Camera(_)))
+                && ui::camera_preview_rect(&window, &drawer).contains(cursor))
+    }) {
+        return;
+    }
     let Some(cursor) = cursor.filter(|point| {
         camera
             .logical_viewport_rect()
@@ -484,42 +630,49 @@ pub(super) fn manipulate(
                 .world_to_viewport(&global, position)
                 .is_ok_and(|point| point.distance(cursor) < 9.0)
     });
-    let target = camera_hit.map(Selection::Camera).or_else(|| {
-        let find = |entity| {
-            std::iter::once(entity)
-                .chain(parents.iter_ancestors(entity))
-                .find_map(|entity| {
-                    editor
-                        .imported
-                        .iter()
-                        .position(|node| node.entity == entity)
-                        .map(Selection::Imported)
-                        .or_else(|| {
-                            scene.models.iter().find_map(|(&id, (root, _))| {
-                                (*root == entity).then_some(Selection::Model(id))
+    let light_hit = super::lighting_gizmos::hit(&editor, camera, view, cursor);
+    let target = camera_hit
+        .map(Selection::Camera)
+        .or_else(|| light_hit.map(Selection::Light))
+        .or_else(|| {
+            let find = |entity| {
+                std::iter::once(entity)
+                    .chain(parents.iter_ancestors(entity))
+                    .find_map(|entity| {
+                        editor
+                            .imported
+                            .iter()
+                            .position(|node| node.entity == entity)
+                            .map(Selection::Imported)
+                            .or_else(|| {
+                                scene.models.iter().find_map(|(&id, (root, _))| {
+                                    (*root == entity).then_some(Selection::Model(id))
+                                })
                             })
-                        })
-                })
-        };
-        let filter = |entity| find(entity).is_some();
-        let settings = MeshRayCastSettings::default().with_filter(&filter);
-        meshes
-            .cast_ray(ray, &settings)
-            .first()
-            .and_then(|(entity, _)| find(*entity))
-    });
+                    })
+            };
+            let filter = |entity| find(entity).is_some();
+            let settings = MeshRayCastSettings::default().with_filter(&filter);
+            meshes
+                .cast_ray(ray, &settings)
+                .first()
+                .and_then(|(entity, _)| find(*entity))
+        });
     editor.select(target);
 }
 
 pub(super) fn shots(editor: &Editor) -> std::ops::Range<usize> {
-    0..editor.definition().cameras.len()
+    0..if editor.has_scene() {
+        editor.definition().cameras.len()
+    } else {
+        0
+    }
 }
 
 pub(super) fn draw(
     editor: Res<Editor>,
     pointer: Res<PointerState>,
     camera: Query<(&Camera, &Transform), With<EditorCamera>>,
-    mut grid: Gizmos,
     mut handles: Gizmos<TransformGizmos>,
 ) {
     let Ok((camera, view)) = camera.single() else {
@@ -528,24 +681,7 @@ pub(super) fn draw(
     if editor.pilot || !editor.ready || !camera.is_active {
         return;
     }
-    for line in -24..=24 {
-        let offset = line as f32 * 0.5;
-        let color = if line % 4 == 0 {
-            Color::srgba(0.60, 0.70, 0.84, 0.20)
-        } else {
-            Color::srgba(0.60, 0.70, 0.84, 0.085)
-        };
-        grid.line(
-            Vec3::new(offset, 0.008, -12.0),
-            Vec3::new(offset, 0.008, 12.0),
-            color,
-        );
-        grid.line(
-            Vec3::new(-12.0, 0.008, offset),
-            Vec3::new(12.0, 0.008, offset),
-            color,
-        );
-    }
+    super::lighting_gizmos::draw(&editor, camera, view, &mut handles);
     for shot in shots(&editor) {
         let placement = editor.camera(shot);
         let pose = placement.pose.transform();
@@ -564,6 +700,28 @@ pub(super) fn draw(
         handles.lineloop(corners, color);
         for corner in corners {
             handles.line(origin, corner, color);
+        }
+        if selected {
+            let orthographic =
+                editor.definition().cameras[shot].projection == LensKind::Orthographic;
+            let corners_at = |depth: f32| {
+                let half_height = if orthographic {
+                    placement.lens * 0.5
+                } else {
+                    (placement.lens.to_radians() * 0.5).tan() * depth
+                };
+                let right = *pose.right() * half_height * CAMERA_ASPECT;
+                let up = *pose.up() * half_height;
+                let center = origin + *pose.forward() * depth;
+                [right + up, right - up, -right - up, -right + up].map(|offset| center + offset)
+            };
+            let near = corners_at(0.05);
+            let far = corners_at(3.0);
+            handles.lineloop(near, CAMERA_COLOR);
+            handles.lineloop(far, HIGHLIGHT);
+            for (start, end) in near.into_iter().zip(far) {
+                handles.line(start, end, CAMERA_COLOR);
+            }
         }
     }
     let Some(selection) = editor.selection else {

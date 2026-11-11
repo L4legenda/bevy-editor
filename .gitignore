@@ -1,5 +1,28 @@
-/target/
-**/*.tmp
+# Rust build output (including auxiliary crates).
+target/
+
+# Local edits to the bundled example scenes.
 /examples/assets/levels/
+
+# Temporary files, editor backups and Python asset-generator caches.
+*.tmp
+*.swp
+*.swo
+*~
+__pycache__/
+*.py[cod]
+
+# Machine-specific IDE settings and local environment variables.
+/.idea/
+/.vscode/
+/.env
+/.env.*
+!/.env.example
+!/.env.sample
+/*.log
+
+# Operating-system metadata.
 .DS_Store
+._*
 Thumbs.db
+Desktop.ini

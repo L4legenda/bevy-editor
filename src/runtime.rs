@@ -2,6 +2,18 @@
 use crate::PlacedModel;
 use bevy::prelude::*;
 
+#[cfg(feature = "lighting")]
+pub use crate::lighting::{apply_camera_lighting, apply_imported_light, apply_light, spawn_light};
+
+/// Instantiate authored lights without changing host lighting or camera settings.
+#[cfg(feature = "lighting")]
+pub fn spawn_lights(commands: &mut Commands, lights: &[crate::SceneLight]) -> Vec<Entity> {
+    lights
+        .iter()
+        .map(|light| spawn_light(commands, light))
+        .collect()
+}
+
 /// Direct children of named groups, excluding host-owned scripted placements.
 pub fn imported_nodes<'a>(
     root: Entity,
