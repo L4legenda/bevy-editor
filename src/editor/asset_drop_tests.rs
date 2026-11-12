@@ -14,7 +14,7 @@ fn workspace() -> (App, Browser) {
 
 fn drop_at(app: &mut App, browser: &Browser, entry: Entry, point: Vec3) -> bool {
     let mut editor = app.world_mut().resource_mut::<Editor>();
-    apply_asset_drop(&mut editor, browser, entry, point)
+    apply_asset_drop(&mut editor, browser, entry, point, None)
 }
 
 fn assert_rejected(app: &mut App, browser: &Browser, entry: Entry, point: Vec3) {
@@ -174,4 +174,26 @@ fn an_unloaded_scene_closed_workspace_or_pending_confirmation_blocks_a_drop() {
         editor.pending = Some(PendingAction::CloseTab(0));
     }
     assert_rejected(&mut app, &browser, Entry::Model(0), Vec3::ZERO);
+}
+
+#[test]
+fn measured_preview_bounds_preserve_the_catalog_collision_setting() {
+    let bounds = BoxBounds {
+        center: [0.0, 0.5, 0.0],
+        half_size: [0.5; 3],
+    };
+    for solid in [false, true] {
+        let (mut app, browser) = workspace();
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.project.catalog[0].solid = solid;
+        assert!(apply_asset_drop(
+            &mut editor,
+            &browser,
+            Entry::Model(0),
+            Vec3::new(1.0, 0.0, 2.0),
+            Some(bounds)
+        ));
+        assert_eq!(editor.edits.models[0].bounds, solid.then_some(bounds));
+        assert_eq!(editor.undo.len(), 1);
+    }
 }

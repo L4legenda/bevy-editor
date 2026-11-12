@@ -37,6 +37,13 @@ pub(crate) struct AssetDrag {
 }
 
 impl AssetDrag {
+    pub fn scene_cursor(&self) -> Option<Vec2> {
+        match self.target {
+            Some(DropTarget::Scene(cursor)) if self.dragging => Some(cursor),
+            _ => None,
+        }
+    }
+
     pub fn active(&self) -> bool {
         self.dragging
     }
@@ -155,17 +162,17 @@ fn scene_target_contains(
     motion: &DrawerMotion,
     cursor: Vec2,
 ) -> bool {
-    if !scene_input_rect(window, motion).contains(cursor) {
+    if !scene_input_rect(window, motion, &editor.sidebar).contains(cursor) {
         return false;
     }
     if !editor.pilot
         && matches!(editor.selection, Some(Selection::Camera(_)))
-        && camera_preview_rect(window, motion).contains(cursor)
+        && camera_preview_rect(window, motion, &editor.sidebar).contains(cursor)
     {
         return false;
     }
     if editor.pilot {
-        let render = viewport_rect(window);
+        let render = viewport_rect(window, &editor.sidebar);
         let scale = window.scale_factor();
         let frame =
             viewport::frame_viewport((render.size() * scale).round().max(Vec2::ONE).as_uvec2());
@@ -213,6 +220,7 @@ pub(crate) fn pointer(
         || !editor.drawer
         || editor.pending.is_some()
         || motion.resizing
+        || editor.sidebar.resizing()
         || keys.just_pressed(KeyCode::Escape)
         || drag
             .payload
@@ -316,6 +324,7 @@ pub(crate) fn visuals(
     browser: Res<Browser>,
     editor: Res<Editor>,
     interface: Res<BrowserUi>,
+    placement: Res<crate::editor::asset_placement::PlacementPreview>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut nodes: Query<&mut Node>,
     mut labels: Query<(&mut Text, &mut TextColor)>,
@@ -357,7 +366,15 @@ pub(crate) fn visuals(
             format!("Переместить в {}", browser.folders[folder].label),
             GREEN,
         ),
-        Some(DropTarget::Scene(_)) => ("Добавить в сцену".into(), BLUE),
+        Some(DropTarget::Scene(_)) => (
+            if placement.loading() {
+                "Загрузка…"
+            } else {
+                "Разместить · Esc — отмена"
+            }
+            .into(),
+            BLUE,
+        ),
         None => ("Здесь нельзя разместить".into(), MUTED),
     };
     let cursor = window.cursor_position().unwrap_or(Vec2::ZERO);
@@ -506,10 +523,10 @@ mod tests {
             &editor,
             &window,
             &motion,
-            camera_preview_rect(&window, &motion).center()
+            camera_preview_rect(&window, &motion, &editor.sidebar).center()
         ));
         editor.pilot = true;
-        let render = viewport_rect(&window);
+        let render = viewport_rect(&window, &editor.sidebar);
         assert!(!scene_target_contains(
             &editor,
             &window,

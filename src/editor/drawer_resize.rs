@@ -16,6 +16,10 @@ pub(crate) struct DrawerSize {
 }
 
 impl DrawerSize {
+    pub(crate) fn inherit_cursor(&mut self, previous: Option<CursorIcon>) {
+        self.previous_cursor = previous;
+    }
+
     fn bounds(window_height: f32) -> (f32, f32) {
         let max = (window_height - TOP - FOOT - 80.0).max(0.0);
         (MIN_HEIGHT.min(max), max)
@@ -52,8 +56,11 @@ pub(crate) fn resize(
     let (window_entity, window, cursor_icon) = *window;
     let cursor = window.cursor_position();
     let top = window.height() - FOOT - motion.visible_height;
-    let settled =
-        editor.pending.is_none() && editor.drawer && motion.progress >= 1.0 && window.focused;
+    let settled = editor.pending.is_none()
+        && editor.drawer
+        && motion.progress >= 1.0
+        && window.focused
+        && !editor.sidebar.resizing();
 
     if editor.pending.is_some()
         || !editor.drawer

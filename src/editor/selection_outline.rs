@@ -24,7 +24,7 @@ pub(super) use material::{OutlineMaskMaterial, OutlineMaterial, OutlineMaterialP
 
 #[cfg(test)]
 #[path = "selection_outline_render_tests.rs"]
-pub(in crate::editor) mod render_tests;
+pub(crate) mod render_tests;
 
 pub(super) const LAYER: usize = 4;
 const WIDTH: f32 = 2.5;

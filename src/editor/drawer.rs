@@ -1215,13 +1215,16 @@ mod tests {
             resolution: (1280, 760).into(),
             ..default()
         };
-        let render = viewport_rect(&window);
+        let render = viewport_rect(&window, &SidebarLayout::default());
         let mut motion = DrawerMotion::default();
-        assert_eq!(scene_input_rect(&window, &motion), render);
+        assert_eq!(
+            scene_input_rect(&window, &motion, &SidebarLayout::default()),
+            render
+        );
         motion.advance(true, DURATION / 2.0, 350.0);
-        let input = scene_input_rect(&window, &motion);
+        let input = scene_input_rect(&window, &motion, &SidebarLayout::default());
         assert_eq!(input.max.y, render.max.y - 175.0);
         assert!(!input.contains(Vec2::new(400.0, render.max.y - 80.0)));
-        assert_eq!(viewport_rect(&window), render);
+        assert_eq!(viewport_rect(&window, &SidebarLayout::default()), render);
     }
 }

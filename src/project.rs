@@ -16,6 +16,37 @@ use crate::{CameraPlacement, LevelEdits, data::relative_path};
 pub type SceneSetup = fn(&mut EntityCommands, &AssetServer, &str);
 pub type CameraSetup = fn(&mut EntityCommands, &str);
 
+pub const PROJECT_FILE_NAME: &str = "project.bevyeditor";
+
+/// Accept a project folder, the standard manifest, or a legacy JSON manifest.
+pub fn resolve_project_file(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let file = if path.is_dir() {
+        let standard = path.join(PROJECT_FILE_NAME);
+        if standard.is_file() {
+            standard
+        } else {
+            let legacy = path.join("project.json");
+            if !legacy.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "В папке нет project.bevyeditor или прежнего project.json",
+                ));
+            }
+            legacy
+        }
+    } else {
+        path.to_path_buf()
+    };
+    if !file.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Файл проекта не найден",
+        ));
+    }
+    file.canonicalize()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditorProject {
@@ -33,9 +64,9 @@ pub struct EditorProject {
 impl EditorProject {
     /// Resolve the asset root against the project file, independent of the CWD.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref();
+        let path = resolve_project_file(path)?;
         let mut project: Self =
-            serde_json::from_slice(&std::fs::read(path)?).map_err(io::Error::other)?;
+            serde_json::from_slice(&std::fs::read(&path)?).map_err(io::Error::other)?;
         project.asset_root = path
             .parent()
             .unwrap_or(Path::new("."))

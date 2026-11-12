@@ -48,7 +48,7 @@ struct Targets {
 }
 
 #[derive(Resource, Default)]
-pub(in crate::editor) struct CapturedImage(Option<Image>);
+pub(crate) struct CapturedImage(Option<Image>);
 
 fn composite_ui(mut commands: Commands, outline: Res<SelectionOutline>, targets: Res<Targets>) {
     let root = commands
@@ -86,7 +86,7 @@ fn composite_ui(mut commands: Commands, outline: Res<SelectionOutline>, targets:
     ));
 }
 
-pub(in crate::editor) fn frame(app: &mut App) {
+pub(crate) fn frame(app: &mut App) {
     app.update();
     app.world()
         .resource::<RenderDevice>()
@@ -128,7 +128,7 @@ fn bounds(image: &image::RgbaImage, accept: impl Fn(&image::Rgba<u8>) -> bool) -
     result
 }
 
-pub(in crate::editor) fn capture_when(
+pub(crate) fn capture_when(
     app: &mut App,
     target: &Handle<Image>,
     output: &std::path::Path,

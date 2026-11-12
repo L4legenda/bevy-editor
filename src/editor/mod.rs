@@ -5,7 +5,7 @@ mod file_moves;
 mod image_previews;
 mod lighting;
 mod lighting_gizmos;
-mod selection_outline;
+pub(crate) mod selection_outline;
 mod starfield;
 #[cfg(test)]
 mod tests;
@@ -23,7 +23,6 @@ use bevy::{
     gltf::{Gltf, GltfLoaderSettings},
     input_focus::tab_navigation::TabNavigationPlugin,
     light::PointLightShadowMap,
-    picking::mesh_picking::ray_cast::MeshRayCast,
     prelude::*,
     transform::helper::TransformHelper,
     ui::IsDefaultUiCamera,
@@ -151,6 +150,7 @@ struct Editor {
     tool: Tool,
     snap: bool,
     drawer: bool,
+    sidebar: ui::SidebarLayout,
     pilot: bool,
     focus: bool,
     pending: Option<PendingAction>,
@@ -185,6 +185,7 @@ impl Editor {
             tool: Tool::Move,
             snap: false,
             drawer: false,
+            sidebar: ui::SidebarLayout::default(),
             pilot: false,
             focus: false,
             pending: None,
@@ -549,6 +550,7 @@ impl Plugin for EditorPlugin {
         .init_resource::<ui::DrawerMotion>()
         .init_resource::<ui::DrawerSize>()
         .init_resource::<ui::AssetDrag>()
+        .init_resource::<asset_placement::PlacementPreview>()
         .init_resource::<image_previews::ImagePreviews>()
         .init_gizmo_group::<viewport::TransformGizmos>()
         .add_message::<Action>()
@@ -559,7 +561,7 @@ impl Plugin for EditorPlugin {
         .add_systems(
             Update,
             (
-                (ui::resize_drawer, ui::drag_assets).chain(),
+                (ui::resize_drawer, ui::resize_sidebar, ui::drag_assets).chain(),
                 (ui::input, ui::shortcuts, ui::scroll, ui::search_browser),
                 (
                     ui::edit_light_name,
@@ -568,7 +570,7 @@ impl Plugin for EditorPlugin {
                 )
                     .chain(),
                 ui::browser_actions,
-                drop_assets,
+                asset_placement::update,
                 handle_actions,
                 ui::animate_drawer,
                 begin_room,
@@ -583,6 +585,7 @@ impl Plugin for EditorPlugin {
                 image_previews::update,
                 (
                     viewport::draw,
+                    asset_placement::draw,
                     viewport_background::sync,
                     viewport_grid::sync,
                     (
@@ -611,6 +614,12 @@ impl Plugin for EditorPlugin {
                 .after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
                 .before(bevy::camera::visibility::VisibilitySystems::UpdateFrusta)
                 .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
+        );
+        app.add_systems(
+            PostUpdate,
+            asset_placement::measure
+                .after(bevy::transform::TransformSystems::Propagate)
+                .after(bevy::camera::visibility::VisibilitySystems::CalculateBounds),
         );
         app.sub_app_mut(bevy::render::RenderApp)
             .add_systems(bevy::render::ExtractSchedule, thumbnails::track_frame);
@@ -934,18 +943,28 @@ fn apply_asset_drop(
     browser: &browser::Browser,
     entry: browser::Entry,
     point: Vec3,
+    bounds: Option<BoxBounds>,
 ) -> bool {
     if !editor.has_scene()
         || !editor.ready
         || editor.pending.is_some()
         || !point.is_finite()
         || point.abs().max_element() > 1000.0
+        || bounds.is_some_and(|bounds| !bounds.valid())
     {
         return false;
     }
     let Some(asset) = browser.model_asset(&editor.project.catalog, entry) else {
         return false;
     };
+    // Bounds used to place a preview must not make decorative assets solid.
+    let bounds = bounds.filter(|_| {
+        editor
+            .project
+            .catalog
+            .iter()
+            .any(|item| item.asset == asset && item.solid)
+    });
     editor.finish_camera_navigation();
     let before = editor.edits.clone();
     let label = asset.rsplit('/').next().unwrap_or(&asset).to_owned();
@@ -953,58 +972,11 @@ fn apply_asset_drop(
         id: 0,
         asset,
         pose: Transform::from_translation(point).into(),
-        bounds: None,
+        bounds,
     });
     editor.finish_edit(before);
     editor.status = format!("Добавлена модель · {label}");
     true
-}
-
-fn drop_assets(
-    mut actions: MessageReader<Action>,
-    mut editor: ResMut<Editor>,
-    browser: Res<browser::Browser>,
-    scene: Res<Scene>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    motion: Res<ui::DrawerMotion>,
-    camera: Query<(&Camera, &Transform), With<viewport::EditorCamera>>,
-    parents: Query<&ChildOf>,
-    mut meshes: MeshRayCast,
-    numeric: Option<Res<ui::NumericInput>>,
-) {
-    for action in actions.read() {
-        let Action::DropAsset(entry, cursor) = *action else {
-            continue;
-        };
-        if !editor.has_scene() || !editor.ready || editor.pending.is_some() {
-            continue;
-        }
-        if let Some(error) = numeric.as_ref().and_then(|input| input.error_message()) {
-            editor.status = error.into();
-            continue;
-        }
-        let over_preview = !editor.pilot
-            && matches!(editor.selection, Some(Selection::Camera(_)))
-            && ui::camera_preview_rect(&window, &motion).contains(cursor);
-        if !ui::scene_input_rect(&window, &motion).contains(cursor) || over_preview {
-            continue;
-        }
-        let Ok((camera, view)) = camera.single() else {
-            continue;
-        };
-        let Some(point) = asset_placement::drop_point(
-            camera,
-            view,
-            cursor - Vec2::new(0.0, ui::TOP),
-            &mut meshes,
-            &scene,
-            &parents,
-            editor.snap,
-        ) else {
-            continue;
-        };
-        apply_asset_drop(&mut editor, &browser, entry, point);
-    }
 }
 
 fn handle_actions(

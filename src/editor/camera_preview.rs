@@ -34,8 +34,12 @@ pub(in crate::editor) struct Preview {
     last_view: Option<(usize, CameraPlacement)>,
 }
 
-pub(in crate::editor) fn rect(window: &Window, drawer: &DrawerMotion) -> Rect {
-    let scene = scene_input_rect(window, drawer);
+pub(in crate::editor) fn rect(
+    window: &Window,
+    drawer: &DrawerMotion,
+    sidebar: &super::SidebarLayout,
+) -> Rect {
+    let scene = scene_input_rect(window, drawer, sidebar);
     if scene.width() < WIDTH + MARGIN * 2.0 || scene.height() < HEIGHT + MARGIN * 2.0 {
         return Rect::default();
     }
@@ -220,7 +224,9 @@ pub(in crate::editor) fn update(
         Some(Selection::Camera(shot)) if editor.ready => Some(shot),
         _ => None,
     };
-    let shown = selected.is_some() && !editor.pilot && rect(&window, &drawer).width() > 0.0;
+    let shown = selected.is_some()
+        && !editor.pilot
+        && rect(&window, &drawer, &editor.sidebar).width() > 0.0;
     for (entity, visible) in [
         (preview.card, shown),
         (preview.exit, selected.is_some() && editor.pilot),

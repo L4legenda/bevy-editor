@@ -37,6 +37,8 @@ mod numeric_input;
 mod orbital;
 #[path = "scene_tabs.rs"]
 mod scene_tabs;
+#[path = "sidebar_resize.rs"]
+mod sidebar_resize;
 #[path = "tool_icons.rs"]
 mod tool_icons;
 pub(super) use button_fx::ButtonFxPlugin;
@@ -55,6 +57,7 @@ pub(super) use lighting_ui::{
     refresh as refresh_lighting, refresh_controls as refresh_lighting_controls,
 };
 pub(super) use numeric_input::{NumericInput, update as update_numeric_input};
+pub(super) use sidebar_resize::{SidebarLayout, resize as resize_sidebar};
 
 pub(super) const TOP: f32 = 94.0;
 pub(super) const SIDE: f32 = 316.0;
@@ -136,18 +139,25 @@ pub(super) struct OutlineState {
     lights: Vec<(u32, String, bool, crate::lighting::LightKind)>,
 }
 
-pub(super) fn viewport_rect(window: &Window) -> Rect {
+pub(super) fn viewport_rect(window: &Window, sidebar: &SidebarLayout) -> Rect {
     Rect::from_corners(
         Vec2::new(0.0, TOP),
-        Vec2::new(window.width() - SIDE, window.height() - FOOT),
+        Vec2::new(
+            window.width() - sidebar.width(window.width()),
+            window.height() - FOOT,
+        ),
     )
 }
 
-pub(super) fn scene_input_rect(window: &Window, drawer: &DrawerMotion) -> Rect {
-    if drawer.resizing {
+pub(super) fn scene_input_rect(
+    window: &Window,
+    drawer: &DrawerMotion,
+    sidebar: &SidebarLayout,
+) -> Rect {
+    if drawer.resizing || sidebar.resizing() {
         return Rect::from_corners(Vec2::splat(-1.0), Vec2::splat(-1.0));
     }
-    let mut rect = viewport_rect(window);
+    let mut rect = viewport_rect(window, sidebar);
     rect.max.y -= drawer.visible_height;
     rect
 }
@@ -530,10 +540,12 @@ pub(super) fn setup(
             min_height: px(0),
             flex_shrink: 0.0,
             border: UiRect::left(px(1)),
+            padding: UiRect::left(px(sidebar_resize::GRIP)),
             ..column(0.0)
         },
         PANEL,
     );
+    sidebar_resize::width_grip(&mut commands, side);
     starfield::background(&mut commands, side, &stars.chrome);
     let header = surface(
         &mut commands,
@@ -567,6 +579,7 @@ pub(super) fn setup(
         },
     );
     commands.entity(outliner).insert(Scroller);
+    sidebar_resize::height_grip(&mut commands, side);
 
     let inspector = surface(
         &mut commands,
@@ -582,6 +595,7 @@ pub(super) fn setup(
         CHROME,
     );
     commands.entity(inspector).insert(Scroller);
+    sidebar_resize::inspector(&mut commands, inspector);
     starfield::background(&mut commands, inspector, &stars.chrome);
     horizon(&mut commands, inspector);
     text(&mut commands, inspector, &font, "Инспектор", 13.0, MUTED);
@@ -912,9 +926,9 @@ pub(super) fn input(
         return;
     }
     if mouse.any_just_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
-        && window
-            .cursor_position()
-            .is_some_and(|cursor| scene_input_rect(&window, &drawer).contains(cursor))
+        && window.cursor_position().is_some_and(|cursor| {
+            scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
+        })
     {
         focus.clear();
     }
@@ -963,9 +977,10 @@ pub(super) fn shortcuts(
         .as_ref()
         .is_some_and(|lighting| lighting.is_menu_open())
         || (keys.just_pressed(KeyCode::Escape)
-            && lighting
-                .as_ref()
-                .is_some_and(|lighting| lighting.is_control_active()))
+            && (editor.sidebar.resizing()
+                || lighting
+                    .as_ref()
+                    .is_some_and(|lighting| lighting.is_control_active())))
     {
         return;
     }
@@ -1416,15 +1431,6 @@ pub(super) fn refresh(
                 pane.display = display;
             }
         }
-    }
-    if let Ok(mut pane) = panes.get_mut(interface.inspector) {
-        let light = matches!(
-            editor.selection,
-            Some(Selection::Light(_) | Selection::Environment)
-        );
-        pane.height = if light { percent(65) } else { px(300) };
-        pane.min_height = if light { px(280) } else { px(0) };
-        pane.max_height = if light { px(520) } else { Val::Auto };
     }
     for (
         entity,

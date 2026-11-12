@@ -168,7 +168,7 @@ pub(super) fn navigate(
     if camera.order != -1 {
         camera.order = -1;
     }
-    let rect = ui::viewport_rect(&window);
+    let rect = ui::viewport_rect(&window, &editor.sidebar);
     let physical = (rect.size() * scale).round().max(Vec2::ONE).as_uvec2();
     let size = Extent3d {
         width: physical.x,
@@ -227,6 +227,7 @@ pub(super) fn navigate(
         && !typing
         && !command
         && !drawer.resizing
+        && !editor.sidebar.resizing()
         && !asset_drag.as_ref().is_some_and(|drag| drag.active());
     let enabled = enabled
         && !lighting
@@ -236,8 +237,9 @@ pub(super) fn navigate(
         editor.ready && !editor.pilot && matches!(editor.selection, Some(Selection::Camera(_)));
     let inside = enabled
         && window.cursor_position().is_some_and(|cursor| {
-            ui::scene_input_rect(&window, &drawer).contains(cursor)
-                && !(preview_visible && ui::camera_preview_rect(&window, &drawer).contains(cursor))
+            ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
+                && !(preview_visible
+                    && ui::camera_preview_rect(&window, &drawer, &editor.sidebar).contains(cursor))
         });
     let orbit_key = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
     let held = match state.nav {
@@ -570,9 +572,9 @@ pub(super) fn manipulate(
         return;
     }
     if !window.cursor_position().is_some_and(|cursor| {
-        ui::scene_input_rect(&window, &drawer).contains(cursor)
+        ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
             && !(matches!(editor.selection, Some(Selection::Camera(_)))
-                && ui::camera_preview_rect(&window, &drawer).contains(cursor))
+                && ui::camera_preview_rect(&window, &drawer, &editor.sidebar).contains(cursor))
     }) {
         return;
     }

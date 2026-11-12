@@ -20,6 +20,8 @@ pub use lighting::{
 mod editor;
 #[cfg(feature = "editor")]
 pub mod project;
+#[cfg(all(feature = "editor", not(target_arch = "wasm32")))]
+pub mod project_manager;
 
 #[cfg(feature = "editor")]
 pub use editor::{EditorPlugin, create_app};

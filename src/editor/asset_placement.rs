@@ -8,6 +8,22 @@ use bevy::{
 
 use super::Scene;
 
+#[path = "placement_preview.rs"]
+mod preview;
+#[cfg(test)]
+pub(super) use preview::PlacementGhost;
+pub(super) use preview::{PlacementPreview, draw, measure, update};
+
+/// Anchor the geometry's bottom-center, rather than its arbitrary GLB origin.
+fn placement_position(contact: Vec3, bounds: crate::BoxBounds) -> Option<Vec3> {
+    if !bounds.valid() {
+        return None;
+    }
+    let center = Vec3::from(bounds.center);
+    let translation = contact - Vec3::new(center.x, center.y - bounds.half_size[1], center.z);
+    bounded(translation).then_some(translation)
+}
+
 const MAX_DISTANCE: f32 = 200.0;
 const POSITION_LIMIT: f32 = 1000.0;
 const FALLBACK_DISTANCE: f32 = 5.0;
@@ -114,6 +130,59 @@ mod tests {
 
     fn ray(origin: Vec3, direction: Vec3) -> Ray3d {
         Ray3d::new(origin, Dir3::new(direction).unwrap())
+    }
+
+    #[test]
+    fn placement_anchors_bottom_center_for_centered_and_offset_models() {
+        let point = Vec3::new(2.0, 1.0, -3.0);
+        for bounds in [
+            crate::BoxBounds {
+                center: [0.0, 0.0, 0.0],
+                half_size: [0.5; 3],
+            },
+            crate::BoxBounds {
+                center: [12.0, 5.0, -7.0],
+                half_size: [2.0, 3.0, 1.0],
+            },
+            crate::BoxBounds {
+                center: [0.0, 0.5, 0.0],
+                half_size: [0.5; 3],
+            },
+        ] {
+            let position = placement_position(point, bounds).unwrap();
+            let bottom = Vec3::from(bounds.center) - Vec3::Y * bounds.half_size[1];
+            assert!((position + bottom).abs_diff_eq(point, 1e-5));
+        }
+    }
+
+    #[test]
+    fn invalid_preview_geometry_cannot_create_an_invalid_placement() {
+        let bounds = crate::BoxBounds {
+            center: [0.0; 3],
+            half_size: [0.5; 3],
+        };
+        assert!(placement_position(Vec3::NAN, bounds).is_none());
+        assert!(placement_position(Vec3::splat(2000.0), bounds).is_none());
+        assert!(
+            placement_position(
+                Vec3::ZERO,
+                crate::BoxBounds {
+                    center: [f32::NAN; 3],
+                    ..bounds
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            placement_position(
+                Vec3::ZERO,
+                crate::BoxBounds {
+                    half_size: [-1.0; 3],
+                    ..bounds
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]
