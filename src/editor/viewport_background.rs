@@ -2,7 +2,7 @@
 use bevy::{
     asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path},
     camera::visibility::{NoFrustumCulling, RenderLayers},
-    light::{NotShadowCaster, NotShadowReceiver},
+    light::{NotShadowCaster, NotShadowReceiver, Skybox},
     material::OpaqueRendererMethod,
     mesh::{MeshVertexBufferLayoutRef, PrimitiveTopology},
     pbr::{MaterialPipeline, MaterialPipelineKey},
@@ -117,14 +117,23 @@ fn setup(
 
 pub(super) fn sync(
     editor: Res<Editor>,
-    camera: Query<(&Camera, &Transform), (With<viewport::EditorCamera>, Without<Background>)>,
+    camera: Query<
+        (&Camera, &Transform, Option<&Skybox>),
+        (With<viewport::EditorCamera>, Without<Background>),
+    >,
+    images: Res<Assets<Image>>,
     mut backgrounds: Query<(&mut Visibility, &mut Transform), With<Background>>,
 ) {
     let view = camera.single().ok();
+    let panorama_loaded = view
+        .and_then(|(_, _, skybox)| skybox)
+        .and_then(|skybox| skybox.image.as_ref())
+        .is_some_and(|image| images.contains(image));
     let visible = editor.has_scene()
         && editor.ready
         && !editor.pilot
-        && view.is_some_and(|(camera, _)| camera.is_active);
+        && !panorama_loaded
+        && view.is_some_and(|(camera, _, _)| camera.is_active);
     for (mut visibility, mut transform) in &mut backgrounds {
         visibility.set_if_neq(if visible {
             Visibility::Visible
@@ -133,7 +142,7 @@ pub(super) fn sync(
         });
         // Keep the dummy bounds around the camera for optional GPU occlusion
         // culling. The vertex shader itself ignores the world transform.
-        if let Some((_, pose)) = view
+        if let Some((_, pose, _)) = view
             && transform.translation != pose.translation
         {
             transform.translation = pose.translation;

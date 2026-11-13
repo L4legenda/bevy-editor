@@ -134,7 +134,7 @@ impl Browser {
         }
         let mut scenes: HashMap<String, Vec<SceneLink>> = HashMap::new();
         for (room, scene) in project.scenes.iter().enumerate() {
-            for path in [&scene.asset, &scene.file] {
+            for path in [&scene.file] {
                 scenes.entry(path.clone()).or_default().push(SceneLink {
                     room,
                     label: scene.label.clone(),
@@ -202,6 +202,38 @@ impl Browser {
                     else {
                         continue;
                     };
+                    if relative_path(&asset, "scene")
+                        && !scenes.contains_key(&asset)
+                        && !hidden
+                        && discover[folder]
+                    {
+                        match crate::LevelEdits::<String>::read(&project.asset_root, &asset) {
+                            Ok(content) => {
+                                if let Some(settings) = content.scene {
+                                    let room = project.scenes.len();
+                                    scenes.insert(
+                                        asset.clone(),
+                                        vec![SceneLink {
+                                            room,
+                                            label: settings.label.clone(),
+                                        }],
+                                    );
+                                    project.scenes.push(crate::project::SceneDefinition {
+                                        label: settings.label,
+                                        asset: String::new(),
+                                        file: asset.clone(),
+                                        groups: Vec::new(),
+                                        excluded_nodes: Vec::new(),
+                                        node_policies: Default::default(),
+                                        cameras: settings.cameras,
+                                        initial_selection: None,
+                                        play: None,
+                                    });
+                                }
+                            }
+                            Err(error) => browser.record_error(&entry.path(), &error),
+                        }
+                    }
                     let links = scenes.get(&asset);
                     if let Some(indices) = catalog.get(&asset).filter(|_| links.is_none()) {
                         browser
@@ -430,6 +462,16 @@ impl Browser {
         true
     }
 
+    pub fn image_files(&self, catalog: &[CatalogItem]) -> Vec<usize> {
+        self.entries(catalog)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Image(file) => Some(file),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn breadcrumbs(&self) -> Vec<usize> {
         let mut result = vec![self.current];
         let mut current = self.current;
@@ -525,9 +567,15 @@ impl Browser {
 
 fn file_kind(extension: &str) -> FileKind {
     match extension.to_ascii_lowercase().as_str() {
-        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tga" | "gif" | "ico" => FileKind::Image,
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tga" | "gif" | "ico" | "svg" => FileKind::Image,
         _ => FileKind::Other,
     }
+}
+
+pub(super) fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| file_kind(ext) == FileKind::Image)
 }
 
 fn ignored_directory(name: &str) -> bool {
@@ -622,7 +670,7 @@ mod tests {
             preview_direction: [-1.0, 1.0, 2.0],
         });
         let mut browser = Browser::new(&mut project);
-        assert_eq!(project.catalog.len(), 2);
+        assert_eq!(project.catalog.len(), 3);
         assert_eq!(project.catalog[0].label, "Кресло");
         assert_eq!(project.catalog[0].category, "Мебель");
         assert!(project.catalog[0].solid);
@@ -661,159 +709,53 @@ mod tests {
     }
 
     #[test]
-    fn source_and_saved_scene_files_open_the_same_scene_without_becoming_models() {
+    fn glbs_are_models_and_only_scene_documents_open_scenes() {
         let files = Fixture::new();
-        for path in [
-            "scenes/Workshop.glb",
-            "levels/workshop.json",
-            "levels/settings.json",
-        ] {
-            files.file(path);
-        }
-        fs::write(files.0.join("scenes/Workshop.glb"), [1, 2, 3]).unwrap();
+        files.file("scenes/Workshop.glb");
+        files.file("levels/workshop.json");
         let mut project = files.project();
         project.scenes.push(scene(
             "Мастерская",
             "scenes/Workshop.glb",
             "levels/workshop.json",
         ));
-        project.catalog.push(CatalogItem {
-            label: "Former scene model".into(),
-            asset: "scenes/Workshop.glb".into(),
-            category: "Configured".into(),
-            solid: false,
-            preview_direction: [1.55, 1.3, 2.3],
-        });
         let mut browser = Browser::new(&mut project);
-        let source = browser
-            .files
-            .iter()
-            .position(|file| file.path == Path::new("scenes/Workshop.glb"))
-            .unwrap();
-        let saved = browser
-            .files
-            .iter()
-            .position(|file| file.path == Path::new("levels/workshop.json"))
-            .unwrap();
-        assert_eq!(browser.files[source].filename, "Workshop.glb");
-        assert_eq!(browser.files[source].bytes, 3);
-        assert_eq!(browser.files[source].kind, FileKind::Scene);
+        assert_eq!(project.catalog.len(), 1);
+        assert_eq!(project.catalog[0].asset, "scenes/Workshop.glb");
+        assert!(browser.files.iter().all(|file| file.extension != "glb"));
         assert_eq!(
-            browser.model_asset(
-                &project.catalog,
-                Entry::Scene {
-                    file: source,
-                    room: 0
-                }
-            ),
+            browser.model_asset(&project.catalog, Entry::Model(0)),
             Some("scenes/Workshop.glb".into())
         );
-        assert_eq!(
-            browser.model_asset(&project.catalog, Entry::File(source)),
-            Some("scenes/Workshop.glb".into())
-        );
-        assert_eq!(
-            browser.model_asset(
-                &project.catalog,
-                Entry::Scene {
-                    file: saved,
-                    room: 0
-                }
-            ),
-            None
-        );
-        assert_eq!(
-            browser.model_asset(&project.catalog, Entry::Folder(0)),
-            None
-        );
-        browser.navigate(browser.files[source].folder);
-        assert_eq!(
-            browser.entries(&project.catalog),
-            vec![Entry::Scene {
-                file: source,
-                room: 0
-            }]
-        );
-        browser.home();
         browser.set_search("мастерская".into());
         let found = browser.entries(&project.catalog);
-        assert_eq!(found.len(), 2);
-        assert!(found.contains(&Entry::Scene {
-            file: source,
-            room: 0
-        }));
-        assert!(found.contains(&Entry::Scene {
-            file: saved,
-            room: 0
-        }));
-        browser.set_search(".json".into());
-        let found = browser.entries(&project.catalog);
-        assert!(found.contains(&Entry::Scene {
-            file: saved,
-            room: 0
-        }));
-        assert!(found.iter().any(|entry| matches!(entry, Entry::File(_))));
-        assert!(!found.iter().any(|entry| matches!(entry, Entry::Model(_))));
-        assert_eq!(
-            project.catalog.len(),
-            1,
-            "scene files are never automatically cataloged"
-        );
+        assert!(matches!(found.as_slice(), [Entry::Scene { room: 0, .. }]));
+        assert_eq!(browser.model_asset(&project.catalog, found[0]), None);
     }
 
     #[test]
-    fn scenes_sharing_a_source_remain_distinct_and_searchable_by_scene_label() {
+    fn scenes_sharing_a_model_remain_distinct_and_searchable_by_label() {
         let files = Fixture::new();
-        files.file("scenes/shared.glb");
+        files.file("models/shared.glb");
         files.file("levels/day.json");
         files.file("levels/night.json");
         let mut project = files.project();
         project.scenes.extend([
-            scene("День", "scenes/shared.glb", "levels/day.json"),
-            scene("Ночь", "scenes/shared.glb", "levels/night.json"),
+            scene("День", "models/shared.glb", "levels/day.json"),
+            scene("Ночь", "models/shared.glb", "levels/night.json"),
         ]);
         let mut browser = Browser::new(&mut project);
-        let source = browser
-            .files
-            .iter()
-            .position(|file| file.path == Path::new("scenes/shared.glb"))
-            .unwrap();
-        browser.navigate(browser.files[source].folder);
-        assert_eq!(
-            browser.entries(&project.catalog),
-            vec![
-                Entry::Scene {
-                    file: source,
-                    room: 0
-                },
-                Entry::Scene {
-                    file: source,
-                    room: 1
-                },
-            ]
-        );
+        assert_eq!(project.catalog.len(), 1);
+        assert_eq!(browser.files.len(), 2);
         browser.set_search("ночь".into());
-        assert_eq!(
-            browser.entries(&project.catalog),
-            vec![Entry::Scene {
-                file: source,
-                room: 1
-            }]
-        );
-        browser.home();
-        browser.set_search("день".into());
-        let found = browser.entries(&project.catalog);
-        assert_eq!(found.len(), 2);
-        assert!(
-            found
-                .iter()
-                .all(|entry| matches!(entry, Entry::Scene { room: 0, .. }))
-        );
-        assert!(project.catalog.is_empty());
+        assert!(matches!(
+            browser.entries(&project.catalog).as_slice(),
+            [Entry::Scene { room: 1, .. }]
+        ));
     }
 
     #[test]
-    fn refresh_discovers_saved_scene_documents_and_keeps_their_scene_identity() {
+    fn refresh_discovers_saved_scene_documents_without_changing_models() {
         let files = Fixture::new();
         files.file("scenes/room.glb");
         let mut project = files.project();
@@ -821,34 +763,14 @@ mod tests {
             .scenes
             .push(scene("Room", "scenes/room.glb", "levels/room.json"));
         let mut browser = Browser::new(&mut project);
-        browser.set_search("room".into());
-        assert!(matches!(
-            browser.entries(&project.catalog).as_slice(),
-            [Entry::Scene { room: 0, .. }]
-        ));
+        assert_eq!(project.catalog.len(), 1);
+        assert!(browser.files.is_empty());
         files.file("levels/room.json");
-        files.file("scenes/00-notes.txt");
         browser.refresh(&mut project);
-        let found = browser.entries(&project.catalog);
-        assert_eq!(found.len(), 2);
-        let paths: HashSet<_> = found
-            .into_iter()
-            .map(|entry| {
-                let Entry::Scene { file, room } = entry else {
-                    panic!("expected scene file")
-                };
-                assert_eq!(room, 0);
-                browser.files[file].path.clone()
-            })
-            .collect();
-        assert_eq!(
-            paths,
-            HashSet::from([
-                PathBuf::from("scenes/room.glb"),
-                PathBuf::from("levels/room.json")
-            ])
-        );
-        assert!(project.catalog.is_empty());
+        assert_eq!(project.catalog.len(), 1);
+        assert_eq!(browser.files.len(), 1);
+        assert_eq!(browser.files[0].path, Path::new("levels/room.json"));
+        assert_eq!(browser.files[0].kind, FileKind::Scene);
     }
 
     #[test]
@@ -879,7 +801,11 @@ mod tests {
             .iter()
             .map(|file| file.path.as_path())
             .collect();
-        let expected: HashSet<_> = configured.into_iter().map(Path::new).collect();
+        let expected: HashSet<_> = configured
+            .into_iter()
+            .filter(|path| path.ends_with(".json"))
+            .map(Path::new)
+            .collect();
         assert_eq!(visible, expected);
         assert!(
             browser
@@ -898,7 +824,7 @@ mod tests {
             .unwrap();
         browser.navigate(folder);
         let entries = browser.entries(&project.catalog);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert!(
             entries
                 .iter()
@@ -911,7 +837,7 @@ mod tests {
                 .iter()
                 .filter(|entry| matches!(entry, Entry::Scene { room: 1, .. }))
                 .count(),
-            2
+            1
         );
     }
 

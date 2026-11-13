@@ -5,10 +5,20 @@ mod asset_drop;
 mod confirmation;
 #[path = "scene_document_tests.rs"]
 mod documents;
+#[path = "focus_animation_tests.rs"]
+mod focus_animation;
 #[path = "lighting_render_tests.rs"]
 mod lighting_render;
 #[path = "lighting_ui_render_tests.rs"]
 pub(super) mod lighting_ui_render;
+#[path = "native_scene_tests.rs"]
+mod native_scenes;
+#[path = "selection_mode_tests.rs"]
+mod selection_mode;
+#[path = "transform_shortcut_tests.rs"]
+mod transform_shortcuts;
+#[path = "transform_space_tests.rs"]
+mod transform_space;
 use bevy::{
     camera::{RenderTarget, ScalingMode},
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
@@ -21,7 +31,7 @@ use bevy::{
 
 fn app() -> App {
     let project = EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut app = App::new();
@@ -37,6 +47,347 @@ fn app() -> App {
 fn action(app: &mut App, action: Action) {
     app.world_mut().write_message(action);
     app.update();
+}
+
+#[test]
+fn confirmation_decisions_remain_available_while_a_model_viewer_is_open() {
+    let mut app = app();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.viewing_model = Some(0);
+        editor.pending = Some(PendingAction::CloseTab(0));
+    }
+    action(&mut app, Action::CancelPending);
+    let editor = app.world().resource::<Editor>();
+    assert!(editor.pending.is_none());
+    assert_eq!(editor.viewing_model, Some(0));
+    assert_eq!(editor.open_tabs, [0]);
+}
+
+#[test]
+fn model_tabs_reuse_documents_and_close_without_changing_the_scene() {
+    let mut app = app();
+    let mut editor = app.world_mut().resource_mut::<Editor>();
+    let before = editor.edits.clone();
+    editor.open_model_tab(0);
+    editor.open_model_tab(1);
+    editor.open_model_tab(0);
+    assert_eq!(editor.model_tabs, [0, 1]);
+    assert_eq!(editor.viewing_model, Some(0));
+    editor.close_model_tab(1);
+    assert_eq!(editor.viewing_model, Some(0));
+    editor.open_model_tab(1);
+    editor.close_model_tab(1);
+    assert_eq!(editor.viewing_model, Some(0));
+    editor.close_model_tab(0);
+    assert_eq!(editor.viewing_model, None);
+    assert!(editor.model_tabs.is_empty());
+    assert_eq!(editor.open_tabs, [0]);
+    assert_eq!(editor.edits, before);
+}
+
+#[test]
+fn scene_tab_can_be_selected_while_a_model_tab_is_active() {
+    let mut app = app();
+    app.world_mut().resource_mut::<Editor>().open_model_tab(0);
+    action(&mut app, Action::Open(0));
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.viewing_model, None);
+    assert_eq!(editor.model_tabs, [0]);
+    assert_eq!(editor.open_tabs, [0]);
+}
+
+#[test]
+fn closing_a_background_scene_keeps_the_model_tab_selected() {
+    let mut app = app();
+    action(&mut app, Action::Open(1));
+    app.world_mut().resource_mut::<Editor>().open_model_tab(0);
+    action(&mut app, Action::CloseTab(1));
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.viewing_model, Some(0));
+    assert_eq!(editor.model_tabs, [0]);
+    assert_eq!(editor.open_tabs, [0]);
+}
+
+#[test]
+fn object_eye_toggles_imported_and_model_visibility_without_editing_the_document() {
+    let mut app = app();
+    let scratch = CameraSavePath::new();
+    app.world_mut().resource_mut::<Editor>().root = scratch.0.clone();
+    app.add_systems(Update, object_visibility::sync.after(handle_actions));
+    let root = app
+        .world_mut()
+        .spawn((Transform::IDENTITY, Visibility::Visible))
+        .id();
+    let model = app
+        .world_mut()
+        .spawn((Transform::IDENTITY, Visibility::Inherited))
+        .id();
+    let child = app
+        .world_mut()
+        .spawn((Visibility::Visible, ChildOf(root)))
+        .id();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.ready = true;
+        editor.imported.push(Imported {
+            entity: root,
+            name: "Block 1".into(),
+            original: Transform::IDENTITY.into(),
+            parent: GlobalTransform::IDENTITY,
+            local: Transform::IDENTITY,
+        });
+    }
+    action(&mut app, Action::Add(0));
+    let id = app.world().resource::<Editor>().edits.models[0].id;
+    app.world_mut()
+        .resource_mut::<Scene>()
+        .models
+        .insert(id, (model, String::new()));
+    let before = app.world().resource::<Editor>().edits.clone();
+    let history = app.world().resource::<Editor>().undo.len();
+    let selection = app.world().resource::<Editor>().selection;
+    for (target, entity, original) in [
+        (Selection::Imported(0), root, Visibility::Visible),
+        (Selection::Model(id), model, Visibility::Inherited),
+    ] {
+        action(&mut app, Action::ToggleVisibility(target));
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Hidden
+        );
+        assert!(app.world().resource::<Editor>().object_hidden(target));
+        if entity == root {
+            assert_eq!(
+                *app.world().get::<Visibility>(child).unwrap(),
+                Visibility::Hidden
+            );
+        }
+        app.update();
+        action(&mut app, Action::ToggleVisibility(target));
+        assert_eq!(*app.world().get::<Visibility>(entity).unwrap(), original);
+        if entity == root {
+            assert_eq!(
+                *app.world().get::<Visibility>(child).unwrap(),
+                Visibility::Visible
+            );
+        }
+        assert!(
+            app.world()
+                .get::<object_visibility::BeforeHide>(entity)
+                .is_none()
+        );
+    }
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.edits, before);
+    assert_eq!(editor.undo.len(), history);
+    assert_eq!(editor.selection, selection);
+}
+
+#[test]
+fn object_eye_keeps_scene_state_separate_and_blocks_invalid_or_modal_actions() {
+    let mut app = app();
+    let scratch = CameraSavePath::new();
+    app.world_mut().resource_mut::<Editor>().root = scratch.0.clone();
+    app.world_mut().resource_mut::<Editor>().ready = true;
+    action(&mut app, Action::Add(0));
+    let id = app.world().resource::<Editor>().edits.models[0].id;
+    let target = Selection::Model(id);
+    action(&mut app, Action::ToggleVisibility(target));
+    assert!(app.world().resource::<Editor>().object_hidden(target));
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.room = 1;
+        assert!(!editor.object_hidden(target));
+        editor.room = 0;
+        assert!(editor.object_hidden(target));
+        editor.pending = Some(PendingAction::Close);
+    }
+    action(&mut app, Action::ToggleVisibility(target));
+    assert!(app.world().resource::<Editor>().object_hidden(target));
+    action(&mut app, Action::CancelPending);
+    for invalid in [
+        Selection::Model(u32::MAX),
+        Selection::Imported(100),
+        Selection::Camera(0),
+    ] {
+        action(&mut app, Action::ToggleVisibility(invalid));
+        assert!(!app.world().resource::<Editor>().object_hidden(invalid));
+    }
+}
+
+#[test]
+fn object_eye_survives_restart_scene_reordering_and_showing_again() {
+    let mut app = app();
+    let scratch = CameraSavePath::new();
+    let id;
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.root = scratch.0.clone();
+        editor.project.asset_root = scratch.0.clone();
+        editor.ready = true;
+        editor.imported.push(Imported {
+            entity: Entity::PLACEHOLDER,
+            name: "Block 1".into(),
+            original: Transform::IDENTITY.into(),
+            parent: GlobalTransform::IDENTITY,
+            local: Transform::IDENTITY,
+        });
+    }
+    action(&mut app, Action::Add(0));
+    id = app.world().resource::<Editor>().edits.models[0].id;
+    action(&mut app, Action::ToggleVisibility(Selection::Imported(0)));
+    action(&mut app, Action::ToggleVisibility(Selection::Model(id)));
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.room = 1;
+        editor.open_tabs.push(1);
+    }
+    action(&mut app, Action::ToggleVisibility(Selection::Imported(0)));
+    let editor = app.world().resource::<Editor>();
+    let mut project = editor.project.clone();
+    project.scenes.swap(0, 1);
+    let edits = editor.edits.clone();
+    let mut restarted = Editor::new(project.clone(), edits.clone());
+    // Recreate the imported node after loading the GLB, as at application startup.
+    restarted.imported.push(Imported {
+        entity: Entity::PLACEHOLDER,
+        name: "Block 1".into(),
+        original: Transform::IDENTITY.into(),
+        parent: GlobalTransform::IDENTITY,
+        local: Transform::IDENTITY,
+    });
+    assert!(restarted.object_hidden(Selection::Imported(0)));
+    assert!(!restarted.object_hidden(Selection::Model(id)));
+    restarted.room = 1;
+    assert!(restarted.object_hidden(Selection::Imported(0)));
+    assert!(restarted.object_hidden(Selection::Model(id)));
+    restarted.toggle_visibility(Selection::Model(id));
+    let restarted_again = Editor::new(project, edits);
+    assert!(!restarted_again.hidden_objects[&1].contains(&object_visibility::ObjectKey::Model(id)));
+    assert!(
+        restarted_again.hidden_objects[&1]
+            .contains(&object_visibility::ObjectKey::Imported("Block 1".into()))
+    );
+    assert!(!restarted_again.dirty());
+}
+
+#[test]
+fn light_eyes_hide_every_kind_restore_authored_state_and_survive_restart() {
+    let mut app = app();
+    app.add_systems(Update, lighting::sync.after(handle_actions));
+    let scratch = CameraSavePath::new();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.root = scratch.0.clone();
+        editor.project.asset_root = scratch.0.clone();
+        editor.ready = true;
+    }
+    for preset in [
+        crate::LightPreset::Bulb,
+        crate::LightPreset::Spot,
+        crate::LightPreset::Sun,
+        crate::LightPreset::Softbox,
+    ] {
+        action(
+            &mut app,
+            Action::Lighting(lighting::LightingAction::Add(preset)),
+        );
+    }
+    let before = app.world().resource::<Editor>().edits.clone();
+    let history = app.world().resource::<Editor>().undo.len();
+    let lights: Vec<_> = app
+        .world_mut()
+        .query::<(Entity, &lighting::LightEntity)>()
+        .iter(app.world())
+        .map(|(entity, light)| (entity, light.0))
+        .collect();
+    assert_eq!(lights.len(), 4);
+    for (entity, id) in lights {
+        let target = Selection::Light(id);
+        action(&mut app, Action::ToggleVisibility(target));
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Hidden)
+        );
+        action(&mut app, Action::ToggleVisibility(target));
+        assert_eq!(
+            app.world().get::<Visibility>(entity),
+            Some(&Visibility::Visible)
+        );
+        action(&mut app, Action::ToggleVisibility(target));
+    }
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.edits, before);
+    assert_eq!(editor.undo.len(), history);
+    let mut editor = Editor::new(editor.project.clone(), before);
+    editor.ready = true;
+    for light in &editor.edits.lights {
+        assert!(editor.object_hidden(Selection::Light(light.id)));
+    }
+    let mut restarted = App::new();
+    restarted
+        .add_plugins(MinimalPlugins)
+        .insert_resource(editor)
+        .init_resource::<Scene>()
+        .add_systems(Update, lighting::sync);
+    restarted.update();
+    assert_eq!(
+        restarted
+            .world_mut()
+            .query::<&lighting::LightEntity>()
+            .iter(restarted.world())
+            .count(),
+        4
+    );
+    for visibility in restarted
+        .world_mut()
+        .query_filtered::<&Visibility, With<lighting::LightEntity>>()
+        .iter(restarted.world())
+    {
+        assert_eq!(*visibility, Visibility::Hidden);
+    }
+    // The eye must not re-enable a light disabled through its authored settings.
+    let id = restarted.world().resource::<Editor>().edits.lights[0].id;
+    {
+        let mut editor = restarted.world_mut().resource_mut::<Editor>();
+        editor.edits.lights[0].enabled = false;
+        editor.toggle_visibility(Selection::Light(id));
+        assert!(!editor.object_hidden(Selection::Light(id)));
+    }
+    restarted.update();
+    let visibility = restarted
+        .world_mut()
+        .query::<(&lighting::LightEntity, &Visibility)>()
+        .iter(restarted.world())
+        .find(|(light, _)| light.0 == id)
+        .unwrap()
+        .1;
+    assert_eq!(*visibility, Visibility::Hidden);
+}
+
+#[test]
+fn object_eye_reports_storage_errors_without_losing_the_last_state() {
+    let mut app = app();
+    let scratch = CameraSavePath::new();
+    app.world_mut().resource_mut::<Editor>().root = scratch.0.clone();
+    app.world_mut().resource_mut::<Editor>().ready = true;
+    action(&mut app, Action::Add(0));
+    let id = app.world().resource::<Editor>().edits.models[0].id;
+    let target = Selection::Model(id);
+    action(&mut app, Action::ToggleVisibility(target));
+    let path = scratch.0.join(".bevy-editor/visibility.json");
+    std::fs::write(&path, b"invalid JSON").unwrap();
+    action(&mut app, Action::ToggleVisibility(target));
+    let editor = app.world().resource::<Editor>();
+    assert!(editor.object_hidden(target));
+    assert!(editor.status.contains("Не удалось сохранить видимость"));
+    assert_eq!(std::fs::read(path).unwrap(), b"invalid JSON");
 }
 
 #[test]
@@ -69,11 +420,14 @@ fn focused_search_app() -> App {
 #[test]
 fn typing_in_asset_search_does_not_trigger_scene_shortcuts() {
     let mut app = focused_search_app();
+    let tool = app.world().resource::<Editor>().tool;
     for key in [
+        KeyCode::KeyQ,
         KeyCode::KeyW,
         KeyCode::KeyE,
         KeyCode::KeyR,
         KeyCode::KeyF,
+        KeyCode::NumpadDecimal,
         KeyCode::Delete,
     ] {
         app.world_mut()
@@ -82,10 +436,103 @@ fn typing_in_asset_search_does_not_trigger_scene_shortcuts() {
     }
     app.update();
     let editor = app.world().resource::<Editor>();
-    assert_eq!(editor.tool, Tool::Move);
+    assert_eq!(editor.tool, tool);
     assert_eq!(editor.edits.models.len(), 1);
     assert!(!editor.focus);
     assert!(editor.drawer);
+}
+
+#[test]
+fn q_selects_the_universal_tool_and_keeps_flight_controls_and_scene_data_intact() {
+    let mut app = focused_search_app();
+    app.world_mut().resource_mut::<InputFocus>().clear();
+    let before = app.world().resource::<Editor>().edits.clone();
+    let undo = app.world().resource::<Editor>().undo.len();
+    for (key, tool) in [
+        (KeyCode::KeyQ, Tool::Universal),
+        (KeyCode::KeyW, Tool::Move),
+        (KeyCode::KeyE, Tool::Rotate),
+        (KeyCode::KeyR, Tool::Scale),
+    ] {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.reset_all();
+        keys.press(key);
+        app.update();
+        assert_eq!(app.world().resource::<Editor>().tool, tool);
+    }
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Right);
+    {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.reset_all();
+        keys.press(KeyCode::KeyQ);
+    }
+    app.update();
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(
+        editor.tool,
+        Tool::Scale,
+        "Q remains a flight key while RMB is held"
+    );
+    assert_eq!(editor.edits, before);
+    assert_eq!(editor.undo.len(), undo);
+}
+
+#[test]
+fn universal_tool_respects_camera_and_point_light_transform_limits() {
+    let mut app = app();
+    app.world_mut().resource_mut::<Editor>().ready = true;
+    action(&mut app, Action::Tool(Tool::Universal));
+    action(&mut app, Action::Select(Selection::Camera(0)));
+    {
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.tool, Tool::Universal);
+        for axis in 0..3 {
+            assert!(viewport::allowed(
+                editor,
+                Selection::Camera(0),
+                Tool::Move,
+                axis
+            ));
+            assert!(viewport::allowed(
+                editor,
+                Selection::Camera(0),
+                Tool::Rotate,
+                axis
+            ));
+            assert!(!viewport::allowed(
+                editor,
+                Selection::Camera(0),
+                Tool::Scale,
+                axis
+            ));
+        }
+    }
+    action(
+        &mut app,
+        Action::Lighting(lighting::LightingAction::Add(
+            crate::lighting::LightPreset::Bulb,
+        )),
+    );
+    action(&mut app, Action::Tool(Tool::Move));
+    action(&mut app, Action::Tool(Tool::Universal));
+    let editor = app.world().resource::<Editor>();
+    let point = editor.selection.unwrap();
+    assert!(matches!(point, Selection::Light(_)));
+    assert_eq!(editor.tool, Tool::Universal);
+    for axis in 0..3 {
+        assert!(viewport::allowed(editor, point, Tool::Universal, axis));
+        assert!(viewport::allowed(editor, point, Tool::Move, axis));
+        assert!(!viewport::allowed(editor, point, Tool::Rotate, axis));
+        assert!(!viewport::allowed(editor, point, Tool::Scale, axis));
+        assert!(!viewport::allowed(
+            editor,
+            Selection::Environment,
+            Tool::Universal,
+            axis
+        ));
+    }
 }
 
 #[test]
@@ -584,7 +1031,12 @@ fn focused_text_input_prevents_camera_motion_without_leaving_the_camera_view() {
 fn camera_control_ignores_numpad_zero_and_pilot_keys_do_not_change_tools() {
     let (mut app, _, _) = camera_app();
     app.world_mut().resource_mut::<Editor>().tool = Tool::Scale;
-    for key in [KeyCode::KeyE, KeyCode::KeyW, KeyCode::KeyF] {
+    for key in [
+        KeyCode::KeyQ,
+        KeyCode::KeyE,
+        KeyCode::KeyW,
+        KeyCode::NumpadDecimal,
+    ] {
         {
             let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
             keys.reset_all();

@@ -211,7 +211,7 @@ pub(super) fn create_project(
     let mut files = Vec::new();
     let mut folders = Vec::new();
     let result = (|| {
-        for folder in ["assets", "assets/scenes", "assets/models", "assets/levels"] {
+        for folder in ["assets", "assets/scenes", "assets/models"] {
             let path = directory.join(folder);
             fs::create_dir(&path)?;
             folders.push(path);
@@ -226,7 +226,6 @@ pub(super) fn create_project(
             file.write_all(bytes)?;
             file.sync_all()
         };
-        write("assets/scenes/main.glb", &scene_glb(template))?;
         write("assets/models/cube.glb", &cube_glb())?;
         let view = Transform::from_xyz(5.0, 4.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y);
         let project = EditorProject {
@@ -234,9 +233,9 @@ pub(super) fn create_project(
             asset_root: "assets".into(),
             scenes: vec![SceneDefinition {
                 label: "Главная сцена".into(),
-                asset: "scenes/main.glb".into(),
-                file: "levels/main.json".into(),
-                groups: vec!["Objects".into()],
+                asset: String::new(),
+                file: "scenes/main.scene".into(),
+                groups: Vec::new(),
                 excluded_nodes: Vec::new(),
                 node_policies: Default::default(),
                 cameras: vec![CameraDefinition {
@@ -248,7 +247,7 @@ pub(super) fn create_project(
                     },
                     projection: LensKind::Perspective,
                 }],
-                initial_selection: (template == Template::Starter).then(|| "Cube".into()),
+                initial_selection: None,
                 play: None,
             }],
             catalog: vec![CatalogItem {
@@ -262,13 +261,21 @@ pub(super) fn create_project(
             camera_setup: None,
         };
         let mut edits = LevelEdits::<String>::default();
+        edits.scene = Some(crate::data::SceneSettings {
+            label: project.scenes[0].label.clone(),
+            cameras: project.scenes[0].cameras.clone(),
+        });
+        edits.lighting = Some(crate::SceneLighting::editor_default());
         if template == Template::Starter {
-            let (environment, lights) = crate::LightingPreset::Daylight.create(1);
-            edits.lighting = Some(environment);
-            edits.lights = lights;
+            edits.models.push(crate::PlacedModel {
+                id: 1,
+                asset: "models/cube.glb".into(),
+                pose: Transform::from_xyz(0.0, 0.5, 0.0).into(),
+                bounds: None,
+            });
         }
         write(
-            "assets/levels/main.json",
+            "assets/scenes/main.scene",
             &serde_json::to_vec_pretty(&edits).map_err(io::Error::other)?,
         )?;
         write(
@@ -293,21 +300,11 @@ pub(super) fn create_project(
     result
 }
 
-fn scene_glb(template: Template) -> Vec<u8> {
-    if template == Template::Empty {
-        return encode_glb(
-            serde_json::json!({"asset":{"version":"2.0","generator":"Bevy Editor"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"name":"Objects"}]}),
-            Vec::new(),
-        );
-    }
-    geometry_glb(false)
-}
-
 fn cube_glb() -> Vec<u8> {
-    geometry_glb(true)
+    geometry_glb()
 }
 
-fn geometry_glb(cube_only: bool) -> Vec<u8> {
+fn geometry_glb() -> Vec<u8> {
     let mut positions = Vec::<f32>::new();
     let mut normals = Vec::<f32>::new();
     let mut indices = Vec::<u16>::new();
@@ -339,7 +336,7 @@ fn geometry_glb(cube_only: bool) -> Vec<u8> {
         bytes.extend(value.to_le_bytes());
     }
     let primitive = |material: u32| serde_json::json!({"attributes":{"POSITION":0,"NORMAL":1},"indices":2,"material":material});
-    let mut json = serde_json::json!({
+    let json = serde_json::json!({
         "asset":{"version":"2.0","generator":"Bevy Editor"}, "scene":0,
         "scenes":[{"nodes":[0]}], "nodes":[{"name":"Cube","mesh":0}],
         "buffers":[{"byteLength":bytes.len()}],
@@ -348,16 +345,6 @@ fn geometry_glb(cube_only: bool) -> Vec<u8> {
         "meshes":[{"primitives":[primitive(0)]}],
         "materials":[{"name":"Warm clay","pbrMetallicRoughness":{"baseColorFactor":[0.65,0.32,0.12,1],"metallicFactor":0,"roughnessFactor":0.7}}]
     });
-    if !cube_only {
-        json["nodes"] = serde_json::json!([
-            {"name":"Objects","children":[1]}, {"name":"Cube","mesh":0,"translation":[0,0.5,0]},
-            {"name":"Ground","mesh":1,"translation":[0,-0.05,0],"scale":[12,0.1,12]}
-        ]);
-        json["scenes"][0]["nodes"] = serde_json::json!([0, 2]);
-        json["meshes"] =
-            serde_json::json!([{"primitives":[primitive(0)]},{"primitives":[primitive(1)]}]);
-        json["materials"].as_array_mut().expect("literal materials array").push(serde_json::json!({"name":"Ground","pbrMetallicRoughness":{"baseColorFactor":[0.25,0.28,0.33,1],"metallicFactor":0,"roughnessFactor":0.9}}));
-    }
     encode_glb(json, bytes)
 }
 

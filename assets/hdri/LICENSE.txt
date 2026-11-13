@@ -1,0 +1,22 @@
+These HDR environment maps are derived from Poly Haven HDRIs (CC0 1.0):
+https://polyhaven.com/license
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Original 1K panoramas, also bundled by Material Painter:
+https://github.com/alla2001/material-painter/tree/main/assets/hdri
+
+studio_small_09                  https://polyhaven.com/a/studio_small_09
+brown_photostudio_02             https://polyhaven.com/a/brown_photostudio_02
+christmas_photo_studio_07        https://polyhaven.com/a/christmas_photo_studio_07
+empty_warehouse_01               https://polyhaven.com/a/empty_warehouse_01
+lebombo                         https://polyhaven.com/a/lebombo
+kloofendal_48d_partly_cloudy_puresky https://polyhaven.com/a/kloofendal_48d_partly_cloudy_puresky
+venice_sunset                   https://polyhaven.com/a/venice_sunset
+industrial_sunset_02_puresky     https://polyhaven.com/a/industrial_sunset_02_puresky
+phalzer_forest_01               https://polyhaven.com/a/phalzer_forest_01
+moonless_golf                   https://polyhaven.com/a/moonless_golf
+
+Diffuse irradiance and GGX specular cubemaps were prepared with
+tools/prepare_hdri.py. Resolution: diffuse 32, specular 256 (9 roughness
+levels). Linear RGBA16F, KTX2 with lossless Zstandard supercompression.
+The maps may be used, modified and redistributed, including commercially.

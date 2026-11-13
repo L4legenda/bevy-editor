@@ -6,6 +6,134 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[test]
+fn hdri_settings_roundtrip_and_legacy_lighting_defaults() {
+    let legacy: SceneLighting = serde_json::from_str(r#"{"ambient_brightness":25.0}"#).unwrap();
+    assert_eq!(legacy.hdri, None);
+    assert_eq!(legacy.hdri_asset, None);
+    assert_eq!(legacy.hdri_brightness, 1000.0);
+    assert_eq!(legacy.hdri_rotation, 0.0);
+    assert!(legacy.hdri_background);
+    let previously_saved: SceneLighting = serde_json::from_str(r#"{"hdri":"forest"}"#).unwrap();
+    assert!(previously_saved.hdri_background);
+    for preset in EnvironmentPreset::ALL {
+        let settings = SceneLighting {
+            hdri: Some(preset),
+            hdri_brightness: 2350.0,
+            hdri_rotation: -75.0,
+            hdri_background: false,
+            ..Default::default()
+        };
+        let edits = LevelEdits::<String> {
+            lighting: Some(settings),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&edits).unwrap();
+        let decoded: LevelEdits<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, edits);
+        decoded.lighting.unwrap().validate().unwrap();
+    }
+}
+
+#[test]
+fn downloaded_hdri_references_roundtrip_and_reject_ambiguous_or_nonportable_paths() {
+    let asset = HdriAsset {
+        provider: HdriProvider::AmbientCg,
+        id: "DaySkyHDRI072B".into(),
+        name: "Day Sky HDRI 072 B".into(),
+        resolution: 1024,
+        asset: "hdri/ambientcg/DaySkyHDRI072B/1k/environment.exr".into(),
+    };
+    let settings = SceneLighting {
+        hdri_asset: Some(asset.clone()),
+        hdri_rotation: 60.0,
+        ..Default::default()
+    };
+    assert!(settings.has_hdri());
+    let edits = LevelEdits::<String> {
+        lighting: Some(settings.clone()),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&edits).unwrap();
+    let restored: LevelEdits<String> = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, edits);
+    restored.lighting.unwrap().validate().unwrap();
+    assert!(
+        SceneLighting {
+            hdri: Some(EnvironmentPreset::Forest),
+            ..settings
+        }
+        .validate()
+        .is_err()
+    );
+    for path in [
+        "../escape.hdr",
+        "C:/outside.hdr",
+        "/outside.exr",
+        "https://example.com/a.hdr",
+        "hdri/a.png",
+    ] {
+        assert!(
+            HdriAsset {
+                asset: path.into(),
+                ..asset.clone()
+            }
+            .validate()
+            .is_err(),
+            "{path}"
+        );
+    }
+    assert!(
+        HdriAsset {
+            id: "../escape".into(),
+            ..asset.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        HdriAsset {
+            resolution: 8192,
+            ..asset
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn hdri_rejects_nonfinite_and_out_of_range_parameters() {
+    for value in [-1.0, 100_001.0, f32::NAN, f32::INFINITY] {
+        assert!(
+            SceneLighting {
+                hdri_brightness: value,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for value in [-181.0, 181.0, f32::NAN, f32::NEG_INFINITY] {
+        assert!(
+            SceneLighting {
+                hdri_rotation: value,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for rotation in [-180.0, 0.0, 180.0] {
+        SceneLighting {
+            hdri_brightness: 0.0,
+            hdri_rotation: rotation,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
 struct Directory(PathBuf);
 
 impl Directory {

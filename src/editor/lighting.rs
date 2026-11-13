@@ -13,8 +13,27 @@ use bevy::{
 
 use super::{Editor, Field, Scene, Selection, ui, viewport::EditorCamera};
 use crate::lighting::{
-    FogSettings, LightKind, LightPreset, LightingPreset, SceneLight, SceneLighting, ToneMap,
+    EnvironmentPreset, FogSettings, LightKind, LightPreset, LightingPreset, SceneLight,
+    SceneLighting, ToneMap,
 };
+
+/// Calibrate both editor views before applying optional host camera settings.
+/// HDRI is applied by `sync` after the original camera state has been captured.
+pub(super) fn apply_camera_defaults(camera: &mut EntityCommands) {
+    let settings = SceneLighting::editor_default();
+    camera.insert((
+        bevy::camera::Hdr,
+        AmbientLight {
+            color: Color::srgb_from_array(settings.ambient_color),
+            brightness: settings.ambient_brightness,
+            ..default()
+        },
+        Exposure {
+            ev100: settings.exposure_ev100,
+        },
+        Tonemapping::from(settings.tonemapping),
+    ));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LightField {
@@ -36,6 +55,8 @@ pub(super) enum LightField {
 pub(super) enum EnvironmentField {
     AmbientBrightness,
     Exposure,
+    HdriBrightness,
+    HdriRotation,
     FogStart,
     FogEnd,
 }
@@ -52,6 +73,8 @@ pub(super) enum LightingAction {
     SetColor([u8; 3]),
     SetNumber(Field, f32),
     ToggleImportedLights,
+    SetEnvironment(Option<EnvironmentPreset>),
+    ToggleHdriBackground,
     ToggleFog,
     ToggleGlobalShadows,
     SetShadowResolution(u32),
@@ -109,6 +132,8 @@ fn environment_number(environment: &SceneLighting, field: EnvironmentField) -> f
     match field {
         EnvironmentField::AmbientBrightness => environment.ambient_brightness,
         EnvironmentField::Exposure => environment.exposure_ev100,
+        EnvironmentField::HdriBrightness => environment.hdri_brightness,
+        EnvironmentField::HdriRotation => environment.hdri_rotation,
         EnvironmentField::FogStart => fog.start,
         EnvironmentField::FogEnd => fog.end,
     }
@@ -118,6 +143,8 @@ fn set_environment_number(environment: &mut SceneLighting, field: EnvironmentFie
     match field {
         EnvironmentField::AmbientBrightness => environment.ambient_brightness = value,
         EnvironmentField::Exposure => environment.exposure_ev100 = value,
+        EnvironmentField::HdriBrightness => environment.hdri_brightness = value,
+        EnvironmentField::HdriRotation => environment.hdri_rotation = value,
         _ => {
             let fog = environment.fog.get_or_insert_with(fog_default);
             match field {
@@ -177,10 +204,15 @@ impl Editor {
                     _ => true,
                 })
             }
-            (Selection::Environment, Field::Environment(field)) => {
-                !matches!(field, EnvironmentField::FogStart | EnvironmentField::FogEnd)
-                    || self.environment().fog.is_some()
-            }
+            (Selection::Environment, Field::Environment(field)) => match field {
+                EnvironmentField::FogStart | EnvironmentField::FogEnd => {
+                    self.environment().fog.is_some()
+                }
+                EnvironmentField::HdriBrightness | EnvironmentField::HdriRotation => {
+                    self.environment().has_hdri()
+                }
+                _ => true,
+            },
             _ => false,
         }
     }
@@ -224,6 +256,8 @@ impl Editor {
                     EnvironmentField::FogStart | EnvironmentField::FogEnd => {
                         "Конец тумана должен быть дальше начала"
                     }
+                    EnvironmentField::HdriRotation => "Поворот HDRI: от −180 до 180°",
+                    EnvironmentField::HdriBrightness => "Яркость HDRI: от 0 до 100 000",
                     _ => "Значение окружения вне допустимого диапазона",
                 })
             }
@@ -240,6 +274,7 @@ impl Editor {
                 if let Some(light) = self.edits.lights.iter_mut().find(|light| light.id == id) {
                     set_light_number(light, field, value);
                 }
+                self.initialize_light_environment(id);
             }
             (Some(Selection::Environment), Field::Environment(field)) => {
                 let mut environment = self.environment().clone();
@@ -248,6 +283,27 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    pub(super) fn initialize_light_environment(&mut self, id: u32) {
+        if self.edits.lighting.is_some() {
+            return;
+        }
+        let Some(light) = self.light(id) else {
+            return;
+        };
+        let preset = match light.kind {
+            LightKind::Directional if light.intensity < 1.0 => LightingPreset::Night,
+            LightKind::Directional => LightingPreset::Daylight,
+            _ => LightingPreset::WarmInterior,
+        };
+        let mut settings = preset.settings();
+        settings.ambient_color = [1.0; 3];
+        if light.kind != LightKind::Directional {
+            settings.ambient_brightness = 2.0;
+            settings.exposure_ev100 = 5.0;
+        }
+        self.edits.lighting = Some(settings);
     }
 }
 
@@ -277,7 +333,10 @@ pub(super) fn handle(editor: &mut Editor, action: LightingAction) -> bool {
             };
             let mut light = preset.create(id);
             light.pose.position = (Vec3::from(light.pose.position) + editor.pivot).to_array();
+            // Start authored lighting with a camera calibrated to the source.
+            // Imported preview lights otherwise overwhelm ordinary local lights.
             editor.edits.lights.push(light);
+            editor.initialize_light_environment(id);
             editor.select(Some(Selection::Light(id)));
         }
         LightingAction::ApplyPreset(preset) => {
@@ -302,12 +361,21 @@ pub(super) fn handle(editor: &mut Editor, action: LightingAction) -> bool {
         }
         LightingAction::ResetEnvironment => editor.edits.lighting = None,
         LightingAction::ToggleImportedLights
+        | LightingAction::SetEnvironment(_)
+        | LightingAction::ToggleHdriBackground
         | LightingAction::ToggleFog
         | LightingAction::ToggleGlobalShadows
         | LightingAction::SetShadowResolution(_)
         | LightingAction::CycleToneMapping => {
             let mut settings = editor.environment().clone();
             match action {
+                LightingAction::SetEnvironment(preset) => {
+                    settings.hdri = preset;
+                    settings.hdri_asset = None;
+                }
+                LightingAction::ToggleHdriBackground => {
+                    settings.hdri_background = !settings.hdri_background
+                }
                 LightingAction::ToggleImportedLights => {
                     settings.scene_lights = !settings.scene_lights
                 }
@@ -389,6 +457,12 @@ pub(super) fn handle(editor: &mut Editor, action: LightingAction) -> bool {
             }
         }
     }
+    if editor.edits != before
+        && !matches!(action, LightingAction::ResetEnvironment)
+        && let Some(Selection::Light(id)) = editor.selection
+    {
+        editor.initialize_light_environment(id);
+    }
     editor.edits != before
 }
 
@@ -402,11 +476,18 @@ struct CameraBaseline {
     tone: Option<Tonemapping>,
     fog: Option<DistanceFog>,
     contact: Option<ContactShadows>,
+    environment: Option<bevy::light::EnvironmentMapLight>,
+    hdri_request: Option<crate::hdri::CameraEnvironment>,
+    skybox: Option<bevy::light::Skybox>,
     hdr: bool,
     depth: bool,
 }
 
 impl CameraBaseline {
+    fn has_environment(&self) -> bool {
+        self.environment.is_some() || self.hdri_request.is_some() || self.skybox.is_some()
+    }
+
     fn capture(world: &World, entity: Entity) -> Self {
         Self {
             ambient: world.get::<AmbientLight>(entity).cloned(),
@@ -414,13 +495,22 @@ impl CameraBaseline {
             tone: world.get::<Tonemapping>(entity).cloned(),
             fog: world.get::<DistanceFog>(entity).cloned(),
             contact: world.get::<ContactShadows>(entity).copied(),
+            environment: world
+                .get::<bevy::light::EnvironmentMapLight>(entity)
+                .cloned(),
+            hdri_request: world.get::<crate::hdri::CameraEnvironment>(entity).cloned(),
+            skybox: world.get::<bevy::light::Skybox>(entity).cloned(),
             hdr: world.get::<bevy::camera::Hdr>(entity).is_some(),
             depth: world.get::<DepthPrepass>(entity).is_some(),
         }
     }
 
     fn settings(&self, world: &World, resolution: u32) -> SceneLighting {
-        let mut settings = SceneLighting::default();
+        let mut settings = if self.has_environment() {
+            SceneLighting::default()
+        } else {
+            SceneLighting::editor_default()
+        };
         let ambient = self.ambient.clone().unwrap_or_else(|| {
             world.get_resource::<GlobalAmbientLight>().map_or_else(
                 AmbientLight::default,
@@ -453,6 +543,9 @@ impl CameraBaseline {
         restore_component(world, entity, &self.tone);
         restore_component(world, entity, &self.fog);
         restore_component(world, entity, &self.contact);
+        restore_component(world, entity, &self.hdri_request);
+        restore_component(world, entity, &self.environment);
+        restore_component(world, entity, &self.skybox);
         if let Ok(mut entity) = world.get_entity_mut(entity) {
             if self.hdr {
                 entity.insert(bevy::camera::Hdr);
@@ -617,7 +710,16 @@ pub(super) fn sync(world: &mut World) {
     };
     let room = editor.has_scene().then_some(editor.room);
     let lights = if room.is_some() {
-        editor.edits.lights.clone()
+        editor
+            .edits
+            .lights
+            .iter()
+            .map(|light| {
+                let mut light = light.clone();
+                light.enabled &= !editor.object_hidden(Selection::Light(light.id));
+                light
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -782,6 +884,17 @@ pub(super) fn sync(world: &mut World) {
             queue.apply(world);
         } else {
             baseline.restore(world, *entity);
+            if !baseline.has_environment() {
+                let mut queue = CommandQueue::default();
+                let mut commands = Commands::new(&mut queue, world);
+                let mut camera = commands.entity(*entity);
+                camera.insert(bevy::camera::Hdr);
+                crate::hdri::apply_camera_environment(
+                    &mut camera,
+                    &SceneLighting::editor_default(),
+                );
+                queue.apply(world);
+            }
         }
         let shadows = environment
             .as_ref()

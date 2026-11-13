@@ -13,6 +13,7 @@ mod tests;
 struct Draft {
     room: usize,
     selection: Selection,
+    local_space: bool,
     field: Field,
     original_text: String,
     changed: bool,
@@ -21,7 +22,9 @@ struct Draft {
 
 impl Draft {
     fn belongs_to(&self, editor: &Editor) -> bool {
-        editor.room == self.room && editor.selection == Some(self.selection)
+        editor.room == self.room
+            && editor.selection == Some(self.selection)
+            && editor.local_space == self.local_space
     }
 
     fn update_changed(&mut self, text: &str) {
@@ -44,6 +47,7 @@ impl NumericInput {
             self.drafts.entry(entity).or_insert_with(|| Draft {
                 room: editor.room,
                 selection,
+                local_space: editor.local_space,
                 field,
                 original_text: display_value(editor, field),
                 changed: false,

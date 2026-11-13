@@ -16,6 +16,7 @@ pub(super) fn hit(editor: &Editor, camera: &Camera, view: &Transform, cursor: Ve
         .edits
         .lights
         .iter()
+        .filter(|light| !editor.object_hidden(Selection::Light(light.id)))
         .filter_map(|light| {
             let position = Vec3::from(light.pose.position);
             if position.distance_squared(view.translation) < 0.04 {
@@ -50,6 +51,9 @@ pub(super) fn draw(
         return;
     }
     for light in &editor.edits.lights {
+        if editor.object_hidden(Selection::Light(light.id)) {
+            continue;
+        }
         let pose = light.pose.transform();
         let origin = pose.translation;
         if origin.distance_squared(view.translation) < 0.04 {

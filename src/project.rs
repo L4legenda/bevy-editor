@@ -10,7 +10,7 @@ use std::{
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{CameraPlacement, LevelEdits, data::relative_path};
+use crate::{LevelEdits, data::relative_path};
 
 /// Optional hooks let the host apply its own lighting and materials.
 pub type SceneSetup = fn(&mut EntityCommands, &AssetServer, &str);
@@ -73,6 +73,16 @@ impl EditorProject {
             .join(&project.asset_root)
             .canonicalize()?;
         crate::asset_paths::apply_project_paths(&mut project)?;
+        for scene in &mut project.scenes {
+            if scene.is_native() {
+                let content = LevelEdits::<String>::read(&project.asset_root, &scene.file)?;
+                let settings = content.scene.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Missing scene metadata")
+                })?;
+                scene.label = settings.label;
+                scene.cameras = settings.cameras;
+            }
+        }
         project.validate()?;
         Ok(project)
     }
@@ -86,9 +96,11 @@ impl EditorProject {
         }
         let mut files = HashSet::new();
         for scene in &self.scenes {
-            if !relative_path(&scene.asset, "glb")
-                || !self.asset_root.join(&scene.asset).is_file()
-                || !relative_path(&scene.file, "json")
+            if (!scene.is_native()
+                && (!relative_path(&scene.asset, "glb")
+                    || !self.asset_root.join(&scene.asset).is_file()))
+                || !crate::data::document_path(&scene.file)
+                || (relative_path(&scene.file, "scene") && !scene.asset.is_empty())
                 || !files.insert(&scene.file)
                 || scene.cameras.is_empty()
             {
@@ -127,18 +139,22 @@ impl EditorProject {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneDefinition {
+    #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub asset: String,
     pub file: String,
     /// Direct children of these named glTF groups become editable placements.
+    #[serde(default)]
     pub groups: Vec<String>,
     #[serde(default)]
     pub excluded_nodes: Vec<String>,
     #[serde(default)]
     pub node_policies: BTreeMap<String, NodePolicy>,
+    #[serde(default)]
     pub cameras: Vec<CameraDefinition>,
     #[serde(default)]
     pub initial_selection: Option<String>,
@@ -147,10 +163,16 @@ pub struct SceneDefinition {
 }
 
 impl SceneDefinition {
+    pub(crate) fn is_native(&self) -> bool {
+        self.asset.is_empty() && relative_path(&self.file, "scene")
+    }
     pub(crate) fn validate_edits(&self, edits: &LevelEdits) -> io::Result<()> {
+        let cameras = edits
+            .scene
+            .as_ref()
+            .map_or(&self.cameras, |settings| &settings.cameras);
         for (key, placement) in &edits.cameras {
-            if self
-                .cameras
+            if cameras
                 .iter()
                 .find(|camera| camera.id == *key)
                 .is_none_or(|camera| !camera.projection.valid_lens(placement.lens))
@@ -165,33 +187,28 @@ impl SceneDefinition {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CameraDefinition {
-    /// Stable ID used as the JSON camera key.
-    pub id: String,
-    pub label: String,
-    pub placement: CameraPlacement,
-    #[serde(default)]
-    pub projection: LensKind,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LensKind {
-    #[default]
-    Perspective,
-    Orthographic,
-}
-
-impl LensKind {
-    pub fn valid_lens(self, value: f32) -> bool {
-        match self {
-            Self::Perspective => (5.0..=145.0).contains(&value),
-            Self::Orthographic => (0.05..=20.0).contains(&value),
+impl Serialize for SceneDefinition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("file", &self.file)?;
+        if !self.is_native() {
+            map.serialize_entry("label", &self.label)?;
+            map.serialize_entry("asset", &self.asset)?;
+            map.serialize_entry("groups", &self.groups)?;
+            map.serialize_entry("excluded_nodes", &self.excluded_nodes)?;
+            map.serialize_entry("node_policies", &self.node_policies)?;
+            map.serialize_entry("cameras", &self.cameras)?;
+            map.serialize_entry("initial_selection", &self.initial_selection)?;
         }
+        if self.play.is_some() {
+            map.serialize_entry("play", &self.play)?;
+        }
+        map.end()
     }
 }
+
+pub use crate::data::{CameraDefinition, LensKind};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

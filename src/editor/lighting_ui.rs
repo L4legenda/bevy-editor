@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     editor::lighting::{EnvironmentField, LightField, LightingAction},
-    lighting::{LightKind, LightPreset, LightingPreset},
+    lighting::{EnvironmentPreset, LightKind, LightPreset, LightingPreset},
 };
 use bevy::{input_focus::FocusCause, window::WindowCloseRequested};
 
@@ -89,6 +89,7 @@ pub(crate) struct Help(&'static str);
 pub(crate) enum VisibleWhen {
     Light,
     Environment,
+    Hdri,
     Local,
     Radius,
     Spot,
@@ -105,6 +106,8 @@ pub(crate) enum VisibleWhen {
 #[derive(Clone, Copy, Component)]
 pub(crate) enum Choice {
     Kind(LightKind),
+    Environment(Option<EnvironmentPreset>),
+    HdriBackground,
     Enabled,
     Temperature,
     Shadows,
@@ -120,6 +123,7 @@ pub(crate) enum Choice {
 
 #[derive(Clone, Copy, Component)]
 pub(crate) enum DynamicLabel {
+    HdriBackground,
     Enabled,
     Temperature,
     Shadows,
@@ -444,14 +448,14 @@ pub(crate) fn setup(
         commands,
         menu,
         font_handle,
-        "Окружение, экспозиция и туман…",
+        "Окружение, HDRI и экспозиция…",
         Action::Select(Selection::Environment),
         Look::Regular,
     );
     help(
         commands,
         environment,
-        "Открыть настройки фонового освещения, экспозиции, теней и тумана.",
+        "Открыть настройки HDRI, отражений, фонового света, экспозиции, теней и тумана.",
     );
     dynamic_button(
         commands,
@@ -668,6 +672,69 @@ pub(crate) fn setup(
     );
 
     let environment = pane(commands, panel, VisibleWhen::Environment);
+    section(commands, environment, font_handle, "HDRI · ОКРУЖЕНИЕ");
+    button(
+        commands,
+        environment,
+        font_handle,
+        "Скачать HDRI…",
+        Action::HdriLibrary(super::HdriAction::Open),
+        Look::Regular,
+    );
+    let environments = wrap(commands, environment, 4.0);
+    for preset in std::iter::once(None).chain(EnvironmentPreset::ALL.into_iter().map(Some)) {
+        let label = preset.map_or("Выкл.", EnvironmentPreset::label);
+        let choice = light_button(
+            commands,
+            environments,
+            font_handle,
+            label,
+            LightingAction::SetEnvironment(preset),
+            "Выбрать панораму для фона, освещения и отражений на материалах.",
+        );
+        commands.entity(choice).insert((
+            Choice::Environment(preset),
+            AccessibleLabel(format!("HDRI: {label}")),
+        ));
+    }
+    let downloaded = node(
+        commands,
+        environment,
+        Node {
+            width: percent(100),
+            ..column(4.0)
+        },
+    );
+    commands
+        .entity(downloaded)
+        .insert(super::hdri_library::DownloadedList);
+    let hdri = pane(commands, environment, VisibleWhen::Hdri);
+    dynamic_button(
+        commands,
+        hdri,
+        font_handle,
+        "Панорама на фоне: вкл.",
+        LightingAction::ToggleHdriBackground,
+        Choice::HdriBackground,
+        DynamicLabel::HdriBackground,
+        "Показывать выбранную панораму вдали. При скрытом фоне HDRI продолжает освещать сцену и отражаться в материалах.",
+    );
+    scalar(
+        commands,
+        hdri,
+        font_handle,
+        "Яркость HDRI",
+        Field::Environment(EnvironmentField::HdriBrightness),
+        "кд/м²",
+    );
+    scalar(
+        commands,
+        hdri,
+        font_handle,
+        "Поворот HDRI",
+        Field::Environment(EnvironmentField::HdriRotation),
+        "°",
+    );
     section(commands, environment, font_handle, "ФОНОВЫЙ СВЕТ");
     color_editor(commands, environment, font_handle, Swatch::Ambient, images);
     palette(commands, environment);
@@ -675,7 +742,7 @@ pub(crate) fn setup(
         commands,
         environment,
         font_handle,
-        "Яркость фона",
+        "Яркость фонового света",
         Field::Environment(EnvironmentField::AmbientBrightness),
         "",
     );
@@ -972,7 +1039,11 @@ pub(crate) fn edit_name(
         focus.set(ui.menu_first, FocusCause::Navigated);
     }
     if ui.menu_open
-        && (keys.just_pressed(KeyCode::Escape) || editor.pending.is_some() || !editor.has_scene())
+        && (keys.just_pressed(KeyCode::Escape)
+            || editor.pending.is_some()
+            || editor.asset_viewer_open()
+            || editor.browser_popup
+            || !editor.has_scene())
     {
         ui.menu_open = false;
         ui.pointer_consumed = true;
@@ -1121,7 +1192,9 @@ pub(crate) fn refresh(
     let environment_selected =
         editor.has_scene() && editor.selection == Some(Selection::Environment);
     let environment = editor.environment();
-    let show = editor.has_scene() && (light.is_some() || environment_selected);
+    let show = editor.has_scene()
+        && editor.viewing_model.is_none()
+        && (light.is_some() || environment_selected);
     if let Ok(mut panel) = nodes.get_mut(ui.inspector) {
         panel.display = if show { Display::Flex } else { Display::None };
     }
@@ -1145,6 +1218,7 @@ pub(crate) fn refresh(
         let visible = match *condition {
             VisibleWhen::Light => light.is_some(),
             VisibleWhen::Environment => environment_selected,
+            VisibleWhen::Hdri => environment_selected && environment.has_hdri(),
             VisibleWhen::Local => light.is_some_and(|light| light.kind != LightKind::Directional),
             VisibleWhen::Radius => {
                 light.is_some_and(|light| matches!(light.kind, LightKind::Point | LightKind::Spot))
@@ -1181,6 +1255,12 @@ pub(crate) fn refresh(
             continue;
         };
         let value = match *label {
+            DynamicLabel::HdriBackground => if environment.hdri_background {
+                "Панорама на фоне: вкл."
+            } else {
+                "Панорама на фоне: выкл."
+            }
+            .into(),
             DynamicLabel::Enabled => if light.is_some_and(|light| light.enabled) {
                 "Свет включён"
             } else {
@@ -1250,6 +1330,10 @@ pub(crate) fn refresh(
         if let Some(choice) = choice {
             let active = match *choice {
                 Choice::Kind(kind) => light.is_some_and(|light| light.kind == kind),
+                Choice::Environment(preset) => {
+                    environment.hdri == preset && environment.hdri_asset.is_none()
+                }
+                Choice::HdriBackground => environment.hdri_background,
                 Choice::Enabled => light.is_some_and(|light| light.enabled),
                 Choice::Temperature => light.is_some_and(|light| light.temperature.is_some()),
                 Choice::Shadows => light.is_some_and(|light| light.shadows),
@@ -1313,7 +1397,8 @@ mod tests {
 
     fn name_app() -> (App, Entity, Entity) {
         let project = crate::project::EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut editor = Editor::new(project, crate::data::LevelEdits::default());

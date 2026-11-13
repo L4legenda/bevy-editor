@@ -1,0 +1,10 @@
+{
+  "moves": {
+    "image-Photoroom (3).png": "Изображения\\image-Photoroom (3).png",
+    "models\\small_room.glb": "models\\Новая папка\\small_room.glb"
+  },
+  "origins": {
+    "models\\Новая папка\\small_room.glb": "models\\small_room.glb",
+    "Изображения\\image-Photoroom (3).png": "image-Photoroom (3).png"
+  }
+}

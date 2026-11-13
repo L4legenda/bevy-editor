@@ -176,6 +176,8 @@ fn limits(editor: &Editor, field: Field) -> Option<Limits> {
             match field {
                 E::AmbientBrightness => (0.0, 100_000.0, true),
                 E::Exposure => (-10.0, 24.0, false),
+                E::HdriBrightness => (0.0, 100_000.0, true),
+                E::HdriRotation => (-180.0, 180.0, false),
                 E::FogStart => (
                     0.0,
                     fog.map_or(100_000.0, |fog| (fog.end - 0.01).min(100_000.0)),
@@ -674,6 +676,8 @@ pub(crate) fn input(
     if !editor.has_scene()
         || !editor.ready
         || editor.pending.is_some()
+        || editor.asset_viewer_open()
+        || editor.browser_popup
         || menu_open
         || numeric.error_message().is_some()
         || state.suppressed

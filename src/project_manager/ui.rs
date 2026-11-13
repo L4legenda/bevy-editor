@@ -1,7 +1,20 @@
 use super::{
-    Action, Dialog, Manager,
+    Action, ContextMenu, Dialog, Manager, effects,
     native::Picker,
     projects::{self, Template},
+};
+
+#[path = "context_menu.rs"]
+mod context_menu;
+use crate::{
+    editor::{
+        icons::{self, Glyph},
+        orbital, starfield,
+    },
+    ui_theme::{
+        self, ACCENT, ACTIVE, CHROME, DISABLED_TEXT, EDGE, ERROR, FOCUS, HOVER, MUTED, ON_ACCENT,
+        PANEL, TEXT, WELL, horizon,
+    },
 };
 use bevy::{
     input::mouse::{AccumulatedMouseScroll, MouseScrollUnit},
@@ -12,23 +25,11 @@ use bevy::{
     picking::hover::Hovered,
     prelude::*,
     text::{EditableText, LineBreak, TextCursorStyle, TextReadWriteMode},
-    ui::{
-        BackgroundGradient, ColorStop, InteractionDisabled, IsDefaultUiCamera, LinearGradient,
-        Pressed, UiGlobalTransform,
-    },
+    ui::{BackgroundGradient, InteractionDisabled, IsDefaultUiCamera, Pressed, UiGlobalTransform},
     ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput},
     window::PrimaryWindow,
 };
-
-const BG: Color = Color::srgb(0.045, 0.049, 0.065);
-const PANEL: Color = Color::srgb(0.075, 0.079, 0.098);
-const WELL: Color = Color::srgb(0.035, 0.040, 0.052);
-const EDGE: Color = Color::srgb(0.20, 0.20, 0.24);
-const TEXT: Color = Color::srgb(0.95, 0.94, 0.91);
-const MUTED: Color = Color::srgb(0.67, 0.68, 0.73);
-const ACCENT: Color = Color::srgb(0.83, 0.66, 0.43);
-const SELECTED: Color = Color::srgb(0.20, 0.17, 0.15);
-const ERROR: Color = Color::srgb(1.0, 0.58, 0.48);
+pub(super) use context_menu::{MenuItem, input as context_input, refresh as refresh_context};
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Input {
@@ -41,7 +42,6 @@ pub(super) struct Control {
     action: Action,
     primary: bool,
     pub(super) modal: bool,
-    selected: bool,
 }
 #[derive(Component)]
 pub(super) struct ScrollArea {
@@ -49,12 +49,13 @@ pub(super) struct ScrollArea {
 }
 #[derive(Component)]
 pub(super) struct Placeholder(Entity);
+#[derive(Component)]
+pub(super) struct ControlLabel;
 #[derive(Resource)]
 pub(super) struct Interface {
     font: Handle<Font>,
     root: Entity,
     list: Entity,
-    actions: Entity,
     count: Entity,
     status: Entity,
     sort: Entity,
@@ -65,6 +66,8 @@ pub(super) struct Interface {
     submit: Option<Entity>,
     list_revision: u64,
     dialog_revision: u64,
+    context_root: Option<Entity>,
+    context_state: Option<ContextMenu>,
 }
 
 fn row(gap: f32) -> Node {
@@ -109,10 +112,8 @@ fn text(
         .id()
 }
 fn surface(commands: &mut Commands, parent: Entity, layout: Node, color: Color) -> Entity {
-    let entity = node(commands, parent, layout);
-    commands
-        .entity(entity)
-        .insert((BackgroundColor(color), BorderColor::all(EDGE)));
+    let entity = ui_theme::surface(commands, parent, layout, color);
+    commands.entity(entity).insert(Pickable::IGNORE);
     entity
 }
 fn button(
@@ -124,40 +125,80 @@ fn button(
     primary: bool,
     modal: bool,
 ) -> (Entity, Entity) {
+    let glyph = match &action {
+        Action::New => Some(Glyph::Plus),
+        Action::Import
+        | Action::Open(_)
+        | Action::PickOpen
+        | Action::PickParent
+        | Action::Reveal => Some(Glyph::FolderOpen),
+        Action::Submit => Some(if label == "Создать" {
+            Glyph::Plus
+        } else {
+            Glyph::FolderOpen
+        }),
+        Action::Template(Template::Empty) => Some(Glyph::Camera),
+        Action::Template(Template::Starter) => Some(Glyph::Box),
+        Action::Sort => Some(Glyph::ChevronDown),
+        Action::Favorite => Some(Glyph::Star),
+        Action::Forget | Action::ClearFilter => Some(Glyph::Close),
+        Action::Close if label == "×" => Some(Glyph::Close),
+        _ => None,
+    };
+    let icon_only = label == "×";
     let entity = commands
         .spawn((
             Button,
             Hovered::default(),
+            effects::Motion::button(primary),
             Control {
                 action,
                 primary,
                 modal,
-                selected: false,
             },
             AccessibleLabel(label.into()),
             TabIndex(0),
             Node {
-                min_height: px(38),
+                min_height: px(30),
+                min_width: px(30),
                 justify_content: JustifyContent::Center,
-                padding: UiRect::axes(px(14), px(9)),
+                padding: UiRect::axes(px(if icon_only { 6 } else { 10 }), px(5)),
+                flex_shrink: 0.0,
                 border: UiRect::all(px(1)),
-                border_radius: BorderRadius::all(px(7)),
-                ..row(0.0)
+                border_radius: BorderRadius::all(px(6)),
+                ..row(6.0)
             },
-            BackgroundColor(if primary { ACCENT } else { PANEL }),
-            BorderColor::all(EDGE),
+            BackgroundColor(if primary { ACCENT } else { Color::NONE }),
+            BackgroundGradient::default(),
+            BorderColor::all(Color::NONE),
             ChildOf(parent),
         ))
         .id();
+    if let Some(glyph) = glyph {
+        let icon = icons::spawn(
+            commands,
+            entity,
+            glyph,
+            15.0,
+            if primary { ON_ACCENT } else { TEXT },
+        );
+        commands.entity(icon).insert(effects::Content(entity));
+    }
     let label = text(
         commands,
         entity,
         font,
-        label,
-        14.0,
-        if primary { WELL } else { TEXT },
+        if icon_only {
+            ""
+        } else {
+            label.trim_start_matches("+ ")
+        },
+        if primary { 14.0 } else { 13.0 },
+        if primary { ON_ACCENT } else { TEXT },
     );
-    commands.entity(label).insert(TextLayout::no_wrap());
+    commands
+        .entity(label)
+        .insert((TextLayout::no_wrap(), ControlLabel));
     (entity, label)
 }
 fn input(
@@ -174,7 +215,7 @@ fn input(
         Node {
             min_width: px(0),
             width: percent(100),
-            height: px(40),
+            height: px(32),
             flex_grow: 1.0,
             ..default()
         },
@@ -189,7 +230,7 @@ fn input(
             TabIndex(0),
             TextFont {
                 font: font.clone().into(),
-                font_size: FontSize::Px(14.0),
+                font_size: FontSize::Px(13.0),
                 ..default()
             },
             TextColor(TEXT),
@@ -201,7 +242,12 @@ fn input(
                 min_height: px(0),
                 border: UiRect::all(px(1)),
                 border_radius: BorderRadius::all(px(6)),
-                padding: UiRect::axes(px(12), px(10)),
+                padding: UiRect {
+                    left: px(if field == Input::Search { 34 } else { 10 }),
+                    right: px(10),
+                    top: px(7),
+                    bottom: px(7),
+                },
                 overflow: Overflow::clip(),
                 ..default()
             },
@@ -213,19 +259,30 @@ fn input(
     if field != Input::Search {
         commands.entity(entity).insert(SelectAllOnFocus);
     }
-    let hint = text(commands, wrap, font, placeholder, 14.0, MUTED);
+    if field == Input::Search {
+        let icon = icons::spawn(commands, wrap, Glyph::Search, 16.0, MUTED);
+        commands.entity(icon).insert(Node {
+            position_type: PositionType::Absolute,
+            left: px(10),
+            top: px(8),
+            width: px(16),
+            height: px(16),
+            ..default()
+        });
+    }
+    let hint = text(commands, wrap, font, placeholder, 13.0, MUTED);
     commands.entity(hint).insert((
         Placeholder(entity),
         Node {
             position_type: PositionType::Absolute,
-            left: px(13),
-            top: px(11),
+            left: px(if field == Input::Search { 35 } else { 11 }),
+            top: px(8),
             ..default()
         },
     ));
     entity
 }
-fn mark(commands: &mut Commands, parent: Entity, font: &Handle<Font>, name: &str, size: f32) {
+fn mark(commands: &mut Commands, parent: Entity, glyph: Glyph, size: f32) -> Entity {
     let badge = surface(
         commands,
         parent,
@@ -233,33 +290,26 @@ fn mark(commands: &mut Commands, parent: Entity, font: &Handle<Font>, name: &str
             width: px(size),
             height: px(size),
             border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(size * 0.22)),
+            border_radius: BorderRadius::all(px(8)),
             justify_content: JustifyContent::Center,
             flex_shrink: 0.0,
             ..row(0.0)
         },
-        SELECTED,
+        CHROME,
     );
     commands
         .entity(badge)
-        .insert(BackgroundGradient::from(LinearGradient::new(
-            LinearGradient::TO_BOTTOM_RIGHT,
-            vec![
-                ColorStop::auto(Color::srgb(0.28, 0.22, 0.20)),
-                ColorStop::auto(Color::srgb(0.11, 0.12, 0.18)),
-            ],
-        )));
-    let initial = name
-        .trim()
-        .chars()
-        .next()
-        .unwrap_or('B')
-        .to_uppercase()
-        .to_string();
-    text(commands, badge, font, initial, size * 0.46, ACCENT);
+        .insert(BorderColor::all(ACCENT.with_alpha(0.36)));
+    icons::spawn(commands, badge, glyph, size * 0.52, ACCENT);
+    badge
 }
 
-pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
+pub(super) fn setup(
+    mut commands: Commands,
+    mut fonts: ResMut<Assets<Font>>,
+    stars: Res<starfield::Starfield>,
+    ambience: Res<effects::Ambience>,
+) {
     commands.spawn((Camera2d, IsDefaultUiCamera));
     let font = fonts.add(Font::from_bytes(
         include_bytes!("../../assets/font/LiberationSans.ttf").to_vec(),
@@ -274,7 +324,7 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
                 overflow: Overflow::clip(),
                 ..column(0.0)
             },
-            BackgroundColor(BG),
+            BackgroundColor(PANEL),
             TabGroup::default(),
             Pickable::IGNORE,
         ))
@@ -283,15 +333,20 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         &mut commands,
         root,
         Node {
-            padding: UiRect::axes(px(24), px(18)),
+            padding: UiRect::axes(px(16), px(14)),
             border: UiRect::bottom(px(1)),
             flex_shrink: 0.0,
             ..row(12.0)
         },
-        PANEL,
+        CHROME,
     );
-    mark(&mut commands, header, &font, "B", 36.0);
-    text(&mut commands, header, &font, "Bevy Editor", 20.0, TEXT);
+    starfield::background(&mut commands, header, &stars.chrome);
+    crate::window_chrome::drag_region(&mut commands, header);
+    horizon(&mut commands, header);
+    orbital::brand(&mut commands, header);
+    let brand = node(&mut commands, header, column(1.0));
+    text(&mut commands, brand, &font, "Bevy Editor", 16.0, TEXT);
+    text(&mut commands, brand, &font, "МЕНЕДЖЕР ПРОЕКТОВ", 9.0, MUTED);
     node(
         &mut commands,
         header,
@@ -318,6 +373,8 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         true,
         false,
     );
+    crate::window_chrome::controls(&mut commands, header);
+    crate::window_chrome::resize_edges(&mut commands, root);
 
     let content = node(
         &mut commands,
@@ -329,8 +386,8 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             height: px(0),
             flex_basis: px(0),
             flex_grow: 1.0,
-            padding: UiRect::all(px(24)),
-            ..column(16.0)
+            padding: UiRect::all(px(16)),
+            ..column(12.0)
         },
     );
     let toolbar = node(
@@ -343,9 +400,10 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             ..row(16.0)
         },
     );
-    let count = text(&mut commands, toolbar, &font, "Проекты", 20.0, TEXT);
+    commands.entity(content).insert(effects::Reveal::panel());
+    let count = text(&mut commands, toolbar, &font, "Проекты", 16.0, TEXT);
     commands.entity(count).insert(Node {
-        min_width: px(150),
+        min_width: px(130),
         ..default()
     });
     let search = node(
@@ -369,7 +427,7 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         false,
         false,
     );
-    let list = surface(
+    let list_frame = surface(
         &mut commands,
         content,
         Node {
@@ -379,46 +437,30 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
             height: px(0),
             flex_basis: px(0),
             flex_grow: 1.0,
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(8)),
+            overflow: Overflow::clip(),
+            ..column(0.0)
+        },
+        PANEL,
+    );
+    starfield::background(&mut commands, list_frame, &stars.chrome);
+    effects::background(&mut commands, list_frame, &ambience);
+    let list = node(
+        &mut commands,
+        list_frame,
+        Node {
+            width: percent(100),
+            height: percent(100),
+            min_height: px(0),
             padding: UiRect::all(px(8)),
             overflow: Overflow::scroll_y(),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(10)),
-            ..column(6.0)
+            ..column(4.0)
         },
-        WELL,
     );
     commands
         .entity(list)
         .insert((ScrollPosition::default(), ScrollArea { modal: false }));
-    let footer = node(
-        &mut commands,
-        content,
-        Node {
-            width: percent(100),
-            min_width: px(0),
-            flex_shrink: 0.0,
-            ..row(12.0)
-        },
-    );
-    button(
-        &mut commands,
-        footer,
-        &font,
-        "Пример",
-        Action::Example,
-        false,
-        false,
-    );
-    let actions = node(
-        &mut commands,
-        footer,
-        Node {
-            min_width: px(0),
-            flex_grow: 1.0,
-            justify_content: JustifyContent::End,
-            ..row(8.0)
-        },
-    );
     let status = text(&mut commands, content, &font, "", 12.0, ERROR);
     commands.entity(status).insert((
         Node {
@@ -430,11 +472,48 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         },
         TextLayout::linebreak(LineBreak::WordOrCharacter),
     ));
+    let status_bar = surface(
+        &mut commands,
+        root,
+        Node {
+            height: px(34),
+            padding: UiRect::horizontal(px(16)),
+            border: UiRect::top(px(1)),
+            flex_shrink: 0.0,
+            ..row(8.0)
+        },
+        CHROME,
+    );
+    icons::spawn(&mut commands, status_bar, Glyph::Folder, 14.0, ACCENT);
+    text(&mut commands, status_bar, &font, "Проекты", 11.0, TEXT);
+    node(
+        &mut commands,
+        status_bar,
+        Node {
+            flex_grow: 1.0,
+            ..default()
+        },
+    );
+    let hints = text(
+        &mut commands,
+        status_bar,
+        &font,
+        "Ctrl+N — новый   ·   Ctrl+O — открыть   ·   Enter — открыть   ·   ПКМ — действия проекта",
+        11.0,
+        MUTED,
+    );
+    commands.entity(hints).insert((
+        Node {
+            min_width: px(0),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+        TextLayout::no_wrap(),
+    ));
     commands.insert_resource(Interface {
         font,
         root,
         list,
-        actions,
         count,
         status,
         sort,
@@ -445,16 +524,19 @@ pub(super) fn setup(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
         submit: None,
         list_revision: 0,
         dialog_revision: u64::MAX,
+        context_root: None,
+        context_state: None,
     });
 }
 
 pub(super) fn activate(
     event: On<Activate>,
-    controls: Query<&Control>,
+    mut controls: Query<(&Control, &mut effects::Motion), Without<InteractionDisabled>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut actions: MessageWriter<Action>,
 ) {
-    if let Ok(control) = controls.get(event.entity) {
+    if let Ok((control, mut effect)) = controls.get_mut(event.entity) {
+        effect.activate();
         let action = if keys.any_just_pressed([KeyCode::Enter, KeyCode::Space]) {
             match &control.action {
                 Action::Select(path) => Action::Open(path.clone()),
@@ -514,7 +596,6 @@ pub(super) fn refresh(
     if ui.list_revision != manager.revision {
         ui.list_revision = manager.revision;
         commands.entity(ui.list).despawn_children();
-        commands.entity(ui.actions).despawn_children();
         let entries = manager.visible_projects();
         if let Ok(mut count) = labels.get_mut(ui.count) {
             count.0 = format!("Проекты · {}", entries.len());
@@ -535,10 +616,17 @@ pub(super) fn refresh(
                     flex_grow: 1.0,
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    ..column(16.0)
+                    padding: UiRect::all(px(16)),
+                    flex_shrink: 0.0,
+                    ..column(12.0)
                 },
             );
-            mark(&mut commands, empty, &ui.font, "B", 56.0);
+            if manager.filter.trim().is_empty() {
+                let orbit = orbital::illustration(&mut commands, empty);
+                commands.entity(orbit).insert(effects::Orbit);
+            } else {
+                mark(&mut commands, empty, Glyph::Search, 56.0);
+            }
             text(
                 &mut commands,
                 empty,
@@ -549,21 +637,32 @@ pub(super) fn refresh(
                     "Ничего не найдено"
                 },
                 20.0,
+                TEXT,
+            );
+            text(
+                &mut commands,
+                empty,
+                &ui.font,
+                if manager.filter.trim().is_empty() {
+                    "Создайте новый проект или откройте существующий"
+                } else {
+                    "Попробуйте другое название или путь к проекту"
+                },
+                13.0,
                 MUTED,
             );
         }
-        for project in entries {
+        for (index, project) in entries.into_iter().enumerate() {
             let exists = project.file.is_file();
-            let selected = manager.selected.as_ref() == Some(&project.file);
             let entry = commands
                 .spawn((
                     Button,
                     Hovered::default(),
+                    effects::Motion::card(index),
                     Control {
                         action: Action::Select(project.file.clone()),
                         primary: false,
                         modal: false,
-                        selected,
                     },
                     AccessibleLabel(format!(
                         "{}{}",
@@ -576,19 +675,21 @@ pub(super) fn refresh(
                     )),
                     TabIndex(0),
                     Node {
-                        min_height: px(78),
-                        padding: UiRect::all(px(14)),
+                        min_height: px(72),
+                        padding: UiRect::axes(px(12), px(10)),
                         flex_shrink: 0.0,
                         border: UiRect::all(px(1)),
-                        border_radius: BorderRadius::all(px(7)),
-                        ..row(14.0)
+                        border_radius: BorderRadius::all(px(6)),
+                        ..row(12.0)
                     },
-                    BackgroundColor(WELL),
-                    BorderColor::all(WELL),
+                    BackgroundColor(Color::NONE),
+                    BackgroundGradient::default(),
+                    BorderColor::all(Color::NONE),
                     ChildOf(ui.list),
                 ))
                 .id();
-            mark(&mut commands, entry, &ui.font, &project.title, 40.0);
+            let badge = mark(&mut commands, entry, Glyph::Layers, 38.0);
+            commands.entity(badge).insert(effects::Content(entry));
             let info = node(
                 &mut commands,
                 entry,
@@ -605,7 +706,7 @@ pub(super) fn refresh(
                 info,
                 &ui.font,
                 &project.title,
-                16.0,
+                14.0,
                 if exists { TEXT } else { MUTED },
             );
             commands.entity(title).insert(TextLayout::no_wrap());
@@ -641,52 +742,6 @@ pub(super) fn refresh(
                 },
                 12.0,
                 if exists { MUTED } else { ERROR },
-            );
-        }
-        if let Some(project) = manager
-            .visible_projects()
-            .into_iter()
-            .find(|project| Some(&project.file) == manager.selected.as_ref())
-        {
-            button(
-                &mut commands,
-                ui.actions,
-                &ui.font,
-                if project.favorite {
-                    "Избранное"
-                } else {
-                    "В избранное"
-                },
-                Action::Favorite,
-                false,
-                false,
-            );
-            button(
-                &mut commands,
-                ui.actions,
-                &ui.font,
-                "Папка",
-                Action::Reveal,
-                false,
-                false,
-            );
-            button(
-                &mut commands,
-                ui.actions,
-                &ui.font,
-                "Убрать из списка",
-                Action::Forget,
-                false,
-                false,
-            );
-            button(
-                &mut commands,
-                ui.actions,
-                &ui.font,
-                "Открыть",
-                Action::Open(project.file.clone()),
-                true,
-                false,
             );
         }
     }
@@ -781,7 +836,8 @@ fn build_dialog(
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.01, 0.012, 0.02, 0.84)),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)),
+            effects::Backdrop::default(),
             GlobalZIndex(100),
             TabGroup::modal(),
             ChildOf(ui.root),
@@ -797,11 +853,12 @@ fn build_dialog(
             max_height: percent(94),
             padding: UiRect::all(px(24)),
             border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(14)),
+            border_radius: BorderRadius::all(px(12)),
             ..column(16.0)
         },
         PANEL,
     );
+    commands.entity(dialog).insert(effects::Reveal::dialog());
     let header = node(
         commands,
         dialog,
@@ -810,6 +867,7 @@ fn build_dialog(
             ..row(10.0)
         },
     );
+    orbital::brand(commands, header);
     let heading = node(
         commands,
         header,
@@ -827,7 +885,7 @@ fn build_dialog(
         } else {
             "Открыть проект"
         },
-        25.0,
+        21.0,
         TEXT,
     );
     button(commands, header, &ui.font, "×", Action::Close, false, true);
@@ -875,7 +933,7 @@ fn build_dialog(
         );
         for (template, title, description) in [
             (Template::Empty, "Пустой", "Только камера"),
-            (Template::Starter, "3D-сцена", "Куб, пол и свет"),
+            (Template::Starter, "3D-сцена", "Куб, камера и свет"),
         ] {
             let (card, _) = button(
                 commands,
@@ -894,6 +952,11 @@ fn build_dialog(
                 border_radius: BorderRadius::all(px(8)),
                 ..column(10.0)
             });
+            commands
+                .entity(card)
+                .insert(effects::Motion::card(usize::from(
+                    template == Template::Starter,
+                )));
             text(commands, card, &ui.font, description, 13.0, MUTED);
         }
     } else {
@@ -950,11 +1013,11 @@ fn build_dialog(
             .spawn((
                 Button,
                 Hovered::default(),
+                effects::Motion::button(false),
                 Control {
                     action: Action::Subfolder,
                     primary: false,
                     modal: true,
-                    selected: false,
                 },
                 AccessibleLabel("Подпапка проекта".into()),
                 TabIndex(0),
@@ -963,6 +1026,7 @@ fn build_dialog(
                     ..row(9.0)
                 },
                 BackgroundColor(PANEL),
+                BackgroundGradient::default(),
                 BorderColor::all(EDGE),
                 ChildOf(body),
             ))
@@ -1068,8 +1132,9 @@ pub(super) fn styles(
         &Control,
         &Hovered,
         Has<Pressed>,
-        &mut BackgroundColor,
-        &mut BorderColor,
+        &Children,
+        Has<MenuItem>,
+        &mut effects::Motion,
         &mut TabIndex,
     )>,
     mut fields: Query<
@@ -1083,10 +1148,14 @@ pub(super) fn styles(
         Without<Control>,
     >,
     values: Query<&EditableText>,
+    mut labels: Query<&mut TextColor, With<ControlLabel>>,
     mut placeholders: Query<(&Placeholder, &mut Node)>,
 ) {
-    for (entity, control, hovered, pressed, mut color, mut border, mut tab) in &mut controls {
+    for (entity, control, hovered, pressed, children, menu_item, mut motion, mut tab) in
+        &mut controls
+    {
         let disabled = (!control.modal && manager.form.is_some())
+            || (manager.context.is_some() && !menu_item)
             || (picker.busy() && !matches!(control.action, Action::Close));
         tab.0 = if disabled { -1 } else { 0 };
         if disabled {
@@ -1094,46 +1163,59 @@ pub(super) fn styles(
         } else {
             commands.entity(entity).remove::<InteractionDisabled>();
         }
-        let chosen = control.selected
+        let chosen = matches!(&control.action, Action::Select(file) if manager.selected.as_ref() == Some(file))
             || matches!(control.action, Action::Template(template) if manager.form.as_ref().is_some_and(|form| form.template == template))
             || matches!(control.action, Action::Favorite)
                 && manager.recent.projects.iter().any(|project| {
                     Some(&project.file) == manager.selected.as_ref() && project.favorite
                 });
         let highlighted = !disabled && (hovered.0 || pressed);
-        color.0 = if control.primary {
-            if highlighted {
-                Color::srgb(0.96, 0.78, 0.53)
-            } else {
-                ACCENT
-            }
+        let background = if disabled {
+            Color::NONE
+        } else if control.primary {
+            if highlighted { FOCUS } else { ACCENT }
         } else if chosen {
-            SELECTED
+            ACTIVE
         } else if highlighted {
-            Color::srgb(0.14, 0.14, 0.18)
-        } else if matches!(control.action, Action::Select(_)) {
-            WELL
+            HOVER
         } else {
-            PANEL
+            Color::NONE
         };
-        *border = BorderColor::all(if chosen || focus.get() == Some(entity) {
-            ACCENT
-        } else if matches!(control.action, Action::Select(_)) && !highlighted {
-            WELL
+        motion.color = background;
+        motion.disabled = disabled;
+        motion.selected = chosen;
+        motion.focused = focus.get() == Some(entity);
+        motion.border = if !disabled && focus.get() == Some(entity) {
+            FOCUS
+        } else if chosen {
+            ACCENT.with_alpha(0.42)
         } else {
-            EDGE
-        });
+            Color::NONE
+        };
+        for child in children.iter() {
+            if let Ok(mut label) = labels.get_mut(child) {
+                label.set_if_neq(TextColor(if disabled {
+                    DISABLED_TEXT
+                } else if control.primary {
+                    ON_ACCENT
+                } else {
+                    TEXT
+                }));
+            }
+        }
     }
     for (entity, field, mut border, mut mode, mut tab) in &mut fields {
-        let disabled = picker.busy() || (*field == Input::Search && manager.form.is_some());
+        let disabled = picker.busy()
+            || manager.context.is_some()
+            || (*field == Input::Search && manager.form.is_some());
         tab.0 = if disabled { -1 } else { 0 };
         *mode = if disabled {
             TextReadWriteMode::ReadOnly
         } else {
             TextReadWriteMode::Editable
         };
-        *border = BorderColor::all(if focus.get() == Some(entity) {
-            ACCENT
+        *border = BorderColor::all(if !disabled && focus.get() == Some(entity) {
+            FOCUS
         } else {
             EDGE
         });
@@ -1218,5 +1300,34 @@ fn compact_path(path: &std::path::Path) -> String {
             format!("~/{}", relative.display())
         };
     }
-    path.to_string_lossy().into_owned()
+    let display = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            match prefix.kind() {
+                Prefix::VerbatimDisk(_) => return display[4..].to_owned(),
+                Prefix::VerbatimUNC(_, _) => return format!(r"\\{}", &display[8..]),
+                _ => {}
+            }
+        }
+    }
+    display.into_owned()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod path_tests {
+    use super::compact_path;
+    use std::path::Path;
+
+    #[test]
+    fn compact_paths_hide_verbatim_prefixes_and_preserve_network_roots() {
+        for (stored, shown) in [
+            (r"\\?\C:\Projects\Пример", r"C:\Projects\Пример"),
+            (r"\\?\UNC\server\share\Project", r"\\server\share\Project"),
+            (r"D:\Projects\Example", r"D:\Projects\Example"),
+        ] {
+            assert_eq!(compact_path(Path::new(stored)), shown);
+        }
+    }
 }

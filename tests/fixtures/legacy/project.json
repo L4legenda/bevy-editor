@@ -1,0 +1,90 @@
+{
+  "title": "Bevy Editor",
+  "asset_root": "assets",
+  "scenes": [
+    {
+      "label": "Мастерская",
+      "asset": "scenes/workshop.glb",
+      "file": "levels/workshop.json",
+      "groups": [
+        "Props"
+      ],
+      "cameras": [
+        {
+          "id": "main",
+          "label": "Главная камера",
+          "placement": {
+            "pose": {
+              "position": [
+                6,
+                4,
+                7
+              ],
+              "rotation": [
+                -0.1906250298611287,
+                0.33970440299905974,
+                0.07051678807492655,
+                0.9183084444635649
+              ],
+              "scale": [
+                1,
+                1,
+                1
+              ]
+            },
+            "lens": 45
+          }
+        }
+      ]
+    },
+    {
+      "label": "Малая сцена",
+      "asset": "scenes/small_room.glb",
+      "file": "levels/small_room.json",
+      "groups": [
+        "Props"
+      ],
+      "cameras": [
+        {
+          "id": "main",
+          "label": "Главная камера",
+          "placement": {
+            "pose": {
+              "position": [
+                6,
+                4,
+                7
+              ],
+              "rotation": [
+                -0.1906250298611287,
+                0.33970440299905974,
+                0.07051678807492655,
+                0.9183084444635649
+              ],
+              "scale": [
+                1,
+                1,
+                1
+              ]
+            },
+            "lens": 45
+          }
+        }
+      ]
+    }
+  ],
+  "catalog": [
+    {
+      "label": "Блок",
+      "asset": "models/block.glb",
+      "category": "Примитивы",
+      "solid": true
+    },
+    {
+      "label": "Синий блок",
+      "asset": "models/blue_block.glb",
+      "category": "Примитивы",
+      "solid": true
+    }
+  ]
+}

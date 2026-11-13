@@ -180,6 +180,40 @@ pub(in crate::editor) struct Prepared;
 #[derive(Component)]
 pub(in crate::editor) struct Subject;
 
+pub(super) fn spawn_native(
+    commands: &mut Commands,
+    snapshot: &SceneSnapshot,
+    parent: Entity,
+) -> Entity {
+    let root = commands
+        .spawn((
+            snapshot.clone(),
+            Prepared,
+            Transform::IDENTITY,
+            Visibility::Inherited,
+            RenderLayers::layer(super::LAYER),
+            ChildOf(parent),
+        ))
+        .id();
+    for light in &snapshot.edits.lights {
+        let mut light = light.clone();
+        if snapshot
+            .edits
+            .lighting
+            .as_ref()
+            .is_some_and(|settings| !settings.shadows)
+        {
+            light.shadows = false;
+            light.contact_shadows = false;
+        }
+        let entity = crate::lighting::spawn_light(commands, &light);
+        commands
+            .entity(entity)
+            .insert((ChildOf(root), RenderLayers::layer(super::LAYER)));
+    }
+    root
+}
+
 pub(super) fn prepare(
     ready: On<WorldInstanceReady>,
     snapshots: Query<&SceneSnapshot>,
@@ -316,7 +350,8 @@ mod tests {
 
     fn editor() -> Editor {
         let project = EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         Editor::new(project, RoomEdits::default())

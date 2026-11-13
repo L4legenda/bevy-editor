@@ -20,6 +20,11 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) {
         IDLE,
     );
     for (index, (tool, glyph, label)) in [
+        (
+            Tool::Universal,
+            icons::Glyph::Cursor,
+            "Выбор и преобразование (Q)",
+        ),
         (Tool::Move, icons::Glyph::Move, "Двигать (W)"),
         (Tool::Rotate, icons::Glyph::Rotate, "Поворот (E)"),
         (Tool::Scale, icons::Glyph::Scale, "Масштаб (R)"),

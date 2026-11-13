@@ -1,0 +1,94 @@
+{
+  "scene": {
+    "label": "Малая сцена",
+    "cameras": [
+      {
+        "id": "main",
+        "label": "Главная камера",
+        "placement": {
+          "pose": {
+            "position": [
+              6.0,
+              4.0,
+              7.0
+            ],
+            "rotation": [
+              -0.19062503,
+              0.3397044,
+              0.07051679,
+              0.91830844
+            ],
+            "scale": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          "lens": 45.0
+        },
+        "projection": "perspective"
+      }
+    ]
+  },
+  "models": [
+    {
+      "id": 1,
+      "asset": "models/blue_block.glb",
+      "pose": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "bounds": {
+        "center": [
+          0.0,
+          0.5,
+          0.0
+        ],
+        "half_size": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    }
+  ],
+  "lighting": {
+    "ambient_color": [
+      0.99999994,
+      0.99999994,
+      0.99999994
+    ],
+    "ambient_brightness": 150.0,
+    "exposure_ev100": 8.0,
+    "scene_lights": true,
+    "shadows": true,
+    "shadow_resolution": 512,
+    "tonemapping": "somewhat_boring_display_transform",
+    "fog": null,
+    "hdri": null,
+    "hdri_asset": {
+      "provider": "ambient_cg",
+      "id": "DaySkyHDRI070B",
+      "name": "Day Sky HDRI 070 B",
+      "resolution": 1024,
+      "asset": "hdri/ambientcg/DaySkyHDRI070B/1k/environment.exr"
+    },
+    "hdri_brightness": 1000.0,
+    "hdri_rotation": 0.0,
+    "hdri_background": true
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "environment": {
+    "provider": "ambient_cg",
+    "id": "DaySkyHDRI069B",
+    "name": "Day Sky HDRI 069 B",
+    "resolution": 1024,
+    "asset": "hdri/ambientcg/DaySkyHDRI069B/1k/environment.exr"
+  },
+  "preview": "hdri/ambientcg/DaySkyHDRI069B/1k/preview.png",
+  "source_url": "https://ambientcg.com/a/DaySkyHDRI069B",
+  "license": "CC0-1.0"
+}

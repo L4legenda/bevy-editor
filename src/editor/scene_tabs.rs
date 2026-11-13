@@ -1,11 +1,10 @@
-//! Document tabs mirror the editor's open scenes rather than the whole project.
+//! Open scene, model, and image documents share the same tab strip.
 use bevy::ui::{Selectable, Selected};
 
 use super::*;
 
 pub(super) const LABEL: Color = TEXT;
 pub(super) const INACTIVE_LABEL: Color = MUTED;
-pub(super) const HOVER: Color = Color::srgba(1.0, 0.88, 0.68, 0.045);
 pub(super) const CLOSE_HOVER: Color = Color::srgba(1.0, 0.69, 0.48, 0.14);
 
 fn background(active: bool) -> BackgroundGradient {
@@ -92,8 +91,115 @@ fn close_icon(commands: &mut Commands, parent: Entity) -> Entity {
     icon
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentTab {
+    Scene(Room),
+    Model(usize),
+    Image(usize),
+}
+
+impl DocumentTab {
+    fn caption(self, editor: &Editor) -> String {
+        match self {
+            Self::Scene(room) => editor.project.scenes[room].label.clone(),
+            Self::Model(index) => editor.project.catalog[index].label.clone(),
+            Self::Image(id) => editor
+                .image_tab(id)
+                .map(|tab| {
+                    tab.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn active(self, editor: &Editor) -> bool {
+        match self {
+            Self::Scene(room) => {
+                editor.viewing_model.is_none()
+                    && editor.viewing_image.is_none()
+                    && editor.has_scene()
+                    && editor.room == room
+            }
+            Self::Model(index) => editor.viewing_model == Some(index),
+            Self::Image(id) => editor.viewing_image == Some(id),
+        }
+    }
+
+    fn open(self) -> Action {
+        match self {
+            Self::Scene(room) => Action::Open(room),
+            Self::Model(index) => Action::ViewModel(index),
+            Self::Image(id) => Action::OpenImageTab(id),
+        }
+    }
+
+    fn close(self) -> Action {
+        match self {
+            Self::Scene(room) => Action::CloseTab(room),
+            Self::Model(index) => Action::CloseModelTab(index),
+            Self::Image(id) => Action::CloseImageTab(id),
+        }
+    }
+
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Scene(_) => "сцену",
+            Self::Model(_) => "модель",
+            Self::Image(_) => "изображение",
+        }
+    }
+
+    fn accessible_label(self, editor: &Editor, active: bool, dirty: bool) -> String {
+        format!(
+            "{}{}{}",
+            self.caption(editor),
+            if active {
+                match self {
+                    Self::Scene(_) => " · активная сцена",
+                    Self::Model(_) => " · активная модель",
+                    Self::Image(_) => " · активное изображение",
+                }
+            } else {
+                ""
+            },
+            if dirty {
+                " · есть несохранённые изменения"
+            } else {
+                ""
+            }
+        )
+    }
+}
+
+fn middle_close(commands: &mut Commands, document: DocumentTab, targets: [Entity; 3]) {
+    commands.spawn(
+        Observer::new(
+            move |mut click: On<PointerClick>,
+                  editor: Res<Editor>,
+                  browser: Res<Browser>,
+                  mut focus: ResMut<InputFocus>,
+                  mut actions: MessageWriter<Action>| {
+                if click.button != PointerButton::Middle {
+                    return;
+                }
+                click.propagate(false);
+                let action = document.close();
+                if available(&editor, &browser, action) {
+                    focus.clear();
+                    actions.write(action);
+                }
+            },
+        )
+        .with_entities(targets),
+    );
+}
+
 struct Tab {
-    room: Room,
+    document: DocumentTab,
     group: Entity,
     open: Entity,
     close: Entity,
@@ -110,7 +216,7 @@ struct Tab {
 
 #[derive(Default)]
 pub(in crate::editor) struct Tabs {
-    rooms: Option<Vec<Room>>,
+    documents: Option<Vec<DocumentTab>>,
     controls: Vec<Tab>,
 }
 
@@ -129,7 +235,7 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) -> Entity {
     commands.entity(strip).insert((
         Scroller,
         HorizontalScroller,
-        AccessibleLabel("Открытые сцены".into()),
+        AccessibleLabel("Открытые вкладки".into()),
     ));
     strip
 }
@@ -168,30 +274,9 @@ pub(super) fn empty_workspace(
     ));
     starfield::background(commands, empty, &stars.space);
     orbital::illustration(commands, empty);
-    let title = text(commands, empty, font, "Нет открытых сцен", 23.0, TEXT);
+    let title = text(commands, empty, font, "Нет открытых вкладок", 23.0, TEXT);
     commands.entity(title).insert(TextLayout::default());
     empty
-}
-
-fn caption(editor: &Editor, room: Room) -> String {
-    editor.project.scenes[room].label.clone()
-}
-
-fn accessible_label(editor: &Editor, room: Room, active: bool, dirty: bool) -> String {
-    format!(
-        "{}{}{}",
-        editor.project.scenes[room].label,
-        if active {
-            " · активная сцена"
-        } else {
-            ""
-        },
-        if dirty {
-            " · есть несохранённые изменения"
-        } else {
-            ""
-        },
-    )
 }
 
 pub(super) fn refresh(
@@ -204,25 +289,43 @@ pub(super) fn refresh(
     focused: Option<Entity>,
     hovered: impl Fn(Entity) -> bool,
 ) {
-    let document_dirty =
-        |room| editor.document_dirty(room) || (room == editor.room && numeric.has_changes(editor));
-    if tabs.rooms.as_ref() != Some(&editor.open_tabs) {
+    let documents: Vec<_> = editor
+        .open_tabs
+        .iter()
+        .copied()
+        .map(DocumentTab::Scene)
+        .chain(editor.model_tabs.iter().copied().map(DocumentTab::Model))
+        .chain(
+            editor
+                .image_tabs
+                .iter()
+                .map(|tab| DocumentTab::Image(tab.id)),
+        )
+        .collect();
+    let document_dirty = |document| match document {
+        DocumentTab::Scene(room) => {
+            editor.document_dirty(room) || (room == editor.room && numeric.has_changes(editor))
+        }
+        DocumentTab::Model(_) => false,
+        DocumentTab::Image(id) => editor.image_tab(id).is_some_and(|tab| tab.dirty),
+    };
+    if tabs.documents.as_ref() != Some(&documents) {
         commands
             .entity(interface.tabs)
             .despawn_related::<Children>();
         tabs.controls.clear();
-        tabs.rooms = Some(editor.open_tabs.clone());
-        if editor.open_tabs.is_empty() {
+        tabs.documents = Some(documents.clone());
+        if documents.is_empty() {
             text(
                 commands,
                 interface.tabs,
                 &interface.font,
-                "Нет открытых сцен",
+                "Нет открытых вкладок",
                 12.0,
                 MUTED,
             );
         }
-        for &room in &editor.open_tabs {
+        for &document in &documents {
             let group = node(
                 commands,
                 interface.tabs,
@@ -241,7 +344,7 @@ pub(super) fn refresh(
             let open = control(
                 commands,
                 group,
-                Action::Open(room),
+                document.open(),
                 Look::Tab,
                 Node {
                     height: percent(100),
@@ -259,9 +362,17 @@ pub(super) fn refresh(
                     ..row(7.0)
                 },
             );
-            scene_icon(commands, open);
-            let active = editor.has_scene() && editor.room == room;
-            let caption = caption(editor, room);
+            match document {
+                DocumentTab::Scene(_) => scene_icon(commands, open),
+                DocumentTab::Model(_) => {
+                    icons::spawn(commands, open, icons::Glyph::Box, 18.0, FOCUS);
+                }
+                DocumentTab::Image(_) => {
+                    icons::spawn(commands, open, icons::Glyph::Eye, 18.0, GREEN);
+                }
+            }
+            let active = document.active(editor);
+            let caption = document.caption(editor);
             let title = node(
                 commands,
                 open,
@@ -282,13 +393,16 @@ pub(super) fn refresh(
                 13.0,
                 if active { LABEL } else { INACTIVE_LABEL },
             );
-            let dirty = document_dirty(room);
-            commands
-                .entity(group)
-                .insert((background(active), frame(active, false)));
+            let dirty = document_dirty(document);
+            commands.entity(group).insert((
+                background(active),
+                frame(active, false),
+                Hovered::default(),
+            ));
             commands.entity(open).insert((
                 Selectable,
-                AccessibleLabel(accessible_label(editor, room, active, dirty)),
+                button_fx::HighlightSurface(group),
+                AccessibleLabel(document.accessible_label(editor, active, dirty)),
             ));
             if active {
                 commands.entity(open).insert(Selected);
@@ -296,7 +410,7 @@ pub(super) fn refresh(
             let close = control(
                 commands,
                 group,
-                Action::CloseTab(room),
+                document.close(),
                 Look::TabClose,
                 Node {
                     width: px(24),
@@ -309,9 +423,12 @@ pub(super) fn refresh(
                 },
             );
             commands.entity(close).insert(AccessibleLabel(format!(
-                "Закрыть сцену {}",
-                editor.project.scenes[room].label,
+                "Закрыть {} {}",
+                document.kind(),
+                document.caption(editor),
             )));
+            // Button widgets stop clicks before they can bubble up to the tab frame.
+            middle_close(commands, document, [group, open, close]);
             let close_icon = close_icon(commands, close);
             commands.entity(close_icon).insert(if dirty {
                 Visibility::Hidden
@@ -367,7 +484,7 @@ pub(super) fn refresh(
                 },
             ));
             tabs.controls.push(Tab {
-                room,
+                document,
                 group,
                 open,
                 close,
@@ -384,9 +501,9 @@ pub(super) fn refresh(
         }
     }
     for tab in &mut tabs.controls {
-        let caption = caption(editor, tab.room);
-        let active = editor.has_scene() && editor.room == tab.room;
-        let dirty = document_dirty(tab.room);
+        let caption = tab.document.caption(editor);
+        let active = tab.document.active(editor);
+        let dirty = document_dirty(tab.document);
         let tab_focused = focused.is_some_and(|entity| entity == tab.open || entity == tab.close);
         if tab.caption != caption
             || tab.active != active
@@ -405,11 +522,9 @@ pub(super) fn refresh(
             } else {
                 Visibility::Hidden
             });
-            commands
-                .entity(tab.open)
-                .insert(AccessibleLabel(accessible_label(
-                    editor, tab.room, active, dirty,
-                )));
+            commands.entity(tab.open).insert(AccessibleLabel(
+                tab.document.accessible_label(editor, active, dirty),
+            ));
             if active {
                 commands.entity(tab.open).insert(Selected);
             } else {

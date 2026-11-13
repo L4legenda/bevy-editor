@@ -350,7 +350,11 @@ pub fn apply_project_paths(project: &mut crate::project::EditorProject) -> io::R
         .iter()
         .map(|scene| {
             Ok((
-                resolved_string(&redirects, &root, &scene.asset)?,
+                if scene.asset.is_empty() {
+                    String::new()
+                } else {
+                    resolved_string(&redirects, &root, &scene.asset)?
+                },
                 resolved_string(&redirects, &root, &scene.file)?,
             ))
         })

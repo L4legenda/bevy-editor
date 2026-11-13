@@ -4,7 +4,7 @@ use bevy::input_focus::FocusCause;
 
 fn fixture(field: Field) -> (App, Entity) {
     let project = EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut editor = Editor::new(project, LevelEdits::default());
@@ -350,6 +350,74 @@ fn blur_commit_precedes_an_already_queued_selection_action() {
     assert_eq!(editor.camera(0).pose.position[0], 123.0);
     assert_eq!(editor.camera(1).pose.position[0], -6.0);
     assert_eq!(editor.undo.len(), 1);
+}
+
+#[test]
+fn a_valid_draft_commits_in_the_old_space_before_the_space_toggle() {
+    use crate::editor::{Action, Imported, Scene, handle_actions, viewport::PointerState};
+    let (mut app, input) = fixture(Field::Position(0));
+    app.init_resource::<Scene>()
+        .init_resource::<PointerState>()
+        .add_message::<Action>()
+        .add_systems(Update, handle_actions.after(update));
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        let parent = GlobalTransform::from(
+            Transform::from_xyz(10.0, 20.0, 0.0)
+                .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2)),
+        );
+        let local = Transform::from_xyz(1.0, 2.0, 0.0);
+        editor.imported.push(Imported {
+            entity: Entity::PLACEHOLDER,
+            name: "Space draft".into(),
+            original: parent.mul_transform(local).compute_transform().into(),
+            parent,
+            local,
+        });
+        editor.selection = Some(Selection::Imported(0));
+    }
+    app.update();
+    type_value(&mut app, input, "5");
+    app.world_mut().resource_mut::<InputFocus>().clear();
+    app.world_mut().write_message(Action::LocalSpace);
+    app.update();
+    let editor = app.world().resource::<Editor>();
+    assert!(editor.local_space);
+    assert!((editor.pose(Selection::Imported(0)).unwrap().position[0] - 5.0).abs() < 1e-4);
+    assert!(
+        (editor
+            .field_value(Selection::Imported(0), Field::Position(0))
+            .unwrap()
+            - 1.0)
+            .abs()
+            < 1e-4
+    );
+    assert_eq!(editor.undo.len(), 1);
+}
+
+#[test]
+fn an_invalid_draft_blocks_space_switching_and_keeps_the_entered_text() {
+    use crate::editor::{Action, Scene, handle_actions, viewport::PointerState};
+    let (mut app, input) = fixture(Field::Position(0));
+    app.init_resource::<Scene>()
+        .init_resource::<PointerState>()
+        .add_message::<Action>()
+        .add_systems(Update, handle_actions.after(update));
+    type_value(&mut app, input, "-");
+    app.world_mut().resource_mut::<InputFocus>().clear();
+    app.world_mut().write_message(Action::LocalSpace);
+    app.update();
+    assert!(!app.world().resource::<Editor>().local_space);
+    assert!(app.world().resource::<NumericInput>().invalid(input));
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(input)
+            .unwrap()
+            .value()
+            .to_string(),
+        "-"
+    );
+    assert!(app.world().resource::<Editor>().undo.is_empty());
 }
 
 #[test]

@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">Bevy Editor — Event Horizon</title>
+  <desc id="description">A dark black hole surrounded by a luminous ivory and gold accretion disk, violet gravitational lensing, and a sparse star field.</desc>
+  <defs>
+    <clipPath id="tile">
+      <rect x="12" y="12" width="488" height="488" rx="108"/>
+    </clipPath>
+    <linearGradient id="background" x1="64" y1="32" x2="430" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17182B"/>
+      <stop offset=".47" stop-color="#090B15"/>
+      <stop offset="1" stop-color="#060810"/>
+    </linearGradient>
+    <radialGradient id="violet-cloud" gradientUnits="userSpaceOnUse" cx="388" cy="132" r="290">
+      <stop stop-color="#8F58DC" stop-opacity=".25"/>
+      <stop offset=".52" stop-color="#5F3C9A" stop-opacity=".10"/>
+      <stop offset="1" stop-color="#5F3C9A" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="amber-cloud" gradientUnits="userSpaceOnUse" cx="111" cy="362" r="227">
+      <stop stop-color="#DA9049" stop-opacity=".13"/>
+      <stop offset="1" stop-color="#DA9049" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile-edge" x1="72" y1="24" x2="444" y2="488" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4D49A" stop-opacity=".58"/>
+      <stop offset=".30" stop-color="#9782B6" stop-opacity=".18"/>
+      <stop offset=".69" stop-color="#9B6DD0" stop-opacity=".26"/>
+      <stop offset="1" stop-color="#E5B66A" stop-opacity=".35"/>
+    </linearGradient>
+    <radialGradient id="corona">
+      <stop offset=".49" stop-color="#090A15" stop-opacity="0"/>
+      <stop offset=".61" stop-color="#EEAD5A" stop-opacity=".07"/>
+      <stop offset=".69" stop-color="#FFD793" stop-opacity=".25"/>
+      <stop offset=".78" stop-color="#B875D4" stop-opacity=".11"/>
+      <stop offset="1" stop-color="#584393" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="disk" x1="50" y1="269" x2="458" y2="242" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8245B2" stop-opacity=".12"/>
+      <stop offset=".12" stop-color="#D48A54" stop-opacity=".74"/>
+      <stop offset=".35" stop-color="#F5C67A"/>
+      <stop offset=".54" stop-color="#FFF3CA"/>
+      <stop offset=".72" stop-color="#FFD18A"/>
+      <stop offset=".90" stop-color="#D88D51" stop-opacity=".85"/>
+      <stop offset="1" stop-color="#9A60D3" stop-opacity=".08"/>
+    </linearGradient>
+    <linearGradient id="photon-ring" x1="176" y1="181" x2="327" y2="350" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D68C49"/>
+      <stop offset=".22" stop-color="#FFF5CE"/>
+      <stop offset=".49" stop-color="#FFE1A0"/>
+      <stop offset=".76" stop-color="#B77AE1"/>
+      <stop offset="1" stop-color="#F2B867"/>
+    </linearGradient>
+    <linearGradient id="front-disk" x1="59" y1="263" x2="462" y2="281" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#BE764F" stop-opacity="0"/>
+      <stop offset=".15" stop-color="#E3A65C" stop-opacity=".78"/>
+      <stop offset=".42" stop-color="#FFF0BD"/>
+      <stop offset=".60" stop-color="#FFD68C"/>
+      <stop offset=".82" stop-color="#F0AD5A" stop-opacity=".88"/>
+      <stop offset="1" stop-color="#9857C6" stop-opacity=".10"/>
+    </linearGradient>
+    <radialGradient id="void" cx=".44" cy=".36" r=".72">
+      <stop stop-color="#010208"/>
+      <stop offset=".75" stop-color="#02030A"/>
+      <stop offset="1" stop-color="#090816"/>
+    </radialGradient>
+    <filter id="soft-glow" x="-45%" y="-45%" width="190%" height="190%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+    <filter id="ring-glow" x="-35%" y="-35%" width="170%" height="170%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="3.5" result="glow"/>
+      <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="disk-glow" x="-20%" y="-110%" width="140%" height="320%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5" result="glow"/>
+      <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#tile)">
+    <path fill="url(#background)" d="M0 0h512v512H0z"/>
+    <path fill="url(#violet-cloud)" d="M0 0h512v512H0z"/>
+    <path fill="url(#amber-cloud)" d="M0 0h512v512H0z"/>
+
+    <g fill="#D9CFEF">
+      <circle cx="94" cy="111" r="1.25" opacity=".55"/>
+      <circle cx="149" cy="71" r=".9" opacity=".42"/>
+      <circle cx="263" cy="84" r="1.05" opacity=".34"/>
+      <circle cx="352" cy="75" r="1" opacity=".53"/>
+      <circle cx="431" cy="171" r="1.25" opacity=".38"/>
+      <circle cx="395" cy="361" r="1.15" opacity=".40"/>
+      <circle cx="437" cy="411" r=".8" opacity=".32"/>
+      <circle cx="342" cy="443" r="1.2" opacity=".50"/>
+      <circle cx="225" cy="421" r=".85" opacity=".33"/>
+      <circle cx="131" cy="405" r="1.3" opacity=".47"/>
+      <circle cx="75" cy="334" r=".95" opacity=".35"/>
+      <circle cx="77" cy="221" r=".8" opacity=".25"/>
+      <circle cx="372" cy="141" r=".7" opacity=".48"/>
+    </g>
+    <g fill="#FFE5AC">
+      <path d="m391 104 1.6 6.4 6.4 1.6-6.4 1.6-1.6 6.4-1.6-6.4-6.4-1.6 6.4-1.6z" opacity=".86"/>
+      <path d="m111 165 1.1 4.9 4.9 1.1-4.9 1.1-1.1 4.9-1.1-4.9-4.9-1.1 4.9-1.1z" opacity=".55"/>
+      <circle cx="164" cy="442" r="1.5" opacity=".66"/>
+    </g>
+
+    <circle cx="256" cy="260" r="157" fill="url(#corona)"/>
+    <g transform="rotate(-20 256 260)">
+      <!-- The far side of the accretion disk disappears behind the horizon. -->
+      <ellipse cx="256" cy="260" rx="200" ry="45" stroke="url(#disk)" stroke-width="18" opacity=".55" filter="url(#soft-glow)"/>
+      <ellipse cx="256" cy="260" rx="201" ry="43" stroke="url(#disk)" stroke-width="6" filter="url(#disk-glow)"/>
+      <ellipse cx="256" cy="260" rx="187" ry="34" stroke="url(#disk)" stroke-width="2.2" opacity=".66"/>
+      <ellipse cx="256" cy="260" rx="210" ry="50" stroke="url(#disk)" stroke-width="1.1" opacity=".26"/>
+      <path d="M61 257c24-27 112-45 195-45 87 0 164 16 197 40" stroke="#FFE6AE" stroke-width="1.4" opacity=".37"/>
+    </g>
+
+    <!-- The dark center and its gravitationally lensed photon ring. -->
+    <circle cx="256" cy="260" r="104" stroke="#AA70D4" stroke-width="2" opacity=".33" filter="url(#ring-glow)"/>
+    <circle cx="256" cy="260" r="98" stroke="url(#photon-ring)" stroke-width="11" opacity=".47" filter="url(#soft-glow)"/>
+    <circle cx="256" cy="260" r="96" fill="url(#void)"/>
+    <circle cx="256" cy="260" r="96.5" stroke="url(#photon-ring)" stroke-width="3.8" filter="url(#ring-glow)"/>
+    <path d="M163 243a95 95 0 0 1 170-42" stroke="#FFF5D6" stroke-width="1.25" stroke-linecap="round" opacity=".88"/>
+    <path d="M183 321a95 95 0 0 0 146 3" stroke="#A17ADC" stroke-width="1" stroke-linecap="round" opacity=".48"/>
+
+    <g transform="rotate(-20 256 260)">
+      <!-- Foreground gas flows across the lower part of the black silhouette. -->
+      <path d="M49 260c75 14 139 24 208 20 80-4 151-18 207-31-45 28-121 50-199 54-84 4-159-15-216-43Z" fill="url(#front-disk)" opacity=".76" filter="url(#disk-glow)"/>
+      <path d="M52 261c77 18 137 25 206 21 80-4 149-18 204-32" stroke="url(#front-disk)" stroke-width="3.4" stroke-linecap="round" filter="url(#ring-glow)"/>
+      <path d="M64 267c71 20 131 27 194 24 76-4 139-18 188-32" stroke="#FFE8AC" stroke-width="1.1" stroke-linecap="round" opacity=".72"/>
+      <path d="M83 277c57 20 117 29 178 25 66-4 121-15 168-30" stroke="#AF75D8" stroke-width="1.5" stroke-linecap="round" opacity=".43"/>
+      <path d="M104 284c45 15 94 23 148 21" stroke="#D99350" stroke-width=".9" stroke-linecap="round" opacity=".49"/>
+    </g>
+  </g>
+  <rect x="13" y="13" width="486" height="486" rx="107" stroke="url(#tile-edge)" stroke-width="1.5"/>
+</svg>

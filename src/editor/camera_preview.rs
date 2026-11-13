@@ -179,14 +179,8 @@ pub(in crate::editor) fn update(
         if let Some(camera) = preview.camera.take() {
             commands.entity(camera).despawn();
         }
-        let mut camera = commands.spawn((
-            Camera3d::default(),
-            ScreenSpaceTransmission::default(),
-            AmbientLight {
-                brightness: 150.0,
-                ..default()
-            },
-        ));
+        let mut camera = commands.spawn((Camera3d::default(), ScreenSpaceTransmission::default()));
+        crate::editor::lighting::apply_camera_defaults(&mut camera);
         if let Some(setup) = editor.project.camera_setup {
             let asset = crate::asset_paths::original_asset_path(
                 &editor.project.asset_root,

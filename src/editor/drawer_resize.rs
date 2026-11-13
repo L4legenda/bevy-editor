@@ -57,12 +57,16 @@ pub(crate) fn resize(
     let cursor = window.cursor_position();
     let top = window.height() - FOOT - motion.visible_height;
     let settled = editor.pending.is_none()
+        && !editor.hdri_library_open
+        && !editor.browser_popup
         && editor.drawer
         && motion.progress >= 1.0
         && window.focused
         && !editor.sidebar.resizing();
 
     if editor.pending.is_some()
+        || editor.hdri_library_open
+        || editor.browser_popup
         || !editor.drawer
         || !window.focused
         || !mouse.pressed(MouseButton::Left)
@@ -170,7 +174,8 @@ mod tests {
     #[test]
     fn resize_system_captures_drags_and_releases_the_mouse() {
         let project = crate::project::EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut editor = Editor::new(project, crate::data::LevelEdits::default());

@@ -2,7 +2,6 @@
 use bevy::{
     asset::{AssetPath, embedded_asset, embedded_path},
     input_focus::InputFocusVisible,
-    prelude::*,
     reflect::TypePath,
     render::render_resource::AsBindGroup,
     shader::ShaderRef,
@@ -29,7 +28,7 @@ impl UiMaterial for ButtonMaterial {
 }
 
 #[derive(Component)]
-pub(super) struct Effect {
+pub(crate) struct Effect {
     material: Handle<ButtonMaterial>,
     hover: f32,
     press: f32,
@@ -43,14 +42,25 @@ pub(super) struct Effect {
     attached: bool,
 }
 
+/// Render a control's highlight across its shared container.
+#[derive(Component)]
+pub(super) struct HighlightSurface(pub Entity);
+
+/// Other editor windows can opt into the same interaction effect.
+#[derive(Component)]
+pub(crate) struct Strength(pub f32);
+
 impl Effect {
     /// Called only after the ordinary control activation has been accepted.
-    pub(super) fn activate(&mut self) {
+    pub(crate) fn activate(&mut self) {
         self.activated = true;
     }
 }
 
-pub(in crate::editor) struct ButtonFxPlugin;
+pub(crate) struct ButtonFxPlugin;
+
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ButtonFxSystems;
 
 impl Plugin for ButtonFxPlugin {
     fn build(&self, app: &mut App) {
@@ -60,6 +70,7 @@ impl Plugin for ButtonFxPlugin {
                 Update,
                 (attach, animate)
                     .chain()
+                    .in_set(ButtonFxSystems)
                     .after(super::refresh)
                     .after(super::refresh_lighting)
                     .after(super::refresh_browser),
@@ -70,15 +81,21 @@ impl Plugin for ButtonFxPlugin {
 fn attach(
     mut commands: Commands,
     mut materials: ResMut<Assets<ButtonMaterial>>,
-    controls: Query<(Entity, &Control), Without<Effect>>,
+    controls: Query<
+        (Entity, Option<&Control>, Option<&Strength>),
+        (Without<Effect>, Or<(With<Control>, With<Strength>)>),
+    >,
 ) {
-    for (entity, control) in &controls {
-        let strength = match control.look {
-            Look::Primary => 0.6,
-            Look::Asset | Look::Outline => 0.75,
-            Look::Tool | Look::Tab => 0.85,
-            _ => 1.0,
-        };
+    for (entity, control, strength) in &controls {
+        let strength = strength.map_or_else(
+            || match control.unwrap().look {
+                Look::Primary => 0.6,
+                Look::Asset | Look::Outline => 0.75,
+                Look::Tool | Look::Tab => 0.85,
+                _ => 1.0,
+            },
+            |strength| strength.0,
+        );
         // The handle lives with the control, so Bevy frees its material when
         // a browser row or scene tab is rebuilt or removed.
         commands.entity(entity).try_insert(Effect {
@@ -108,14 +125,17 @@ fn animate(
     focus_visible: Res<InputFocusVisible>,
     drag: Option<Res<AssetDrag>>,
     mut materials: ResMut<Assets<ButtonMaterial>>,
-    mut controls: Query<(
-        Entity,
+    surfaces: Query<(
         &Hovered,
-        Has<Pressed>,
-        Has<InteractionDisabled>,
         &ComputedNode,
         &UiGlobalTransform,
         &InheritedVisibility,
+    )>,
+    mut controls: Query<(
+        Entity,
+        Has<Pressed>,
+        Has<InteractionDisabled>,
+        Option<&HighlightSurface>,
         &mut Effect,
     )>,
 ) {
@@ -129,9 +149,11 @@ fn animate(
             next
         }
     };
-    for (entity, hovered, pressed, disabled, computed, transform, visibility, mut effect) in
-        &mut controls
-    {
+    for (entity, pressed, disabled, surface, mut effect) in &mut controls {
+        let surface = surface.map_or(entity, |surface| surface.0);
+        let Ok((hovered, computed, transform, visibility)) = surfaces.get(surface) else {
+            continue;
+        };
         let enabled = !disabled
             && !dragging
             && window.focused
@@ -195,11 +217,11 @@ fn animate(
         if active != effect.attached {
             if active {
                 commands
-                    .entity(entity)
+                    .entity(surface)
                     .try_insert(MaterialNode(effect.material.clone()));
             } else {
                 commands
-                    .entity(entity)
+                    .entity(surface)
                     .try_remove::<MaterialNode<ButtonMaterial>>();
             }
             effect.attached = active;

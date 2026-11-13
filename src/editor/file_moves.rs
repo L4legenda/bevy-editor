@@ -352,6 +352,22 @@ fn prepare(
     }
     let mut redirects = Redirects::read(&editor.root)?;
     let mut companions = Vec::new();
+    if matches!(entry, Entry::Image(_)) {
+        let native = from.with_extension("pcraft");
+        match fs::symlink_metadata(editor.root.join(&native)) {
+            Ok(metadata) => {
+                checked_path(&editor.root, &native)?;
+                if !metadata.is_file() {
+                    return Err(invalid("Сопутствующий .pcraft должен быть обычным файлом"));
+                }
+                let target = to.with_extension("pcraft");
+                destination_available(&editor.root.join(&target))?;
+                companions.push((native, target));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     if source.is_file() {
         // Metadata may have been moved separately earlier. Follow its retained
         // alias rather than silently dropping those settings on the next move.
@@ -426,8 +442,8 @@ fn prepare(
     for (index, scene) in updated.scenes.iter_mut().enumerate() {
         remap_string(&mut scene.asset, &from, &to);
         remap_string(&mut scene.file, &from, &to);
-        if !crate::data::relative_path(&scene.asset, "glb")
-            || !crate::data::relative_path(&scene.file, "json")
+        if (!scene.is_native() && !crate::data::relative_path(&scene.asset, "glb"))
+            || !crate::data::document_path(&scene.file)
         {
             return Err(invalid(
                 "Путь сцены после перемещения не поддерживается редактором",
@@ -673,6 +689,9 @@ pub(super) fn move_entry(
             remap_edits(edits, &plan.from, &plan.to);
         }
     }
+    for tab in &mut editor.image_tabs {
+        tab.path = remap(&tab.path, &plan.from, &plan.to);
+    }
     browser.refresh_after_move(&mut editor.project, &plan.from, &plan.to);
     Ok(true)
 }
@@ -785,6 +804,35 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn moving_an_open_image_updates_its_tab_path_without_changing_its_identity() {
+        let files = Fixture::new();
+        files.file("images/photo.png", b"image");
+        files.file("images/photo.pcraft", b"native layers");
+        fs::create_dir(files.0.join("archive")).unwrap();
+        let (mut editor, mut browser) = files.editor();
+        editor.open_image_tab(PathBuf::from("images/photo.png"));
+        let tab = editor.viewing_image.unwrap();
+        let image = browser
+            .files
+            .iter()
+            .position(|file| file.path == Path::new("images/photo.png"))
+            .unwrap();
+        let destination = folder(&browser, "archive");
+        assert!(move_entry(&mut editor, &mut browser, Entry::Image(image), destination).unwrap());
+        assert_eq!(editor.viewing_image, Some(tab));
+        assert_eq!(
+            editor.image_tab(tab).unwrap().path,
+            PathBuf::from("archive/photo.png")
+        );
+        assert!(files.0.join("archive/photo.png").exists());
+        assert_eq!(
+            fs::read(files.0.join("archive/photo.pcraft")).unwrap(),
+            b"native layers"
+        );
+        assert!(!files.0.join("images/photo.pcraft").exists());
+    }
+
     fn placements(asset: &str) -> RoomEdits {
         RoomEdits {
             models: vec![PlacedModel {
@@ -795,6 +843,53 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn moving_native_scene_models_rewrites_the_single_scene_document() {
+        let files = Fixture::new();
+        files.glb("models/chair.glb", None);
+        fs::create_dir(files.0.join("archive")).unwrap();
+        let (mut editor, _) = files.editor();
+        editor.project.scenes[0].asset.clear();
+        editor.project.scenes[0].file = "scenes/room.scene".into();
+        let mut edits = placements("models/chair.glb");
+        edits.scene = Some(crate::SceneSettings {
+            label: "Room".into(),
+            cameras: editor.project.scenes[0].cameras.clone(),
+        });
+        edits.write(&files.0, "scenes/room.scene").unwrap();
+        editor.edits = edits.clone();
+        editor.saved = edits;
+        fs::write(
+            files.0.join(crate::project::PROJECT_FILE_NAME),
+            serde_json::to_vec_pretty(&editor.project).unwrap(),
+        )
+        .unwrap();
+        let mut browser = Browser::new(&mut editor.project);
+        let index = model(&editor, "models/chair.glb");
+        let target = folder(&browser, "archive");
+        move_entry(&mut editor, &mut browser, Entry::Model(index), target).unwrap();
+        let saved = editor.project.read_scene(0).unwrap();
+        assert_eq!(saved.models[0].asset, "archive/chair.glb");
+        assert!(saved.scene.is_some());
+        let file = browser
+            .files
+            .iter()
+            .position(|file| file.path == Path::new("scenes/room.scene"))
+            .unwrap();
+        let target = folder(&browser, "archive");
+        move_entry(
+            &mut editor,
+            &mut browser,
+            Entry::Scene { file, room: 0 },
+            target,
+        )
+        .unwrap();
+        assert_eq!(editor.project.scenes[0].file, "archive/room.scene");
+        let reopened = EditorProject::load(&files.0).unwrap();
+        assert!(reopened.scenes[0].is_native());
+        assert_eq!(reopened.read_scene(0).unwrap(), saved);
     }
 
     #[test]
@@ -880,7 +975,13 @@ mod tests {
                 .join("archive/chair/textures/wood albedo.png")
                 .is_file()
         );
-        assert_eq!(editor.project.catalog[0].asset, "archive/chair/model.glb");
+        assert!(
+            editor
+                .project
+                .catalog
+                .iter()
+                .any(|item| item.asset == "archive/chair/model.glb")
+        );
     }
 
     #[test]
@@ -1118,7 +1219,7 @@ mod tests {
             original_parent,
         )
         .unwrap();
-        assert_eq!(editor.project.catalog.len(), 1);
+        assert_eq!(editor.project.catalog.len(), 2);
         assert_eq!(editor.project.catalog[index].asset, "models/chair.glb");
         assert_eq!(editor.edits.models[0].asset, "models/chair.glb");
         assert!(files.0.join("models/chair.glb").is_file());

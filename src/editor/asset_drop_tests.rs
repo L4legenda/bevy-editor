@@ -76,22 +76,20 @@ fn dropping_a_model_places_one_instance_at_the_drop_point_with_one_undo_step() {
 }
 
 #[test]
-fn scene_source_and_generic_glb_drops_place_instances_without_opening_their_scene() {
+fn glbs_previously_used_as_sources_are_placeable_models() {
     for scene_card in [true, false] {
         let (mut app, browser) = workspace();
         let editor = app.world().resource::<Editor>();
         let source = editor.project.scenes[1].asset.clone();
         let catalog_count = editor.project.catalog.len();
-        let file = browser
-            .files
+        let index = editor
+            .project
+            .catalog
             .iter()
-            .position(|file| file.path == std::path::Path::new(&source))
+            .position(|model| model.asset == source)
             .unwrap();
-        let entry = if scene_card {
-            Entry::Scene { file, room: 1 }
-        } else {
-            Entry::File(file)
-        };
+        let _ = scene_card;
+        let entry = Entry::Model(index);
         let point = Vec3::new(-1.0, 0.0, 2.5);
         assert!(drop_at(&mut app, &browser, entry, point));
         let editor = app.world().resource::<Editor>();

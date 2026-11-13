@@ -7,7 +7,7 @@ import struct
 ROOT = Path(__file__).parent
 
 
-def glb(path, color, placements=None):
+def glb(path, color):
     positions, normals, indices = [], [], []
     # Counterclockwise faces with separate vertices for flat normals.
     for normal, corners in [
@@ -42,18 +42,6 @@ def glb(path, color, placements=None):
             {'bufferView': 2, 'componentType': 5123, 'count': 36, 'type': 'SCALAR'},
         ],
     }
-    if placements is not None:
-        data['nodes'] = [
-            {'name': 'Example room', 'children': [1, 2, 3]},
-            {'name': 'Floor', 'mesh': 1, 'translation': [0, -0.1, 0], 'scale': [12, 0.2, 12]},
-            {'name': 'Props', 'children': list(range(4, 4 + len(placements)))},
-            {'name': 'Key light', 'rotation': [-0.35, 0.2, 0.1, math.sqrt(0.8275)],
-             'extensions': {'KHR_lights_punctual': {'light': 0}}},
-        ] + [{'name': f'Block {index + 1}', 'mesh': 0, 'translation': point} for index, point in enumerate(placements)]
-        data['meshes'].append({'primitives': [{'attributes': attributes, 'indices': 2, 'material': 1}]})
-        data['materials'].append({'pbrMetallicRoughness': {'baseColorFactor': [0.26, 0.29, 0.34, 1], 'metallicFactor': 0, 'roughnessFactor': 0.8}})
-        data['extensionsUsed'] = ['KHR_lights_punctual']
-        data['extensions'] = {'KHR_lights_punctual': {'lights': [{'type': 'directional', 'intensity': 1500, 'color': [1, 0.96, 0.9]}]}}
     encoded = json.dumps(data, separators=(',', ':')).encode()
     encoded += b' ' * (-len(encoded) % 4)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,17 +52,24 @@ def glb(path, color, placements=None):
 
 glb(ROOT / 'assets/models/block.glb', [0.72, 0.36, 0.13, 1])
 glb(ROOT / 'assets/models/blue_block.glb', [0.12, 0.4, 0.72, 1])
-glb(ROOT / 'assets/scenes/workshop.glb', [0.72, 0.36, 0.13, 1], [[-2, 0.5, 0], [0, 0.5, 0], [2, 0.5, 0]])
-glb(ROOT / 'assets/scenes/small_room.glb', [0.12, 0.4, 0.72, 1], [[0, 0.5, 0]])
-
 yaw, pitch = math.atan2(6, 7), -math.atan2(4, math.hypot(6, 7))
 rotation = [math.cos(yaw / 2) * math.sin(pitch / 2), math.sin(yaw / 2) * math.cos(pitch / 2),
             -math.sin(yaw / 2) * math.sin(pitch / 2), math.cos(yaw / 2) * math.cos(pitch / 2)]
 camera = {'id': 'main', 'label': 'Главная камера', 'placement': {
     'pose': {'position': [6, 4, 7], 'rotation': rotation, 'scale': [1, 1, 1]}, 'lens': 45}}
+definitions = [('Мастерская', 'workshop', 'block', [[-2, 0, 0], [0, 0, 0], [2, 0, 0]]),
+               ('Малая сцена', 'small_room', 'blue_block', [[0, 0, 0]])]
+for label, name, model, positions in definitions:
+    scene = {'scene': {'label': label, 'cameras': [camera]}, 'models': [
+        {'id': index + 1, 'asset': f'models/{model}.glb',
+         'pose': {'position': position, 'rotation': [0, 0, 0, 1], 'scale': [1, 1, 1]}}
+        for index, position in enumerate(positions)
+    ]}
+    path = ROOT / f'assets/scenes/{name}.scene'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(scene, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 project = {'title': 'Bevy Editor', 'asset_root': 'assets', 'scenes': [
-    {'label': label, 'asset': f'scenes/{name}.glb', 'file': f'levels/{name}.json', 'groups': ['Props'], 'cameras': [camera]}
-    for label, name in [('Мастерская', 'workshop'), ('Малая сцена', 'small_room')]
+    {'file': f'scenes/{name}.scene'} for _, name, _, _ in definitions
 ], 'catalog': [
     {'label': label, 'asset': f'models/{name}.glb', 'category': 'Примитивы', 'solid': True}
     for label, name in [('Блок', 'block'), ('Синий блок', 'blue_block')]

@@ -8,7 +8,7 @@ use bevy::{
 };
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-pub(super) struct StarfieldMaterial {
+pub(crate) struct StarfieldMaterial {
     // Opacity, drift speed, seed, and padding; vec4 preserves uniform alignment.
     #[uniform(0)]
     parameters: Vec4,
@@ -23,7 +23,7 @@ impl UiMaterial for StarfieldMaterial {
 }
 
 #[derive(Resource)]
-pub(super) struct Starfield {
+pub(crate) struct Starfield {
     pub chrome: Handle<StarfieldMaterial>,
     pub space: Handle<StarfieldMaterial>,
 }
@@ -42,7 +42,7 @@ impl FromWorld for Starfield {
     }
 }
 
-pub(super) struct StarfieldPlugin;
+pub(crate) struct StarfieldPlugin;
 
 impl Plugin for StarfieldPlugin {
     fn build(&self, app: &mut App) {
@@ -52,7 +52,7 @@ impl Plugin for StarfieldPlugin {
     }
 }
 
-pub(super) fn background(
+pub(crate) fn background(
     commands: &mut Commands,
     parent: Entity,
     material: &Handle<StarfieldMaterial>,

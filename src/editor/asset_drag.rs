@@ -150,6 +150,7 @@ fn destination_allowed(
 
 fn can_place(entry: Entry, browser: &Browser, editor: &Editor) -> bool {
     editor.has_scene()
+        && !editor.asset_viewer_open()
         && editor.ready
         && browser
             .model_asset(&editor.project.catalog, entry)
@@ -219,6 +220,8 @@ pub(crate) fn pointer(
             .is_some_and(|lighting| lighting.blocks_scene_input())
         || !editor.drawer
         || editor.pending.is_some()
+        || editor.hdri_library_open
+        || editor.browser_popup
         || motion.resizing
         || editor.sidebar.resizing()
         || keys.just_pressed(KeyCode::Escape)
@@ -484,32 +487,35 @@ mod tests {
     }
 
     #[test]
-    fn scene_and_generic_glbs_are_placeable_only_with_a_ready_open_scene() {
+    fn models_are_placeable_and_scene_documents_are_not() {
         let mut project = crate::project::EditorProject::load(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let browser = Browser::new(&mut project);
         let file = browser
             .files
             .iter()
-            .position(|file| file.path == Path::new(&project.scenes[0].asset))
+            .position(|file| file.path == Path::new(&project.scenes[0].file))
             .unwrap();
         let mut editor = Editor::new(project, crate::data::LevelEdits::default());
-        let scene = Entry::Scene { file, room: 0 };
-        assert!(!can_place(scene, &browser, &editor));
+        assert!(!can_place(Entry::Model(0), &browser, &editor));
         editor.ready = true;
-        assert!(can_place(scene, &browser, &editor));
-        assert!(can_place(Entry::File(file), &browser, &editor));
-        assert!(!can_place(Entry::Image(file), &browser, &editor));
+        assert!(can_place(Entry::Model(0), &browser, &editor));
+        assert!(!can_place(
+            Entry::Scene { file, room: 0 },
+            &browser,
+            &editor
+        ));
+        assert!(!can_place(Entry::File(file), &browser, &editor));
         editor.open_tabs.clear();
-        assert!(!can_place(scene, &browser, &editor));
+        assert!(!can_place(Entry::Model(0), &browser, &editor));
     }
 
     #[test]
     fn camera_preview_and_pilot_letterbox_bars_are_not_drop_targets() {
         let project = crate::project::EditorProject::load(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut editor = Editor::new(project, crate::data::LevelEdits::default());
@@ -545,7 +551,7 @@ mod tests {
     fn pointer_system_emits_a_scene_drop_instead_of_a_card_click() {
         use bevy::ecs::message::MessageCursor;
         let mut project = crate::project::EditorProject::load(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let browser = Browser::new(&mut project);

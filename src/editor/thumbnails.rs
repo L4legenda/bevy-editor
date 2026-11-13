@@ -10,12 +10,14 @@ use bevy::{
         ClearColorConfig, Exposure, Hdr, RenderTarget, primitives::Aabb, visibility::RenderLayers,
     },
     gltf::GltfLoaderSettings,
-    light::CascadeShadowConfigBuilder,
+    light::{CascadeShadowConfigBuilder, EnvironmentMapLight},
     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceTransmission},
     prelude::*,
     render::{
         MainWorld,
+        render_asset::RenderAssets,
         render_resource::{PipelineCache, TextureFormat},
+        texture::GpuImage,
         view::Tonemapping,
     },
 };
@@ -26,6 +28,9 @@ use super::{
     load_error, viewport,
 };
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "asset_loading_tests.rs"]
+mod asset_loading_tests;
 #[path = "thumbnail_framing.rs"]
 mod framing;
 #[cfg(test)]
@@ -49,6 +54,13 @@ enum Target {
     Scene(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreviewState {
+    Loading,
+    Ready,
+    Failed,
+}
+
 impl Target {
     fn from_entry(entry: Entry) -> Option<Self> {
         match entry {
@@ -64,6 +76,7 @@ pub(super) struct Thumbnails {
     pub(super) images: Vec<Handle<Image>>,
     pub(super) scene_images: Vec<Handle<Image>>,
     completed: HashSet<Target>,
+    failed: HashSet<Target>,
     snapshots: Vec<Option<scene::SceneSnapshot>>,
     changed: Vec<Instant>,
     scan_revision: Option<u64>,
@@ -120,6 +133,7 @@ impl Thumbnails {
             images: Vec::with_capacity(models),
             scene_images: Vec::with_capacity(scenes),
             completed: HashSet::new(),
+            failed: HashSet::new(),
             snapshots: vec![None; scenes],
             changed: vec![Instant::now(); scenes],
             scan_revision: None,
@@ -142,6 +156,14 @@ impl Thumbnails {
 
     pub(super) fn extend(&mut self, images: &mut Assets<Image>, count: usize) {
         self.images.resize_with(count, || target_texture(images));
+    }
+
+    pub(super) fn state(&self, entry: Entry) -> PreviewState {
+        match Target::from_entry(entry) {
+            Some(target) if self.failed.contains(&target) => PreviewState::Failed,
+            Some(target) if !self.completed.contains(&target) => PreviewState::Loading,
+            _ => PreviewState::Ready,
+        }
     }
 
     fn image(&self, target: Target) -> Handle<Image> {
@@ -176,10 +198,16 @@ impl Thumbnails {
 
     fn complete(&mut self, target: Target) {
         self.completed.insert(target);
+        self.failed.remove(&target);
         if self.warmup == Some(target) {
             self.warmup = None;
             self.warmed_up = true;
         }
+    }
+
+    fn fail(&mut self, target: Target) {
+        self.complete(target);
+        self.failed.insert(target);
     }
 
     fn accept_snapshot(
@@ -195,7 +223,7 @@ impl Thumbnails {
             Ok(_) => {} // The document was opened/edited while its disk read was running.
             Err(error) => {
                 self.snapshots[room] = None;
-                self.complete(Target::Scene(room));
+                self.fail(Target::Scene(room));
                 warn!(
                     "Scene thumbnail for {}: {error}",
                     editor.project.scenes[room].label
@@ -259,6 +287,7 @@ impl Thumbnails {
                 self.cancel(commands);
             }
             self.completed.remove(&Target::Scene(room));
+            self.failed.remove(&Target::Scene(room));
             self.changed[room] = Instant::now();
             self.snapshots[room] = None;
             // Bound concurrent disk reads. Open documents need no worker or I/O.
@@ -311,7 +340,14 @@ pub(super) fn update(
     meshes: Query<(&Aabb, &GlobalTransform)>,
     mut studio_meshes: ResMut<Assets<Mesh>>,
     mut studio_materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
+    let scene_count = editor.project.scenes.len();
+    previews
+        .scene_images
+        .resize_with(scene_count, || target_texture(&mut images));
+    previews.snapshots.resize_with(scene_count, || None);
+    previews.changed.resize_with(scene_count, Instant::now);
     if previews.scan_revision != Some(browser.scan_revision) {
         if previews.scan_revision.is_some() {
             let mut paths: HashSet<_> = editor
@@ -339,11 +375,14 @@ pub(super) fn update(
             }
             // reload only touches assets already loaded; unopened scenes stay lazy.
             for path in paths {
-                assets.reload(path);
+                if !path.is_empty() {
+                    assets.reload(path);
+                }
             }
         }
         previews.cancel(&mut commands);
         previews.completed.clear();
+        previews.failed.clear();
         previews.snapshots.fill(None);
         previews.pending_snapshots.clear();
         previews.browser_revision = None;
@@ -390,14 +429,18 @@ pub(super) fn update(
                 Target::Model(index) => &editor.project.catalog[index].asset,
                 Target::Scene(room) => &editor.project.scenes[room].asset,
             };
-            let asset = assets
-                .load_builder()
-                .with_settings(|settings: &mut GltfLoaderSettings| {
-                    settings.load_cameras = false;
-                    settings.load_lights = true;
-                    settings.load_animations = false;
-                })
-                .load(path.clone());
+            let asset = if path.is_empty() {
+                Handle::default()
+            } else {
+                assets
+                    .load_builder()
+                    .with_settings(|settings: &mut GltfLoaderSettings| {
+                        settings.load_cameras = false;
+                        settings.load_lights = true;
+                        settings.load_animations = false;
+                    })
+                    .load(path.clone())
+            };
             let root = commands
                 .spawn((
                     Transform::IDENTITY,
@@ -439,18 +482,36 @@ pub(super) fn update(
         });
     if let Some(error) = error {
         warn!("Thumbnail for {:?}: {error}", job.target);
-        previews.complete(job.target);
+        previews.fail(job.target);
         previews.stop(job, &mut commands);
         return;
     }
 
     if job.instances.is_empty() {
-        if assets.is_loaded_with_dependencies(job.asset.id())
+        let native = match job.target {
+            Target::Scene(room) => previews.snapshots[room]
+                .as_ref()
+                .filter(|snapshot| snapshot.asset.is_empty()),
+            _ => None,
+        };
+        if let Some(snapshot) = native {
+            let root = scene::spawn_native(&mut commands, snapshot, job.root);
+            job.instances.push(root);
+            for model in &snapshot.edits.models {
+                let root = crate::runtime::spawn_model(&mut commands, &assets, model);
+                commands
+                    .entity(root)
+                    .insert(ChildOf(job.root))
+                    .observe(scene::prepare);
+                job.instances.push(root);
+                job.models.push(crate::runtime::load_model(&assets, model));
+            }
+        } else if assets.is_loaded_with_dependencies(job.asset.id())
             && let Some(gltf) = gltfs.get(&job.asset)
         {
             let Some(world) = gltf.default_scene.as_ref().or_else(|| gltf.scenes.first()) else {
                 warn!("Thumbnail for {:?}: GLB has no scene", job.target);
-                previews.complete(job.target);
+                previews.fail(job.target);
                 previews.stop(job, &mut commands);
                 return;
             };
@@ -523,7 +584,15 @@ pub(super) fn update(
                 Target::Scene(room) => previews.snapshots.get(room).and_then(Option::as_ref),
                 Target::Model(_) => None,
             };
-            let environment = snapshot.and_then(|snapshot| snapshot.edits.lighting.clone());
+            let host_lighting = matches!(job.target, Target::Scene(_))
+                && (editor.project.scene_setup.is_some() || editor.project.camera_setup.is_some());
+            let environment = snapshot.and_then(|snapshot| {
+                snapshot
+                    .edits
+                    .lighting
+                    .clone()
+                    .or_else(|| (!host_lighting).then(crate::SceneLighting::editor_default))
+            });
             let custom_lights = snapshot.is_some_and(|snapshot| !snapshot.edits.lights.is_empty());
             let contacts = snapshot.is_some_and(|snapshot| {
                 snapshot.edits.lights.iter().any(|light| {
@@ -532,8 +601,6 @@ pub(super) fn update(
                         && light.kind != crate::lighting::LightKind::Rect
                 })
             });
-            let host_lighting = matches!(job.target, Target::Scene(_))
-                && (editor.project.scene_setup.is_some() || editor.project.camera_setup.is_some());
             let studio_fill = environment.is_none() && !custom_lights && !host_lighting;
             let fill = DirectionalLight {
                 illuminance: if studio_fill { 2400.0 } else { 0.0 },
@@ -643,7 +710,12 @@ pub(super) fn update(
             if let Target::Scene(room) = job.target
                 && let Some(setup) = editor.project.camera_setup
             {
-                let path = &editor.project.scenes[room].asset;
+                let definition = &editor.project.scenes[room];
+                let path = if definition.is_native() {
+                    &definition.file
+                } else {
+                    &definition.asset
+                };
                 let logical = crate::asset_paths::original_asset_path(&editor.root, path)
                     .unwrap_or_else(|_| path.clone());
                 setup(&mut camera, &logical);
@@ -679,12 +751,34 @@ pub(super) fn update(
     previews.job = Some(job);
 }
 
-pub(super) fn track_frame(mut world: ResMut<MainWorld>, cache: Res<PipelineCache>) {
+pub(super) fn track_frame(
+    mut world: ResMut<MainWorld>,
+    cache: Res<PipelineCache>,
+    images: Res<RenderAssets<GpuImage>>,
+) {
+    let environment_ready = world
+        .get_resource::<Thumbnails>()
+        .and_then(|previews| previews.job.as_ref())
+        .and_then(|job| job.camera)
+        .is_some_and(|camera| {
+            if world
+                .get::<crate::hdri::CameraEnvironment>(camera)
+                .is_none()
+            {
+                return true;
+            }
+            world
+                .get::<EnvironmentMapLight>(camera)
+                .is_some_and(|environment| {
+                    images.get(&environment.diffuse_map).is_some()
+                        && images.get(&environment.specular_map).is_some()
+                })
+        });
     if let Some(mut previews) = world.get_resource_mut::<Thumbnails>()
         && let Some(job) = &mut previews.job
         && job.camera.is_some()
     {
-        job.stable_frames = if cache.waiting_pipelines().next().is_none() {
+        job.stable_frames = if environment_ready && cache.waiting_pipelines().next().is_none() {
             job.stable_frames.saturating_add(1)
         } else {
             0
@@ -747,7 +841,8 @@ mod tests {
         use bevy::ecs::system::SystemState;
 
         let project = EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut editor = Editor::new(project, LevelEdits::default());

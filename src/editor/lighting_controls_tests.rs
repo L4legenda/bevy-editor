@@ -3,7 +3,7 @@ use crate::editor::{Scene, handle_actions, viewport::PointerState};
 
 fn fixture() -> (App, Entity, Entity) {
     let project = crate::EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut editor = Editor::new(project, crate::data::LevelEdits::default());
@@ -81,6 +81,42 @@ fn value(app: &mut App, source: Entity, value: f32, is_final: bool) {
         is_final,
     });
     app.update();
+}
+
+#[test]
+fn hdri_slider_drags_are_live_and_each_produce_one_undo_step() {
+    for field in [
+        EnvironmentField::HdriRotation,
+        EnvironmentField::HdriBrightness,
+    ] {
+        let (mut app, number, _) = fixture();
+        app.world_mut()
+            .write_message(Action::Lighting(LightingAction::SetEnvironment(Some(
+                crate::EnvironmentPreset::SmallStudio,
+            ))));
+        app.update();
+        app.world_mut()
+            .get_mut::<LightingSlider>(number)
+            .unwrap()
+            .binding = Binding::Number(Field::Environment(field));
+        let original = app.world().resource::<Editor>().edits.clone();
+        let history = app.world().resource::<Editor>().undo.len();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        value(&mut app, number, 0.2, false);
+        value(&mut app, number, 0.8, false);
+        assert_ne!(app.world().resource::<Editor>().edits, original);
+        assert_eq!(app.world().resource::<Editor>().undo.len(), history);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .release(MouseButton::Left);
+        app.update();
+        assert_eq!(app.world().resource::<Editor>().undo.len(), history + 1);
+        app.world_mut().write_message(Action::Undo);
+        app.update();
+        assert_eq!(app.world().resource::<Editor>().edits, original);
+    }
 }
 
 #[test]
@@ -170,6 +206,7 @@ fn switching_documents_finishes_the_drag_before_stashing_and_blocks_old_input() 
 #[test]
 fn choosing_a_hue_on_white_keeps_it_until_saturation_changes() {
     let (mut app, _, plane) = fixture();
+    app.world_mut().resource_mut::<Editor>().lighting_defaults.ambient_color = [1.0; 3];
     let dummy = app.world_mut().spawn_empty().id();
     let hue = app
         .world_mut()

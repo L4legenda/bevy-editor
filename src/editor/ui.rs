@@ -1,10 +1,14 @@
 use bevy::{
-    input::mouse::{AccumulatedMouseScroll, MouseScrollUnit},
+    input::{
+        ButtonState,
+        keyboard::KeyboardInput,
+        mouse::{AccumulatedMouseScroll, MouseScrollUnit},
+    },
     input_focus::{
-        InputFocus,
+        FocusedInput, InputFocus,
         tab_navigation::{TabGroup, TabIndex},
     },
-    picking::hover::Hovered,
+    picking::{events::PointerClick, hover::Hovered, pointer::PointerButton},
     prelude::*,
     text::{EditableText, TextCursorStyle, TextReadWriteMode},
     ui::{ComputedNode, InteractionDisabled, Pressed, UiGlobalTransform},
@@ -13,12 +17,19 @@ use bevy::{
 };
 
 use super::Room;
-use crate::project::LensKind;
+use crate::{project::LensKind, ui_theme::*};
 
-use super::{Action, Editor, Field, Selection, Tool, browser::Browser, starfield, viewport};
+use super::{Action, Editor, Field, Reset, Selection, Tool, browser::Browser, starfield, viewport};
 
+#[cfg(test)]
+#[path = "asset_activation_tests.rs"]
+mod asset_activation_tests;
+#[path = "asset_loading.rs"]
+pub(crate) mod asset_loading;
+#[path = "browser_context.rs"]
+mod browser_context;
 #[path = "button_fx.rs"]
-mod button_fx;
+pub(crate) mod button_fx;
 #[path = "camera_preview.rs"]
 mod camera_preview;
 #[path = "confirmation.rs"]
@@ -28,19 +39,32 @@ mod control_hints;
 #[path = "drawer.rs"]
 mod drawer;
 #[path = "icons.rs"]
-mod icons;
+pub(crate) mod icons;
+#[path = "image_viewer.rs"]
+mod image_viewer;
+#[path = "model_viewer.rs"]
+mod model_viewer;
+pub(super) use model_viewer::{ModelViewAction, ModelViewerPlugin};
+#[path = "hdri_library.rs"]
+mod hdri_library;
 #[path = "lighting_ui.rs"]
 mod lighting_ui;
+pub(super) use hdri_library::{HdriAction, HdriLibrary, HdriLibraryPlugin};
 #[path = "numeric_input.rs"]
 mod numeric_input;
 #[path = "orbital.rs"]
-mod orbital;
+pub(crate) mod orbital;
 #[path = "scene_tabs.rs"]
 mod scene_tabs;
 #[path = "sidebar_resize.rs"]
 mod sidebar_resize;
 #[path = "tool_icons.rs"]
 mod tool_icons;
+pub(super) use asset_loading::AssetLoadingPlugin;
+pub(super) use browser_context::{
+    BrowserContext, BrowserDeletionPlugin, input as browser_context_input,
+    refresh as refresh_browser_context, update as browser_context_actions,
+};
 pub(super) use button_fx::ButtonFxPlugin;
 pub(super) use camera_preview::PreviewCamera;
 pub(super) use camera_preview::{rect as camera_preview_rect, update as update_camera_preview};
@@ -52,39 +76,26 @@ pub(super) use drawer::{
     update_files as update_browser_files,
 };
 pub(super) use icons::SvgIconsPlugin;
+pub(super) use image_viewer::edit::{
+    color_pointer as photo_editor_input, refresh as refresh_photo_editor,
+};
+pub(super) use image_viewer::{
+    ImageAction, ImageViewer, cursor as image_viewer_cursor, edit::EditAction as ImageEditAction,
+    refresh as refresh_image_viewer, update as view_images,
+};
 pub(super) use lighting_ui::{
     LightingUi, edit_controls as edit_lighting_controls, edit_name as edit_light_name,
     refresh as refresh_lighting, refresh_controls as refresh_lighting_controls,
 };
 pub(super) use numeric_input::{NumericInput, update as update_numeric_input};
-pub(super) use sidebar_resize::{SidebarLayout, resize as resize_sidebar};
+pub(super) use sidebar_resize::{
+    SidebarLayout, layout as layout_sidebar, resize as resize_sidebar,
+};
 
 pub(super) const TOP: f32 = 94.0;
 pub(super) const SIDE: f32 = 316.0;
 pub(super) const DRAWER: f32 = 350.0;
 pub(super) const FOOT: f32 = 34.0;
-
-const CHROME: Color = Color::srgb(0.077, 0.081, 0.100);
-const PANEL: Color = Color::srgb(0.047, 0.055, 0.068);
-const WELL: Color = Color::srgb(0.032, 0.038, 0.049);
-const EDGE: Color = Color::srgb(0.195, 0.194, 0.221);
-const HOVER: Color = Color::srgb(0.160, 0.153, 0.187);
-const ACTIVE: Color = Color::srgb(0.225, 0.183, 0.135);
-const ACCENT: Color = Color::srgb(0.755, 0.584, 0.359);
-const TEXT: Color = Color::srgb(0.944, 0.932, 0.902);
-const MUTED: Color = Color::srgb(0.652, 0.659, 0.711);
-const FOCUS: Color = Color::srgb(0.909, 0.766, 0.536);
-const ON_ACCENT: Color = Color::srgb(0.075, 0.060, 0.048);
-const BLUE: Color = Color::srgb(0.510, 0.729, 1.0);
-const GREEN: Color = Color::srgb(0.476, 0.803, 0.674);
-const AMBER: Color = Color::srgb(1.0, 0.775, 0.433);
-const ERROR: Color = Color::srgb(1.0, 0.40, 0.40);
-const DISABLED_TEXT: Color = Color::srgb(0.48, 0.50, 0.55);
-const AXIS: [Color; 3] = [
-    Color::srgb(1.0, 0.54, 0.54),
-    Color::srgb(0.53, 0.88, 0.64),
-    BLUE,
-];
 
 #[derive(Clone, Copy)]
 enum Look {
@@ -113,10 +124,12 @@ pub(super) struct HorizontalScroller;
 pub(super) struct Interface {
     font: Handle<Font>,
     tabs: Entity,
+    viewport: Entity,
     scene_image: Entity,
     scene_badge: Entity,
     empty_scene: Entity,
     outliner: Entity,
+    tree_chevron: Entity,
     inspector: Entity,
     status: Entity,
     dirty: Entity,
@@ -127,15 +140,17 @@ pub(super) struct Interface {
     transforms: Entity,
     scale_row: Entity,
     lens_row: Entity,
-    field_hint: Entity,
+    field_error: Entity,
     navigation_hint: Entity,
 }
 
 #[derive(Default)]
 pub(super) struct OutlineState {
     room: Option<Room>,
+    model: Option<usize>,
     imported: usize,
     models: Vec<u32>,
+    hidden: Vec<bool>,
     lights: Vec<(u32, String, bool, crate::lighting::LightKind)>,
 }
 
@@ -164,68 +179,6 @@ pub(super) fn scene_input_rect(
 
 fn node(commands: &mut Commands, parent: Entity, node: Node) -> Entity {
     commands.spawn((node, ChildOf(parent))).id()
-}
-
-fn surface(commands: &mut Commands, parent: Entity, node: Node, color: Color) -> Entity {
-    let entity = commands
-        .spawn((
-            node,
-            BackgroundColor(color),
-            BorderColor::all(EDGE),
-            ChildOf(parent),
-        ))
-        .id();
-    // Only chrome surfaces receive a gradient; icon and preview colors stay literal.
-    let colors = if color == CHROME {
-        Some([
-            Color::srgb(0.125, 0.111, 0.110),
-            CHROME,
-            Color::srgb(0.090, 0.086, 0.128),
-        ])
-    } else if color == PANEL {
-        Some([
-            Color::srgb(0.081, 0.078, 0.105),
-            PANEL,
-            Color::srgb(0.036, 0.045, 0.054),
-        ])
-    } else if color == WELL {
-        Some([Color::srgb(0.060, 0.057, 0.073), WELL, WELL])
-    } else {
-        None
-    };
-    if let Some(colors) = colors {
-        commands
-            .entity(entity)
-            .insert(gradient(LinearGradient::TO_BOTTOM_RIGHT, colors));
-    }
-    entity
-}
-
-fn gradient(angle: f32, colors: [Color; 3]) -> BackgroundGradient {
-    LinearGradient::new(angle, colors.into_iter().map(ColorStop::auto).collect()).into()
-}
-
-fn horizon(commands: &mut Commands, parent: Entity) {
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(0),
-            right: px(0),
-            bottom: px(0),
-            height: px(1),
-            ..default()
-        },
-        gradient(
-            LinearGradient::TO_RIGHT,
-            [
-                Color::srgba(0.91, 0.73, 0.47, 0.65),
-                Color::srgba(0.63, 0.54, 0.77, 0.23),
-                Color::srgba(0.63, 0.54, 0.77, 0.0),
-            ],
-        ),
-        Pickable::IGNORE,
-        ChildOf(parent),
-    ));
 }
 
 fn font(handle: &Handle<Font>, size: f32) -> TextFont {
@@ -290,20 +243,30 @@ fn control(
     look: Look,
     node: Node,
 ) -> Entity {
-    commands
-        .spawn((
-            Button,
-            TabIndex(0),
-            Hovered::default(),
-            Control { action, look },
-            node,
-            BackgroundColor(Color::NONE),
-            BackgroundGradient::default(),
-            BorderColor::all(EDGE),
-            ChildOf(parent),
-        ))
-        .observe(activate_control)
-        .id()
+    let mut entity = commands.spawn((
+        Button,
+        TabIndex(0),
+        Hovered::default(),
+        Control { action, look },
+        node,
+        BackgroundColor(Color::NONE),
+        BackgroundGradient::default(),
+        BorderColor::all(EDGE),
+        ChildOf(parent),
+    ));
+    if matches!(
+        (look, action),
+        (Look::Asset, Action::Browse(_) | Action::ViewImage(_))
+    ) {
+        // Button emits Activate on every click; folder and image cards use their own event.
+        entity
+            .observe(activate_control::<AssetActivate>)
+            .observe(asset_pointer_click)
+            .observe(asset_keypress);
+    } else {
+        entity.observe(activate_control::<Activate>);
+    }
+    entity.id()
 }
 
 fn button(
@@ -344,7 +307,7 @@ pub(super) fn setup(
     mut fonts: ResMut<Assets<Font>>,
     mut images: ResMut<Assets<Image>>,
     scene_surface: Res<viewport::Surface>,
-    outline: Res<super::selection_outline::Outline>,
+    mut transform_handless: ResMut<Assets<viewport::HandleMaterial>>,
     stars: Res<starfield::Starfield>,
     editor: Res<Editor>,
 ) {
@@ -400,6 +363,7 @@ pub(super) fn setup(
             ..row(8.0)
         },
     );
+    crate::window_chrome::drag_region(&mut commands, project_bar);
     orbital::brand(&mut commands, brand);
     let name = node(
         &mut commands,
@@ -418,7 +382,7 @@ pub(super) fn setup(
         16.0,
         TEXT,
     );
-    text(&mut commands, name, &font, "РЕДАКТОР ЛОКАЦИЙ", 9.0, MUTED);
+    text(&mut commands, name, &font, "РЕДАКТОР СЦЕН", 9.0, MUTED);
 
     let tabs = scene_tabs::setup(&mut commands, project_bar);
     button(
@@ -429,9 +393,19 @@ pub(super) fn setup(
         Action::Play,
         Look::Regular,
     );
+    crate::window_chrome::controls(&mut commands, project_bar);
+    crate::window_chrome::resize_edges(&mut commands, root);
     let tool_bar = node(&mut commands, toolbar, row(12.0));
     tool_icons::setup(&mut commands, tool_bar);
     let tools = group(&mut commands, tool_bar);
+    icons::button(
+        &mut commands,
+        tools,
+        icons::Glyph::Box,
+        "Использовать локальное пространство",
+        Action::LocalSpace,
+        Look::Regular,
+    );
     icons::button(
         &mut commands,
         tools,
@@ -492,19 +466,7 @@ pub(super) fn setup(
             ChildOf(viewport),
         ))
         .id();
-    commands.spawn((
-        MaterialNode(outline.material.clone()),
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(0),
-            top: px(0),
-            width: percent(100),
-            height: percent(100),
-            ..default()
-        },
-        Pickable::IGNORE,
-        ChildOf(viewport),
-    ));
+    viewport::spawn_overlay(&mut commands, &mut transform_handless, viewport);
     let badge = surface(
         &mut commands,
         viewport,
@@ -559,13 +521,33 @@ pub(super) fn setup(
         },
         CHROME,
     );
-    let tree_title = text(&mut commands, header, &font, "Дерево сцены", 14.0, TEXT);
-    commands.entity(tree_title).insert(Node {
-        flex_grow: 1.0,
-        min_width: px(0),
-        overflow: Overflow::clip(),
-        ..default()
-    });
+    let tree_toggle = control(
+        &mut commands,
+        header,
+        Action::ToggleSceneTree,
+        Look::Regular,
+        Node {
+            height: percent(100),
+            flex_grow: 1.0,
+            min_width: px(0),
+            padding: UiRect::horizontal(px(4)),
+            border_radius: BorderRadius::all(px(4)),
+            overflow: Overflow::clip(),
+            ..row(6.0)
+        },
+    );
+    commands
+        .entity(tree_toggle)
+        .insert(AccessibleLabel("Дерево сцены".into()));
+    let tree_chevron = icons::themed(&mut commands, tree_toggle, icons::Glyph::ChevronDown, 12.0);
+    text(
+        &mut commands,
+        tree_toggle,
+        &font,
+        "Дерево сцены",
+        14.0,
+        TEXT,
+    );
     horizon(&mut commands, header);
     let outliner = node(
         &mut commands,
@@ -578,7 +560,11 @@ pub(super) fn setup(
             ..column(2.0)
         },
     );
-    commands.entity(outliner).insert(Scroller);
+    commands.entity(outliner).insert((
+        Scroller,
+        sidebar_resize::SceneTree,
+        AccessibleLabel("Список объектов сцены".into()),
+    ));
     sidebar_resize::height_grip(&mut commands, side);
 
     let inspector = surface(
@@ -625,8 +611,6 @@ pub(super) fn setup(
         },
     );
     for (label, action) in [
-        ("Фокус", Action::Focus),
-        ("Сброс", Action::Reset),
         ("Управление камерой", Action::Pilot),
         ("Из вида", Action::Align),
         ("Дублировать", Action::Duplicate),
@@ -634,17 +618,19 @@ pub(super) fn setup(
     ] {
         button(&mut commands, actions, &font, label, action, Look::Regular);
     }
-    let field_hint = text(
-        &mut commands,
-        transforms,
-        &font,
-        "Enter / Tab — применить · Esc — отменить",
-        11.0,
-        MUTED,
-    );
-    commands.entity(field_hint).insert(TextLayout::default());
+    let field_error = text(&mut commands, transforms, &font, "", 11.0, ERROR);
+    commands.entity(field_error).insert((
+        TextLayout::default(),
+        Node {
+            display: Display::None,
+            ..default()
+        },
+    ));
 
-    drawer::setup(&mut commands, root, &font, &stars);
+    let checker = image_viewer::checker_texture(&mut images);
+    drawer::setup(&mut commands, root, &font, &stars, &checker);
+    image_viewer::setup(&mut commands, viewport, &font, &checker);
+    browser_context::setup(&mut commands, root, &font);
 
     let footer = surface(
         &mut commands,
@@ -681,10 +667,12 @@ pub(super) fn setup(
     commands.insert_resource(Interface {
         font,
         tabs,
+        viewport,
         scene_image,
         scene_badge: badge,
         empty_scene,
         outliner,
+        tree_chevron,
         inspector,
         status,
         dirty,
@@ -695,7 +683,7 @@ pub(super) fn setup(
         transforms,
         scale_row,
         lens_row,
-        field_hint,
+        field_error,
         navigation_hint,
     });
 }
@@ -747,6 +735,84 @@ fn outline_entry(
             node.left = px(8);
             node.top = px(6);
         });
+}
+
+fn object_outline_entry(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    editor: &Editor,
+    target: Selection,
+) {
+    let hidden = editor.object_hidden(target);
+    let label = editor.label(target);
+    let container = node(
+        commands,
+        parent,
+        Node {
+            width: percent(100),
+            height: px(28),
+            flex_shrink: 0.0,
+            ..row(0.0)
+        },
+    );
+    let name = node(
+        commands,
+        container,
+        Node {
+            flex_grow: 1.0,
+            flex_basis: px(0),
+            min_width: px(0),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+    );
+    let light = match target {
+        Selection::Light(id) => editor.light(id),
+        _ => None,
+    };
+    outline_entry(
+        commands,
+        name,
+        font,
+        &label,
+        target,
+        light.map(|light| light.kind),
+        !hidden && light.is_none_or(|light| light.enabled),
+    );
+    let eye = control(
+        commands,
+        container,
+        Action::ToggleVisibility(target),
+        Look::Regular,
+        Node {
+            width: px(28),
+            height: px(28),
+            flex_shrink: 0.0,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+    );
+    commands.entity(eye).insert(AccessibleLabel(format!(
+        "{}: {label}",
+        if hidden {
+            "Показать объект"
+        } else {
+            "Скрыть объект"
+        }
+    )));
+    icons::spawn(
+        commands,
+        eye,
+        if hidden {
+            icons::Glyph::EyeOff
+        } else {
+            icons::Glyph::Eye
+        },
+        16.0,
+        if hidden { MUTED } else { TEXT },
+    );
 }
 
 fn field_caption(
@@ -839,29 +905,74 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
             _ => false,
         };
     }
+    if editor.hdri_library_open {
+        return matches!(
+            action,
+            Action::HdriLibrary(_) | Action::UseDownloadedHdri(_)
+        );
+    }
+    if editor.viewing_image.is_some() && !Editor::model_tab_action(action) {
+        return false;
+    }
+    if editor.viewing_model.is_some() && !Editor::model_tab_action(action) {
+        return false;
+    }
+    if editor.browser_popup {
+        return matches!(
+            action,
+            Action::BrowserNewFolder
+                | Action::BrowserNewImage
+                | Action::BrowserImageSize(..)
+                | Action::BrowserCreateImage
+                | Action::BrowserCreateFolder
+                | Action::BrowserCancelPopup
+                | Action::BrowserDeleteFile
+                | Action::BrowserRestoreFile
+        );
+    }
     match action {
+        Action::ImageEdit(_) => editor.viewing_image.is_some(),
+        Action::ImageView(ImageAction::Previous) => {
+            editor.viewing_image.is_some()
+                && image_viewer::neighbor(editor, browser, false).is_some()
+        }
+        Action::ImageView(ImageAction::Next) => {
+            editor.viewing_image.is_some()
+                && image_viewer::neighbor(editor, browser, true).is_some()
+        }
+        Action::ImageView(_) => editor.viewing_image.is_some(),
+        Action::OpenImageTab(id) | Action::CloseImageTab(id) => editor.image_tab(id).is_some(),
+        Action::HdriLibrary(HdriAction::Open) | Action::UseDownloadedHdri(_) => {
+            editor.has_scene() && editor.ready
+        }
+        Action::HdriLibrary(_) => false,
+        Action::ModelView(_) => editor.viewing_model.is_some(),
+        Action::CloseModelTab(index) => editor.model_tabs.contains(&index),
+        Action::ViewModel(index) => index < editor.project.catalog.len(),
+        Action::BrowserCreateFolder
+        | Action::BrowserCreateImage
+        | Action::BrowserImageSize(..)
+        | Action::BrowserCancelPopup => false,
+        Action::BrowserNewFolder | Action::BrowserNewImage => editor.drawer,
         Action::SaveAndContinue | Action::DiscardAndContinue | Action::CancelPending => false,
         Action::Open(room) => room < editor.project.scenes.len(),
         Action::CloseTab(room) => editor.open_tabs.contains(&room),
         Action::Tool(tool) => {
             editor.has_scene()
                 && editor.ready
-                && match editor.selection {
-                    Some(Selection::Environment) => false,
-                    Some(target @ Selection::Light(_)) => (0..3).any(|axis| {
-                        editor.field_allowed(
-                            target,
-                            match tool {
-                                Tool::Move => Field::Position(axis),
-                                Tool::Rotate => Field::Rotation(axis),
-                                Tool::Scale => Field::Scale(axis),
-                            },
-                        )
-                    }),
-                    _ => true,
-                }
+                && (tool == Tool::Universal
+                    || match editor.selection {
+                        Some(Selection::Environment) => false,
+                        Some(target @ Selection::Light(_)) => {
+                            (0..3).any(|axis| viewport::allowed(editor, target, tool, axis))
+                        }
+                        _ => true,
+                    })
         }
-        Action::Snap | Action::Select(_) => editor.has_scene() && editor.ready,
+        Action::Select(_) => editor.has_scene() && editor.ready && editor.tool == Tool::Universal,
+        Action::LocalSpace | Action::Snap | Action::ToggleVisibility(_) => {
+            editor.has_scene() && editor.ready
+        }
         Action::Lighting(_) | Action::LightMenu | Action::LightAdvanced => {
             editor.has_scene() && editor.ready
         }
@@ -887,18 +998,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                 && !editor.pilot
         }
         Action::Focus => editor.has_scene() && editor.ready,
-        Action::Reset => {
-            editor.has_scene()
-                && matches!(
-                    editor.selection,
-                    Some(
-                        Selection::Camera(_)
-                            | Selection::Imported(_)
-                            | Selection::Light(_)
-                            | Selection::Environment
-                    )
-                )
-        }
+        Action::Reset(_) => editor.has_scene() && editor.ready && editor.selection.is_some(),
         Action::Delete | Action::Duplicate => {
             editor.has_scene()
                 && matches!(
@@ -919,6 +1019,8 @@ pub(super) fn input(
     lighting: Option<Res<LightingUi>>,
 ) {
     if editor.pending.is_some()
+        || editor.browser_popup
+        || editor.asset_viewer_open()
         || lighting
             .as_ref()
             .is_some_and(|lighting| lighting.blocks_scene_input())
@@ -934,8 +1036,35 @@ pub(super) fn input(
     }
 }
 
-fn activate_control(
-    activate: On<Activate>,
+#[derive(EntityEvent)]
+struct AssetActivate {
+    entity: Entity,
+}
+
+fn asset_pointer_click(mut click: On<PointerClick>, mut commands: Commands) {
+    click.propagate(false);
+    if click.button == PointerButton::Primary && click.count == 2 {
+        commands.trigger(AssetActivate {
+            entity: click.entity,
+        });
+    }
+}
+
+fn asset_keypress(mut event: On<FocusedInput<KeyboardInput>>, mut commands: Commands) {
+    let input = &event.input;
+    if !input.repeat
+        && input.state == ButtonState::Pressed
+        && matches!(input.key_code, KeyCode::Enter | KeyCode::Space)
+    {
+        event.propagate(false);
+        commands.trigger(AssetActivate {
+            entity: event.focused_entity,
+        });
+    }
+}
+
+fn activate_control<E: EntityEvent>(
+    activate: On<E>,
     editor: Res<Editor>,
     browser: Res<Browser>,
     drag: Res<AssetDrag>,
@@ -944,12 +1073,22 @@ fn activate_control(
     mut effects: Query<&mut button_fx::Effect>,
     mut focus: ResMut<InputFocus>,
     mut messages: MessageWriter<Action>,
+    mouse: Option<Res<ButtonInput<MouseButton>>>,
 ) {
+    // Bevy's Button emits Activate for secondary clicks as well. Reserve those
+    // for context menus even when press and release arrive in the same frame.
+    if mouse.as_ref().is_some_and(|mouse| {
+        mouse.any_pressed([MouseButton::Right, MouseButton::Middle])
+            || mouse.any_just_released([MouseButton::Right, MouseButton::Middle])
+    }) {
+        return;
+    }
+    let entity = activate.event_target();
     if !drag.suppress_activation_at(window.cursor_position())
-        && let Ok(control) = controls.get(activate.entity)
+        && let Ok(control) = controls.get(entity)
         && available(&editor, &browser, control.action)
     {
-        if let Ok(mut effect) = effects.get_mut(activate.entity) {
+        if let Ok(mut effect) = effects.get_mut(entity) {
             effect.activate();
         }
         if !matches!(
@@ -972,7 +1111,118 @@ pub(super) fn shortcuts(
     editor: Res<Editor>,
     drag: Option<Res<AssetDrag>>,
     lighting: Option<Res<LightingUi>>,
+    browser_context: Option<Res<BrowserContext>>,
+    image_viewer: Option<Res<ImageViewer>>,
+    sliders: Query<(), With<bevy::ui_widgets::Slider>>,
 ) {
+    if keys.any_just_pressed([
+        KeyCode::ArrowLeft,
+        KeyCode::ArrowRight,
+        KeyCode::ArrowUp,
+        KeyCode::ArrowDown,
+    ]) && focus.get().is_some_and(|entity| sliders.contains(entity))
+    {
+        return;
+    }
+    if editor.hdri_library_open && editor.pending.is_none() {
+        if keys.just_pressed(KeyCode::Escape) {
+            actions.write(Action::HdriLibrary(HdriAction::Close));
+        } else if keys.just_pressed(KeyCode::Enter)
+            && focus.get().is_some_and(|entity| inputs.contains(entity))
+        {
+            actions.write(Action::HdriLibrary(HdriAction::Search));
+        }
+        return;
+    }
+    if editor.browser_popup && editor.pending.is_none() {
+        browser_context::shortcuts(&keys, browser_context.as_deref(), &mut actions);
+        return;
+    }
+    if editor.viewing_model.is_some() && editor.viewing_image.is_none() && editor.pending.is_none()
+    {
+        let command = keys.any_pressed([
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ]);
+        if focus.get().is_some_and(|entity| inputs.contains(entity)) {
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape) || (command && keys.just_pressed(KeyCode::KeyW)) {
+            actions.write(Action::ModelView(ModelViewAction::Close));
+        }
+        if keys.just_pressed(KeyCode::KeyF) {
+            actions.write(Action::ModelView(ModelViewAction::Fit));
+        }
+        if keys.just_pressed(KeyCode::F5) {
+            actions.write(Action::ModelView(ModelViewAction::Retry));
+        }
+        if command && keys.just_pressed(KeyCode::Space) {
+            actions.write(Action::Drawer);
+        }
+        if command && keys.just_pressed(KeyCode::KeyO) {
+            actions.write(Action::OpenBrowser);
+        }
+        return;
+    }
+    if editor.viewing_image.is_some() && editor.pending.is_none() {
+        let command = keys.any_pressed([
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ]);
+        if command && keys.just_pressed(KeyCode::KeyW) {
+            actions.write(Action::CloseImageTab(editor.viewing_image.unwrap()));
+            return;
+        }
+        if command && keys.just_pressed(KeyCode::KeyS) {
+            actions.write(Action::ImageEdit(ImageEditAction::Save));
+            return;
+        }
+        if command && keys.just_pressed(KeyCode::Space) {
+            actions.write(Action::Drawer);
+            return;
+        }
+        if command && keys.just_pressed(KeyCode::KeyO) {
+            actions.write(Action::OpenBrowser);
+            return;
+        }
+        if command
+            && editor.drawer
+            && keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+            && keys.just_pressed(KeyCode::KeyN)
+        {
+            actions.write(Action::BrowserNewFolder);
+            return;
+        }
+        if focus.get().is_some_and(|entity| inputs.contains(entity)) {
+            if keys.just_pressed(KeyCode::Escape) {
+                focus.clear();
+            }
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape) {
+            if image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.paint_menu)
+            {
+                actions.write(Action::ImageEdit(ImageEditAction::PaintMenu));
+            } else if image_viewer.as_ref().is_some_and(|viewer| viewer.edit.menu) {
+                actions.write(Action::ImageEdit(ImageEditAction::Menu));
+            } else if editor.drawer {
+                actions.write(Action::Drawer);
+            } else {
+                focus.clear();
+            }
+            return;
+        }
+        if !image_viewer::edit::shortcuts(&keys, image_viewer.as_deref(), &mut actions) {
+            image_viewer::shortcuts(&keys, &mut actions);
+        }
+        return;
+    }
     if lighting
         .as_ref()
         .is_some_and(|lighting| lighting.is_menu_open())
@@ -996,6 +1246,14 @@ pub(super) fn shortcuts(
         } else if command && keys.just_pressed(KeyCode::KeyS) {
             actions.write(Action::SaveAndContinue);
         }
+        return;
+    }
+    if editor.drawer
+        && command
+        && keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+        && keys.just_pressed(KeyCode::KeyN)
+    {
+        actions.write(Action::BrowserNewFolder);
         return;
     }
     if keys.just_pressed(KeyCode::Escape)
@@ -1059,11 +1317,25 @@ pub(super) fn shortcuts(
             }
         }
     } else if !editor.pilot && !mouse.pressed(MouseButton::Right) {
+        if keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]) {
+            for (key, reset) in [
+                (KeyCode::KeyQ, Reset::All),
+                (KeyCode::KeyW, Reset::Position),
+                (KeyCode::KeyE, Reset::Rotation),
+                (KeyCode::KeyR, Reset::Scale),
+            ] {
+                if keys.just_pressed(key) {
+                    actions.write(Action::Reset(reset));
+                }
+            }
+            return;
+        }
         for (key, action) in [
+            (KeyCode::KeyQ, Action::Tool(Tool::Universal)),
             (KeyCode::KeyW, Action::Tool(Tool::Move)),
             (KeyCode::KeyE, Action::Tool(Tool::Rotate)),
             (KeyCode::KeyR, Action::Tool(Tool::Scale)),
-            (KeyCode::KeyF, Action::Focus),
+            (KeyCode::NumpadDecimal, Action::Focus),
             (KeyCode::Delete, Action::Delete),
         ] {
             if keys.just_pressed(key) {
@@ -1096,7 +1368,11 @@ pub(super) fn scroll(
     {
         return;
     }
-    if editor.pending.is_some() || scroll.delta == Vec2::ZERO {
+    if editor.pending.is_some()
+        || editor.hdri_library_open
+        || editor.browser_popup
+        || scroll.delta == Vec2::ZERO
+    {
         return;
     }
     let Some(cursor) = window
@@ -1149,6 +1425,7 @@ pub(super) fn refresh(
     editor: Res<Editor>,
     interface: Res<Interface>,
     browser: Res<Browser>,
+    image_viewer: Option<Res<ImageViewer>>,
     (focus, focus_visible): (Res<InputFocus>, Res<bevy::input_focus::InputFocusVisible>),
     browser_ui: Res<drawer::BrowserUi>,
     numeric: Res<NumericInput>,
@@ -1192,6 +1469,15 @@ pub(super) fn refresh(
         (With<TextInput>, Without<Field>, Without<Control>),
     >,
 ) {
+    icons::set_glyph(
+        &mut commands,
+        interface.tree_chevron,
+        if editor.sidebar.tree_collapsed() {
+            icons::Glyph::ChevronRight
+        } else {
+            icons::Glyph::ChevronDown
+        },
+    );
     scene_tabs::refresh(
         &mut commands,
         &editor,
@@ -1206,7 +1492,9 @@ pub(super) fn refresh(
                 .is_ok_and(|(_, _, hovered, pressed, ..)| hovered.0 || pressed)
         },
     );
-    let room = editor.has_scene().then_some(editor.room);
+    let room =
+        (editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none())
+            .then_some(editor.room);
     let selected_document = (room, editor.selection);
     if *inspector_selection != Some(selected_document) {
         if let Ok(mut scroll) = scroll_positions.get_mut(interface.inspector) {
@@ -1215,6 +1503,18 @@ pub(super) fn refresh(
         *inspector_selection = Some(selected_document);
     }
     let models: Vec<_> = editor.edits.models.iter().map(|model| model.id).collect();
+    let hidden: Vec<_> = (0..editor.imported.len())
+        .map(Selection::Imported)
+        .chain(models.iter().copied().map(Selection::Model))
+        .chain(
+            editor
+                .edits
+                .lights
+                .iter()
+                .map(|light| Selection::Light(light.id)),
+        )
+        .map(|target| editor.object_hidden(target))
+        .collect();
     let lights: Vec<_> = editor
         .edits
         .lights
@@ -1222,14 +1522,18 @@ pub(super) fn refresh(
         .map(|light| (light.id, light.name.clone(), light.enabled, light.kind))
         .collect();
     if outline.room != room
+        || outline.model != editor.viewing_model
         || outline.imported != editor.imported.len()
         || outline.models != models
+        || outline.hidden != hidden
         || outline.lights != lights
     {
         *outline = OutlineState {
             room,
+            model: editor.viewing_model,
             imported: editor.imported.len(),
             models,
+            hidden,
             lights,
         };
         commands
@@ -1248,7 +1552,9 @@ pub(super) fn refresh(
             );
             text(commands, section, &interface.font, label, 11.0, MUTED);
         };
-        if editor.has_scene() {
+        if editor.viewing_model.is_some() {
+            heading(&mut commands, "ПРОСМОТР МОДЕЛИ");
+        } else if editor.has_scene() {
             heading(&mut commands, "ОСВЕЩЕНИЕ");
             outline_entry(
                 &mut commands,
@@ -1261,14 +1567,12 @@ pub(super) fn refresh(
             );
             for light in &editor.edits.lights {
                 let target = Selection::Light(light.id);
-                outline_entry(
+                object_outline_entry(
                     &mut commands,
                     interface.outliner,
                     &interface.font,
-                    &light.name,
+                    &editor,
                     target,
-                    Some(light.kind),
-                    light.enabled,
                 );
             }
             heading(&mut commands, "КАМЕРЫ");
@@ -1284,31 +1588,27 @@ pub(super) fn refresh(
                     true,
                 );
             }
-            heading(&mut commands, "ОБЪЕКТЫ КОМНАТЫ");
+            heading(&mut commands, "ОБЪЕКТЫ СЦЕНЫ");
             for index in 0..editor.imported.len() {
-                let target = Selection::Imported(index);
-                outline_entry(
+                object_outline_entry(
                     &mut commands,
                     interface.outliner,
                     &interface.font,
-                    &editor.label(target),
-                    target,
-                    None,
-                    true,
+                    &editor,
+                    Selection::Imported(index),
                 );
             }
             if !editor.edits.models.is_empty() {
-                heading(&mut commands, "ЭКЗЕМПЛЯРЫ КАТАЛОГА");
+                if !editor.definition().is_native() {
+                    heading(&mut commands, "ЭКЗЕМПЛЯРЫ КАТАЛОГА");
+                }
                 for model in &editor.edits.models {
-                    let target = Selection::Model(model.id);
-                    outline_entry(
+                    object_outline_entry(
                         &mut commands,
                         interface.outliner,
                         &interface.font,
-                        &editor.label(target),
-                        target,
-                        None,
-                        true,
+                        &editor,
+                        Selection::Model(model.id),
                     );
                 }
             }
@@ -1328,31 +1628,36 @@ pub(super) fn refresh(
     set_label(interface.status, &editor.status, MUTED);
     set_label(
         interface.navigation_hint,
-        if !editor.has_scene() {
+        if editor.viewing_image.is_some() {
+            if image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.editing(editor.viewing_image))
+            {
+                "Редактирование изображения · Пробел — панорама · Ctrl+S — сохранить"
+            } else {
+                "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
+            }
+        } else if editor.viewing_model.is_some() {
+            "Просмотр модели · ЛКМ — вращение · Колесо — приближение"
+        } else if !editor.has_scene() {
             "Откройте сцену в файловом менеджере"
         } else if editor.pilot {
             "ПКМ + WASD / Q E · Shift — быстрее · Esc — выйти"
         } else if editor.selection.is_some() {
-            "F — фокус · Alt + ЛКМ — орбита · СКМ — панорама"
+            "Num . — фокус · Alt + ЛКМ — орбита · СКМ — панорама"
         } else {
             "Выберите объект в сцене или дереве · ПКМ + WASD — полёт"
         },
         MUTED,
     );
     set_label(
-        interface.field_hint,
-        numeric
-            .error_message()
-            .unwrap_or("Enter / Tab — применить · Esc — отменить"),
-        if numeric.error_message().is_some() {
-            ERROR
-        } else {
-            MUTED
-        },
+        interface.field_error,
+        numeric.error_message().unwrap_or_default(),
+        ERROR,
     );
     set_label(
         interface.dirty,
-        if !editor.has_scene() {
+        if !editor.has_scene() || editor.viewing_model.is_some() || editor.viewing_image.is_some() {
             ""
         } else if editor.dirty()
             || numeric.has_changes(&editor)
@@ -1388,7 +1693,13 @@ pub(super) fn refresh(
         },
         MUTED,
     );
-    if !editor.has_scene() {
+    if let Some(model) = editor
+        .viewing_model
+        .and_then(|index| editor.project.catalog.get(index))
+    {
+        set_label(interface.selected, &model.label, TEXT);
+        set_label(interface.kind, "Просмотр 3D-модели", MUTED);
+    } else if !editor.has_scene() {
         set_label(interface.selected, "Сцена не открыта", MUTED);
         set_label(interface.kind, "Откройте файл сцены внизу", MUTED);
     } else if let Some(target) = editor.selection {
@@ -1409,17 +1720,28 @@ pub(super) fn refresh(
         set_label(interface.kind, "В 3D-виде или в дереве сцены", MUTED);
     }
     for (entity, shown) in [
-        (interface.scene_image, editor.has_scene()),
-        (interface.scene_badge, editor.has_scene()),
-        (interface.empty_scene, !editor.has_scene()),
+        (
+            interface.scene_image,
+            editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+        ),
+        (
+            interface.scene_badge,
+            editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+        ),
+        (
+            interface.empty_scene,
+            !editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+        ),
         (
             interface.transforms,
             editor.has_scene()
+                && editor.viewing_model.is_none()
                 && editor
                     .selection
                     .is_some_and(|target| target != Selection::Environment),
         ),
         (interface.lens_row, camera),
+        (interface.field_error, numeric.error_message().is_some()),
         (
             interface.scale_row,
             !camera && !matches!(editor.selection, Some(Selection::Light(_))),
@@ -1449,15 +1771,35 @@ pub(super) fn refresh(
     {
         let active = match control.action {
             Action::Open(room) | Action::CloseTab(room) => {
-                editor.has_scene() && editor.room == room
+                editor.viewing_model.is_none()
+                    && editor.viewing_image.is_none()
+                    && editor.has_scene()
+                    && editor.room == room
             }
             Action::Select(target) => editor.selection == Some(target),
             Action::Tool(tool) => editor.tool == tool,
+            Action::LocalSpace => editor.local_space,
             Action::Snap => editor.snap,
             Action::Drawer => editor.drawer,
             Action::Browse(index) => browser.current == index,
             Action::BrowseFile(index) => browser_ui.selected == Some(index),
-            Action::BrowseModel(index) => browser_ui.selected_model == Some(index),
+            Action::ViewImage(index) => browser_ui.selected == Some(index),
+            Action::OpenImageTab(id) | Action::CloseImageTab(id) => {
+                editor.viewing_image == Some(id)
+            }
+            Action::ImageEdit(action) => image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.active(action, editor.viewing_image)),
+            Action::ImageView(ImageAction::Fit) => {
+                image_viewer.as_ref().is_some_and(|viewer| viewer.is_fit())
+            }
+            Action::ImageView(ImageAction::ActualSize) => image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.is_actual_size()),
+            Action::ViewModel(index) if matches!(control.look, Look::Tab) => {
+                editor.viewing_model == Some(index)
+            }
+            Action::ViewModel(index) => browser_ui.selected_model == Some(index),
             Action::Pilot => editor.pilot,
             _ => false,
         };
@@ -1471,9 +1813,6 @@ pub(super) fn refresh(
                     Some(Selection::Model(_) | Selection::Light(_))
                 )
             }
-            Action::Reset => {
-                editor.has_scene() && !matches!(editor.selection, Some(Selection::Model(_)))
-            }
             _ => true,
         };
         let display = if visible {
@@ -1484,7 +1823,13 @@ pub(super) fn refresh(
         if node.display != display {
             node.display = display;
         }
-        let enabled = available(&editor, &browser, control.action);
+        let enabled = available(&editor, &browser, control.action)
+            && match control.action {
+                Action::ImageEdit(action) => image_viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer.edit.available(action, editor.viewing_image)),
+                _ => true,
+            };
         if enabled == disabled {
             if enabled {
                 commands.entity(entity).try_remove::<InteractionDisabled>();
@@ -1533,13 +1878,11 @@ pub(super) fn refresh(
         }
         let color = if !enabled {
             Color::NONE
-        } else if matches!(control.look, Look::Tab | Look::TabClose) {
+        } else if matches!(control.look, Look::Tab) {
+            Color::NONE
+        } else if matches!(control.look, Look::TabClose) {
             if hovered.0 || pressed {
-                if matches!(control.look, Look::TabClose) {
-                    scene_tabs::CLOSE_HOVER
-                } else {
-                    scene_tabs::HOVER
-                }
+                scene_tabs::CLOSE_HOVER
             } else {
                 Color::NONE
             }
@@ -1567,28 +1910,14 @@ pub(super) fn refresh(
             && (matches!(control.look, Look::Primary)
                 || (active && matches!(control.look, Look::Tool)))
         {
-            gradient(
-                LinearGradient::TO_BOTTOM_RIGHT,
-                [
-                    if hovered.0 || pressed {
-                        Color::srgb(0.985, 0.873, 0.660)
-                    } else {
-                        FOCUS
-                    },
-                    ACCENT,
-                    Color::srgb(0.640, 0.480, 0.300),
-                ],
-            )
+            primary_gradient(hovered.0 || pressed)
         } else if enabled
             && active
             && !hovered.0
             && !pressed
             && !matches!(control.look, Look::Tab | Look::TabClose)
         {
-            gradient(
-                LinearGradient::TO_BOTTOM_RIGHT,
-                [ACTIVE, Color::srgb(0.125, 0.116, 0.137), PANEL],
-            )
+            active_gradient()
         } else {
             BackgroundGradient::default()
         };
@@ -1596,6 +1925,7 @@ pub(super) fn refresh(
     }
     for (entity, &field, mut text, mut border, mut mode, computed, mut tab_index) in &mut fields {
         let allowed = editor.ready
+            && !editor.asset_viewer_open()
             && editor.pending.is_none()
             && editor
                 .selection

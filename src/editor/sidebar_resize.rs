@@ -23,6 +23,8 @@ pub(in crate::editor) enum Axis {
 pub(in crate::editor) struct Sidebar;
 #[derive(Component)]
 pub(in crate::editor) struct Inspector;
+#[derive(Component)]
+pub(in crate::editor) struct SceneTree;
 
 struct Drag {
     axis: Axis,
@@ -33,6 +35,7 @@ struct Drag {
 
 #[derive(Default)]
 pub(in crate::editor) struct SidebarLayout {
+    tree_collapsed: bool,
     preferred_width: Option<f32>,
     preferred_height: Option<f32>,
     drag: Option<Drag>,
@@ -61,6 +64,9 @@ impl SidebarLayout {
     }
 
     pub fn inspector_height(&self, window_height: f32, lighting: bool) -> f32 {
+        if self.tree_collapsed {
+            return (window_height - TOP - FOOT - TREE_HEADER).max(0.0);
+        }
         let (min, max) = Self::height_bounds(window_height);
         let default = if lighting {
             ((window_height - TOP - FOOT) * 0.65).clamp(280.0, 520.0)
@@ -75,6 +81,21 @@ impl SidebarLayout {
 
     pub fn resizing(&self) -> bool {
         self.drag.is_some() || self.suppressed
+    }
+
+    pub fn tree_collapsed(&self) -> bool {
+        self.tree_collapsed
+    }
+
+    pub fn toggle_tree(&mut self) {
+        self.tree_collapsed = !self.tree_collapsed;
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.axis == Axis::Height)
+        {
+            self.drag = None;
+        }
     }
 }
 
@@ -161,7 +182,6 @@ pub(in crate::editor) fn resize(
         Option<&CalculatedClip>,
         &mut BackgroundColor,
     )>,
-    mut panes: Query<(&mut Node, Has<Sidebar>), Or<(With<Sidebar>, With<Inspector>)>>,
 ) {
     let (window_entity, window, cursor_icon) = *window;
     let light = matches!(
@@ -169,10 +189,14 @@ pub(in crate::editor) fn resize(
         Some(Selection::Light(_) | Selection::Environment)
     );
     let allowed = editor.pending.is_none()
+        && editor.viewing_image.is_none()
+        && !editor.hdri_library_open
+        && !editor.browser_popup
         && window.focused
         && !drawer.resizing
         && !lighting.as_ref().is_some_and(|ui| ui.blocks_scene_input())
         && !assets.as_ref().is_some_and(|drag| drag.active());
+    let viewing_model = editor.viewing_model.is_some();
     let layout = &mut editor.sidebar;
     if !mouse.pressed(MouseButton::Left) && !mouse.just_released(MouseButton::Left) {
         layout.suppressed = false;
@@ -196,8 +220,9 @@ pub(in crate::editor) fn resize(
             let point = point * window.scale_factor();
             grips
                 .iter()
-                .find(|(_, _, node, transform, clip, _)| {
-                    !node.is_empty()
+                .find(|(_, axis, node, transform, clip, _)| {
+                    (!layout.tree_collapsed || **axis != Axis::Height)
+                        && !node.is_empty()
                         && node.contains_point(**transform, point)
                         && clip.is_none_or(|clip| clip.contains_point(point))
                 })
@@ -252,6 +277,7 @@ pub(in crate::editor) fn resize(
         };
         if let Some(entity) = focus.get()
             && let Ok((_, axis, ..)) = grips.get(entity)
+            && (!layout.tree_collapsed || *axis != Axis::Height)
         {
             if keys.just_pressed(KeyCode::Home) {
                 match axis {
@@ -307,7 +333,9 @@ pub(in crate::editor) fn resize(
             Color::srgba(0.19, 0.19, 0.22, 0.35)
         };
         color.set_if_neq(BackgroundColor(value));
-        if allowed {
+        let enabled =
+            allowed && (!(layout.tree_collapsed || viewing_model) || *axis != Axis::Height);
+        if enabled {
             commands.entity(entity).try_remove::<InteractionDisabled>();
         } else {
             commands.entity(entity).try_insert(InteractionDisabled);
@@ -315,7 +343,7 @@ pub(in crate::editor) fn resize(
         }
         commands
             .entity(entity)
-            .try_insert(TabIndex(if allowed { 0 } else { -1 }));
+            .try_insert(TabIndex(if enabled { 0 } else { -1 }));
     }
     if let Some(axis) = active {
         if !layout.cursor_owned {
@@ -341,13 +369,43 @@ pub(in crate::editor) fn resize(
             commands.entity(window_entity).remove::<CursorIcon>();
         }
     }
-    for (mut node, sidebar) in &mut panes {
+}
+
+pub(in crate::editor) fn layout(
+    editor: Res<Editor>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut panes: Query<
+        (&mut Node, Has<Sidebar>, Has<Inspector>, Option<&Axis>),
+        Or<(With<Sidebar>, With<Inspector>, With<SceneTree>, With<Axis>)>,
+    >,
+) {
+    let layout = &editor.sidebar;
+    let light = matches!(
+        editor.selection,
+        Some(Selection::Light(_) | Selection::Environment)
+    );
+    for (mut node, sidebar, inspector, axis) in &mut panes {
         if sidebar {
+            node.display = if editor.viewing_image.is_some() {
+                Display::None
+            } else {
+                Display::Flex
+            };
             node.width = px(layout.width(window.width()));
-        } else {
-            node.height = px(layout.inspector_height(window.height(), light));
+        } else if inspector {
+            node.height = px(if editor.viewing_model.is_some() {
+                (window.height() - TOP - FOOT - TREE_HEADER).max(0.0)
+            } else {
+                layout.inspector_height(window.height(), light)
+            });
             node.min_height = px(0);
             node.max_height = Val::Auto;
+        } else if axis != Some(&Axis::Width) {
+            node.display = if layout.tree_collapsed || editor.viewing_model.is_some() {
+                Display::None
+            } else {
+                Display::Flex
+            };
         }
     }
 }

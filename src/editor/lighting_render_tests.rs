@@ -66,6 +66,120 @@ fn custom_lights(app: &mut App) -> usize {
         .count()
 }
 
+fn image_difference(a: &image::RgbaImage, b: &image::RgbaImage) -> f64 {
+    let total: u64 = a
+        .pixels()
+        .zip(b.pixels())
+        .map(|(a, b)| {
+            a.0[..3]
+                .iter()
+                .zip(&b.0[..3])
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum::<u64>()
+        })
+        .sum();
+    total as f64 / (a.width() * a.height() * 3) as f64
+}
+
+#[test]
+#[ignore = "requires GPU adapter; renders HDRI diffuse light and metallic reflections"]
+fn gpu_hdri_lighting_reflections_rotation_brightness_and_undo() {
+    use crate::EnvironmentPreset;
+    let directory = std::env::temp_dir().join(format!("bevy-editor-hdri-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    println!("HDRI GPU artifacts: {}", directory.display());
+    let (mut app, output, camera) = fixture();
+    let sphere = app
+        .world_mut()
+        .resource_mut::<Assets<Mesh>>()
+        .add(Sphere::new(0.7).mesh().uv(48, 32));
+    let metal = app
+        .world_mut()
+        .resource_mut::<Assets<StandardMaterial>>()
+        .add(StandardMaterial {
+            base_color: Color::srgb(0.9, 0.9, 0.9),
+            metallic: 1.0,
+            perceptual_roughness: 0.08,
+            ..default()
+        });
+    app.world_mut().spawn((
+        Mesh3d(sphere),
+        MeshMaterial3d(metal),
+        Transform::from_xyz(1.1, 0.7, 0.0),
+    ));
+    let baseline = capture_when(&mut app, &output, &directory.join("01-off.png"), |image| {
+        brightness(image) < 2.0
+    });
+    issue(&mut app, Action::Select(Selection::Environment));
+    change(&mut app, LightingAction::ToggleHdriBackground);
+    change(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::SmallStudio)),
+    );
+    let studio = capture_when(
+        &mut app,
+        &output,
+        &directory.join("02-studio.png"),
+        |image| brightness(image) > 12.0 && image_difference(image, &baseline) > 8.0,
+    );
+    assert!(
+        app.world()
+            .get::<bevy::light::EnvironmentMapLight>(camera)
+            .is_some()
+    );
+    assert_eq!(
+        custom_lights(&mut app),
+        0,
+        "The environment alone must light the scene"
+    );
+    change(
+        &mut app,
+        LightingAction::SetNumber(Field::Environment(EnvironmentField::HdriRotation), 120.0),
+    );
+    let rotated = capture_when(
+        &mut app,
+        &output,
+        &directory.join("03-rotated.png"),
+        |image| image_difference(image, &studio) > 2.0,
+    );
+    change(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::VeniceSunset)),
+    );
+    let sunset = capture_when(
+        &mut app,
+        &output,
+        &directory.join("04-sunset.png"),
+        |image| image_difference(image, &rotated) > 5.0 && brightness(image) > 5.0,
+    );
+    change(
+        &mut app,
+        LightingAction::SetNumber(Field::Environment(EnvironmentField::HdriBrightness), 0.0),
+    );
+    capture_when(
+        &mut app,
+        &output,
+        &directory.join("05-zero-brightness.png"),
+        |image| brightness(image) < 2.0,
+    );
+    issue(&mut app, Action::Undo);
+    capture_when(&mut app, &output, &directory.join("06-undo.png"), |image| {
+        image_difference(image, &sunset) < 0.1
+    });
+    change(&mut app, LightingAction::SetEnvironment(None));
+    capture_when(
+        &mut app,
+        &output,
+        &directory.join("07-disabled.png"),
+        |image| brightness(image) < 2.0,
+    );
+    assert!(
+        app.world()
+            .get::<bevy::light::EnvironmentMapLight>(camera)
+            .is_none()
+    );
+}
+
 fn fixture() -> (App, Handle<Image>, Entity) {
     let mut app = App::new();
     app.add_plugins(
@@ -82,6 +196,7 @@ fn fixture() -> (App, Handle<Image>, Entity) {
             .disable::<WinitPlugin>()
             .disable::<PipelinedRenderingPlugin>(),
     )
+    .add_plugins(crate::HdriPlugin)
     .init_resource::<CapturedImage>()
     .init_resource::<PointerState>()
     .add_message::<Action>()
@@ -152,7 +267,7 @@ fn fixture() -> (App, Handle<Image>, Entity) {
         ChildOf(root),
     ));
     let project = crate::EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut editor = Editor::new(project, RoomEdits::default());
@@ -283,8 +398,14 @@ fn gpu_light_types_color_exposure_and_undo() {
         |image| channels(image)[2] < channels(&blue)[2] * 0.8,
     );
     issue(&mut app, Action::Undo);
-    assert!(app.world().resource::<Editor>().edits.lighting.is_none());
-    assert_eq!(app.world().get::<Exposure>(camera).unwrap().ev100, 8.0);
+    assert_eq!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .exposure_ev100,
+        5.0
+    );
+    assert_eq!(app.world().get::<Exposure>(camera).unwrap().ev100, 5.0);
     capture_when(
         &mut app,
         &output,

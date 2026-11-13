@@ -89,6 +89,8 @@ impl Editor {
             return false;
         }
         if self.has_scene() && self.room == room {
+            self.viewing_model = None;
+            self.viewing_image = None;
             return true;
         }
         // Read and validate a new document before changing the current tab.
@@ -96,7 +98,15 @@ impl Editor {
             document
         } else {
             match self.project.read_scene(room) {
-                Ok(edits) => SceneDocument::loaded(self, room, edits),
+                Ok(edits) => {
+                    if self.project.scenes[room].is_native()
+                        && let Some(settings) = &edits.scene
+                    {
+                        self.project.scenes[room].label = settings.label.clone();
+                        self.project.scenes[room].cameras = settings.cameras.clone();
+                    }
+                    SceneDocument::loaded(self, room, edits)
+                }
                 Err(error) => {
                     self.status = format!("Не удалось открыть сцену · {error}");
                     return false;
@@ -104,6 +114,8 @@ impl Editor {
             }
         };
         self.stash_document();
+        self.viewing_model = None;
+        self.viewing_image = None;
         if !self.open_tabs.contains(&room) {
             self.open_tabs.push(room);
         }
@@ -126,6 +138,8 @@ impl Editor {
     }
 
     pub(super) fn close_document(&mut self, room: Room) {
+        let active_model = self.viewing_model;
+        let active_image = self.viewing_image;
         let Some(index) = self.open_tabs.iter().position(|&tab| tab == room) else {
             return;
         };
@@ -154,6 +168,8 @@ impl Editor {
         } else {
             self.status = "Откройте сцену в файловом менеджере".into();
         }
+        self.viewing_model = active_model;
+        self.viewing_image = active_image;
     }
 
     pub(super) fn request_exit(&mut self) {
@@ -172,6 +188,17 @@ impl Editor {
     }
 
     pub(super) fn continue_exit(&mut self) {
+        if let Some(id) = self
+            .image_tabs
+            .iter()
+            .find(|tab| tab.dirty)
+            .map(|tab| tab.id)
+        {
+            self.activate_image_tab(id);
+            self.pending = Some(PendingAction::CloseImageEditor(id));
+            self.status = "Есть несохранённые изменения изображения".into();
+            return;
+        }
         if self.exit_queue.is_empty() {
             self.exit_requested = true;
             return;

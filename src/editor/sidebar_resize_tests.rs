@@ -2,7 +2,7 @@ use super::*;
 
 fn fixture(axis: Axis, scale: f32) -> (App, Entity, Entity, Vec2) {
     let project = crate::EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let editor = Editor::new(project, crate::data::LevelEdits::default());
@@ -25,7 +25,7 @@ fn fixture(axis: Axis, scale: f32) -> (App, Entity, Entity, Vec2) {
         .init_resource::<ButtonInput<MouseButton>>()
         .init_resource::<ButtonInput<KeyCode>>()
         .init_resource::<InputFocus>()
-        .add_systems(Update, resize);
+        .add_systems(Update, (resize, layout).chain());
     let window = app
         .world_mut()
         .spawn((
@@ -114,8 +114,12 @@ fn inspector_height_drag_moves_both_panes_and_does_not_edit_the_scene() {
 
 #[test]
 fn sidebar_width_drag_recalculates_the_viewport_and_handles_retina_coordinates() {
-    for scale in [1.0, 2.0] {
+    for (scale, collapsed) in [(1.0, false), (2.0, false), (1.0, true), (2.0, true)] {
         let (mut app, window, _, point) = fixture(Axis::Width, scale);
+        app.world_mut()
+            .resource_mut::<Editor>()
+            .sidebar
+            .tree_collapsed = collapsed;
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .press(MouseButton::Left);
@@ -141,6 +145,88 @@ fn sidebar_width_drag_recalculates_the_viewport_and_handles_retina_coordinates()
             Some(&CursorIcon::from(SystemCursorIcon::EwResize))
         );
     }
+}
+
+#[test]
+fn collapsed_tree_gives_the_inspector_space_and_restores_the_preferred_split() {
+    let mut layout = SidebarLayout {
+        preferred_height: Some(420.0),
+        preferred_width: Some(380.0),
+        ..default()
+    };
+    assert!(!layout.tree_collapsed());
+    layout.toggle_tree();
+    for height in [400.0, 760.0, 1080.0] {
+        assert_eq!(
+            layout.inspector_height(height, false),
+            height - TOP - FOOT - TREE_HEADER
+        );
+        assert_eq!(
+            layout.inspector_height(height, true),
+            height - TOP - FOOT - TREE_HEADER
+        );
+    }
+    assert_eq!(layout.width(1280.0), 380.0);
+    layout.toggle_tree();
+    assert_eq!(layout.inspector_height(760.0, false), 420.0);
+    assert_eq!(layout.inspector_height(760.0, true), 420.0);
+}
+
+#[test]
+fn collapsed_tree_disables_its_splitter_without_losing_the_saved_height() {
+    let (mut app, _, inspector, _) = fixture(Axis::Height, 1.0);
+    let tree = app.world_mut().spawn((SceneTree, Node::default())).id();
+    let grip = app
+        .world_mut()
+        .query_filtered::<Entity, With<Axis>>()
+        .single(app.world())
+        .unwrap();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.sidebar.preferred_height = Some(420.0);
+        editor.sidebar.toggle_tree();
+    }
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(grip, FocusCause::Navigated);
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::Home);
+    frame(&mut app);
+    let editor = app.world().resource::<Editor>();
+    assert!(!editor.sidebar.resizing());
+    assert_eq!(editor.sidebar.preferred_height, Some(420.0));
+    assert!(app.world().get::<InteractionDisabled>(grip).is_some());
+    assert_eq!(app.world().get::<TabIndex>(grip), Some(&TabIndex(-1)));
+    assert_eq!(
+        app.world().get::<Node>(tree).unwrap().display,
+        Display::None
+    );
+    assert_eq!(
+        app.world().get::<Node>(inspector).unwrap().height,
+        px(760.0 - TOP - FOOT - TREE_HEADER)
+    );
+    assert!(!editor.dirty() && editor.undo.is_empty());
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .reset_all();
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .reset_all();
+    app.world_mut()
+        .resource_mut::<Editor>()
+        .sidebar
+        .toggle_tree();
+    frame(&mut app);
+    assert_eq!(
+        app.world().get::<Node>(tree).unwrap().display,
+        Display::Flex
+    );
+    assert_eq!(app.world().get::<Node>(inspector).unwrap().height, px(420));
+    assert!(app.world().get::<InteractionDisabled>(grip).is_none());
 }
 
 #[test]

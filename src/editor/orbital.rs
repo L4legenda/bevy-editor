@@ -83,68 +83,11 @@ fn ring(
     entity
 }
 
-pub(super) fn brand(commands: &mut Commands, parent: Entity) -> Entity {
-    let mark = commands
-        .spawn((
-            Node {
-                width: px(31),
-                height: px(31),
-                flex_shrink: 0.0,
-                border: UiRect::all(px(1)),
-                border_radius: BorderRadius::all(px(8)),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            BackgroundGradient::from(LinearGradient::new(
-                LinearGradient::TO_BOTTOM_RIGHT,
-                vec![
-                    ColorStop::auto(Color::srgb(0.16, 0.14, 0.18)),
-                    ColorStop::auto(Color::srgb(0.045, 0.048, 0.065)),
-                ],
-            )),
-            BorderColor::all(Color::srgba(0.79, 0.65, 0.44, 0.36)),
-            Pickable::IGNORE,
-            ChildOf(parent),
-        ))
-        .id();
-    let glow = part(commands, mark, 28.0, 28.0, Vec2::ZERO, 0.0);
-    radial(
-        commands,
-        glow,
-        vec![
-            ColorStop::percent(Color::srgba(0.9, 0.67, 0.37, 0.28), 0),
-            ColorStop::percent(Color::srgba(0.9, 0.67, 0.37, 0.0), 100),
-        ],
-    );
-    let core = ring(
-        commands,
-        mark,
-        Vec2::splat(16.0),
-        0.0,
-        1.2,
-        [GOLD, IVORY, Color::srgb(0.65, 0.49, 0.35)],
-    );
-    commands
-        .entity(core)
-        .insert(BackgroundColor(Color::srgb(0.035, 0.036, 0.048)));
-    ring(
-        commands,
-        mark,
-        Vec2::new(28.0, 9.0),
-        -24.0,
-        0.8,
-        [
-            Color::srgba(0.92, 0.77, 0.53, 0.28),
-            IVORY,
-            Color::srgba(0.92, 0.77, 0.53, 0.36),
-        ],
-    );
-    let star = part(commands, mark, 2.0, 2.0, Vec2::new(9.0, -8.0), 0.0);
-    commands.entity(star).insert(BackgroundColor(IVORY));
-    mark
+pub(crate) fn brand(commands: &mut Commands, parent: Entity) -> Entity {
+    crate::app_icon::brand(commands, parent)
 }
 
-pub(super) fn illustration(commands: &mut Commands, parent: Entity) -> Entity {
+pub(crate) fn illustration(commands: &mut Commands, parent: Entity) -> Entity {
     let stage = commands
         .spawn((
             Node {

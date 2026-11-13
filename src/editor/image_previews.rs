@@ -8,6 +8,7 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
+use image::ImageDecoder;
 
 use super::{
     Editor,
@@ -44,16 +45,22 @@ impl ImagePreviews {
 struct Job {
     file: usize,
     scan_revision: u64,
-    task: Task<Result<DecodedThumbnail, String>>,
+    task: Task<Result<DecodedImage, String>>,
 }
 
-struct DecodedThumbnail {
-    rgba: Vec<u8>,
-    size: UVec2,
-    original: UVec2,
+pub(super) struct DecodedImage {
+    pub rgba: Vec<u8>,
+    pub size: UVec2,
+    pub original: UVec2,
 }
 
-fn decode(path: &Path) -> Result<DecodedThumbnail, String> {
+pub(super) fn decode_image(path: &Path, bounds: UVec2) -> Result<DecodedImage, String> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+    {
+        return decode_svg(path, bounds);
+    }
     let mut reader = image::ImageReader::open(path)
         .map_err(|error| error.to_string())?
         .with_guessed_format()
@@ -63,19 +70,87 @@ fn decode(path: &Path) -> Result<DecodedThumbnail, String> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let source = reader.decode().map_err(|error| error.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+    let orientation = decoder.orientation().map_err(|error| error.to_string())?;
+    let mut source =
+        image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
+    source.apply_orientation(orientation);
     let original = UVec2::new(source.width(), source.height());
-    let thumbnail = if original.x > WIDTH || original.y > HEIGHT {
-        source.thumbnail(WIDTH, HEIGHT)
+    let thumbnail = if original.x > bounds.x || original.y > bounds.y {
+        source.thumbnail(bounds.x, bounds.y)
     } else {
         source
     };
     let rgba = thumbnail.into_rgba8();
-    Ok(DecodedThumbnail {
+    Ok(DecodedImage {
         size: UVec2::new(rgba.width(), rgba.height()),
         rgba: rgba.into_raw(),
         original,
     })
+}
+
+fn decode(path: &Path) -> Result<DecodedImage, String> {
+    decode_image(path, UVec2::new(WIDTH, HEIGHT))
+}
+
+fn decode_svg(path: &Path, bounds: UVec2) -> Result<DecodedImage, String> {
+    // Bound XML as well as raster allocation; SVG previews never fetch remote resources.
+    if std::fs::metadata(path)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 16 * 1024 * 1024
+    {
+        return Err("SVG превышает 16 МБ".into());
+    }
+    let data = std::fs::read(path).map_err(|error| error.to_string())?;
+    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
+        .map_err(|error| error.to_string())?;
+    let original = UVec2::new(
+        tree.size().width().ceil().max(1.0) as u32,
+        tree.size().height().ceil().max(1.0) as u32,
+    );
+    let scale = (bounds.x as f32 / original.x as f32)
+        .min(bounds.y as f32 / original.y as f32)
+        .min(1.0);
+    let size = (original.as_vec2() * scale)
+        .round()
+        .max(Vec2::ONE)
+        .as_uvec2();
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(size.x, size.y).ok_or("Некорректный размер SVG")?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let mut rgba = Vec::with_capacity((size.x * size.y * 4) as usize);
+    for pixel in pixmap.pixels() {
+        let pixel = pixel.demultiply();
+        rgba.extend_from_slice(&[pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]);
+    }
+    Ok(DecodedImage {
+        rgba,
+        size,
+        original,
+    })
+}
+
+pub(super) fn texture(decoded: DecodedImage, images: &mut Assets<Image>) -> Handle<Image> {
+    images.add(texture_image(decoded))
+}
+
+pub(super) fn texture_image(decoded: DecodedImage) -> Image {
+    Image::new(
+        Extent3d {
+            width: decoded.size.x,
+            height: decoded.size.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        decoded.rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 pub(super) fn update(
@@ -92,26 +167,30 @@ pub(super) fn update(
         // finish before starting another job, then reject its obsolete index.
     }
 
+    if previews.browser_revision != Some(browser.revision) {
+        previews.visible_files = browser
+            .entries(&editor.project.catalog)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Image(file) => Some(file),
+                _ => None,
+            })
+            .collect();
+        let visible = previews.visible_files.clone();
+        previews.completed.retain(|file, _| visible.contains(file));
+        previews.browser_revision = Some(browser.revision);
+    }
+
     let finished = previews.pending.as_mut().and_then(|job| {
         block_on(poll_once(&mut job.task)).map(|result| (job.file, job.scan_revision, result))
     });
     if let Some((file, scan_revision, result)) = finished {
         previews.pending = None;
-        if scan_revision == browser.scan_revision {
+        if scan_revision == browser.scan_revision && previews.visible_files.contains(&file) {
             let preview = match result {
                 Ok(decoded) => ImagePreview {
-                    image: Some(images.add(Image::new(
-                        Extent3d {
-                            width: decoded.size.x,
-                            height: decoded.size.y,
-                            depth_or_array_layers: 1,
-                        },
-                        TextureDimension::D2,
-                        decoded.rgba,
-                        TextureFormat::Rgba8UnormSrgb,
-                        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-                    ))),
                     dimensions: Some(decoded.original),
+                    image: Some(texture(decoded, &mut images)),
                     error: None,
                 },
                 Err(error) => ImagePreview {
@@ -126,17 +205,6 @@ pub(super) fn update(
 
     if !editor.drawer || previews.pending.is_some() {
         return;
-    }
-    if previews.browser_revision != Some(browser.revision) {
-        previews.visible_files = browser
-            .entries(&editor.project.catalog)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Entry::Image(file) => Some(file),
-                _ => None,
-            })
-            .collect();
-        previews.browser_revision = Some(browser.revision);
     }
     let next = previews
         .visible_files
@@ -160,7 +228,7 @@ mod tests {
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
-    fn decode_png(width: u32, height: u32) -> DecodedThumbnail {
+    fn decode_png(width: u32, height: u32) -> DecodedImage {
         let path = std::env::temp_dir().join(format!(
             "bevy-editor-image-preview-{}-{}.png",
             std::process::id(),

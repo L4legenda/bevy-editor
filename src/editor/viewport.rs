@@ -8,7 +8,6 @@ use bevy::{
     picking::mesh_picking::ray_cast::{MeshRayCast, MeshRayCastSettings},
     prelude::*,
     render::render_resource::{Extent3d, TextureFormat},
-    shape::Ray3d,
     ui_widgets::TextInput,
     window::PrimaryWindow,
 };
@@ -16,6 +15,18 @@ use bevy::{
 use crate::{data::LevelEdits as RoomEdits, project::LensKind};
 
 use super::{Editor, Field, Scene, Selection, Shot, Tool, ui};
+
+#[path = "transform_handles.rs"]
+mod transform_handles;
+pub(super) use transform_handles::{HandleMaterial, HandlePlugin, spawn_overlay};
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "rotation_gizmo_tests.rs"]
+mod rotation_tests;
+
+#[cfg(test)]
+#[path = "transform_space_gizmo_tests.rs"]
+mod space_tests;
 
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
 const AXIS_COLORS: [Color; 3] = [
@@ -26,6 +37,7 @@ const AXIS_COLORS: [Color; 3] = [
 const HIGHLIGHT: Color = Color::srgb(1.0, 0.81, 0.38);
 const CAMERA_COLOR: Color = Color::srgba(0.49, 0.72, 1.0, 0.72);
 const EDITOR_FOV: f32 = 58.0_f32.to_radians();
+const FOCUS_DURATION: f32 = 0.5;
 pub(super) const CAMERA_ASPECT: f32 = 16.0 / 9.0;
 pub(super) const EDITOR_GIZMO_LAYER: usize = 3;
 
@@ -56,13 +68,64 @@ enum Navigation {
     Orbit,
 }
 
+struct FocusFlight {
+    room: super::Room,
+    selection: Option<Selection>,
+    start: Vec3,
+    end: Vec3,
+    start_pivot: Vec3,
+    end_pivot: Vec3,
+    elapsed: f32,
+}
+
+impl FocusFlight {
+    fn new(editor: &Editor) -> Self {
+        let pivot = editor
+            .selection
+            .and_then(|target| editor.pose(target))
+            .map_or(Vec3::ZERO, |target| target.transform().translation);
+        Self {
+            room: editor.room,
+            selection: editor.selection,
+            start: editor.view.translation,
+            end: pivot + *editor.view.back() * if editor.selection.is_some() { 3.0 } else { 8.0 },
+            start_pivot: editor.pivot,
+            end_pivot: pivot,
+            elapsed: 0.0,
+        }
+    }
+
+    fn advance(&mut self, editor: &mut Editor, delta: f32) -> bool {
+        self.elapsed = (self.elapsed + delta).min(FOCUS_DURATION);
+        let t = self.elapsed / FOCUS_DURATION;
+        let eased = t * t * (3.0 - 2.0 * t);
+        editor.view.translation = self.start.lerp(self.end, eased);
+        editor.pivot = self.start_pivot.lerp(self.end_pivot, eased);
+        if self.elapsed >= FOCUS_DURATION {
+            editor.view.translation = self.end;
+            editor.pivot = self.end_pivot;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Resource, Default)]
 pub(super) struct PointerState {
     nav: Option<Navigation>,
+    focus_flight: Option<FocusFlight>,
     pilot: Option<Shot>,
     pivot: Vec3,
     drag: Option<Drag>,
-    hover: Option<usize>,
+    hover: Option<TransformHandle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformHandle {
+    Axis { tool: Tool, axis: usize },
+    Plane { normal: usize },
+    ViewRotation,
 }
 
 impl PointerState {
@@ -72,21 +135,25 @@ impl PointerState {
 
     pub(super) fn stop_navigation(&mut self) {
         self.nav = None;
+        self.focus_flight = None;
         self.pilot = None;
     }
 }
 
 struct Drag {
     selection: Selection,
+    handle: TransformHandle,
     tool: Tool,
     axis: usize,
     direction: Vec3,
+    frame: Quat,
     before: RoomEdits,
     start: Transform,
     cursor: Vec2,
     pixels_per_metre: Vec2,
     scale_length: f32,
     ring_start: Option<Vec3>,
+    plane_start: Option<Vec3>,
 }
 
 pub(super) fn setup(mut config: ResMut<GizmoConfigStore>) {
@@ -115,21 +182,22 @@ pub(super) fn spawn_camera(
         ScreenSpaceTransmission::default(),
         RenderTarget::Image(surface.0.clone().into()),
     ));
-    camera.insert(AmbientLight {
-        brightness: 150.0,
-        ..default()
-    });
+    super::lighting::apply_camera_defaults(&mut camera);
     if let Some(setup) = editor.project.camera_setup {
-        let logical =
-            crate::asset_paths::original_asset_path(&editor.root, &editor.definition().asset)
-                .unwrap_or_else(|_| editor.definition().asset.clone());
+        let path = if editor.definition().is_native() {
+            &editor.definition().file
+        } else {
+            &editor.definition().asset
+        };
+        let logical = crate::asset_paths::original_asset_path(&editor.root, path)
+            .unwrap_or_else(|_| path.clone());
         setup(&mut camera, &logical);
     }
     camera.entry::<RenderLayers>().and_modify(|mut layers| {
         *layers = layers
             .clone()
             .with(EDITOR_GIZMO_LAYER)
-            .without(super::selection_outline::LAYER);
+            .with(super::selection_outline::LAYER);
     });
     // A stable image matters when tracking a small handle with the pointer.
     camera.remove::<(TemporalAntiAliasing, ScreenSpaceAmbientOcclusion)>();
@@ -196,22 +264,13 @@ pub(super) fn navigate(
     if state.pilot != shot {
         editor.finish_camera_navigation();
         state.nav = None;
+        state.focus_flight = None;
         state.pilot = shot;
         if let Some(shot) = shot {
             let view = editor.camera(shot).pose.transform();
             state.pivot = view.translation + *view.forward() * 3.0;
         }
     }
-    if shot.is_none() && std::mem::take(&mut editor.focus) {
-        editor.pivot = editor
-            .selection
-            .and_then(|target| editor.pose(target))
-            .map_or(Vec3::ZERO, |target| target.transform().translation);
-        let back = *editor.view.back();
-        editor.view.translation =
-            editor.pivot + back * if editor.selection.is_some() { 3.0 } else { 8.0 };
-    }
-
     let typing = focus
         .get()
         .is_some_and(|entity| text_inputs.contains(entity));
@@ -222,6 +281,8 @@ pub(super) fn navigate(
         KeyCode::SuperRight,
     ]);
     let enabled = window.focused
+        && !editor.asset_viewer_open()
+        && !editor.browser_popup
         && editor.ready
         && editor.pending.is_none()
         && !typing
@@ -260,6 +321,27 @@ pub(super) fn navigate(
         } else if orbit_key && mouse.just_pressed(MouseButton::Left) {
             state.nav = Some(Navigation::Orbit);
         }
+    }
+    let interrupted = !enabled
+        || shot.is_some()
+        || state.dragging()
+        || state.nav.is_some()
+        || keys.just_pressed(KeyCode::Escape)
+        || (inside && (mouse.just_pressed(MouseButton::Left) || scroll.delta.y != 0.0));
+    if std::mem::take(&mut editor.focus) && !interrupted {
+        state.focus_flight = Some(FocusFlight::new(&editor));
+    }
+    if interrupted
+        || state.focus_flight.as_ref().is_some_and(|flight| {
+            flight.room != editor.room || flight.selection != editor.selection
+        })
+    {
+        state.focus_flight = None;
+    }
+    if let Some(flight) = state.focus_flight.as_mut()
+        && flight.advance(&mut editor, time.delta_secs())
+    {
+        state.focus_flight = None;
     }
     let mut placement = shot.map(|shot| editor.camera(shot));
     let mut view = placement.map_or(editor.view, |placement| placement.pose.transform());
@@ -404,32 +486,177 @@ pub(super) fn length(camera: &Camera, view: &Transform, pivot: Vec3) -> f32 {
     (175.0 * depth * (EDITOR_FOV * 0.5).tan() / height).clamp(0.06, 8.0)
 }
 
-fn allowed(editor: &Editor, selection: Selection, tool: Tool, axis: usize) -> bool {
-    editor.field_allowed(
-        selection,
-        match tool {
-            Tool::Move => Field::Position(axis),
-            Tool::Rotate => Field::Rotation(axis),
-            Tool::Scale => Field::Scale(axis),
-        },
-    )
+pub(super) fn allowed(editor: &Editor, selection: Selection, tool: Tool, axis: usize) -> bool {
+    let field = match tool {
+        Tool::Universal => {
+            return tool
+                .operations()
+                .iter()
+                .any(|&tool| allowed(editor, selection, tool, axis));
+        }
+        Tool::Move => Field::Position(axis),
+        Tool::Rotate => Field::Rotation(axis),
+        Tool::Scale => Field::Scale(axis),
+    };
+    editor.field_allowed(selection, field)
 }
 
-fn direction(pose: Transform, tool: Tool, axis: usize) -> Vec3 {
-    if tool == Tool::Scale {
-        pose.rotation * AXES[axis]
+fn axis_length(mode: Tool, tool: Tool, length: f32) -> f32 {
+    if mode == Tool::Universal && tool == Tool::Move {
+        length * 1.45
     } else {
-        AXES[axis]
+        length
     }
+}
+
+fn direction(editor: &Editor, pose: Transform, axis: usize) -> Vec3 {
+    editor.gizmo_rotation(pose) * AXES[axis]
+}
+
+fn scaled_pose(start: Transform, frame: Quat, axis: usize, factor: f32) -> Transform {
+    if frame.abs_diff_eq(start.rotation, 1e-5) {
+        let mut pose = start;
+        pose.scale[axis] *= factor;
+        return pose;
+    }
+    let basis = Mat4::from_quat(frame);
+    let mut scale = Vec3::ONE;
+    scale[axis] = factor;
+    let mut pose = Transform::from_matrix(
+        basis * Mat4::from_scale(scale) * basis.inverse() * start.to_matrix(),
+    );
+    pose.translation = start.translation;
+    pose.rotation = pose.rotation.normalize();
+    pose
 }
 
 fn ring_points(pivot: Vec3, axis: usize, radius: f32) -> impl Iterator<Item = Vec3> {
     let u = AXES[(axis + 1) % 3];
     let v = AXES[(axis + 2) % 3];
-    (0..=48).map(move |index| {
-        let (sin, cos) = (std::f32::consts::TAU * index as f32 / 48.0).sin_cos();
+    (0..=96).map(move |index| {
+        let (sin, cos) = (std::f32::consts::TAU * index as f32 / 96.0).sin_cos();
         pivot + (u * cos + v * sin) * radius
     })
+}
+
+const ROTATION_RADIUS_PIXELS: f32 = 88.0;
+const ROTATION_COLORS: [Color; 3] = [
+    Color::srgb(1.0, 0.12, 0.30),
+    Color::srgb(0.55, 0.85, 0.02),
+    Color::srgb(0.03, 0.54, 1.0),
+];
+
+fn rotation_radius(camera: &Camera, view: &Transform, pivot: Vec3) -> f32 {
+    let global = GlobalTransform::from(*view);
+    camera
+        .world_to_viewport(&global, pivot)
+        .ok()
+        .zip(
+            camera
+                .world_to_viewport(&global, pivot + *view.right())
+                .ok(),
+        )
+        .map(|(a, b)| ROTATION_RADIUS_PIXELS / a.distance(b).max(0.001))
+        .unwrap_or_else(|| length(camera, view, pivot))
+}
+
+/// The gizmo uses parallel projection at its pivot depth. Every ring shares
+/// exactly the same projected center, even off-center or close to the camera.
+#[cfg(test)]
+fn display_ring_points(
+    pivot: Vec3,
+    axis: usize,
+    radius: f32,
+    view: &Transform,
+) -> impl Iterator<Item = Vec3> {
+    let forward = *view.forward();
+    ring_points(pivot, axis, radius).map(move |point| {
+        let offset = point - pivot;
+        point - forward * offset.dot(forward)
+    })
+}
+
+/// The rotation reference shows the front hemisphere of each axis circle.
+/// The grey view-aligned outer ring provides the complete circular silhouette.
+fn universal_ring_segments(
+    pivot: Vec3,
+    axis: usize,
+    radius: f32,
+    view: &Transform,
+    frame: Quat,
+) -> impl Iterator<Item = (Vec3, Vec3)> {
+    let forward = *view.forward();
+    let flatten = move |point: Vec3| point - forward * (point - pivot).dot(forward);
+    let mut previous = None;
+    ring_points(pivot, axis, radius).filter_map(move |point| {
+        let point = pivot + frame * (point - pivot);
+        let start = previous.replace(point)?;
+        let a = (start - pivot).dot(*view.back());
+        let b = (point - pivot).dot(*view.back());
+        let (a, b) = match (a >= 0.0, b >= 0.0) {
+            (true, true) => (start, point),
+            (false, false) => return None,
+            _ => {
+                let equator = start.lerp(point, a / (a - b));
+                if a >= 0.0 {
+                    (start, equator)
+                } else {
+                    (equator, point)
+                }
+            }
+        };
+        Some((flatten(a), flatten(b)))
+    })
+}
+
+fn plane_corners(pivot: Vec3, normal: usize, size: f32, frame: Quat) -> [Vec3; 4] {
+    let u = frame * AXES[(normal + 1) % 3];
+    let v = frame * AXES[(normal + 2) % 3];
+    let center = pivot + (u + v) * size * 0.28;
+    [u + v, u - v, -u - v, -u + v].map(|offset| center + offset * size * 0.065)
+}
+
+fn plane_allowed(editor: &Editor, selection: Selection, normal: usize) -> bool {
+    [1, 2]
+        .into_iter()
+        .all(|offset| allowed(editor, selection, Tool::Move, (normal + offset) % 3))
+}
+
+fn view_rotation_allowed(editor: &Editor, selection: Selection) -> bool {
+    (0..3).all(|axis| allowed(editor, selection, Tool::Rotate, axis))
+}
+
+fn outer_ring_radius(camera: &Camera, view: &Transform, pivot: Vec3, radius: f32) -> Option<f32> {
+    let global = GlobalTransform::from(*view);
+    let start = camera.world_to_viewport(&global, pivot).ok()?;
+    let end = camera
+        .world_to_viewport(&global, pivot + *view.right() * radius * 1.15)
+        .ok()?;
+    Some(start.distance(end))
+}
+
+fn plane_point(ray: Ray3d, center: Vec3, normal: Vec3) -> Option<Vec3> {
+    let denominator = ray.direction.dot(normal);
+    if denominator.abs() < 1e-4 {
+        return None;
+    }
+    let point = ray.get_point((center - ray.origin).dot(normal) / denominator);
+    point.is_finite().then_some(point)
+}
+
+fn quad_contains(point: Vec2, corners: [Vec2; 4]) -> bool {
+    let mut lower = f32::INFINITY;
+    let mut upper = f32::NEG_INFINITY;
+    let mut area = 0.0;
+    for index in 0..4 {
+        let a = corners[index];
+        let b = corners[(index + 1) % 4];
+        let side = (b - a).perp_dot(point - a);
+        lower = lower.min(side);
+        upper = upper.max(side);
+        area += a.perp_dot(b);
+    }
+    area.abs() >= 6.0 && (lower >= 0.0 || upper <= 0.0)
 }
 
 fn distance_to_segment(point: Vec2, a: Vec2, b: Vec2) -> f32 {
@@ -445,43 +672,89 @@ fn handle_at(
     camera: &Camera,
     view: &Transform,
     cursor: Vec2,
-) -> Option<usize> {
+    rotation_radius: f32,
+) -> Option<TransformHandle> {
     let global = GlobalTransform::from(*view);
     let project = |point| camera.world_to_viewport(&global, point).ok();
     let pivot = pose.translation;
+    let frame = editor.gizmo_rotation(pose);
     let length = length(camera, view, pivot);
     let start = project(pivot)?;
-    (0..3)
-        .filter(|&axis| allowed(editor, selection, editor.tool, axis))
-        .filter_map(|axis| {
-            let distance = if editor.tool == Tool::Rotate {
-                let points: Vec<_> = ring_points(pivot, axis, length * 0.83)
-                    .map(project)
-                    .collect();
-                points
-                    .windows(2)
-                    .filter_map(|line| Some(distance_to_segment(cursor, line[0]?, line[1]?)))
+    if editor.tool == Tool::Universal {
+        for normal in (0..3).rev() {
+            if !plane_allowed(editor, selection, normal) {
+                continue;
+            }
+            let [Some(a), Some(b), Some(c), Some(d)] =
+                plane_corners(pivot, normal, length, frame).map(project)
+            else {
+                continue;
+            };
+            if quad_contains(cursor, [a, b, c, d]) {
+                return Some(TransformHandle::Plane { normal });
+            }
+        }
+    }
+    let mut nearest: Option<(TransformHandle, f32)> = None;
+    for &tool in editor.tool.operations() {
+        for axis in 0..3 {
+            if !allowed(editor, selection, tool, axis) {
+                continue;
+            }
+            let distance = if tool == Tool::Rotate {
+                universal_ring_segments(pivot, axis, rotation_radius, view, frame)
+                    .filter_map(|(a, b)| {
+                        Some(distance_to_segment(cursor, project(a)?, project(b)?))
+                    })
                     .fold(f32::INFINITY, f32::min)
             } else {
-                let end = project(pivot + direction(pose, editor.tool, axis) * length)?;
+                let extent = axis_length(editor.tool, tool, length);
+                let Some(end) = project(pivot + direction(editor, pose, axis) * extent) else {
+                    continue;
+                };
                 if end.distance(start) < 13.0 {
-                    return None;
+                    continue;
                 }
                 distance_to_segment(cursor, start.lerp(end, 0.23), end)
             };
-            (distance < 9.0).then_some((axis, distance))
-        })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(axis, _)| axis)
+            if distance < 9.0 && nearest.is_none_or(|(_, best)| distance < best) {
+                nearest = Some((TransformHandle::Axis { tool, axis }, distance));
+            }
+        }
+    }
+    if editor.tool.operations().contains(&Tool::Rotate)
+        && view_rotation_allowed(editor, selection)
+        && let Some(radius) = outer_ring_radius(camera, view, pivot, rotation_radius)
+    {
+        let distance = (cursor.distance(start) - radius).abs();
+        if distance < 5.0 && nearest.is_none_or(|(_, best)| distance < best) {
+            nearest = Some((TransformHandle::ViewRotation, distance));
+        }
+    }
+    nearest.map(|(handle, _)| handle)
 }
 
-fn ring_direction(ray: Ray3d, center: Vec3, normal: Vec3) -> Option<Vec3> {
-    let denominator = ray.direction.dot(normal);
+/// Invert the same parallel projection used for drawing, rather than using
+/// a perspective ray against a ring which no longer has perspective distortion.
+fn rotation_direction(
+    camera: &Camera,
+    view: &Transform,
+    cursor: Vec2,
+    center: Vec3,
+    normal: Vec3,
+) -> Option<Vec3> {
+    let ray = camera
+        .viewport_to_world(&GlobalTransform::from(*view), cursor)
+        .ok()?;
+    let forward = *view.forward();
+    let depth = (center - ray.origin).dot(forward) / ray.direction.dot(forward);
+    let plane_point = ray.get_point(depth);
+    let denominator = forward.dot(normal);
     if denominator.abs() < 1e-4 {
         return None;
     }
-    let distance = (center - ray.origin).dot(normal) / denominator;
-    (ray.origin + *ray.direction * distance - center).try_normalize()
+    let distance = (center - plane_point).dot(normal) / denominator;
+    (plane_point + forward * distance - center).try_normalize()
 }
 
 pub(super) fn manipulate(
@@ -502,6 +775,8 @@ pub(super) fn manipulate(
         return;
     };
     if editor.pending.is_some()
+        || editor.asset_viewer_open()
+        || editor.browser_popup
         || asset_drag.as_ref().is_some_and(|drag| drag.active())
         || lighting
             .as_ref()
@@ -536,29 +811,59 @@ pub(super) fn manipulate(
                 };
                 let mut pose = drag.start;
                 match drag.tool {
+                    Tool::Universal => unreachable!("dragging resolves to one transform operation"),
+                    Tool::Move if matches!(drag.handle, TransformHandle::Plane { .. }) => {
+                        if let Some(point) =
+                            drag.plane_start
+                                .zip(camera.viewport_to_world(&global, cursor).ok().and_then(
+                                    |ray| plane_point(ray, pose.translation, drag.direction),
+                                ))
+                                .map(|(start, end)| end - start)
+                        {
+                            let local = drag.frame.inverse() * point;
+                            let mut shift = Vec3::ZERO;
+                            for axis in 0..3 {
+                                if axis != drag.axis {
+                                    shift[axis] = snap(local[axis], 0.25);
+                                }
+                            }
+                            pose.translation += drag.frame * shift;
+                        }
+                    }
                     Tool::Move => pose.translation += drag.direction * snap(delta, 0.25),
                     Tool::Scale => {
-                        let original = pose.scale[drag.axis];
-                        let scale = 1.0 + delta / drag.scale_length;
-                        pose.scale[drag.axis] = original.signum()
-                            * snap(original.abs() * scale, 0.1).clamp(0.01, 100.0);
+                        let original = if editor.local_space {
+                            pose.scale[drag.axis].abs()
+                        } else {
+                            (pose.rotation.inverse() * drag.direction * pose.scale).length()
+                        };
+                        let scale = snap(original * (1.0 + delta / drag.scale_length), 0.1)
+                            .clamp(0.01, 100.0);
+                        pose = scaled_pose(pose, drag.frame, drag.axis, scale / original);
                     }
                     Tool::Rotate => {
-                        let angle =
-                            drag.ring_start
-                                .zip(camera.viewport_to_world(&global, cursor).ok().and_then(
-                                    |ray| ring_direction(ray, pose.translation, drag.direction),
-                                ))
-                                .map_or((offset.x - offset.y) * 0.011, |(start, end)| {
-                                    drag.direction.dot(start.cross(end)).atan2(start.dot(end))
-                                });
+                        let angle = drag
+                            .ring_start
+                            .zip(rotation_direction(
+                                camera,
+                                view,
+                                cursor,
+                                pose.translation,
+                                drag.direction,
+                            ))
+                            .map_or((offset.x - offset.y) * 0.011, |(start, end)| {
+                                drag.direction.dot(start.cross(end)).atan2(start.dot(end))
+                            });
                         pose.rotation = Quat::from_axis_angle(
                             drag.direction,
                             snap(angle, 15.0_f32.to_radians()),
                         ) * pose.rotation;
                     }
                 }
-                if pose.translation.is_finite() && pose.translation.abs().max_element() <= 1000.0 {
+                if pose.translation.is_finite()
+                    && pose.translation.abs().max_element() <= 1000.0
+                    && crate::Pose::from(pose).valid()
+                {
                     editor.set_pose(drag.selection, pose);
                 }
             }
@@ -589,15 +894,33 @@ pub(super) fn manipulate(
         return;
     };
     if let Some(selection) = editor.selection
+        && !editor.object_hidden(selection)
         && let Some(pose) = editor.pose(selection)
     {
         let pose = pose.transform();
-        pointer.hover = handle_at(&editor, selection, pose, camera, view, cursor);
-        if let Some(axis) = pointer.hover
+        let rotation_radius = rotation_radius(camera, view, pose.translation);
+        pointer.hover = handle_at(
+            &editor,
+            selection,
+            pose,
+            camera,
+            view,
+            cursor,
+            rotation_radius,
+        );
+        if let Some(handle) = pointer.hover
             && mouse.just_pressed(MouseButton::Left)
         {
-            let direction = direction(pose, editor.tool, axis);
-            let length = length(camera, view, pose.translation);
+            let (tool, axis, direction) = match handle {
+                TransformHandle::Axis { tool, axis } => {
+                    (tool, axis, direction(&editor, pose, axis))
+                }
+                TransformHandle::Plane { normal } => {
+                    (Tool::Move, normal, direction(&editor, pose, normal))
+                }
+                TransformHandle::ViewRotation => (Tool::Rotate, 0, *view.back()),
+            };
+            let length = axis_length(editor.tool, tool, length(camera, view, pose.translation));
             let pixels_per_metre = camera
                 .world_to_viewport(&global, pose.translation + direction * length)
                 .and_then(|end| {
@@ -608,20 +931,35 @@ pub(super) fn manipulate(
                 .unwrap_or(Vec2::X);
             pointer.drag = Some(Drag {
                 selection,
-                tool: editor.tool,
+                handle,
+                tool,
                 axis,
                 direction,
+                frame: editor.gizmo_rotation(pose),
                 before: editor.edits.clone(),
                 start: pose,
                 cursor,
                 pixels_per_metre,
-                scale_length: length,
-                ring_start: ring_direction(ray, pose.translation, direction),
+                scale_length: if tool == Tool::Rotate {
+                    rotation_radius
+                } else {
+                    length
+                },
+                ring_start: rotation_direction(camera, view, cursor, pose.translation, direction),
+                plane_start: matches!(handle, TransformHandle::Plane { .. })
+                    .then(|| plane_point(ray, pose.translation, direction))
+                    .flatten(),
             });
             return;
         }
     }
     if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+
+    // Transform tools keep the current selection, including clicks on empty
+    // space. Only the cursor mode performs scene picking or deselection.
+    if editor.tool != Tool::Universal {
         return;
     }
 
@@ -653,7 +991,7 @@ pub(super) fn manipulate(
                             })
                     })
             };
-            let filter = |entity| find(entity).is_some();
+            let filter = |entity| find(entity).is_some_and(|target| !editor.object_hidden(target));
             let settings = MeshRayCastSettings::default().with_filter(&filter);
             meshes
                 .cast_ray(ray, &settings)
@@ -729,38 +1067,59 @@ pub(super) fn draw(
     let Some(selection) = editor.selection else {
         return;
     };
+    if editor.object_hidden(selection) {
+        return;
+    }
     let Some(pose) = editor.pose(selection) else {
         return;
     };
     let pose = pose.transform();
     let pivot = pose.translation;
-    let length = length(camera, view, pivot);
-    for (axis, color) in AXIS_COLORS.into_iter().enumerate() {
-        if !allowed(&editor, selection, editor.tool, axis) {
-            continue;
-        }
-        let color = if pointer.hover == Some(axis)
-            || pointer.drag.as_ref().is_some_and(|drag| drag.axis == axis)
-        {
-            HIGHLIGHT
-        } else {
-            color
-        };
-        if editor.tool == Tool::Rotate {
-            handles.linestrip(ring_points(pivot, axis, length * 0.83), color);
-        } else {
-            let end = pivot + direction(pose, editor.tool, axis) * length;
-            if editor.tool == Tool::Move {
-                handles
-                    .arrow(pivot, end, color)
-                    .with_tip_length(length * 0.15);
-            } else {
-                handles.line(pivot, end, color);
-                handles.cube(
-                    Transform::from_translation(end).with_scale(Vec3::splat(length * 0.12)),
-                    color,
-                );
+    let frame = editor.gizmo_rotation(pose);
+    if editor.tool.operations().contains(&Tool::Rotate) {
+        let active = pointer
+            .drag
+            .as_ref()
+            .filter(|drag| drag.tool == Tool::Rotate && drag.selection == selection);
+        // Geometry can rotate during a drag; keep its handle radius stable.
+        let radius = active.map_or_else(
+            || rotation_radius(camera, view, pivot),
+            |drag| drag.scale_length,
+        );
+        for (axis, color) in ROTATION_COLORS.into_iter().enumerate() {
+            if !allowed(&editor, selection, Tool::Rotate, axis) {
+                continue;
+            }
+            let mut color = axis_color(&pointer, Tool::Rotate, axis, color);
+            if active.is_some_and(|drag| {
+                drag.handle
+                    != (TransformHandle::Axis {
+                        tool: Tool::Rotate,
+                        axis,
+                    })
+            }) {
+                color = color.with_alpha(0.25);
+            }
+            for (a, b) in universal_ring_segments(pivot, axis, radius, view, frame) {
+                handles.line(a, b, color);
             }
         }
+    }
+}
+
+fn axis_color(pointer: &PointerState, tool: Tool, axis: usize, color: Color) -> Color {
+    handle_color(pointer, TransformHandle::Axis { tool, axis }, color)
+}
+
+fn handle_color(pointer: &PointerState, handle: TransformHandle, color: Color) -> Color {
+    if pointer.hover == Some(handle)
+        || pointer
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.handle == handle)
+    {
+        HIGHLIGHT
+    } else {
+        color
     }
 }

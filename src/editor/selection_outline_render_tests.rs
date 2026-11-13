@@ -2,7 +2,7 @@
 //! renderer and Screenshot APIs from Bevy's installed examples.
 //!
 //! Run with:
-//! `cargo +1.97.1 test --locked gpu_outline_shows_the_full_selection_boundary_through_occluders -- --ignored --test-threads=1 --nocapture`
+//! `cargo test --locked gpu_selection_brackets_follow_bounds_and_show_through_occluders -- --ignored --test-threads=1 --nocapture`
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -10,9 +10,10 @@ use std::{path::PathBuf, time::Duration};
 
 use bevy::{
     camera::{
-        CameraUpdateSystems, ClearColorConfig, RenderTarget, ScalingMode, Viewport,
+        ClearColorConfig, RenderTarget, ScalingMode, Viewport,
         visibility::{RenderLayers, VisibilitySystems},
     },
+    gizmos::AppGizmoBuilder,
     prelude::*,
     render::{
         RenderPlugin,
@@ -29,7 +30,7 @@ use bevy::{
     winit::WinitPlugin,
 };
 
-use super::{Outline as SelectionOutline, OutlineMaterialPlugin, setup, sync, sync_camera};
+use super::{LAYER, SelectionGizmos, draw, setup};
 use crate::{
     data::PlacedModel,
     editor::{Editor, RoomEdits, Scene, Selection, ui, viewport::EditorCamera},
@@ -50,7 +51,7 @@ struct Targets {
 #[derive(Resource, Default)]
 pub(crate) struct CapturedImage(Option<Image>);
 
-fn composite_ui(mut commands: Commands, outline: Res<SelectionOutline>, targets: Res<Targets>) {
+fn composite_ui(mut commands: Commands, targets: Res<Targets>) {
     let root = commands
         .spawn((
             UiTargetCamera(targets.ui_camera),
@@ -63,19 +64,6 @@ fn composite_ui(mut commands: Commands, outline: Res<SelectionOutline>, targets:
         .id();
     commands.spawn((
         ImageNode::new(targets.scene.clone()),
-        Node {
-            position_type: PositionType::Absolute,
-            width: percent(100),
-            height: percent(100),
-            ..default()
-        },
-        ChildOf(root),
-    ));
-    // Keep the material node present on deselection. This specifically tests
-    // the shader's transparent/zero-width path against a previously white mask.
-    commands.spawn((
-        MaterialNode(outline.material.clone()),
-        ZIndex(1),
         Node {
             position_type: PositionType::Absolute,
             width: percent(100),
@@ -201,15 +189,14 @@ fn fixture() -> (App, Entity) {
             .disable::<WinitPlugin>()
             .disable::<PipelinedRenderingPlugin>(),
     )
-    .add_plugins(OutlineMaterialPlugin)
+    .init_gizmo_group::<SelectionGizmos>()
     .init_resource::<CapturedImage>()
     .add_systems(Startup, (setup, composite_ui).chain())
-    .add_systems(Update, sync_camera.before(CameraUpdateSystems))
     .add_systems(
         PostUpdate,
-        sync.after(TransformSystems::Propagate)
+        draw.after(TransformSystems::Propagate)
             .after(VisibilitySystems::VisibilityPropagate)
-            .before(VisibilitySystems::CheckVisibility),
+            .after(VisibilitySystems::CalculateBounds),
     );
 
     // Runtime synchronization can query a primary window without creating an
@@ -233,7 +220,7 @@ fn fixture() -> (App, Entity) {
         Camera {
             order: -1,
             clear_color: ClearColorConfig::Custom(Color::srgb(0.025, 0.035, 0.05)),
-            // A nonzero viewport catches mask/scene UV alignment mistakes.
+            // Exercise projection and bracket padding with a nonzero viewport offset.
             viewport: Some(Viewport {
                 physical_position: UVec2::new(16, 12),
                 physical_size: UVec2::new(WIDTH - 32, HEIGHT - 24),
@@ -242,7 +229,7 @@ fn fixture() -> (App, Entity) {
             ..default()
         },
         RenderTarget::Image(scene_image.clone().into()),
-        RenderLayers::layer(0),
+        RenderLayers::from_layers(&[0, LAYER]),
         Projection::Orthographic(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
                 viewport_height: 4.0,
@@ -329,7 +316,7 @@ fn fixture() -> (App, Entity) {
         .id();
 
     let project = EditorProject::load(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let asset = project.catalog[0].asset.clone();
@@ -358,7 +345,7 @@ fn fixture() -> (App, Entity) {
 
 #[test]
 #[ignore = "requires GPU adapter"]
-fn gpu_outline_shows_the_full_selection_boundary_through_occluders() {
+fn gpu_selection_brackets_follow_bounds_and_show_through_occluders() {
     let output =
         std::env::temp_dir().join(format!("bevy-editor-outline-render-{}", std::process::id()));
     std::fs::create_dir_all(&output).unwrap();
@@ -391,7 +378,7 @@ fn gpu_outline_shows_the_full_selection_boundary_through_occluders() {
         .count();
     assert!(
         exterior > 20,
-        "The contour must extend outside the original silhouette"
+        "The brackets must extend outside the original silhouette"
     );
     for y in center.1 - 8..=center.1 + 8 {
         for x in center.0 - 8..=center.0 + 8 {
@@ -408,19 +395,17 @@ fn gpu_outline_shows_the_full_selection_boundary_through_occluders() {
             }
         }
     }
-    let mask = app.world().resource::<SelectionOutline>().mask.clone();
-    let mask_image = capture_when(
-        &mut app,
-        &mask,
-        &output.join("selected-mask.png"),
-        |image| image.get_pixel(center.0, center.1).0[0] > 240,
-    );
-    let mask_bounds = bounds(&mask_image, |pixel| pixel.0[0] > 240);
-    for (mask, scene) in mask_bounds.into_iter().zip(cube_bounds) {
-        assert!(
-            mask.abs_diff(scene) <= 1,
-            "Mask and source viewport are misaligned"
-        );
+    // The middle of each edge stays open: this is a corner frame, not a
+    // continuous silhouette or a full wireframe box.
+    let bracket_bounds = bounds(&selected, amber);
+    let mid_x = (bracket_bounds[0] + bracket_bounds[2]) / 2;
+    for y in bracket_bounds[1]..=bracket_bounds[3] {
+        if y.abs_diff(center.1) > 12 {
+            assert!(
+                !amber(selected.get_pixel(mid_x, y)),
+                "The edge midpoint must remain open"
+            );
+        }
     }
 
     app.world_mut().resource_mut::<Editor>().selection = None;
@@ -433,8 +418,8 @@ fn gpu_outline_shows_the_full_selection_boundary_through_occluders() {
     );
 
     app.world_mut().resource_mut::<Editor>().selection = Some(Selection::Model(1));
-    let contour_bounds = bounds(&selected, amber);
-    let contour_pixels = amber_count(&selected);
+    let brackets_bounds = bounds(&selected, amber);
+    let brackets_pixels = amber_count(&selected);
     let cover_position = app.world().get::<Transform>(cover).unwrap().translation;
     let cover_is_visible = |image: &image::RgbaImage| {
         let [red, green, blue, _] = image.get_pixel(center.0, center.1).0.map(u16::from);
@@ -464,15 +449,15 @@ fn gpu_outline_shows_the_full_selection_boundary_through_occluders() {
                     }
             },
         );
-        for (actual, expected) in bounds(&occluded, amber).into_iter().zip(contour_bounds) {
+        for (actual, expected) in bounds(&occluded, amber).into_iter().zip(brackets_bounds) {
             assert!(
                 actual.abs_diff(expected) <= 1,
                 "The full object dimensions must remain visible when {name}"
             );
         }
         assert!(
-            amber_count(&occluded) * 10 >= contour_pixels * 9,
-            "Occluding geometry must not hide the selection contour when {name}"
+            amber_count(&occluded) * 10 >= brackets_pixels * 9,
+            "Occluding geometry must not hide the selection brackets when {name}"
         );
     }
     app.world_mut().resource_mut::<Editor>().selection = None;

@@ -263,6 +263,15 @@ pub struct SceneLighting {
     pub shadow_resolution: u32,
     pub tonemapping: ToneMap,
     pub fog: Option<FogSettings>,
+    pub hdri: Option<EnvironmentPreset>,
+    /// Downloaded environment, relative to the project's asset root.
+    pub hdri_asset: Option<HdriAsset>,
+    /// Multiplier for the HDR map's linear radiance, in cd/m².
+    pub hdri_brightness: f32,
+    /// Rotation around the world Y axis, in degrees.
+    pub hdri_rotation: f32,
+    /// Show the selected environment as a distant panorama as well as lighting.
+    pub hdri_background: bool,
 }
 
 impl Default for SceneLighting {
@@ -276,24 +285,189 @@ impl Default for SceneLighting {
             shadow_resolution: 1024,
             tonemapping: ToneMap::AgX,
             fog: None,
+            hdri: None,
+            hdri_asset: None,
+            hdri_brightness: 1000.0,
+            hdri_rotation: 0.0,
+            hdri_background: true,
         }
     }
 }
 
 impl SceneLighting {
+    /// Starting environment for editor-created scenes; serialized legacy data
+    /// keeps its existing defaults and explicit HDRI-off settings.
+    #[cfg(feature = "editor")]
+    pub(crate) fn editor_default() -> Self {
+        Self {
+            ambient_color: [1.0, 0.76, 0.48],
+            ambient_brightness: 1000.0,
+            exposure_ev100: 8.0,
+            tonemapping: ToneMap::ReinhardLuminance,
+            hdri: Some(EnvironmentPreset::Cloudy),
+            hdri_brightness: 1300.0,
+            hdri_rotation: -5.0,
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         if !rgb(self.ambient_color)
             || !bounded(self.ambient_brightness, 0.0, 100000.0)
             || !bounded(self.exposure_ev100, -10.0, 24.0)
             || !(128..=8192).contains(&self.shadow_resolution)
             || !self.shadow_resolution.is_power_of_two()
+            || !bounded(self.hdri_brightness, 0.0, 100_000.0)
+            || !bounded(self.hdri_rotation, -180.0, 180.0)
         {
             return Err(invalid("Invalid scene lighting or shadow-map resolution"));
         }
         if let Some(fog) = &self.fog {
             fog.validate()?;
         }
+        if let Some(asset) = &self.hdri_asset {
+            asset.validate()?;
+            if self.hdri.is_some() {
+                return Err(invalid(
+                    "Choose either a built-in or downloaded environment",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    pub fn has_hdri(&self) -> bool {
+        self.hdri.is_some() || self.hdri_asset.is_some()
+    }
+}
+
+/// Public catalog supplying a downloaded HDRI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HdriProvider {
+    PolyHaven,
+    AmbientCg,
+}
+
+impl HdriProvider {
+    pub const ALL: [Self; 2] = [Self::PolyHaven, Self::AmbientCg];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PolyHaven => "Poly Haven",
+            Self::AmbientCg => "ambientCG",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::PolyHaven => "polyhaven",
+            Self::AmbientCg => "ambientcg",
+        }
+    }
+
+    pub fn asset_url(self, id: &str) -> String {
+        match self {
+            Self::PolyHaven => format!("https://polyhaven.com/a/{id}"),
+            Self::AmbientCg => format!("https://ambientcg.com/a/{id}"),
+        }
+    }
+}
+
+/// Portable reference to a downloaded scene-linear HDR or EXR panorama.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HdriAsset {
+    pub provider: HdriProvider,
+    pub id: String,
+    pub name: String,
+    pub resolution: u32,
+    pub asset: String,
+}
+
+impl HdriAsset {
+    pub fn validate(&self) -> io::Result<()> {
+        if !valid_hdri_id(&self.id)
+            || self.name.trim().is_empty()
+            || self.name.chars().count() > 128
+            || self.name.chars().any(char::is_control)
+            || ![1024, 2048, 4096].contains(&self.resolution)
+            || !(crate::data::relative_path(&self.asset, "hdr")
+                || crate::data::relative_path(&self.asset, "exr"))
+        {
+            return Err(invalid("Invalid downloaded HDRI reference"));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn valid_hdri_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Built-in Poly Haven environments. The maps are distributed under CC0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentPreset {
+    SmallStudio,
+    PhotoStudio,
+    SoftStudio,
+    Warehouse,
+    Interior,
+    Cloudy,
+    VeniceSunset,
+    IndustrialSunset,
+    Forest,
+    Night,
+}
+
+impl EnvironmentPreset {
+    pub const ALL: [Self; 10] = [
+        Self::SmallStudio,
+        Self::PhotoStudio,
+        Self::SoftStudio,
+        Self::Warehouse,
+        Self::Interior,
+        Self::Cloudy,
+        Self::VeniceSunset,
+        Self::IndustrialSunset,
+        Self::Forest,
+        Self::Night,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SmallStudio => "Студия",
+            Self::PhotoStudio => "Фотостудия",
+            Self::SoftStudio => "Мягкий свет",
+            Self::Warehouse => "Склад",
+            Self::Interior => "Интерьер",
+            Self::Cloudy => "Облачно",
+            Self::VeniceSunset => "Закат",
+            Self::IndustrialSunset => "Промзона",
+            Self::Forest => "Лес",
+            Self::Night => "Ночь",
+        }
+    }
+
+    #[cfg(feature = "lighting")]
+    pub(crate) fn asset_name(self) -> &'static str {
+        match self {
+            Self::SmallStudio => "studio_small_09",
+            Self::PhotoStudio => "brown_photostudio_02",
+            Self::SoftStudio => "christmas_photo_studio_07",
+            Self::Warehouse => "empty_warehouse_01",
+            Self::Interior => "lebombo",
+            Self::Cloudy => "kloofendal_48d_partly_cloudy_puresky",
+            Self::VeniceSunset => "venice_sunset",
+            Self::IndustrialSunset => "industrial_sunset_02_puresky",
+            Self::Forest => "phalzer_forest_01",
+            Self::Night => "moonless_golf",
+        }
     }
 }
 
@@ -701,6 +875,7 @@ mod rendering {
             Tonemapping::from(settings.tonemapping),
             Hdr,
         ));
+        crate::hdri::apply_camera_environment(entity, settings);
         if let Some(fog) = &settings.fog {
             let [red, green, blue] = fog.color;
             entity.insert(DistanceFog {

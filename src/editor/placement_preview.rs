@@ -512,7 +512,8 @@ mod pending_tests {
 
     fn pending() -> (App, Entity) {
         let mut project = crate::EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let browser = Browser::new(&mut project);

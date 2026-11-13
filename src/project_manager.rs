@@ -1,4 +1,5 @@
 //! Native project launcher. Each editor owns its own window and event loop.
+mod effects;
 mod native;
 mod projects;
 #[cfg(test)]
@@ -30,11 +31,12 @@ enum Action {
     Template(Template),
     Subfolder,
     Select(PathBuf),
+    Context(PathBuf, Vec2),
+    DismissContext,
     Open(PathBuf),
     Favorite,
     Forget,
     Reveal,
-    Example,
     Sort,
     ClearFilter,
 }
@@ -43,6 +45,12 @@ enum Action {
 enum Dialog {
     Create,
     Open,
+}
+
+#[derive(Clone, PartialEq)]
+struct ContextMenu {
+    file: PathBuf,
+    position: Vec2,
 }
 
 struct Form {
@@ -74,6 +82,7 @@ struct Manager {
     revision: u64,
     dialog_revision: u64,
     form: Option<Form>,
+    context: Option<ContextMenu>,
     status: String,
     last_click: Option<(PathBuf, f64)>,
     running: Vec<(PathBuf, Child)>,
@@ -144,6 +153,7 @@ impl Manager {
             revision: 1,
             dialog_revision: 0,
             form: None,
+            context: None,
             status,
             last_click: None,
             running: Vec::new(),
@@ -223,6 +233,7 @@ pub fn create_project_manager_app() -> Result<App, Box<dyn std::error::Error>> {
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: "Bevy Editor · Менеджер проектов".into(),
+            decorations: false,
             resolution: (1100, 760).into(),
             resize_constraints: WindowResizeConstraints {
                 min_width: 880.0,
@@ -239,6 +250,12 @@ pub fn create_project_manager_app() -> Result<App, Box<dyn std::error::Error>> {
 
 fn install(app: &mut App, manager: Manager) {
     app.insert_resource(manager)
+        .add_plugins((
+            crate::editor::icons::SvgIconsPlugin,
+            crate::editor::starfield::StarfieldPlugin,
+            effects::EffectsPlugin,
+            crate::window_chrome::WindowChromePlugin,
+        ))
         .init_resource::<native::Picker>()
         .add_message::<Action>()
         .add_plugins(TabNavigationPlugin)
@@ -249,10 +266,12 @@ fn install(app: &mut App, manager: Manager) {
             (
                 ui::inputs,
                 shortcuts,
+                ui::context_input,
                 native::poll,
                 actions,
                 poll_editors,
                 ui::refresh,
+                ui::refresh_context,
                 ui::styles,
                 ui::scroll,
             )
@@ -271,7 +290,7 @@ fn actions(
         if manager.project_opened {
             break;
         }
-        if picker.busy() && !matches!(action, Action::Close) {
+        if picker.busy() && !matches!(action, Action::Close | Action::DismissContext) {
             continue;
         }
         // Modal dialogs own all interactions until closed.
@@ -281,11 +300,11 @@ fn actions(
                 Action::New
                     | Action::Import
                     | Action::Select(_)
+                    | Action::Context(_, _)
                     | Action::Open(_)
                     | Action::Favorite
                     | Action::Forget
                     | Action::Reveal
-                    | Action::Example
                     | Action::Sort
                     | Action::ClearFilter
             )
@@ -293,6 +312,21 @@ fn actions(
             continue;
         }
         match action {
+            Action::Context(file, position) => {
+                if manager
+                    .visible_projects()
+                    .iter()
+                    .any(|project| &project.file == file)
+                {
+                    manager.selected = Some(file.clone());
+                    manager.last_click = None;
+                    manager.context = Some(ContextMenu {
+                        file: file.clone(),
+                        position: *position,
+                    });
+                }
+            }
+            Action::DismissContext => manager.context = None,
             Action::New => manager.show(Dialog::Create),
             Action::Import => manager.show(Dialog::Open),
             Action::Close => {
@@ -318,7 +352,6 @@ fn actions(
                 });
                 manager.last_click = Some((file.clone(), time.elapsed_secs_f64()));
                 manager.selected = Some(file.clone());
-                manager.revision += 1;
                 if double && let Err(error) = manager.open(file) {
                     manager.error(error);
                 }
@@ -391,17 +424,14 @@ fn actions(
                     manager.error(error);
                 }
             }
-            Action::Example => {
-                let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json");
-                if let Err(error) = manager.open(&path) {
-                    manager.error(error);
-                }
-            }
             Action::Sort => {
                 manager.alphabetic = !manager.alphabetic;
                 manager.revision += 1;
             }
             Action::ClearFilter => manager.set_filter(String::new()),
+        }
+        if !matches!(action, Action::Context(_, _)) {
+            manager.context = None;
         }
         if !matches!(action, Action::Template(_) | Action::Subfolder) {
             focus.clear();
@@ -448,7 +478,9 @@ fn shortcuts(
         KeyCode::SuperLeft,
         KeyCode::SuperRight,
     ]);
-    let action = if keys.just_pressed(KeyCode::Escape) && manager.form.is_some() {
+    let action = if keys.just_pressed(KeyCode::Escape) && manager.context.is_some() {
+        Some(Action::DismissContext)
+    } else if keys.just_pressed(KeyCode::Escape) && manager.form.is_some() {
         Some(Action::Close)
     } else if keys.just_pressed(KeyCode::Escape) && !manager.filter.is_empty() {
         Some(Action::ClearFilter)

@@ -1,0 +1,112 @@
+name: Windows releases
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish Windows executable
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      # Ship one executable without requiring the Visual C++ runtime installer.
+      RUSTFLAGS: -C target-feature=+crt-static
+
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Prepare release metadata
+        id: metadata
+        shell: python
+        run: |
+          import os
+          import tomllib
+          from pathlib import Path
+
+          package = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]
+          branch = os.environ["GITHUB_REF_NAME"]
+          build = f"{os.environ['GITHUB_RUN_NUMBER']}.{os.environ['GITHUB_RUN_ATTEMPT']}"
+          sha = os.environ["GITHUB_SHA"]
+          version = package["version"]
+          tag = (
+              f"v{version}+build.{build}.{sha[:8]}"
+              if branch == "main"
+              else f"develop-{build}-{sha[:8]}"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"toolchain={package['rust-version']}", file=output)
+              print(f"tag={tag}", file=output)
+              print(f"title=Bevy Editor {version} ({branch}, build {build})", file=output)
+
+          Path("release-notes.md").write_text(
+              f"Windows x64 release build from `{branch}`.\n\n"
+              f"Commit: `{sha}`\n\n"
+              "Download `bevy-editor.exe` and launch it to open the project manager. "
+              "Rust and Cargo are not required.\n\n"
+              "Open an existing project with `bevy-editor.exe --project PATH`.\n",
+              encoding="utf-8",
+          )
+
+      - name: Install the Rust version required by Cargo.toml
+        env:
+          RUST_TOOLCHAIN: ${{ steps.metadata.outputs.toolchain }}
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup override set $env:RUST_TOOLCHAIN
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          key: windows-x64-release
+
+      - name: Build the editor
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin bevy-editor
+
+      - name: Check that the executable starts
+        run: |
+          $process = Start-Process -FilePath 'target/x86_64-pc-windows-msvc/release/bevy-editor.exe' -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "bevy-editor.exe --help failed with exit code $($process.ExitCode)"
+          }
+
+      - name: Publish the release and its executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.metadata.outputs.title }}
+        run: |
+          $releaseArgs = @(
+            'release', 'create', $env:RELEASE_TAG,
+            'target/x86_64-pc-windows-msvc/release/bevy-editor.exe',
+            '--repo', $env:GITHUB_REPOSITORY,
+            '--target', $env:GITHUB_SHA,
+            '--title', $env:RELEASE_TITLE,
+            '--notes-file', 'release-notes.md'
+          )
+          if ($env:GITHUB_REF_NAME -eq 'develop') {
+            $releaseArgs += @('--prerelease', '--latest=false')
+          } else {
+            $releaseArgs += '--latest'
+          }
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          "Published: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG" >> $env:GITHUB_STEP_SUMMARY

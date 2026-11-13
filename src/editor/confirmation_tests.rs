@@ -32,6 +32,7 @@ fn request_close(app: &mut App, window: Entity) {
 #[test]
 fn cancelling_tab_close_preserves_edits_and_blocks_background_actions() {
     let (mut app, scratch) = dirty_scene();
+    let tool = app.world().resource::<Editor>().tool;
     let edits = app.world().resource::<Editor>().edits.clone();
     let undo = app.world().resource::<Editor>().undo.clone();
     action(&mut app, Action::CloseTab(0));
@@ -54,7 +55,7 @@ fn cancelling_tab_close_preserves_edits_and_blocks_background_actions() {
         assert_eq!(editor.open_tabs, [0]);
         assert_eq!(editor.edits, edits);
         assert_eq!(editor.undo, undo);
-        assert_eq!(editor.tool, Tool::Move);
+        assert_eq!(editor.tool, tool);
         assert!(!scratch.0.join(&editor.definition().file).exists());
     }
     action(&mut app, Action::CancelPending);

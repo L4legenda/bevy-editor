@@ -58,9 +58,13 @@ fn retarget_ui(
 
 pub(in crate::editor) fn fixture() -> (App, Entity, Handle<Image>) {
     let project = EditorProject::load(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
+    fixture_project(project)
+}
+
+pub(in crate::editor) fn fixture_project(project: EditorProject) -> (App, Entity, Handle<Image>) {
     let mut app = App::new();
     app.add_plugins(AssetRedirectPlugin::new(&project.asset_root).unwrap())
         .add_plugins(
@@ -102,6 +106,7 @@ pub(in crate::editor) fn fixture() -> (App, Entity, Handle<Image>) {
             PrimaryWindow,
             Window {
                 resolution: (WIDTH, HEIGHT).into(),
+                decorations: false,
                 focused: true,
                 ..default()
             },
@@ -134,6 +139,173 @@ fn warm(app: &mut App, frames: usize) {
     }
 }
 
+#[test]
+#[ignore = "requires GPU adapter; opens, edits, saves and previews native .scene documents"]
+fn gpu_native_scene_documents_open_edit_save_and_preview() {
+    let directory =
+        std::env::temp_dir().join(format!("bevy-editor-native-scene-{}", std::process::id()));
+    std::fs::create_dir_all(directory.join("models")).unwrap();
+    let mut project = EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+    )
+    .unwrap();
+    for model in &project.catalog {
+        std::fs::copy(
+            project.asset_root.join(&model.asset),
+            directory.join(&model.asset),
+        )
+        .unwrap();
+    }
+    for index in 0..project.scenes.len() {
+        project
+            .read_scene(index)
+            .unwrap()
+            .write(&directory, &project.scenes[index].file)
+            .unwrap();
+    }
+    project.asset_root = directory.clone();
+    let (mut app, _, target) = fixture_project(project);
+    warm(&mut app, 40);
+    {
+        let editor = app.world().resource::<Editor>();
+        assert!(editor.imported.is_empty());
+        assert_eq!(editor.edits.models.len(), 3);
+        let scene = app.world().resource::<super::Scene>();
+        assert_eq!(scene.models.len(), 3);
+        assert!(
+            app.world()
+                .get::<WorldAssetRoot>(scene.root.unwrap())
+                .is_none()
+        );
+    }
+    app.world_mut()
+        .write_message(Action::Select(Selection::Model(1)));
+    warm(&mut app, 2);
+    app.world_mut()
+        .write_message(Action::Number(Field::Position(0), -3.0));
+    warm(&mut app, 2);
+    app.world_mut().write_message(Action::Save);
+    warm(&mut app, 8);
+    let saved = crate::LevelEdits::<String>::read(&directory, "scenes/workshop.scene").unwrap();
+    assert_eq!(saved.models[0].pose.position[0], -3.0);
+    assert!(!app.world().resource::<Editor>().dirty());
+    app.world_mut().write_message(Action::Open(1));
+    warm(&mut app, 40);
+    assert!(app.world().resource::<Editor>().ready);
+    assert_eq!(app.world().resource::<Editor>().edits.models.len(), 1);
+    app.world_mut().write_message(Action::OpenBrowser);
+    warm(&mut app, 180);
+    let previews = app
+        .world()
+        .resource::<super::thumbnails::Thumbnails>()
+        .scene_images
+        .clone();
+    let regions: Vec<_> = {
+        let world = app.world_mut();
+        let mut nodes = world.query::<(&ImageNode, &ComputedNode, &bevy::ui::UiGlobalTransform)>();
+        previews
+            .iter()
+            .map(|handle| {
+                let (_, node, transform) = nodes
+                    .iter(world)
+                    .find(|(image, node, _)| {
+                        image.image == *handle && node.size().min_element() > 0.0
+                    })
+                    .unwrap();
+                let center = transform.affine().translation;
+                Rect::from_corners(
+                    center - node.size() * 0.5 + Vec2::splat(4.0),
+                    center + node.size() * 0.5 - Vec2::splat(4.0),
+                )
+            })
+            .collect()
+    };
+    // Screenshot redirects a target's next render; retained thumbnail cameras
+    // are inactive, so inspect their images through the active UI camera.
+    capture_when(&mut app, &target, &directory.join("editor.png"), |image| {
+        regions.iter().all(|rect| {
+            let mut colored = 0;
+            for y in rect.min.y as u32..rect.max.y as u32 {
+                for x in rect.min.x as u32..rect.max.x as u32 {
+                    let pixel = image.get_pixel(x, y);
+                    if pixel[0].abs_diff(pixel[2]) > 24 {
+                        colored += 1;
+                    }
+                }
+            }
+            colored > 64
+        })
+    });
+    println!("Native scene GPU artifacts: {}", directory.display());
+}
+
+#[test]
+#[ignore = "requires GPU adapter; verifies lighting in the actual editor viewport"]
+fn gpu_editor_viewport_local_light_changes_objects() {
+    let output =
+        std::env::temp_dir().join(format!("bevy-editor-viewport-light-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    let (mut app, _, target) = fixture();
+    app.world_mut().resource_mut::<Editor>().selection = None;
+    warm(&mut app, 16);
+    capture_when(&mut app, &target, &output.join("original.png"), |_| true);
+    app.world_mut()
+        .write_message(Action::Lighting(LightingAction::Add(LightPreset::Bulb)));
+    warm(&mut app, 16);
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        let light = editor.edits.lights.last_mut().unwrap();
+        light.pose.position = [0.0, 2.0, 2.0];
+        light.temperature = None;
+        light.color = [0.0, 0.0, 1.0];
+        light.enabled = false;
+        editor.selection = None;
+    }
+    warm(&mut app, 16);
+    let baseline = capture_when(&mut app, &target, &output.join("baseline.png"), |_| true);
+    app.world_mut()
+        .resource_mut::<Editor>()
+        .edits
+        .lights
+        .last_mut()
+        .unwrap()
+        .enabled = true;
+    warm(&mut app, 16);
+    let lit = capture_when(&mut app, &target, &output.join("blue.png"), |_| true);
+    let point = {
+        let world = app.world_mut();
+        let (camera, transform) = world
+            .query_filtered::<(&Camera, &GlobalTransform), With<super::viewport::EditorCamera>>()
+            .single(world)
+            .unwrap();
+        camera
+            .world_to_viewport(transform, Vec3::new(0.0, 0.6, 0.4))
+            .unwrap()
+            + Vec2::new(0.0, ui::TOP)
+    };
+    let sample = |image: &image::RgbaImage| {
+        let mut sum = [0.0; 3];
+        for y in point.y as u32 - 4..point.y as u32 + 4 {
+            for x in point.x as u32 - 4..point.x as u32 + 4 {
+                for (total, channel) in sum.iter_mut().zip(image.get_pixel(x, y).0) {
+                    *total += channel as f32 / 64.0;
+                }
+            }
+        }
+        sum
+    };
+    println!(
+        "Viewport lighting artifacts: {} baseline={:?} blue={:?}",
+        output.display(),
+        sample(&baseline),
+        sample(&lit)
+    );
+    assert!(
+        sample(&lit)[2] > sample(&baseline)[2] + 10.0,
+        "Default local light must visibly affect the actual scene"
+    );
+}
+
 fn labeled_rect(app: &mut App, wanted: &str) -> Rect {
     let world = app.world_mut();
     let mut query = world.query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>();
@@ -147,6 +319,131 @@ fn labeled_rect(app: &mut App, wanted: &str) -> Rect {
     );
     let center = transform.affine().translation;
     Rect::from_corners(center - node.size() * 0.5, center + node.size() * 0.5)
+}
+
+#[test]
+#[ignore = "requires GPU adapter; clicks the actual scene-tree header and captures collapsed/restored panes"]
+fn gpu_scene_tree_header_collapses_the_list_and_restores_the_split() {
+    let (mut app, window, target) = fixture();
+    let before = app.world().resource::<Editor>().edits.clone();
+    let history = app.world().resource::<Editor>().undo.len();
+    let inspector = labeled_rect(&mut app, "Инспектор свойств");
+    let tree = labeled_rect(&mut app, "Список объектов сцены");
+    let header = labeled_rect(&mut app, "Дерево сцены");
+    assert!(tree.height() > 100.0);
+    move_pointer(&mut app, window, header.center());
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 4);
+    assert!(app.world().resource::<Editor>().sidebar.tree_collapsed());
+    {
+        let world = app.world_mut();
+        let mut query = world.query::<(&AccessibleLabel, &ComputedNode, &Node)>();
+        let (_, computed, node) = query
+            .iter(world)
+            .find(|(label, ..)| label.0 == "Список объектов сцены")
+            .unwrap();
+        assert!(computed.is_empty());
+        assert_eq!(node.display, Display::None);
+    }
+    let expanded_inspector = labeled_rect(&mut app, "Инспектор свойств");
+    assert!(expanded_inspector.height() > inspector.height() + 100.0);
+    assert!((expanded_inspector.min.y - header.max.y).abs() < 2.0);
+    assert!((expanded_inspector.max.y - inspector.max.y).abs() < 2.0);
+    labeled_rect(&mut app, "+ Свет");
+    let output =
+        std::env::temp_dir().join(format!("bevy-editor-tree-collapse-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    capture_when(&mut app, &target, &output.join("collapsed.png"), ui_pixels);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 4);
+    assert!(!app.world().resource::<Editor>().sidebar.tree_collapsed());
+    let restored_tree = labeled_rect(&mut app, "Список объектов сцены");
+    let restored_inspector = labeled_rect(&mut app, "Инспектор свойств");
+    assert!((restored_tree.height() - tree.height()).abs() < 2.0);
+    assert!((restored_inspector.height() - inspector.height()).abs() < 2.0);
+    assert_eq!(app.world().resource::<Editor>().edits, before);
+    assert_eq!(app.world().resource::<Editor>().undo.len(), history);
+    capture_when(&mut app, &target, &output.join("expanded.png"), ui_pixels);
+    println!("Scene tree collapse screenshots: {}", output.display());
+}
+
+#[test]
+#[ignore = "requires GPU adapter; clicks the space toggle and captures the actual world/local axes"]
+fn gpu_space_toggle_rotates_the_rendered_gizmo_without_moving_the_object() {
+    let (mut app, window, target) = fixture();
+    let selection = Selection::Imported(0);
+    app.world_mut()
+        .write_message(Action::Tool(crate::editor::Tool::Universal));
+    app.world_mut().write_message(Action::Select(selection));
+    app.world_mut()
+        .write_message(Action::Tool(crate::editor::Tool::Move));
+    warm(&mut app, 4);
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.set_pose(
+            selection,
+            Transform::from_xyz(0.0, 0.7, 0.0)
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+        );
+        let pivot = Vec3::new(0.0, 0.7, 0.0);
+        editor.view = Transform::from_translation(pivot + Vec3::new(4.0, 3.0, 6.0))
+            .looking_at(pivot, Vec3::Y);
+        editor.pivot = pivot;
+    }
+    warm(&mut app, 12);
+    let before = app.world().resource::<Editor>().edits.clone();
+    let history = app.world().resource::<Editor>().undo.len();
+    assert!(!app.world().resource::<Editor>().local_space);
+    let toggle = labeled_rect(&mut app, "Использовать локальное пространство");
+    assert!(toggle.min.y >= 0.0 && toggle.max.y <= ui::TOP);
+    let output = std::env::temp_dir().join(format!("bevy-editor-spaces-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    let sample = |app: &mut App, axis: Vec3| {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(&Camera, &Transform, &GlobalTransform), With<crate::editor::viewport::EditorCamera>>();
+        let (camera, view, global) = query.single(world).unwrap();
+        let pivot = Vec3::new(0.0, 0.7, 0.0);
+        let origin = camera.world_to_viewport(global, pivot).unwrap();
+        let end = camera
+            .world_to_viewport(
+                global,
+                pivot + axis * crate::editor::viewport::length(camera, view, pivot),
+            )
+            .unwrap();
+        (end - (end - origin).normalize() * 8.0 + Vec2::Y * ui::TOP)
+            .round()
+            .as_uvec2()
+    };
+    let red = |image: &image::RgbaImage, point: UVec2| {
+        let pixel = image.get_pixel(point.x, point.y).0;
+        pixel[0] > 180
+            && pixel[0] > pixel[1].saturating_add(60)
+            && pixel[0] > pixel[2].saturating_add(60)
+    };
+    let global_sample = sample(&mut app, Vec3::X);
+    capture_when(&mut app, &target, &output.join("global.png"), |image| {
+        red(image, global_sample)
+    });
+    move_pointer(&mut app, window, toggle.center());
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 8);
+    assert!(app.world().resource::<Editor>().local_space);
+    let local_sample = sample(&mut app, Vec3::NEG_Z);
+    assert!(local_sample.as_vec2().distance(global_sample.as_vec2()) > 30.0);
+    capture_when(&mut app, &target, &output.join("local.png"), |image| {
+        red(image, local_sample)
+    });
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 8);
+    let editor = app.world().resource::<Editor>();
+    assert!(!editor.local_space);
+    assert_eq!(editor.edits, before);
+    assert_eq!(editor.undo.len(), history);
+    println!("World/local space screenshots: {}", output.display());
 }
 
 fn visible_field(app: &mut App, wanted: Field) -> bool {
@@ -217,7 +514,7 @@ fn scroll_to_entity(app: &mut App, entity: Entity) {
     warm(app, 4);
 }
 
-fn move_pointer(app: &mut App, window: Entity, position: Vec2) {
+pub(in crate::editor) fn move_pointer(app: &mut App, window: Entity, position: Vec2) {
     let old = app
         .world()
         .get::<Window>(window)
@@ -244,7 +541,7 @@ fn move_pointer(app: &mut App, window: Entity, position: Vec2) {
     warm(app, 2);
 }
 
-fn mouse(app: &mut App, window: Entity, state: ButtonState) {
+pub(in crate::editor) fn mouse(app: &mut App, window: Entity, state: ButtonState) {
     app.world_mut().write_message(MouseButtonInput {
         window,
         button: MouseButton::Left,
@@ -310,6 +607,205 @@ fn ui_pixels_from(image: &image::RgbaImage, left: u32) -> bool {
         }
     }
     text_pixels > 180
+}
+
+#[test]
+#[ignore = "requires GPU adapter; exercises the real HDRI inspector controls"]
+fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
+    let output = std::env::temp_dir().join(format!("bevy-editor-hdri-ui-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    println!("HDRI UI artifacts: {}", output.display());
+    let (mut app, window, target) = fixture();
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(crate::EnvironmentPreset::Cloudy)
+    );
+    assert!(!app.world().resource::<Editor>().dirty());
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("00-default-cloudy.png"),
+        |image| {
+            ui_pixels(image)
+                && image.enumerate_pixels().filter(|(x, y, pixel)| {
+                    let [red, green, blue, _] = pixel.0;
+                    *x < 960 && *y > 150 && *y < 850
+                        && red > 230 && green > 130 && blue < 180
+                        && red.saturating_sub(green) > 15
+                        && green.saturating_sub(blue) > 20
+                }).count() > 2000
+        },
+    );
+    app.world_mut()
+        .write_message(Action::Select(Selection::Environment));
+    warm(&mut app, 8);
+    for preset in crate::EnvironmentPreset::ALL {
+        let rect = labeled_rect(&mut app, &format!("HDRI: {}", preset.label()));
+        assert!(
+            rect.width() > 10.0,
+            "Every built-in environment must have a visible choice"
+        );
+    }
+    scroll_to_label(&mut app, "HDRI: Студия");
+    let rect = labeled_rect(&mut app, "HDRI: Студия");
+    move_pointer(&mut app, window, rect.center());
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(crate::EnvironmentPreset::SmallStudio)
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("01-environments.png"),
+        ui_pixels,
+    );
+    let history = app.world().resource::<Editor>().undo.len();
+    drag_control(
+        &mut app,
+        window,
+        "Поворот HDRI",
+        Vec2::new(0.5, 0.5),
+        Vec2::new(0.8, 0.5),
+    );
+    assert!(app.world().resource::<Editor>().environment().hdri_rotation > 80.0);
+    assert_eq!(app.world().resource::<Editor>().undo.len(), history + 1);
+    let original_brightness = app.world().resource::<Editor>().environment().hdri_brightness;
+    drag_control(
+        &mut app,
+        window,
+        "Яркость HDRI",
+        Vec2::new(0.6, 0.5),
+        Vec2::new(0.7, 0.5),
+    );
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_brightness
+            > 2000.0
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("02-rotation-brightness.png"),
+        ui_pixels,
+    );
+    app.world_mut().write_message(Action::Undo);
+    warm(&mut app, 4);
+    assert_eq!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_brightness,
+        original_brightness
+    );
+}
+
+#[test]
+#[ignore = "requires GPU adapter; verifies the HDRI panorama behind the actual editor scene"]
+fn gpu_hdri_panorama_background_rotates_hides_and_restores_with_undo() {
+    use crate::editor::{viewport::EditorCamera, viewport_background::Background};
+    use bevy::light::{EnvironmentMapLight, Skybox};
+    let output = std::env::temp_dir().join(format!(
+        "bevy-editor-hdri-background-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&output).unwrap();
+    println!("HDRI panorama artifacts: {}", output.display());
+    let (mut app, _, target) = fixture();
+    app.world_mut()
+        .write_message(Action::Select(Selection::Environment));
+    app.world_mut()
+        .write_message(Action::Lighting(LightingAction::SetEnvironment(None)));
+    warm(&mut app, 4);
+    let camera = app
+        .world_mut()
+        .query_filtered::<Entity, With<EditorCamera>>()
+        .single(app.world())
+        .unwrap();
+    let backdrop = app
+        .world_mut()
+        .query_filtered::<Entity, With<Background>>()
+        .single(app.world())
+        .unwrap();
+    let background_difference = |a: &image::RgbaImage, b: &image::RgbaImage| {
+        let mut total = 0_u64;
+        let mut count = 0_u64;
+        for y in 150..210 {
+            for x in 80..800 {
+                for (a, b) in a.get_pixel(x, y).0[..3]
+                    .iter()
+                    .zip(&b.get_pixel(x, y).0[..3])
+                {
+                    total += u64::from(a.abs_diff(*b));
+                    count += 1;
+                }
+            }
+        }
+        total as f64 / count as f64
+    };
+    let baseline = capture_when(
+        &mut app,
+        &target,
+        &output.join("01-gradient.png"),
+        ui_pixels,
+    );
+    app.world_mut()
+        .write_message(Action::Lighting(LightingAction::SetEnvironment(Some(
+            crate::EnvironmentPreset::Forest,
+        ))));
+    let forest = capture_when(
+        &mut app,
+        &target,
+        &output.join("02-forest-panorama.png"),
+        |image| ui_pixels(image) && background_difference(image, &baseline) > 15.0,
+    );
+    assert!(app.world().get::<Skybox>(camera).unwrap().image.is_some());
+    assert_eq!(
+        app.world().get::<Visibility>(backdrop),
+        Some(&Visibility::Hidden)
+    );
+    app.world_mut()
+        .write_message(Action::Lighting(LightingAction::SetNumber(
+            Field::Environment(EnvironmentField::HdriRotation),
+            120.0,
+        )));
+    let rotated = capture_when(
+        &mut app,
+        &target,
+        &output.join("03-rotated-panorama.png"),
+        |image| background_difference(image, &forest) > 8.0,
+    );
+    app.world_mut()
+        .write_message(Action::Lighting(LightingAction::ToggleHdriBackground));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("04-hidden-panorama.png"),
+        |image| background_difference(image, &baseline) < 0.5,
+    );
+    assert!(app.world().get::<Skybox>(camera).is_none());
+    assert!(app.world().get::<EnvironmentMapLight>(camera).is_some());
+    assert_eq!(
+        app.world().get::<Visibility>(backdrop),
+        Some(&Visibility::Visible)
+    );
+    app.world_mut().write_message(Action::Undo);
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("05-undo-panorama.png"),
+        |image| background_difference(image, &rotated) < 0.5,
+    );
+    assert!(app.world().get::<Skybox>(camera).is_some());
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_background
+    );
 }
 
 #[test]
@@ -747,7 +1243,7 @@ fn gpu_dragged_model_preview_tracks_cursor_and_release_matches_the_preview() {
         .unwrap();
     app.world_mut().write_message(Action::Browse(models));
     warm(&mut app, 24);
-    let card_label = "Выбрать модель block.glb · Блок";
+    let card_label = "Открыть модель block.glb · Блок";
 
     fn cursor_at(app: &mut App, window: Entity, point: Vec3) -> Vec2 {
         let world = app.world_mut();

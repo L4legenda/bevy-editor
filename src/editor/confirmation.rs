@@ -143,14 +143,27 @@ pub(in crate::editor) fn update(
         focus.set(dialog.cancel, FocusCause::Auto);
     }
     let destination = match pending {
-        PendingAction::CloseTab(_) => "закрытием вкладки",
-        PendingAction::Close => "закрытием редактора",
+        PendingAction::CloseTab(_) | PendingAction::CloseImageTab(_) => "закрытием вкладки",
+        PendingAction::Close | PendingAction::CloseImageEditor(_) => "закрытием редактора",
     };
-    let message = format!(
-        "В сцене «{}» есть несохранённые изменения. Сохранить их перед {}?",
-        editor.definition().label,
-        destination
-    );
+    let message = if let PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id) =
+        pending
+    {
+        format!(
+            "В изображении «{}» есть несохранённые изменения. Сохранить слои .pcraft и обновить исходное изображение перед {}?",
+            editor
+                .image_tab(id)
+                .map(|tab| tab.path.display().to_string())
+                .unwrap_or_default(),
+            destination
+        )
+    } else {
+        format!(
+            "В сцене «{}» есть несохранённые изменения. Сохранить их перед {}?",
+            editor.definition().label,
+            destination
+        )
+    };
     let error = if editor.status.starts_with("Не удалось") || editor.status.starts_with("Дождитесь")
     {
         editor.status.as_str()
@@ -178,7 +191,8 @@ mod tests {
     #[test]
     fn modal_recovers_lost_focus_and_releases_it_when_closed() {
         let project = EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut app = App::new();

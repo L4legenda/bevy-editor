@@ -3,7 +3,7 @@ use crate::editor::{Action, RoomEdits, handle_actions, viewport};
 
 fn app() -> App {
     let project = crate::EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut editor = Editor::new(project, RoomEdits::default());
@@ -27,6 +27,175 @@ fn action(app: &mut App, action: LightingAction) {
 fn history(app: &mut App, action: Action) {
     app.world_mut().write_message(action);
     app.update();
+}
+
+#[test]
+fn cloudy_is_automatic_without_overwriting_saved_off_or_dirtying_the_scene() {
+    let mut app = app();
+    let camera = app
+        .world_mut()
+        .spawn((EditorCamera, Camera3d::default()))
+        .id();
+    app.update();
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.environment().hdri, Some(EnvironmentPreset::Cloudy));
+    assert!(editor.environment().hdri_background);
+    assert!(editor.edits.lighting.is_none());
+    assert!(!editor.dirty());
+    assert!(editor.undo.is_empty());
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_some()
+    );
+
+    action(&mut app, LightingAction::SetEnvironment(None));
+    assert_eq!(app.world().resource::<Editor>().environment().hdri, None);
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_none()
+    );
+    // A saved explicit "off" remains off on subsequent synchronization frames.
+    app.update();
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_none()
+    );
+    history(&mut app, Action::Undo);
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(EnvironmentPreset::Cloudy)
+    );
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_some()
+    );
+    assert!(!app.world().resource::<Editor>().dirty());
+
+    action(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::Forest)),
+    );
+    app.update();
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(EnvironmentPreset::Forest)
+    );
+}
+
+#[test]
+fn hdri_selection_rotation_brightness_and_off_are_undoable() {
+    let mut app = app();
+    history(&mut app, Action::Select(Selection::Environment));
+    action(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::SmallStudio)),
+    );
+    action(
+        &mut app,
+        LightingAction::SetNumber(Field::Environment(EnvironmentField::HdriRotation), 90.0),
+    );
+    action(
+        &mut app,
+        LightingAction::SetNumber(Field::Environment(EnvironmentField::HdriBrightness), 2500.0),
+    );
+    let settings = app.world().resource::<Editor>().environment();
+    assert_eq!(settings.hdri, Some(EnvironmentPreset::SmallStudio));
+    assert_eq!(settings.hdri_rotation, 90.0);
+    assert_eq!(settings.hdri_brightness, 2500.0);
+    assert!(settings.hdri_background);
+    action(&mut app, LightingAction::ToggleHdriBackground);
+    assert!(
+        !app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_background
+    );
+    history(&mut app, Action::Undo);
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_background
+    );
+    action(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::Forest)),
+    );
+    history(&mut app, Action::Undo);
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(EnvironmentPreset::SmallStudio)
+    );
+    action(&mut app, LightingAction::SetEnvironment(None));
+    assert_eq!(app.world().resource::<Editor>().environment().hdri, None);
+    history(&mut app, Action::Undo);
+    assert_eq!(
+        app.world()
+            .resource::<Editor>()
+            .environment()
+            .hdri_brightness,
+        2500.0
+    );
+    history(&mut app, Action::Redo);
+    assert_eq!(app.world().resource::<Editor>().environment().hdri, None);
+    action(&mut app, LightingAction::ResetEnvironment);
+    assert!(app.world().resource::<Editor>().edits.lighting.is_none());
+}
+
+#[test]
+fn environment_override_and_reset_restore_host_reflections() {
+    use bevy::light::{EnvironmentMapLight, Skybox};
+    let mut app = app();
+    let original = EnvironmentMapLight {
+        intensity: 42.0,
+        rotation: Quat::from_rotation_y(0.4),
+        ..default()
+    };
+    let skybox = Skybox {
+        image: Some(Handle::default()),
+        brightness: 42.0,
+        rotation: original.rotation,
+    };
+    let camera = app
+        .world_mut()
+        .spawn((
+            EditorCamera,
+            Camera3d::default(),
+            original.clone(),
+            skybox.clone(),
+        ))
+        .id();
+    app.update();
+    history(&mut app, Action::Select(Selection::Environment));
+    action(&mut app, LightingAction::SetEnvironment(None));
+    assert!(app.world().get::<EnvironmentMapLight>(camera).is_none());
+    assert!(app.world().get::<Skybox>(camera).is_none());
+    action(
+        &mut app,
+        LightingAction::SetEnvironment(Some(EnvironmentPreset::Cloudy)),
+    );
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_some()
+    );
+    action(&mut app, LightingAction::ResetEnvironment);
+    let restored = app.world().get::<EnvironmentMapLight>(camera).unwrap();
+    assert_eq!(restored.intensity, original.intensity);
+    assert_eq!(restored.rotation, original.rotation);
+    let restored_skybox = app.world().get::<Skybox>(camera).unwrap();
+    assert_eq!(restored_skybox.image, skybox.image);
+    assert_eq!(restored_skybox.brightness, skybox.brightness);
+    assert_eq!(restored_skybox.rotation, skybox.rotation);
+    assert!(
+        app.world()
+            .get::<crate::hdri::CameraEnvironment>(camera)
+            .is_none()
+    );
 }
 
 #[test]
@@ -92,12 +261,38 @@ fn a_light_and_a_complete_rig_each_have_one_undo_step() {
     history(&mut app, Action::Undo);
     let editor = app.world().resource::<Editor>();
     assert_eq!(editor.edits.lights, [light.clone()]);
-    assert!(editor.edits.lighting.is_none());
+    assert_eq!(editor.edits.lighting.as_ref().unwrap().exposure_ev100, 5.0);
     history(&mut app, Action::Undo);
     assert!(app.world().resource::<Editor>().edits.lights.is_empty());
     assert!(!app.world().resource::<Editor>().dirty());
     history(&mut app, Action::Redo);
     assert_eq!(app.world().resource::<Editor>().edits.lights, [light]);
+}
+
+#[test]
+fn editing_legacy_lights_initializes_exposure_but_preserves_authored_environments() {
+    let mut app = app();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.edits.lights.push(LightPreset::Bulb.create(1));
+        editor.selection = Some(Selection::Light(1));
+    }
+    action(
+        &mut app,
+        LightingAction::SetNumber(Field::Light(LightField::Intensity), 1200.0),
+    );
+    let settings = app.world().resource::<Editor>().environment().clone();
+    assert_eq!(settings.exposure_ev100, 5.0);
+    assert!(!settings.scene_lights);
+    action(&mut app, LightingAction::Add(LightPreset::Sun));
+    assert_eq!(*app.world().resource::<Editor>().environment(), settings);
+    history(&mut app, Action::Undo);
+    history(&mut app, Action::Undo);
+    assert!(app.world().resource::<Editor>().edits.lighting.is_none());
+    assert_eq!(
+        app.world().resource::<Editor>().edits.lights[0].intensity,
+        800.0
+    );
 }
 
 #[test]
@@ -202,14 +397,17 @@ fn runtime_restores_imported_lights_and_camera_defaults_after_undo() {
     action(&mut app, LightingAction::Add(LightPreset::Bulb));
     assert_eq!(
         app.world().get::<PointLight>(source).unwrap().intensity,
-        1234.0
+        0.0
     );
     action(&mut app, LightingAction::ToggleImportedLights);
     assert_eq!(
         app.world().get::<PointLight>(source).unwrap().intensity,
-        0.0
+        1234.0
     );
-    assert_eq!(app.world().get::<RectLight>(rect).unwrap().intensity, 0.0);
+    assert_eq!(
+        app.world().get::<RectLight>(rect).unwrap().intensity,
+        2345.0
+    );
     action(&mut app, LightingAction::ToggleGlobalShadows);
     assert!(
         !app.world()
@@ -219,6 +417,12 @@ fn runtime_restores_imported_lights_and_camera_defaults_after_undo() {
     );
     assert_eq!(app.world().get::<Exposure>(mask).unwrap().ev100, 12.0);
     history(&mut app, Action::Undo);
+    history(&mut app, Action::Undo);
+    assert!(app.world().resource::<Editor>().edits.lighting.is_some());
+    assert_eq!(
+        app.world().get::<PointLight>(source).unwrap().intensity,
+        0.0
+    );
     history(&mut app, Action::Undo);
     assert!(app.world().resource::<Editor>().edits.lighting.is_none());
     assert_eq!(
@@ -234,8 +438,7 @@ fn runtime_restores_imported_lights_and_camera_defaults_after_undo() {
         app.world().get::<Tonemapping>(camera),
         Some(&Tonemapping::TonyMcMapface)
     );
-    assert!(app.world().get::<bevy::camera::Hdr>(camera).is_none());
-    history(&mut app, Action::Undo);
+    assert!(app.world().get::<bevy::camera::Hdr>(camera).is_some());
     assert_eq!(
         app.world_mut()
             .query::<&LightEntity>()

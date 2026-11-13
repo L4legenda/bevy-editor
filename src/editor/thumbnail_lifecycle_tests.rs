@@ -115,7 +115,7 @@ fn opening_a_hidden_scene_cancels_its_pending_disk_read_and_uses_the_live_draft(
     IoTaskPool::get_or_init(TaskPool::new);
     let scratch = Scratch::new();
     let project = EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
     .unwrap();
     let mut editor = Editor::new(project, Default::default());

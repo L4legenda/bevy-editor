@@ -13,7 +13,7 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Glyph {
+pub(crate) enum Glyph {
     ChevronLeft,
     ChevronRight,
     ChevronDown,
@@ -21,11 +21,18 @@ pub(super) enum Glyph {
     ArrowUp,
     Search,
     Close,
+    Minimize,
+    Maximize,
+    Restore,
     Folder,
     FolderOpen,
     File,
+    Image,
+    Trash,
     Layers,
+    Star,
     Plus,
+    Cursor,
     Move,
     Rotate,
     Scale,
@@ -38,6 +45,16 @@ pub(super) enum Glyph {
     Globe,
     Refresh,
     Magnet,
+    Eye,
+    EyeOff,
+    Brush,
+    Pencil,
+    Eraser,
+    Hand,
+    Pipette,
+    PaintBucket,
+    Undo,
+    Redo,
 }
 
 impl Glyph {
@@ -50,11 +67,18 @@ impl Glyph {
             Self::ArrowUp => include_str!("../../assets/icons/lucide/arrow-up.svg"),
             Self::Search => include_str!("../../assets/icons/lucide/search.svg"),
             Self::Close => include_str!("../../assets/icons/lucide/x.svg"),
+            Self::Minimize => include_str!("../../assets/icons/lucide/minus.svg"),
+            Self::Maximize => include_str!("../../assets/icons/lucide/square.svg"),
+            Self::Restore => include_str!("../../assets/icons/lucide/copy.svg"),
             Self::Folder => include_str!("../../assets/icons/lucide/folder.svg"),
             Self::FolderOpen => include_str!("../../assets/icons/lucide/folder-open.svg"),
             Self::File => include_str!("../../assets/icons/lucide/file.svg"),
+            Self::Image => include_str!("../../assets/icons/lucide/image.svg"),
+            Self::Trash => include_str!("../../assets/icons/lucide/trash-2.svg"),
             Self::Layers => include_str!("../../assets/icons/lucide/layers.svg"),
+            Self::Star => include_str!("../../assets/icons/lucide/star.svg"),
             Self::Plus => include_str!("../../assets/icons/lucide/plus.svg"),
+            Self::Cursor => include_str!("../../assets/icons/lucide/mouse-pointer.svg"),
             Self::Move => include_str!("../../assets/icons/lucide/move.svg"),
             Self::Rotate => include_str!("../../assets/icons/lucide/rotate-cw.svg"),
             Self::Scale => include_str!("../../assets/icons/lucide/scaling.svg"),
@@ -67,6 +91,16 @@ impl Glyph {
             Self::Globe => include_str!("../../assets/icons/lucide/globe.svg"),
             Self::Refresh => include_str!("../../assets/icons/lucide/refresh-cw.svg"),
             Self::Magnet => include_str!("../../assets/icons/lucide/magnet.svg"),
+            Self::Eye => include_str!("../../assets/icons/lucide/eye.svg"),
+            Self::EyeOff => include_str!("../../assets/icons/lucide/eye-off.svg"),
+            Self::Brush => include_str!("../../assets/icons/lucide/brush.svg"),
+            Self::Pencil => include_str!("../../assets/icons/lucide/pencil.svg"),
+            Self::Eraser => include_str!("../../assets/icons/lucide/eraser.svg"),
+            Self::Hand => include_str!("../../assets/icons/lucide/hand.svg"),
+            Self::Pipette => include_str!("../../assets/icons/lucide/pipette.svg"),
+            Self::PaintBucket => include_str!("../../assets/icons/lucide/paint-bucket.svg"),
+            Self::Undo => include_str!("../../assets/icons/lucide/undo-2.svg"),
+            Self::Redo => include_str!("../../assets/icons/lucide/redo-2.svg"),
         }
     }
 }
@@ -108,7 +142,7 @@ impl Library {
     }
 }
 
-pub(in crate::editor) struct SvgIconsPlugin;
+pub(crate) struct SvgIconsPlugin;
 
 impl Plugin for SvgIconsPlugin {
     fn build(&self, app: &mut App) {
@@ -117,7 +151,7 @@ impl Plugin for SvgIconsPlugin {
     }
 }
 
-pub(super) fn spawn(
+pub(crate) fn spawn(
     commands: &mut Commands,
     parent: Entity,
     glyph: Glyph,
@@ -131,7 +165,7 @@ pub(super) fn themed(commands: &mut Commands, parent: Entity, glyph: Glyph, size
     spawn_icon(commands, parent, glyph, size, Tint::Control)
 }
 
-pub(super) fn set_glyph(commands: &mut Commands, entity: Entity, glyph: Glyph) {
+pub(crate) fn set_glyph(commands: &mut Commands, entity: Entity, glyph: Glyph) {
     commands
         .entity(entity)
         .entry::<SvgIcon>()
@@ -235,9 +269,10 @@ fn tint(icon: &SvgIcon, owner: Option<(&Control, bool, bool)>, editor: &Editor) 
 fn sync(
     mut library: ResMut<Library>,
     mut images: ResMut<Assets<Image>>,
-    editor: Res<Editor>,
+    editor: Option<Res<Editor>>,
     parents: Query<&ChildOf>,
     controls: Query<(&Control, &super::Hovered, Has<InteractionDisabled>)>,
+    disabled: Query<(), With<InteractionDisabled>>,
     mut icons: Query<(Entity, &SvgIcon, &ComputedNode, &mut ImageNode)>,
 ) {
     for (entity, icon, computed, mut image) in &mut icons {
@@ -253,7 +288,18 @@ fn sync(
                 .ok()
                 .map(|(control, hovered, disabled)| (control, hovered.0, disabled))
         });
-        let color = tint(icon, owner, &editor);
+        let color = if parents
+            .iter_ancestors(entity)
+            .any(|parent| disabled.contains(parent))
+        {
+            DISABLED_TEXT
+        } else if let Some(editor) = editor.as_deref() {
+            tint(icon, owner, editor)
+        } else if let Tint::Fixed(color) = icon.tint {
+            color
+        } else {
+            TEXT
+        };
         if image.image != handle {
             image.image = handle;
         }
@@ -306,11 +352,19 @@ mod tests {
             Glyph::ArrowUp,
             Glyph::Search,
             Glyph::Close,
+            Glyph::Minimize,
+            Glyph::Maximize,
+            Glyph::Restore,
             Glyph::Folder,
             Glyph::FolderOpen,
             Glyph::File,
+            Glyph::Image,
+            Glyph::Trash,
+            Glyph::Undo,
             Glyph::Layers,
+            Glyph::Star,
             Glyph::Plus,
+            Glyph::Cursor,
             Glyph::Move,
             Glyph::Rotate,
             Glyph::Scale,
@@ -323,6 +377,8 @@ mod tests {
             Glyph::Globe,
             Glyph::Refresh,
             Glyph::Magnet,
+            Glyph::Eye,
+            Glyph::EyeOff,
         ] {
             for size in [16, 32] {
                 let image = rasterize(glyph, size).unwrap();
@@ -359,7 +415,8 @@ mod tests {
     #[test]
     fn nested_button_icons_follow_disabled_and_tool_states_and_reuse_dpi_textures() {
         let project = crate::EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut app = App::new();
@@ -368,6 +425,7 @@ mod tests {
             .init_resource::<Assets<Image>>()
             .init_resource::<Library>()
             .add_systems(Update, sync);
+        app.world_mut().resource_mut::<Editor>().tool = super::super::Tool::Move;
         let owner = app
             .world_mut()
             .spawn((

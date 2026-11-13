@@ -77,6 +77,45 @@ pub struct CameraPlacement {
     pub lens: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraDefinition {
+    /// Stable ID used as the JSON camera key.
+    pub id: String,
+    pub label: String,
+    pub placement: CameraPlacement,
+    #[serde(default)]
+    pub projection: LensKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensKind {
+    #[default]
+    Perspective,
+    Orthographic,
+}
+
+impl LensKind {
+    pub fn valid_lens(self, value: f32) -> bool {
+        match self {
+            Self::Perspective => (5.0..=145.0).contains(&value),
+            Self::Orthographic => (0.05..=20.0).contains(&value),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneSettings {
+    pub label: String,
+    pub cameras: Vec<CameraDefinition>,
+}
+
+pub(crate) fn document_path(path: &str) -> bool {
+    relative_path(path, "scene") || relative_path(path, "json")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoxBounds {
     pub center: [f32; 3],
@@ -106,6 +145,8 @@ pub struct PlacedModel {
 #[serde(default, deny_unknown_fields)]
 #[serde(bound(deserialize = "K: Ord + Deserialize<'de>"))]
 pub struct LevelEdits<K: Ord = String> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<SceneSettings>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub nodes: BTreeMap<String, NodeEdit>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -121,6 +162,7 @@ pub struct LevelEdits<K: Ord = String> {
 impl<K: Ord> Default for LevelEdits<K> {
     fn default() -> Self {
         Self {
+            scene: None,
             nodes: BTreeMap::new(),
             cameras: BTreeMap::new(),
             models: Vec::new(),
@@ -135,7 +177,7 @@ impl<K: Ord> LevelEdits<K> {
     where
         K: serde::de::DeserializeOwned,
     {
-        if !relative_path(file, "json") {
+        if !document_path(file) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid document path",
@@ -143,13 +185,21 @@ impl<K: Ord> LevelEdits<K> {
         }
         let resolved = match crate::asset_paths::resolve_asset_path(root, file) {
             Ok(path) => path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && relative_path(file, "json") =>
+            {
+                return Ok(Self::default());
+            }
             Err(error) => return Err(error),
         };
         let path = root.join(resolved);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && relative_path(file, "json") =>
+            {
+                return Ok(Self::default());
+            }
             Err(error) => return Err(error),
         };
         let edits: Self = serde_json::from_slice(&bytes).map_err(|error| {
@@ -158,12 +208,39 @@ impl<K: Ord> LevelEdits<K> {
                 format!("{}: {error}", path.display()),
             )
         })?;
+        if relative_path(file, "scene") && edits.scene.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Scene metadata is missing",
+            ));
+        }
         edits.validate(root)?;
         Ok(edits)
     }
 
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        if let Some(scene) = &self.scene {
+            if !self.nodes.is_empty() {
+                return Err(invalid(
+                    "Standalone scenes must store model instances instead of source-node edits"
+                        .into(),
+                ));
+            }
+            let mut ids = HashSet::new();
+            if scene.label.trim().is_empty() || scene.cameras.is_empty() {
+                return Err(invalid("A scene needs a name and a camera".into()));
+            }
+            for camera in &scene.cameras {
+                if camera.id.is_empty()
+                    || !ids.insert(&camera.id)
+                    || !camera.placement.pose.valid()
+                    || !camera.projection.valid_lens(camera.placement.lens)
+                {
+                    return Err(invalid("Invalid scene camera".into()));
+                }
+            }
+        }
         let redirects = crate::asset_paths::Redirects::read(root)?;
         if let Some(settings) = &self.lighting {
             settings.validate()?;
@@ -211,7 +288,13 @@ impl<K: Ord> LevelEdits<K> {
         use std::io::Write;
 
         self.validate(root)?;
-        if !relative_path(file, "json") {
+        if relative_path(file, "scene") && self.scene.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Scene metadata is missing",
+            ));
+        }
+        if !document_path(file) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid document path",

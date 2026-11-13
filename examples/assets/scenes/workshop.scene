@@ -1,0 +1,156 @@
+{
+  "scene": {
+    "label": "Мастерская",
+    "cameras": [
+      {
+        "id": "main",
+        "label": "Главная камера",
+        "placement": {
+          "pose": {
+            "position": [
+              6.0,
+              4.0,
+              7.0
+            ],
+            "rotation": [
+              -0.19062503,
+              0.3397044,
+              0.07051679,
+              0.91830844
+            ],
+            "scale": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          "lens": 45.0
+        },
+        "projection": "perspective"
+      }
+    ]
+  },
+  "models": [
+    {
+      "id": 1,
+      "asset": "models/block.glb",
+      "pose": {
+        "position": [
+          -2.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          -0.020985324,
+          0.0,
+          0.9997798
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "bounds": {
+        "center": [
+          0.0,
+          0.5,
+          0.0
+        ],
+        "half_size": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "asset": "models/block.glb",
+      "pose": {
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "bounds": {
+        "center": [
+          0.0,
+          0.5,
+          0.0
+        ],
+        "half_size": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "asset": "models/block.glb",
+      "pose": {
+        "position": [
+          1.8135641,
+          0.0,
+          -0.062975645
+        ],
+        "rotation": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "scale": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "bounds": {
+        "center": [
+          0.0,
+          0.5,
+          0.0
+        ],
+        "half_size": [
+          0.5,
+          0.5,
+          0.5
+        ]
+      }
+    }
+  ],
+  "lighting": {
+    "ambient_color": [
+      1.0,
+      0.7607843,
+      0.47843137
+    ],
+    "ambient_brightness": 973.9956,
+    "exposure_ev100": 8.0,
+    "scene_lights": true,
+    "shadows": true,
+    "shadow_resolution": 512,
+    "tonemapping": "reinhard_luminance",
+    "fog": null,
+    "hdri": "cloudy",
+    "hdri_asset": null,
+    "hdri_brightness": 1311.2083,
+    "hdri_rotation": -4.680008,
+    "hdri_background": true
+  }
+}

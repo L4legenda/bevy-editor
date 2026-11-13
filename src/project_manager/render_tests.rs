@@ -3,12 +3,18 @@ use super::*;
 use crate::editor::selection_outline::render_tests::{CapturedImage, capture_when, frame};
 use bevy::{
     camera::RenderTarget,
+    input::{ButtonState, mouse::MouseButtonInput},
+    picking::{
+        input::PointerInputSettings,
+        pointer::{Location, PointerAction, PointerButton, PointerId, PointerInput},
+    },
     render::{
         RenderPlugin,
         pipelined_rendering::PipelinedRenderingPlugin,
         render_resource::{TextureFormat, TextureUsages},
     },
     text::EditableText,
+    time::TimeUpdateStrategy,
     ui::{CalculatedClip, IsDefaultUiCamera, UiGlobalTransform},
     ui_widgets::Activate,
     window::{ExitCondition, PrimaryWindow},
@@ -21,19 +27,69 @@ fn retarget(canvas: Res<Canvas>, mut cameras: Query<&mut RenderTarget, With<IsDe
     *cameras.single_mut().unwrap() = RenderTarget::Image(canvas.0.clone().into());
 }
 fn warm(app: &mut App) {
-    for _ in 0..12 {
+    for _ in 0..26 {
         frame(app);
     }
 }
 fn activate(app: &mut App, label: &str) {
     let world = app.world_mut();
-    let mut query = world.query::<(Entity, &AccessibleLabel)>();
+    let mut query = world.query_filtered::<
+        (Entity, &AccessibleLabel),
+        (With<ui::Control>, Without<bevy::ui::InteractionDisabled>),
+    >();
     let (entity, _) = query
         .iter(world)
         .find(|(_, name)| name.0 == label)
         .unwrap_or_else(|| panic!("Missing button: {label}"));
     world.trigger(Activate { entity });
     warm(app);
+}
+
+fn mouse_click(app: &mut App, window: Entity, position: Vec2, button: MouseButton) {
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .set_cursor_position(Some(position));
+    let target = {
+        let world = app.world_mut();
+        world
+            .query_filtered::<&RenderTarget, With<IsDefaultUiCamera>>()
+            .single(world)
+            .unwrap()
+            .normalize(Some(window))
+            .unwrap()
+    };
+    let location = Location { target, position };
+    app.world_mut().write_message(PointerInput {
+        pointer_id: PointerId::Mouse,
+        location: location.clone(),
+        action: PointerAction::Move { delta: Vec2::ZERO },
+    });
+    warm(app);
+    let pointer_button = if button == MouseButton::Right {
+        PointerButton::Secondary
+    } else {
+        PointerButton::Primary
+    };
+    for (state, action) in [
+        (ButtonState::Pressed, PointerAction::Press(pointer_button)),
+        (
+            ButtonState::Released,
+            PointerAction::Release(pointer_button),
+        ),
+    ] {
+        app.world_mut().write_message(MouseButtonInput {
+            window,
+            button,
+            state,
+        });
+        app.world_mut().write_message(PointerInput {
+            pointer_id: PointerId::Mouse,
+            location: location.clone(),
+            action,
+        });
+        warm(app);
+    }
 }
 fn set(app: &mut App, field: ui::Input, value: &str) {
     let world = app.world_mut();
@@ -54,6 +110,28 @@ fn set(app: &mut App, field: ui::Input, value: &str) {
 }
 fn assert_controls_fit(app: &mut App, width: f32, height: f32) {
     let world = app.world_mut();
+    let mut captions = world.query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>();
+    let mut caption_count = 0;
+    for (label, computed, transform) in captions.iter(world) {
+        if ![
+            "Свернуть окно",
+            "Развернуть окно",
+            "Восстановить размер окна",
+            "Закрыть окно",
+        ]
+        .contains(&label.0.as_str())
+        {
+            continue;
+        }
+        caption_count += 1;
+        let bounds = Rect::from_center_size(transform.affine().translation, computed.size());
+        assert!(
+            bounds.min.cmpge(Vec2::ZERO).all() && bounds.max.cmple(Vec2::new(width, height)).all(),
+            "Window controls must fit at the minimum supported size: {bounds:?}"
+        );
+        assert!(computed.size().cmpge(Vec2::splat(28.0)).all());
+    }
+    assert_eq!(caption_count, 3);
     let modal = world.resource::<Manager>().form.is_some();
     let mut query = world.query::<(
         Entity,
@@ -106,10 +184,10 @@ fn screenshot(app: &mut App, target: &Handle<Image>, output: &Path) {
 }
 
 #[test]
-#[ignore = "requires a GPU adapter; writes project-manager screenshots under /tmp"]
+#[ignore = "requires a GPU adapter; writes project-manager screenshots to the system temp directory"]
 fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     let scratch = Scratch::new();
-    let output = PathBuf::from("/tmp").join(format!(
+    let output = std::env::temp_dir().join(format!(
         "bevy-editor-project-manager-{}",
         std::process::id()
     ));
@@ -130,11 +208,20 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
             .disable::<WinitPlugin>()
             .disable::<PipelinedRenderingPlugin>(),
     )
+    .insert_resource(TimeUpdateStrategy::ManualDuration(
+        std::time::Duration::from_secs_f64(1.0 / 60.0),
+    ))
+    .insert_resource(PointerInputSettings {
+        is_mouse_enabled: false,
+        ..default()
+    })
     .init_resource::<CapturedImage>()
     .add_systems(Startup, retarget.after(ui::setup));
+    // The test harness rejects --project and exits without opening an OS window.
+    // We only need to verify that a child was launched, then reap it below.
     let manager = Manager::load(
         scratch.0.join("history.json"),
-        PathBuf::from("/usr/bin/true"),
+        std::env::current_exe().unwrap(),
     );
     install(&mut app, manager);
     let window = app
@@ -143,6 +230,7 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
             PrimaryWindow,
             Window {
                 resolution: (1100, 760).into(),
+                decorations: false,
                 focused: true,
                 ..default()
             },
@@ -171,6 +259,13 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         .unwrap();
     assert!(EditorProject::load(&file).is_ok());
     assert_eq!(app.world().resource::<Manager>().recent.projects.len(), 1);
+    {
+        let mut manager = app.world_mut().resource_mut::<Manager>();
+        for (_, mut child) in manager.running.drain(..) {
+            child.wait().unwrap();
+        }
+        manager.status.clear();
+    }
     screenshot(&mut app, &target, &output.join("03-recent.png"));
     set(&mut app, ui::Input::Search, "no matching projects");
     assert!(app.world().resource::<Manager>().selected.is_none());
@@ -196,7 +291,7 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         manager.recent.remember(&file, "Моя первая сцена");
         manager.recent.projects[0].favorite = true;
         let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/project.json")
+            .join("tests/fixtures/legacy/project.json")
             .canonicalize()
             .unwrap();
         manager.recent.remember(&example, "Мастерская");
@@ -225,6 +320,63 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     warm(&mut app);
     screenshot(&mut app, &target, &output.join("07-create-minimum.png"));
     assert_controls_fit(&mut app, 880.0, 620.0);
+    activate(&mut app, "Отмена");
+    let row = {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(Entity, &AccessibleLabel), With<ui::Control>>();
+        query
+            .iter(world)
+            .find(|(_, label)| label.0 == "Мастерская")
+            .unwrap()
+            .0
+    };
+    activate(&mut app, "Мастерская");
+    assert!(
+        app.world().get_entity(row).is_ok(),
+        "Selection must preserve the row and its running effects"
+    );
+    let selected = app.world().resource::<Manager>().selected.clone();
+    let point = app
+        .world()
+        .get::<UiGlobalTransform>(row)
+        .unwrap()
+        .affine()
+        .translation;
+    mouse_click(&mut app, window, point, MouseButton::Right);
+    assert!(app.world().resource::<Manager>().context.is_some());
+    assert!(
+        app.world().resource::<Manager>().running.is_empty(),
+        "A context click must not open the project"
+    );
+    assert_controls_fit(&mut app, 880.0, 620.0);
+    screenshot(&mut app, &target, &output.join("09-context-menu.png"));
+    mouse_click(&mut app, window, Vec2::new(20.0, 580.0), MouseButton::Left);
+    assert!(app.world().resource::<Manager>().context.is_none());
+    assert_eq!(
+        app.world_mut()
+            .query_filtered::<Entity, With<ui::MenuItem>>()
+            .iter(app.world())
+            .count(),
+        0
+    );
+    // Test the menu near the bottom-right edge without opening another project.
+    app.world_mut().write_message(Action::Context(
+        selected.clone().unwrap(),
+        Vec2::new(875.0, 615.0),
+    ));
+    warm(&mut app);
+    assert_controls_fit(&mut app, 880.0, 620.0);
+    screenshot(
+        &mut app,
+        &target,
+        &output.join("10-context-menu-at-edge.png"),
+    );
+    activate(&mut app, "Открыть");
+    assert_eq!(
+        app.world().resource::<Manager>().selected,
+        selected,
+        "The context action must open its target project"
+    );
     for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
         child.wait().unwrap();
     }

@@ -3,6 +3,8 @@ use crate::PlacedModel;
 use bevy::prelude::*;
 
 #[cfg(feature = "lighting")]
+pub use crate::HdriPlugin;
+#[cfg(feature = "lighting")]
 pub use crate::lighting::{apply_camera_lighting, apply_imported_light, apply_light, spawn_light};
 
 /// Instantiate authored lights without changing host lighting or camera settings.

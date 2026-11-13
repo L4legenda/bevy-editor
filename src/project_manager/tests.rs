@@ -27,9 +27,9 @@ impl Drop for Scratch {
 #[test]
 fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
     let scratch = Scratch::new();
-    for (name, template, nodes) in [
-        ("empty", Template::Empty, 1),
-        ("starter", Template::Starter, 3),
+    for (name, template, models) in [
+        ("empty", Template::Empty, 0),
+        ("starter", Template::Starter, 1),
     ] {
         let root = scratch.0.join(name);
         let file = projects::create_project(&root, "Мой проект", template).unwrap();
@@ -39,14 +39,21 @@ fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
         let project = EditorProject::load(&root).unwrap();
         assert_eq!(project.title, "Мой проект");
         let edits = project.read_scene(0).unwrap();
-        assert_eq!(edits.lights.is_empty(), template == Template::Empty);
-        for asset in [&project.scenes[0].asset, &project.catalog[0].asset] {
+        assert!(edits.lights.is_empty(), "HDRI supplies the default scene lighting");
+        assert_eq!(edits.models.len(), models);
+        let environment = edits.lighting.as_ref().unwrap();
+        assert_eq!(environment.hdri, Some(crate::EnvironmentPreset::Cloudy));
+        assert!(environment.hdri_background);
+        assert!(edits.scene.is_some());
+        assert!(project.scenes[0].asset.is_empty());
+        assert!(project.scenes[0].file.ends_with(".scene"));
+        assert!(raw["scenes"][0].get("asset").is_none());
+        assert!(raw["scenes"][0].get("cameras").is_none());
+        assert!(!root.join("assets/levels").exists());
+        for asset in [&project.catalog[0].asset] {
             let bytes = fs::read(project.asset_root.join(asset)).unwrap();
             let parsed = gltf::Gltf::from_slice(&bytes)
                 .expect("A template must produce a valid glTF 2.0 binary");
-            if asset.starts_with("scenes/") {
-                assert_eq!(parsed.nodes().count(), nodes);
-            }
             for mesh in parsed.meshes() {
                 for primitive in mesh.primitives() {
                     let reader = primitive.reader(|_| parsed.blob.as_deref());
@@ -66,6 +73,38 @@ fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
         let moved = scratch.0.join(format!("{name}-moved"));
         fs::rename(&root, &moved).unwrap();
         assert_eq!(EditorProject::load(&moved).unwrap().title, project.title);
+    }
+}
+
+fn assert_scene_meshes_are_editable(parsed: &gltf::Gltf, groups: &[String]) {
+    let editable: Vec<_> = parsed
+        .nodes()
+        .filter(|node| {
+            node.name()
+                .is_some_and(|name| groups.iter().any(|group| group == name))
+        })
+        .flat_map(|group| group.children().map(|node| node.index()))
+        .collect();
+    for node in parsed.nodes().filter(|node| node.mesh().is_some()) {
+        assert!(
+            editable.contains(&node.index()),
+            "Generated geometry {:?} must belong to an editable group",
+            node.name()
+        );
+        assert!(!matches!(node.name(), Some("Floor" | "Ground")));
+    }
+}
+
+#[test]
+fn example_scenes_have_no_automatic_floor_or_uneditable_geometry() {
+    let project = EditorProject::load(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    for scene in &project.scenes {
+        let bytes = fs::read(project.asset_root.join(&scene.asset)).unwrap();
+        let parsed = gltf::Gltf::from_slice(&bytes).unwrap();
+        assert_scene_meshes_are_editable(&parsed, &scene.groups);
     }
 }
 
@@ -154,6 +193,86 @@ fn controller(scratch: &Scratch) -> App {
 fn action(app: &mut App, action: Action) {
     app.world_mut().write_message(action);
     app.update();
+}
+
+#[test]
+fn context_actions_target_the_clicked_project_and_dismiss_after_use() {
+    let scratch = Scratch::new();
+    let alpha =
+        projects::create_project(&scratch.0.join("alpha"), "Alpha", Template::Empty).unwrap();
+    let beta = projects::create_project(&scratch.0.join("beta"), "Beta", Template::Empty).unwrap();
+    let mut app = controller(&scratch);
+    {
+        let mut manager = app.world_mut().resource_mut::<Manager>();
+        manager.recent.remember(&alpha, "Alpha");
+        manager.recent.remember(&beta, "Beta");
+        manager.selected = Some(alpha.clone());
+        manager.last_click = Some((beta.clone(), 0.0));
+    }
+    action(
+        &mut app,
+        Action::Context(beta.clone(), Vec2::new(800.0, 600.0)),
+    );
+    assert_eq!(
+        app.world().resource::<Manager>().selected.as_ref(),
+        Some(&beta)
+    );
+    assert!(app.world().resource::<Manager>().last_click.is_none());
+    action(&mut app, Action::Favorite);
+    let manager = app.world().resource::<Manager>();
+    assert!(manager.context.is_none());
+    assert!(
+        manager
+            .recent
+            .projects
+            .iter()
+            .find(|project| project.file == beta)
+            .unwrap()
+            .favorite
+    );
+    assert!(
+        !manager
+            .recent
+            .projects
+            .iter()
+            .find(|project| project.file == alpha)
+            .unwrap()
+            .favorite
+    );
+    action(&mut app, Action::Context(beta.clone(), Vec2::ZERO));
+    action(&mut app, Action::Forget);
+    assert!(app.world().resource::<Manager>().context.is_none());
+    assert_eq!(app.world().resource::<Manager>().recent.projects.len(), 1);
+    assert!(EditorProject::load(beta).is_ok());
+}
+
+#[test]
+fn escape_dismisses_context_before_clearing_search_and_dialogs_block_context() {
+    let scratch = Scratch::new();
+    let file =
+        projects::create_project(&scratch.0.join("project"), "Project", Template::Empty).unwrap();
+    let mut app = controller(&scratch);
+    app.init_resource::<ButtonInput<KeyCode>>()
+        .add_systems(Update, shortcuts.before(actions));
+    {
+        let mut manager = app.world_mut().resource_mut::<Manager>();
+        manager.recent.remember(&file, "Project");
+        manager.set_filter("project".into());
+    }
+    action(&mut app, Action::Context(file.clone(), Vec2::ZERO));
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::Escape);
+    app.update();
+    assert!(app.world().resource::<Manager>().context.is_none());
+    assert_eq!(app.world().resource::<Manager>().filter, "project");
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .reset_all();
+    action(&mut app, Action::New);
+    action(&mut app, Action::Context(file, Vec2::ZERO));
+    assert!(app.world().resource::<Manager>().context.is_none());
+    assert!(app.world().resource::<Manager>().form.is_some());
 }
 
 #[test]

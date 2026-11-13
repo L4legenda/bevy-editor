@@ -41,7 +41,7 @@ pub(crate) struct DrawerScroll;
 pub(crate) struct AssetSearch;
 
 #[derive(Component)]
-pub(crate) struct FileCard(Entry, u64);
+pub(crate) struct FileCard(pub(super) Entry, pub(super) u64);
 
 #[derive(Component)]
 pub(crate) struct FileImage(usize, u64);
@@ -55,14 +55,15 @@ pub(crate) struct ImagePlaceholder(usize, u64);
 #[derive(Resource)]
 pub(crate) struct BrowserUi {
     font: Handle<Font>,
-    panel: Entity,
+    pub(super) panel: Entity,
     tree: Entity,
     breadcrumbs: Entity,
-    grid: Entity,
+    pub(super) grid: Entity,
     count: Entity,
     detail: Entity,
     placeholder: Entity,
     overlay: Entity,
+    checker: Handle<Image>,
     pub(super) selected: Option<usize>,
     pub(super) selected_model: Option<usize>,
 }
@@ -107,6 +108,7 @@ pub(super) fn setup(
     root: Entity,
     font_handle: &Handle<Font>,
     stars: &starfield::Starfield,
+    checker: &Handle<Image>,
 ) {
     let panel = surface(
         commands,
@@ -356,8 +358,6 @@ pub(super) fn setup(
         Action::BrowseClear,
         Look::Regular,
     );
-    text(commands, filters, font_handle, "ВСЕ ФАЙЛЫ", 10.0, BLUE);
-
     let grid = node(
         commands,
         content,
@@ -404,7 +404,7 @@ pub(super) fn setup(
         commands,
         detail_cell,
         font_handle,
-        "Потяните верхнюю границу, чтобы изменить высоту панели",
+        "Перетащите изображения сюда · ПКМ — создать папку",
         11.0,
         MUTED,
     );
@@ -419,6 +419,7 @@ pub(super) fn setup(
         detail,
         placeholder,
         overlay: root,
+        checker: checker.clone(),
         selected: None,
         selected_model: None,
     });
@@ -466,7 +467,11 @@ pub(crate) fn actions(
     numeric: Option<Res<NumericInput>>,
 ) {
     for action in messages.read() {
-        if editor.pending.is_some() || pointer.dragging() {
+        if editor.pending.is_some()
+            || editor.hdri_library_open
+            || editor.browser_popup
+            || pointer.dragging()
+        {
             continue;
         }
         match *action {
@@ -476,7 +481,7 @@ pub(crate) fn actions(
                     .scenes
                     .get(editor.room)
                     .and_then(|scene| {
-                        let parent = std::path::Path::new(&scene.asset).parent()?;
+                        let parent = std::path::Path::new(&scene.file).parent()?;
                         browser
                             .folders
                             .iter()
@@ -524,11 +529,11 @@ pub(crate) fn actions(
             Action::BrowseToggle(folder) => {
                 browser.toggle_folder(folder);
             }
-            Action::BrowseFile(file) if file < browser.files.len() => {
+            Action::BrowseFile(file) | Action::ViewImage(file) if file < browser.files.len() => {
                 interface.selected = Some(file);
                 interface.selected_model = None;
             }
-            Action::BrowseModel(model) if model < editor.project.catalog.len() => {
+            Action::ViewModel(model) if model < editor.project.catalog.len() => {
                 interface.selected = None;
                 interface.selected_model = Some(model);
             }
@@ -578,12 +583,16 @@ pub(crate) fn actions(
 }
 
 pub(crate) fn search(
+    editor: Res<Editor>,
     mut browser: ResMut<Browser>,
     focus: Res<InputFocus>,
     interface: Res<BrowserUi>,
     mut inputs: Query<(Entity, &mut EditableText), With<AssetSearch>>,
     mut nodes: Query<&mut Node>,
 ) {
+    if editor.hdri_library_open || editor.browser_popup {
+        return;
+    }
     let Ok((entity, mut input)) = inputs.single_mut() else {
         return;
     };
@@ -827,7 +836,7 @@ fn file_icon(
     icon
 }
 
-fn file_size(bytes: u64) -> String {
+pub(super) fn file_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} Б")
     } else if bytes < 1024 * 1024 {
@@ -912,11 +921,19 @@ pub(crate) fn refresh(
             Entry::Model(index) => {
                 let item = &editor.project.catalog[index];
                 let filename = item.asset.rsplit('/').next().unwrap_or(&item.asset);
-                let card = asset_card(&mut commands, interface.grid, Action::BrowseModel(index));
+                let card = asset_card(&mut commands, interface.grid, Action::ViewModel(index));
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
-                    AccessibleLabel(format!("Выбрать модель {filename} · {}", item.label)),
+                    AccessibleLabel(format!("Открыть модель {filename} · {}", item.label)),
                 ));
+                let well = preview_well(&mut commands, card);
+                asset_loading::attach(
+                    &mut commands,
+                    well,
+                    entry,
+                    browser.scan_revision,
+                    &interface.font,
+                );
                 commands.spawn((
                     ImageNode::new(previews.images[index].clone()),
                     Pickable::IGNORE,
@@ -927,7 +944,7 @@ pub(crate) fn refresh(
                         border_radius: BorderRadius::top(px(9)),
                         ..default()
                     },
-                    ChildOf(card),
+                    ChildOf(well),
                 ));
                 caption(
                     &mut commands,
@@ -950,6 +967,14 @@ pub(crate) fn refresh(
                         file.path.display()
                     )),
                 ));
+                let well = preview_well(&mut commands, card);
+                asset_loading::attach(
+                    &mut commands,
+                    well,
+                    entry,
+                    browser.scan_revision,
+                    &interface.font,
+                );
                 commands.spawn((
                     ImageNode::new(previews.scene_images[room].clone()),
                     Pickable::IGNORE,
@@ -960,7 +985,7 @@ pub(crate) fn refresh(
                         border_radius: BorderRadius::top(px(9)),
                         ..default()
                     },
-                    ChildOf(card),
+                    ChildOf(well),
                 ));
                 caption(
                     &mut commands,
@@ -973,13 +998,56 @@ pub(crate) fn refresh(
             }
             Entry::Image(index) | Entry::File(index) => {
                 let file = &browser.files[index];
-                let card = asset_card(&mut commands, interface.grid, Action::BrowseFile(index));
+                let is_image = matches!(entry, Entry::Image(_));
+                let action = if is_image {
+                    Action::ViewImage(index)
+                } else {
+                    Action::BrowseFile(index)
+                };
+                let card = asset_card(&mut commands, interface.grid, action);
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
-                    AccessibleLabel(format!("Выбрать файл {}", file.filename)),
+                    AccessibleLabel(format!(
+                        "{} {}",
+                        if is_image {
+                            "Открыть изображение"
+                        } else {
+                            "Выбрать файл"
+                        },
+                        file.filename
+                    )),
                 ));
                 let well = preview_well(&mut commands, card);
-                let kind = if matches!(entry, Entry::Image(_)) {
+                let kind = if is_image {
+                    asset_loading::attach(
+                        &mut commands,
+                        well,
+                        entry,
+                        browser.scan_revision,
+                        &interface.font,
+                    );
+                    // Tiled UI images ignore border radii. Repeat the texture through
+                    // UVs instead so the checker cannot cover the card's curved border.
+                    commands.spawn((
+                        ImageNode {
+                            image: interface.checker.clone(),
+                            image_mode: NodeImageMode::Stretch,
+                            rect: Some(Rect::from_corners(
+                                Vec2::ZERO,
+                                Vec2::new(PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                            )),
+                            ..default()
+                        },
+                        Node {
+                            position_type: PositionType::Absolute,
+                            width: percent(100),
+                            height: percent(100),
+                            border_radius: BorderRadius::top(px(9)),
+                            ..default()
+                        },
+                        Pickable::IGNORE,
+                        ChildOf(well),
+                    ));
                     let placeholder =
                         file_icon(&mut commands, well, &interface.font, &file.extension);
                     commands.entity(placeholder).insert((
@@ -1060,7 +1128,7 @@ pub(crate) fn refresh(
             empty,
             &interface.font,
             if browser.search.is_empty() {
-                "После добавления файлов нажмите «Обновить»"
+                "Перетащите изображения сюда · ПКМ — создать папку"
             } else {
                 "Попробуйте другое название или расширение файла"
             },
@@ -1158,14 +1226,19 @@ pub(crate) fn update_files(
                         format!(" · {} × {} px", size.x, size.y)
                     });
                 format!(
-                    "{} · {}{}",
+                    "{} · {}{}{}",
                     file.path.display(),
                     file_size(file.bytes),
-                    dimensions
+                    dimensions,
+                    if matches!(entry, Entry::Image(_)) {
+                        " · Двойной щелчок — открыть"
+                    } else {
+                        ""
+                    }
                 )
             }
         })
-        .unwrap_or_else(|| "Потяните верхнюю границу, чтобы изменить высоту панели".into());
+        .unwrap_or_else(|| "Перетащите изображения сюда · ПКМ — создать папку".into());
     for (entity, mut text, image_info) in &mut labels {
         let value = if entity == interface.detail {
             Some(detail.clone())
