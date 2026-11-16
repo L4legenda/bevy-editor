@@ -104,6 +104,24 @@ fn duplicate_inner(root: &Path, source: &Path) -> io::Result<PathBuf> {
     )));
     fs::create_dir(&stage.0)?;
     copy_saved(&absolute, &stage.0.join("file"))?;
+    if source
+        .extension()
+        .is_some_and(|extension| extension == "scene")
+    {
+        let bytes = fs::read(stage.0.join("file"))?;
+        if crate::scene_io::modern(&bytes)? {
+            let mut scene = crate::scene_format::Scene::from_slice(&bytes)
+                .map_err(|error| invalid(error.to_string()))?;
+            scene.id = crate::scene_format::Scene::new(&scene.name).id;
+            let mut output = fs::File::create(stage.0.join("file"))?;
+            output.write_all(
+                &scene
+                    .to_source()
+                    .map_err(|error| invalid(error.to_string()))?,
+            )?;
+            output.sync_all()?;
+        }
+    }
     let redirects = crate::asset_paths::Redirects::read(&root)?;
     let meta = optional_file(&root, &redirects.resolve(file_moves::meta_path(source))?)?;
     if let Some(path) = &meta {

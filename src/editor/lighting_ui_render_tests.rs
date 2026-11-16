@@ -253,9 +253,17 @@ fn gpu_native_scene_documents_open_edit_save_and_preview() {
         .unwrap();
     }
     for index in 0..project.scenes.len() {
-        project
-            .read_scene(index)
-            .unwrap()
+        let document = project.read_scene(index).unwrap();
+        if let Some(hdri) = document
+            .lighting
+            .as_ref()
+            .and_then(|lighting| lighting.hdri_asset.as_ref())
+        {
+            let destination = directory.join(&hdri.asset);
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(project.asset_root.join(&hdri.asset), destination).unwrap();
+        }
+        document
             .write(&directory, &project.scenes[index].file)
             .unwrap();
     }
@@ -333,6 +341,208 @@ fn gpu_native_scene_documents_open_edit_save_and_preview() {
         })
     });
     println!("Native scene GPU artifacts: {}", directory.display());
+}
+
+#[test]
+#[ignore = "requires GPU adapter; exercises the real hierarchy outliner, inspector and scene instances"]
+fn gpu_scene_hierarchy_outliner_instances_and_affine_rendering() {
+    use super::scene_hierarchy::{HierarchyAction as H, tests::fixture as hierarchy_fixture};
+    let mut files = hierarchy_fixture();
+    files.keep = true;
+    let original_prefab = std::fs::read(files.root.join("lamp.scene")).unwrap();
+    let (mut app, window, target) = fixture_project(files.project.clone());
+    warm(&mut app, 60);
+    let (mount, mesh, expected) = {
+        let editor = app.world().resource::<Editor>();
+        let h = editor.edits.hierarchy.as_ref().unwrap();
+        (
+            h.by_id("a").unwrap().key,
+            h.by_id("a/mesh").unwrap().key,
+            h.by_id("a/mesh").unwrap().affine(),
+        )
+    };
+    let entity = app.world().resource::<super::Scene>().models[&mesh].0;
+    assert!(
+        app.world()
+            .get::<GlobalTransform>(entity)
+            .unwrap()
+            .affine()
+            .abs_diff_eq(expected, 1e-5)
+    );
+    let click = |app: &mut App, predicate: fn(Action, u32) -> bool, key: u32| {
+        let center = {
+            let world = app.world_mut();
+            let mut controls = world.query::<(&ui::Control, &ComputedNode, &UiGlobalTransform)>();
+            let (_, node, transform) = controls
+                .iter(world)
+                .find(|(control, node, _)| {
+                    predicate(control.action, key) && node.size().min_element() > 0.0
+                })
+                .expect("Hierarchy control missing from the rendered UI");
+            assert!(node.size().y > 10.0);
+            transform.affine().translation
+        };
+        move_pointer(app, window, center);
+        mouse(app, window, ButtonState::Pressed);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 3);
+    };
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::ToggleVisibility(Selection::Camera(shot)) if shot==k as usize),
+        0,
+    );
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .object_hidden(Selection::Camera(0))
+    );
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::ToggleVisibility(Selection::Camera(shot)) if shot==k as usize),
+        0,
+    );
+    assert!(
+        !app.world()
+            .resource::<Editor>()
+            .object_hidden(Selection::Camera(0))
+    );
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::Select(Selection::Node(key)) if key==k),
+        mount,
+    );
+    assert_eq!(
+        app.world().resource::<Editor>().selection,
+        Some(Selection::Node(mount))
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &files.root.join("hierarchy-expanded.png"),
+        ui_pixels,
+    );
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::Hierarchy(H::Fold(key)) if key==k),
+        mount,
+    );
+    {
+        let world = app.world_mut();
+        let mut controls = world.query::<&ui::Control>();
+        assert!(
+            !controls
+                .iter(world)
+                .any(|c| matches!(c.action,Action::Select(Selection::Model(key)) if key==mesh))
+        );
+    }
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::Hierarchy(H::Fold(key)) if key==k),
+        mount,
+    );
+    click(
+        &mut app,
+        |a, k| matches!(a,Action::Select(Selection::Model(key)) if key==k),
+        mesh,
+    );
+    app.world_mut().write_message(Action::LocalSpace);
+    warm(&mut app, 2);
+    app.world_mut()
+        .write_message(Action::Number(Field::Position(1), 1.3));
+    warm(&mut app, 3);
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    app.world_mut().write_message(Action::Save);
+    warm(&mut app, 4);
+    assert!(!app.world().resource::<Editor>().dirty());
+    let loaded = crate::LevelEdits::<String>::read(&files.root, "room.scene").unwrap();
+    assert_eq!(
+        loaded
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .node(mesh)
+            .unwrap()
+            .local()
+            .position[1],
+        1.3
+    );
+    assert_eq!(
+        std::fs::read(files.root.join("lamp.scene")).unwrap(),
+        original_prefab
+    );
+    app.world_mut()
+        .write_message(Action::Hierarchy(H::ResetOverrides));
+    warm(&mut app, 3);
+    assert!(
+        !app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    app.world_mut().write_message(Action::Undo);
+    warm(&mut app, 3);
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    app.world_mut()
+        .write_message(Action::Select(Selection::Node(mount)));
+    warm(&mut app, 3);
+    capture_when(
+        &mut app,
+        &target,
+        &files.root.join("hierarchy-overrides.png"),
+        ui_pixels,
+    );
+    // Exercise the actual source tab command and return to the unsaved parent draft.
+    app.world_mut()
+        .write_message(Action::Hierarchy(H::OpenSource));
+    warm(&mut app, 20);
+    assert_eq!(app.world().resource::<Editor>().room, 1);
+    app.world_mut().write_message(Action::Open(0));
+    warm(&mut app, 25);
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    app.world_mut().write_message(Action::OpenBrowser);
+    warm(&mut app, 180);
+    assert!(
+        app.world()
+            .resource::<super::thumbnails::Thumbnails>()
+            .scene_images
+            .len()
+            >= 2
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &files.root.join("hierarchy-browser.png"),
+        ui_pixels,
+    );
+    println!("Hierarchy GPU artifacts: {}", files.root.display());
 }
 
 #[test]

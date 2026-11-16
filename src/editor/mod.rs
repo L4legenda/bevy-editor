@@ -25,6 +25,7 @@ mod object_visibility;
 mod photo_document;
 mod play;
 mod render_worker;
+mod scene_hierarchy;
 mod scene_selection;
 pub(crate) mod selection_outline;
 pub(crate) mod starfield;
@@ -75,6 +76,7 @@ fn load_error<A: Asset>(server: &AssetServer, handle: &Handle<A>) -> Option<Stri
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Selection {
+    Node(u32),
     Imported(usize),
     Model(u32),
     Camera(Shot),
@@ -123,6 +125,7 @@ enum Reset {
 #[derive(Clone, Copy, Message)]
 #[cfg_attr(test, derive(Debug))]
 enum Action {
+    Hierarchy(scene_hierarchy::HierarchyAction),
     Open(Room),
     Narrative(ui::NarrativeAction),
     Generation(ui::GenerationAction),
@@ -165,6 +168,7 @@ enum Action {
     BrowserCancelPopup,
     BrowserDeleteFile,
     BrowserOpenEntry,
+    BrowserRevealEntry,
     BrowserRenameFile,
     BrowserConfirmRename,
     BrowserDuplicateFile,
@@ -176,6 +180,7 @@ enum Action {
     ImageEdit(ui::ImageEditAction),
     MoveAsset(browser::Entry, usize),
     DropAsset(browser::Entry, Vec2),
+    BrowserInstanceScene,
     Undo,
     Redo,
     Save,
@@ -246,6 +251,8 @@ struct Editor {
     imported_ancestors: HashMap<String, Vec<String>>,
     selection: Option<Selection>,
     selection_group: Option<(Room, Vec<Selection>)>,
+    hierarchy_collapsed: std::collections::HashSet<(Room, u32)>,
+    hierarchy_parenting: Option<(Room, u32)>,
     tool: Tool,
     local_space: bool,
     snap: bool,
@@ -307,6 +314,8 @@ impl Editor {
             imported_ancestors: HashMap::new(),
             selection: None,
             selection_group: None,
+            hierarchy_collapsed: default(),
+            hierarchy_parenting: None,
             tool: Tool::default(),
             local_space: false,
             snap: false,
@@ -393,6 +402,7 @@ impl Editor {
                 | Action::BrowserCancelPopup
                 | Action::BrowserDeleteFile
                 | Action::BrowserOpenEntry
+                | Action::BrowserRevealEntry
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
@@ -519,6 +529,12 @@ impl Editor {
             return None;
         }
         match selection {
+            Selection::Node(key) => self
+                .edits
+                .hierarchy
+                .as_ref()?
+                .node(key)
+                .map(|node| node.pose()),
             Selection::Imported(index) => self.imported.get(index).map(|node| {
                 self.edits
                     .nodes
@@ -533,6 +549,14 @@ impl Editor {
     }
 
     fn model(&self, id: u32) -> Option<&PlacedModel> {
+        if self.edits.hierarchy.is_some() {
+            return self
+                .edits
+                .models
+                .binary_search_by_key(&id, |model| model.id)
+                .ok()
+                .map(|i| &self.edits.models[i]);
+        }
         self.edits.models.iter().find(|model| model.id == id)
     }
 
@@ -549,6 +573,13 @@ impl Editor {
             return name.clone();
         }
         match selection {
+            Selection::Node(key) => self
+                .edits
+                .hierarchy
+                .as_ref()
+                .and_then(|h| h.node(key))
+                .map(|n| n.entity.name.clone().unwrap_or_else(|| n.entity.id.clone()))
+                .unwrap_or_default(),
             Selection::Imported(index) => {
                 self.imported.get(index).map_or_else(String::new, |node| {
                     self.definition()
@@ -616,7 +647,12 @@ impl Editor {
         {
             return;
         }
+        if let Some(key) = self.hierarchy_key(target) {
+            self.edit_hierarchy(|h| h.set_world(key, pose));
+            return;
+        }
         match target {
+            Selection::Node(_) => {}
             Selection::Imported(index) => {
                 let node = &self.imported[index];
                 if same_pose(pose, node.original) {
@@ -653,6 +689,10 @@ impl Editor {
     }
 
     fn set_camera(&mut self, shot: Shot, placement: CameraPlacement) {
+        if let Some(key) = self.hierarchy_key(Selection::Camera(shot)) {
+            self.edit_hierarchy(|h| h.set_camera(key, placement));
+            return;
+        }
         let original = self.default_camera(shot);
         if same_pose(placement.pose, original.pose) && (placement.lens - original.lens).abs() < 1e-5
         {
@@ -672,6 +712,49 @@ impl Editor {
             if reset == Reset::All {
                 self.edits.lighting = None;
             }
+            return;
+        }
+        if let Selection::Camera(shot) = target
+            && let Some(key) = self.hierarchy_key(target)
+        {
+            let node = self.edits.hierarchy.as_ref().unwrap().node(key).unwrap();
+            let current = CameraPlacement {
+                pose: node.local(),
+                lens: self.camera(shot).lens,
+            };
+            let original = node.entity.components["camera"]
+                .get("reset")
+                .and_then(|value| serde_json::from_value::<CameraPlacement>(value.clone()).ok())
+                .unwrap_or(current);
+            let mut placement = current;
+            match reset {
+                Reset::All => placement = original,
+                Reset::Position => placement.pose.position = original.pose.position,
+                Reset::Rotation => placement.pose.rotation = original.pose.rotation,
+                Reset::Scale => placement.pose.scale = original.pose.scale,
+            }
+            self.edit_hierarchy(|h| h.set_camera_local(key, placement));
+            return;
+        }
+        if matches!(target, Selection::Node(_) | Selection::Model(_))
+            && let Some(key) = self.hierarchy_key(target)
+        {
+            let mut pose = self
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .node(key)
+                .unwrap()
+                .local()
+                .transform();
+            match reset {
+                Reset::All => pose = Transform::IDENTITY,
+                Reset::Position => pose.translation = Vec3::ZERO,
+                Reset::Rotation => pose.rotation = Quat::IDENTITY,
+                Reset::Scale => pose.scale = Vec3::ONE,
+            }
+            self.edit_hierarchy(|h| h.set_local(key, pose.into()));
             return;
         }
         let Some(mut pose) = self.pose(target) else {
@@ -722,7 +805,34 @@ impl Editor {
         }
     }
 
-    fn finish_edit(&mut self, before: RoomEdits) {
+    fn finish_edit(&mut self, mut before: RoomEdits) {
+        if self.edits.hierarchy.is_some() && before.hierarchy.is_none() {
+            match self.upgrade_flat_history(&before) {
+                Ok(upgraded) => before = upgraded,
+                Err(error) => {
+                    self.edits = before;
+                    self.status = format!("Изменение не применено · {error}");
+                    return;
+                }
+            }
+        }
+        if let Some(graph) = self.edits.hierarchy.clone() {
+            let mut graph = (*graph).clone();
+            if let Err(error) = graph.reconcile(&self.edits) {
+                self.edits = before;
+                self.status = format!("Изменение не применено · {error}");
+                return;
+            }
+            match graph.project() {
+                Ok(edits) => self.edits = edits,
+                Err(error) => {
+                    self.edits = before;
+                    self.status = format!("Изменение не применено · {error}");
+                    return;
+                }
+            }
+            self.sync_hierarchy_metadata();
+        }
         if before != self.edits {
             self.undo.push(before);
             if self.undo.len() > HISTORY_LIMIT {
@@ -763,6 +873,12 @@ impl Editor {
     }
 
     fn add_model(&mut self, mut model: PlacedModel) {
+        if self.edits.hierarchy.is_some() {
+            if let Some(key) = self.edit_hierarchy(|h| h.add_model(model, None)) {
+                self.select(Some(Selection::Model(key)));
+            }
+            return;
+        }
         let next = self
             .edits
             .models
@@ -779,6 +895,12 @@ impl Editor {
     }
 
     fn add_light(&mut self, mut light: crate::lighting::SceneLight) {
+        if self.edits.hierarchy.is_some() {
+            if let Some(key) = self.edit_hierarchy(|h| h.add_light(light)) {
+                self.select(Some(Selection::Light(key)));
+            }
+            return;
+        }
         let Some(id) = self
             .edits
             .lights
@@ -878,6 +1000,9 @@ struct Scene {
     root: Option<Entity>,
     pending: Option<Handle<Gltf>>,
     models: HashMap<u32, (Entity, String)>,
+    spatial: HashMap<u32, Entity>,
+    spatial_room: Option<Room>,
+    spatial_graph: Option<std::sync::Arc<crate::hierarchy::SceneHierarchy>>,
 }
 
 /// Add to an app after DefaultPlugins. The host owns the asset root and window.
@@ -992,9 +1117,10 @@ impl Plugin for EditorPlugin {
                 viewport::navigate,
                 viewport::manipulate,
                 sync_placements,
-                object_visibility::sync,
                 ui::update_camera_preview,
                 lighting::sync,
+                scene_hierarchy::sync,
+                object_visibility::sync,
                 (thumbnails::watch_assets, thumbnails::update).chain(),
                 image_previews::update,
                 (
@@ -1319,7 +1445,11 @@ fn sync_placements(
             (entity, model.asset.clone())
         });
         if let Ok(mut transform) = transforms.get_mut(*entity) {
-            transform.set_if_neq(model.pose.transform());
+            transform.set_if_neq(if editor.edits.hierarchy.is_some() {
+                Transform::IDENTITY
+            } else {
+                model.pose.transform()
+            });
         }
     }
 }
@@ -1391,6 +1521,16 @@ fn save_editor(
         editor.status = "Дождитесь загрузки добавленных моделей перед сохранением".into();
         return false;
     }
+    if let Some(graph) = &saved.hierarchy {
+        let mut graph = (**graph).clone();
+        match graph.reconcile(&saved).and_then(|()| graph.project()) {
+            Ok(edits) => saved = edits,
+            Err(error) => {
+                editor.status = format!("Не удалось сохранить · {error}");
+                return false;
+            }
+        }
+    }
     match editor
         .definition()
         .validate_edits(&saved)
@@ -1426,6 +1566,39 @@ fn apply_asset_drop(
         return false;
     }
     let Some(asset) = browser.model_asset(&editor.project.catalog, entry) else {
+        if let browser::Entry::Scene { room, .. } = entry
+            && let Some(source) = editor
+                .project
+                .scenes
+                .get(room)
+                .filter(|s| s.is_native())
+                .cloned()
+            && editor.definition().is_native()
+        {
+            let before = editor.edits.clone();
+            if let Err(error) = editor.enable_hierarchy() {
+                editor.status = error.to_string();
+                return false;
+            }
+            let root = editor.root.clone();
+            if let Some(key) = editor.edit_hierarchy(|h| {
+                h.insert_scene(
+                    &source.file,
+                    &source.label,
+                    Transform::from_translation(point).into(),
+                    &root,
+                )
+            }) {
+                editor.select(Some(Selection::Node(key)));
+                editor.finish_edit(before);
+                editor.status = format!("Добавлен экземпляр сцены · {}", source.label);
+                return true;
+            }
+            if before.hierarchy.is_none() {
+                editor.edits = before;
+                editor.sync_hierarchy_metadata();
+            }
+        }
         return false;
     };
     // Bounds used to place a preview must not make decorative assets solid.
@@ -1474,6 +1647,7 @@ fn handle_actions(
                 | Action::MoveAsset(_, _)
                 | Action::HdriLibrary(_)
                 | Action::DropAsset(_, _)
+                | Action::BrowserInstanceScene
                 | Action::Browse(_)
                 | Action::BrowseBack
                 | Action::BrowseForward
@@ -1496,6 +1670,7 @@ fn handle_actions(
                 | Action::ViewImage(_)
                 | Action::BrowserDeleteFile
                 | Action::BrowserOpenEntry
+                | Action::BrowserRevealEntry
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
@@ -1598,8 +1773,11 @@ fn handle_actions(
             Action::Select(target)
                 if editor.ready && editor.has_scene() && editor.tool == Tool::Universal =>
             {
-                editor.select(Some(target))
+                if !editor.hierarchy_parent_target(target) {
+                    editor.select(Some(target))
+                }
             }
+            Action::Hierarchy(action) => editor.hierarchy_action(action),
             Action::ToggleVisibility(target) if editor.ready && editor.has_scene() => {
                 editor.toggle_visibility(target);
             }
@@ -1637,16 +1815,22 @@ fn handle_actions(
                 }
             }
             Action::Undo if editor.has_scene() => {
+                let selected = editor.hierarchy_selection_snapshot();
                 if let Some(previous) = editor.undo.pop() {
                     let current = std::mem::replace(&mut editor.edits, previous);
                     editor.redo.push(current);
+                    editor.sync_hierarchy_metadata();
+                    editor.restore_hierarchy_selection(selected);
                     editor.status = "Действие отменено".into();
                 }
             }
             Action::Redo if editor.has_scene() => {
+                let selected = editor.hierarchy_selection_snapshot();
                 if let Some(next) = editor.redo.pop() {
                     let current = std::mem::replace(&mut editor.edits, next);
                     editor.undo.push(current);
+                    editor.sync_hierarchy_metadata();
+                    editor.restore_hierarchy_selection(selected);
                     editor.status = "Действие повторено".into();
                 }
             }

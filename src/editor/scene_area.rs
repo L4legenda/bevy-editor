@@ -71,6 +71,9 @@ pub(super) fn targets(
         }
     }
     for shot in shots(editor) {
+        if editor.object_hidden(Selection::Camera(shot)) {
+            continue;
+        }
         let p = editor.camera(shot).pose.transform().translation;
         if p.distance_squared(editor.view.translation) > 0.04
             && project(p).is_some_and(|p| area.contains(p))

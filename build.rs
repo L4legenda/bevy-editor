@@ -1,4 +1,7 @@
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_EDITOR").is_some() {
+        bevy_uv_build::bundle();
+    }
     println!("cargo:rerun-if-changed=assets/icons/bevy-editor.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || std::env::var_os("CARGO_FEATURE_EDITOR").is_none()

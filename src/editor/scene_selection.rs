@@ -61,15 +61,18 @@ impl Editor {
     pub(super) fn batch_editable(&self) -> bool {
         let targets = self.selected_targets();
         !targets.is_empty()
-            && targets
-                .iter()
-                .all(|t| matches!(t, Selection::Model(_) | Selection::Light(_)))
+            && targets.iter().all(|t| {
+                self.hierarchy_key(*t).is_some()
+                    || matches!(t, Selection::Model(_) | Selection::Light(_))
+            })
     }
     pub(super) fn object_editable(&self, target: Selection) -> bool {
-        matches!(
-            target,
-            Selection::Imported(_) | Selection::Model(_) | Selection::Light(_)
-        ) && self.pose(target).is_some()
+        (self.hierarchy_key(target).is_some()
+            || matches!(
+                target,
+                Selection::Imported(_) | Selection::Model(_) | Selection::Light(_)
+            ))
+            && self.pose(target).is_some()
     }
     pub(super) fn object_deleted(&self, target: Selection) -> bool {
         match target {
@@ -108,6 +111,14 @@ impl Editor {
         }
         self.finish_camera_navigation();
         let before = self.edits.clone();
+        if let Some(key) = self.hierarchy_key(target) {
+            if self.edit_hierarchy(|h| h.rename(key, name)).is_none() {
+                return Err("Не удалось переименовать объект");
+            }
+            self.finish_edit(before);
+            self.status = format!("Объект переименован · {name}");
+            return Ok(());
+        }
         match target {
             Selection::Model(id) => {
                 self.edits.model_names.insert(id, name.into());
@@ -130,6 +141,13 @@ impl Editor {
     }
     pub(super) fn delete_targets(&mut self) {
         if !self.deletable_targets() {
+            return;
+        }
+        if self.edits.hierarchy.is_some() {
+            let keys = self.hierarchy_roots();
+            if self.edit_hierarchy(|h| h.delete(&keys)).is_some() {
+                self.select(None);
+            }
             return;
         }
         let targets = self.selected_targets();
@@ -157,6 +175,21 @@ impl Editor {
     }
     pub(super) fn duplicate_targets(&mut self) {
         if !self.batch_editable() {
+            return;
+        }
+        if self.edits.hierarchy.is_some() {
+            let keys = self.hierarchy_roots();
+            if let Some(copies) = self.edit_hierarchy(|h| {
+                keys.into_iter()
+                    .map(|k| h.duplicate(k))
+                    .collect::<std::io::Result<Vec<_>>>()
+            }) {
+                let targets = copies
+                    .into_iter()
+                    .map(|k| self.hierarchy_selection(k))
+                    .collect();
+                self.select_targets(targets, Mode::Replace);
+            }
             return;
         }
         let mut copies = Vec::new();

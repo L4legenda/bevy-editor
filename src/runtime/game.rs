@@ -226,31 +226,44 @@ fn setup_level(
         placement.pose.transform(),
     ));
     super::apply_camera_lighting(&mut entity, environment);
+    let spatial = level
+        .edits
+        .hierarchy
+        .as_ref()
+        .map(|h| h.spawn(&mut commands))
+        .unwrap_or_default();
     for model in &level.edits.models {
         status.pending_instances += 1;
         let handle = super::load_model(&server, model);
         status.models.push(handle.clone());
-        commands
-            .spawn((
-                GameModel(model.id),
-                Name::new(
-                    level
-                        .edits
-                        .model_names
-                        .get(&model.id)
-                        .cloned()
-                        .unwrap_or_else(|| model.asset.clone()),
-                ),
-                WorldAssetRoot(handle),
-                model.pose.transform(),
-            ))
-            .observe(prepare_instance);
+        let mut instance = commands.spawn((
+            GameModel(model.id),
+            Name::new(
+                level
+                    .edits
+                    .model_names
+                    .get(&model.id)
+                    .cloned()
+                    .unwrap_or_else(|| model.asset.clone()),
+            ),
+            WorldAssetRoot(handle),
+            model.pose.transform(),
+        ));
+        if let Some(parent) = spatial.get(&model.id) {
+            instance.insert((Transform::IDENTITY, ChildOf(*parent)));
+        }
+        instance.observe(prepare_instance);
     }
     for light in &level.edits.lights {
         let mut light = light.clone();
         light.enabled &= environment.scene_lights;
         light.shadows &= environment.shadows;
-        super::spawn_light(&mut commands, &light);
+        let entity = super::spawn_light(&mut commands, &light);
+        if let Some(parent) = spatial.get(&light.id) {
+            commands
+                .entity(entity)
+                .insert((Transform::IDENTITY, ChildOf(*parent)));
+        }
     }
     status.source_ready = level.asset.is_empty();
     if !level.asset.is_empty() {

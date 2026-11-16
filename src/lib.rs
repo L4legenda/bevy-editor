@@ -5,8 +5,11 @@
 
 pub mod asset_paths;
 pub mod data;
+pub mod hierarchy;
 pub mod lighting;
 pub mod runtime;
+mod scene_io;
+pub use bevy_scene_format as scene_format;
 
 #[cfg(feature = "lighting")]
 mod hdri;

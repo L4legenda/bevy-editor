@@ -475,6 +475,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
             let point = uv.min + uv.size() * Vec2::new(0.25, 0.5);
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("target/model-paint-qa/07-gpu-live-before-readback.png");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             capture_when(&mut app, &target, &path, |image| {
                 let p = image.get_pixel(point.x as u32, point.y as u32);
                 p[0].abs_diff(164) < 4 && p[1].abs_diff(61) < 4 && p[2].abs_diff(68) < 4
@@ -508,8 +509,12 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
         assert_eq!(&p[front..front + 4], &expected, "GPU channel {channel}");
         assert_eq!(p[back + 3], 0, "GPU stroke must not paint the rear plane");
     }
-    app.world_mut().write_message(Action::ModelView(ModelViewAction::Paint(PaintAction::Channel(0))));
-    warm(&mut app,2);paint_ready(&mut app);
+    app.world_mut()
+        .write_message(Action::ModelView(ModelViewAction::Paint(
+            PaintAction::Channel(0),
+        )));
+    warm(&mut app, 2);
+    paint_ready(&mut app);
     paint_click(&mut app, window, PaintAction::Tool(PaintTool::Eraser));
     move_pointer(&mut app, window, center);
     mouse(&mut app, window, ButtonState::Pressed);
@@ -547,6 +552,176 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
     mouse(&mut app, window, ButtonState::Released);
     paint_ready(&mut app);
     assert_eq!(pixel(&app, 256, 512), [164, 61, 68, 255]);
+    paint_click(&mut app, window, PaintAction::Add(LayerKind::Paint));
+    {
+        let mut paint = app.world_mut().resource_mut::<PaintState>();
+        let s = paint.sessions.get_mut(&0).unwrap();
+        s.opacity = 50.;
+        s.flow = 100.;
+        s.hardness = 100.;
+    }
+    // Queue two strokes without waiting for the first readback: GPU snapshots
+    // and CPU undo records must retain their submission order.
+    move_pointer(&mut app, window, center);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    paint_ready(&mut app);
+    let alpha = |app: &App| {
+        let surface = app.world().resource::<editing::State>().documents[&0].objects[0].materials
+            [0]
+        .paint
+        .as_ref()
+        .unwrap();
+        let i = ((surface.size / 2) * surface.size + surface.size / 4) as usize * 4 + 3;
+        surface.stack.layers[1].channels[0].as_ref().unwrap()[i]
+    };
+    assert_eq!(
+        alpha(&app),
+        192,
+        "second stroke must build on the first GPU layer snapshot"
+    );
+    paint_click(&mut app, window, PaintAction::Undo);
+    assert_eq!(alpha(&app), 128, "one undo record per completed GPU stroke");
+}
+#[test]
+#[ignore = "GPU throughput benchmark on 40k triangles; no readback during the held stroke"]
+fn gpu_model_paint_benchmark_40k() {
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+    use bevy::render::{RenderApp, render_resource::PollType, renderer::RenderDevice};
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app
+            .world()
+            .resource::<editing::State>()
+            .documents
+            .contains_key(&0)
+        {
+            break;
+        }
+    }
+    let mut mesh = Geometry::default();
+    let nx = 100;
+    let ny = 200;
+    for y in 0..ny {
+        for x in 0..nx {
+            let start = mesh.positions.len();
+            let uv = [
+                Vec2::new(x as f32 / nx as f32, y as f32 / ny as f32),
+                Vec2::new((x + 1) as f32 / nx as f32, y as f32 / ny as f32),
+                Vec2::new((x + 1) as f32 / nx as f32, (y + 1) as f32 / ny as f32),
+                Vec2::new(x as f32 / nx as f32, (y + 1) as f32 / ny as f32),
+            ];
+            mesh.positions
+                .extend(uv.map(|p| Vec3::new(p.x * 2. - 1., p.y * 2. - 1., 0.)));
+            mesh.faces.push(Face {
+                corners: (0..4)
+                    .map(|i| {
+                        let mut c = Corner::new(start + i);
+                        c.uv = uv[i];
+                        c
+                    })
+                    .collect(),
+                material: 0,
+                smooth: false,
+            });
+        }
+    }
+    {
+        let mut state = app.world_mut().resource_mut::<editing::State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        doc.objects[0].geometry = mesh.into();
+        doc.objects[0].transform = Transform::IDENTITY;
+        doc.mode = Mode::Paint;
+        doc.revision += 1;
+    }
+    warm(&mut app, 5);
+    paint_ready(&mut app);
+    {
+        let mut viewer = app.world_mut().resource_mut::<Viewer>();
+        viewer.center = Vec3::ZERO;
+        viewer.distance = 4.;
+        viewer.radius = 2.;
+        viewer.yaw = 0.;
+        viewer.pitch = 0.;
+    }
+    {
+        let mut paint = app.world_mut().resource_mut::<PaintState>();
+        let s = paint.sessions.get_mut(&0).unwrap();
+        s.size = 80.;
+        s.flow = 35.;
+        s.hardness = 60.;
+        s.color = 3;
+    }
+    warm(&mut app, 3);
+    let center = labelled(&mut app, "3D-вид модели").center();
+    move_pointer(&mut app, window, center);
+    mouse(&mut app, window, ButtonState::Pressed);
+    let warmup = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        if app.world().resource::<engine::Runtime>().worker_idle(0) {
+            break;
+        }
+        assert!(warmup.elapsed().as_secs() < 30);
+    }
+    let wait = |app: &mut App| {
+        app.sub_app(RenderApp)
+            .world()
+            .resource::<RenderDevice>()
+            .poll(PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .unwrap();
+    };
+    wait(&mut app);
+    let baseline_start = std::time::Instant::now();
+    for _ in 0..120 {
+        app.update();
+    }
+    wait(&mut app);
+    let baseline = baseline_start.elapsed().as_secs_f64();
+    let start = std::time::Instant::now();
+    let frames = 120;
+    for i in 0..frames {
+        let x = ((i % 60) as f32 - 30.) * 2.;
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(center + Vec2::new(x, 0.)));
+        app.update();
+    }
+    wait(&mut app);
+    let seconds = start.elapsed().as_secs_f64();
+    let (batches, stamps, readbacks) = app.world().resource::<engine::gpu::Queue>().statistics();
+    assert_eq!(readbacks, 0);
+    assert!(batches > 10 && stamps > 20);
+    eprintln!(
+        "GPU PAINT: triangles=40000 texture=1024 frames={frames} total_ms={:.2} avg_frame_ms={:.2} batches={batches} stamps={stamps} in_stroke_readbacks={readbacks} baseline_avg_ms={:.2} paint_overhead_ms={:.2}",
+        seconds * 1000.,
+        seconds * 1000. / frames as f64,
+        baseline * 1000. / 120.,
+        (seconds - baseline) * 1000. / 120.
+    );
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .set_cursor_position(Some(center));
+    mouse(&mut app, window, ButtonState::Released);
+    paint_ready(&mut app);
+    assert_eq!(
+        app.world().resource::<engine::gpu::Queue>().statistics().2,
+        1
+    );
 }
 
 #[test]

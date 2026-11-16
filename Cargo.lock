@@ -557,6 +557,8 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bevy",
+ "bevy-scene-format",
+ "bevy-uv-build",
  "embed-resource",
  "half",
  "image",
@@ -578,6 +580,27 @@ dependencies = [
  "tokio",
  "uuid",
  "winit",
+ "zip",
+]
+
+[[package]]
+name = "bevy-scene-format"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "lz4_flex 0.14.2",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bevy-uv-build"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "serde_json",
+ "sha2 0.10.9",
  "zip",
 ]
 
@@ -4986,6 +5009,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "mach2"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6123,7 +6155,7 @@ name = "photocraft-raster"
 version = "0.23.1"
 dependencies = [
  "crc32fast",
- "lz4_flex",
+ "lz4_flex 0.11.6",
  "photocraft-color",
  "photocraft-geom",
  "rayon",

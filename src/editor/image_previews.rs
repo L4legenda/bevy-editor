@@ -1,6 +1,9 @@
 //! Decode only images being browsed, uploading small previews instead of source textures.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -13,10 +16,15 @@ use image::ImageDecoder;
 use super::{
     Editor,
     browser::{Browser, Entry},
+    dialogue::Content,
 };
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 160;
+
+#[cfg(test)]
+#[path = "character_preview_tests.rs"]
+mod character_tests;
 
 pub(super) struct ImagePreview {
     /// Failed previews have no texture, so the UI can keep its file placeholder.
@@ -32,6 +40,7 @@ pub(super) struct ImagePreviews {
     browser_revision: Option<u64>,
     visible_files: Vec<usize>,
     completed: HashMap<usize, ImagePreview>,
+    sources: HashMap<usize, Source>,
     pending: Option<Job>,
 }
 
@@ -45,7 +54,70 @@ impl ImagePreviews {
 struct Job {
     file: usize,
     scan_revision: u64,
-    task: Task<Result<DecodedImage, String>>,
+    source: Source,
+    task: Task<Result<Option<DecodedImage>, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source {
+    Image(PathBuf),
+    Character(PathBuf),
+    Empty,
+}
+
+fn source(editor: &Editor, browser: &Browser, file: usize) -> Source {
+    let file = &browser.files[file];
+    if !file.extension.eq_ignore_ascii_case("dcharacter") {
+        return Source::Image(file.path.clone());
+    }
+    if let Some(character) = editor
+        .narrative
+        .tabs
+        .iter()
+        .find(|document| document.path == file.path)
+        .and_then(|document| match &document.content {
+            Content::Character(character) => Some(character),
+            _ => None,
+        })
+    {
+        return character
+            .portraits
+            .first()
+            .map_or(Source::Empty, |portrait| {
+                Source::Image(portrait.path.clone().into())
+            });
+    }
+    Source::Character(file.path.clone())
+}
+
+fn decode_source(root: &Path, source: &Source) -> Result<Option<DecodedImage>, String> {
+    let path = match source {
+        Source::Empty => return Ok(None),
+        Source::Image(path) => path.clone(),
+        Source::Character(path) => {
+            let Content::Character(character) = Content::read(root, path)? else {
+                return Err("Ожидается файл персонажа".into());
+            };
+            let Some(portrait) = character.portraits.first() else {
+                return Ok(None);
+            };
+            portrait.path.clone().into()
+        }
+    };
+    // These are filesystem names, including names with '#', not AssetServer
+    // subasset labels. Resolve move aliases and keep symlinks inside the root.
+    let path = crate::asset_paths::Redirects::read(root)
+        .and_then(|redirects| redirects.resolve(path))
+        .map_err(|error| error.to_string())?;
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let path = root
+        .join(path)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !path.starts_with(&root) {
+        return Err("Портрет находится вне ассетов проекта".into());
+    }
+    decode(&path).map(Some)
 }
 
 pub(super) struct DecodedImage {
@@ -161,6 +233,7 @@ pub(super) fn update(
 ) {
     if previews.scan_revision != Some(browser.scan_revision) {
         previews.completed.clear();
+        previews.sources.clear();
         previews.scan_revision = Some(browser.scan_revision);
         previews.browser_revision = None;
         // A synchronous codec may still be running inside the worker. Let it
@@ -173,24 +246,55 @@ pub(super) fn update(
             .into_iter()
             .filter_map(|entry| match entry {
                 Entry::Image(file) => Some(file),
+                Entry::File(file)
+                    if browser.files[file]
+                        .extension
+                        .eq_ignore_ascii_case("dcharacter") =>
+                {
+                    Some(file)
+                }
                 _ => None,
             })
             .collect();
         let visible = previews.visible_files.clone();
         previews.completed.retain(|file, _| visible.contains(file));
+        previews.sources.retain(|file, _| visible.contains(file));
         previews.browser_revision = Some(browser.revision);
     }
 
+    // Open character documents include unsaved portrait changes and undo.
+    // Invalidate before polling so an old job cannot restore a removed image.
+    for file in previews.visible_files.clone() {
+        if !browser.files[file]
+            .extension
+            .eq_ignore_ascii_case("dcharacter")
+            && previews.sources.contains_key(&file)
+        {
+            continue;
+        }
+        let source = source(&editor, &browser, file);
+        if previews.sources.get(&file) != Some(&source) {
+            previews.completed.remove(&file);
+            previews.sources.insert(file, source);
+        }
+    }
+
     let finished = previews.pending.as_mut().and_then(|job| {
-        block_on(poll_once(&mut job.task)).map(|result| (job.file, job.scan_revision, result))
+        block_on(poll_once(&mut job.task))
+            .map(|result| (job.file, job.scan_revision, job.source.clone(), result))
     });
-    if let Some((file, scan_revision, result)) = finished {
+    if let Some((file, scan_revision, source, result)) = finished {
         previews.pending = None;
-        if scan_revision == browser.scan_revision && previews.visible_files.contains(&file) {
+        if scan_revision == browser.scan_revision && previews.sources.get(&file) == Some(&source) {
             let preview = match result {
-                Ok(decoded) => ImagePreview {
+                Ok(Some(decoded)) => ImagePreview {
                     dimensions: Some(decoded.original),
                     image: Some(texture(decoded, &mut images)),
+                    error: None,
+                },
+                Ok(None) => ImagePreview {
+                    image: None,
+                    dimensions: None,
                     error: None,
                 },
                 Err(error) => ImagePreview {
@@ -212,11 +316,14 @@ pub(super) fn update(
         .copied()
         .find(|file| !previews.completed.contains_key(file));
     let Some(file) = next else { return };
-    let path = editor.root.join(&browser.files[file].path);
+    let root = editor.root.clone();
+    let source = previews.sources[&file].clone();
+    let request = source.clone();
     previews.pending = Some(Job {
         file,
         scan_revision: browser.scan_revision,
-        task: AsyncComputeTaskPool::get().spawn(async move { decode(&path) }),
+        source,
+        task: AsyncComputeTaskPool::get().spawn(async move { decode_source(&root, &request) }),
     });
 }
 

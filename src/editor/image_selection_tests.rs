@@ -3,6 +3,9 @@ use crate::editor::photo_document::{PhotoTool, SelectionTool};
 use bevy::ecs::system::RunSystemOnce;
 use edit::selection::{SelectionAction as Op, TransformMode, frame_quad, transformed_quad};
 
+#[path = "image_transform_render_tests.rs"]
+mod transform_render;
+
 fn editing() -> (Fixture, App) {
     let fixture = Fixture::new();
     let mut app = fixture.app();
@@ -184,6 +187,119 @@ fn image_transform_geometry_scales_about_opposite_corner_and_alt_center_and_snap
     );
     assert_eq!(distorted[0], Vec2::new(-2.0, -3.0));
     assert_eq!(distorted[1], quad[1]);
+}
+
+#[test]
+fn image_live_transform_keeps_pixels_untouched_until_release_and_uses_native_history() {
+    let (fixture, mut app) = editing();
+    action(&mut app, Op::Transform);
+    action(&mut app, Op::Nearest);
+    let id = app.world().resource::<ImageViewer>().tab.unwrap();
+    let doc = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(Some(id))
+        .unwrap();
+    let before = doc.composite().pixels;
+    let revision = doc.revision;
+    let frame = doc.transform_frame().unwrap();
+    let quad = frame_quad(frame);
+    let window = app
+        .world_mut()
+        .query_filtered::<Entity, With<PrimaryWindow>>()
+        .single(app.world())
+        .unwrap();
+    let p = point(&mut app, quad[2]);
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .set_cursor_position(Some(p));
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .press(MouseButton::Left);
+    app.update();
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .clear();
+    for delta in [Vec2::new(8.0, 4.0), Vec2::new(12.0, 6.0)] {
+        let p = point(&mut app, quad[2] + delta);
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(p));
+        app.update();
+        let doc = app
+            .world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap();
+        assert_eq!(doc.revision, revision);
+        assert_eq!(doc.composite().pixels, before);
+    }
+    let result = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .selection
+        .transform
+        .as_ref()
+        .unwrap()
+        .quad;
+    assert_ne!(result, quad);
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .release(MouseButton::Left);
+    app.update();
+    let mut native =
+        crate::editor::photo_document::PhotoDocument::load(&fixture.0.join("nested/d-small.png"))
+            .unwrap();
+    let mut edit = native.begin_move();
+    native
+        .preview_transform(&mut edit, frame, result.map(|p| p.to_array()), true)
+        .unwrap();
+    let expected = native.composite().pixels;
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap()
+            .composite()
+            .pixels,
+        expected
+    );
+    app.world_mut()
+        .resource_mut::<ButtonInput<MouseButton>>()
+        .clear();
+    action(&mut app, Op::Apply);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap()
+            .composite()
+            .pixels,
+        before
+    );
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Redo));
+    app.update();
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap()
+            .composite()
+            .pixels,
+        expected
+    );
 }
 
 #[test]
@@ -400,10 +516,69 @@ fn gpu_image_selection_and_transform_tools_match_canvas_and_preserve_history() {
         .unwrap()
         .quad;
     let p = point(&mut app, quad[2]);
+    let revision = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(Some(id))
+        .unwrap()
+        .revision;
     move_pointer(&mut app, window, p);
     mouse(&mut app, window, ButtonState::Pressed);
     let p = point(&mut app, quad[2] + Vec2::new(70.0, 55.0));
     move_pointer(&mut app, window, p);
+    for _ in 0..120 {
+        frame(&mut app);
+        if app
+            .world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::super::canvas_material::HANDLE)
+            .unwrap()
+            .transform_style
+            .x
+            > 0.5
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap()
+            .revision,
+        revision,
+        "Live dragging must not resample the document or dirty its thumbnails"
+    );
+    let material = app
+        .world()
+        .resource::<Assets<CanvasMaterial>>()
+        .get(&super::super::canvas_material::HANDLE)
+        .unwrap();
+    assert_eq!(material.transform_style.x, 1.0);
+    let moving = material.transform_moving.clone();
+    let pixel = point(&mut app, Vec2::new(270.0, 190.0));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("02-during-drag.png"),
+        |image| {
+            let c = image.get_pixel(pixel.x as u32, pixel.y as u32).0;
+            c[2] > 180 && c[0] < 100
+        },
+    );
+    let p = point(&mut app, quad[2] + Vec2::new(75.0, 60.0));
+    move_pointer(&mut app, window, p);
+    assert_eq!(
+        app.world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::super::canvas_material::HANDLE)
+            .unwrap()
+            .transform_moving,
+        moving,
+        "Mouse movement must reuse the cached GPU planes"
+    );
     mouse(&mut app, window, ButtonState::Released);
     assert!(coverage(&app, 270, 190) > 0.5);
     capture_when(
@@ -443,6 +618,21 @@ fn gpu_image_selection_and_transform_tools_match_canvas_and_preserve_history() {
     mouse(&mut app, window, ButtonState::Pressed);
     let p = point(&mut app, quad[1] - Vec2::new(25.0, 0.0));
     move_pointer(&mut app, window, p);
+    let material = app
+        .world()
+        .resource::<Assets<CanvasMaterial>>()
+        .get(&super::super::canvas_material::HANDLE)
+        .unwrap();
+    let images = app.world().resource::<Assets<Image>>();
+    let source_mask = images
+        .get(material.transform_selection.as_ref().unwrap())
+        .unwrap();
+    let current_mask = images.get(material.selection.as_ref().unwrap()).unwrap();
+    assert_eq!(source_mask.data.as_ref().unwrap()[190 * 480 + 270], 0);
+    assert!(
+        current_mask.data.as_ref().unwrap()[190 * 480 + 270] > 128,
+        "A second gesture must map the original selection, not transform the last preview twice"
+    );
     mouse(&mut app, window, ButtonState::Released);
     let after = app
         .world()

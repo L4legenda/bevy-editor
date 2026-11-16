@@ -4,6 +4,8 @@ use super::*;
 mod deletion;
 #[path = "browser_duplicate.rs"]
 mod duplication;
+#[path = "browser_explorer.rs"]
+mod explorer;
 #[path = "browser_image.rs"]
 mod image_creation;
 #[path = "browser_primitives.rs"]
@@ -248,8 +250,10 @@ pub(in crate::editor) struct ContextUi {
     new_folder: Entity,
     creation: [Entity; 5],
     open: Entity,
+    instance: Entity,
     open_icon: Entity,
     open_label: Entity,
+    reveal: Entity,
     rename: Entity,
     duplicate: Entity,
     shown_entry: Option<Entity>,
@@ -329,6 +333,38 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
     );
     let open_icon = icons::themed(commands, open, icons::Glyph::File, 16.0);
     let open_label = text(commands, open, font_handle, "Открыть", 13.0, TEXT);
+    let instance = button(
+        commands,
+        menu,
+        font_handle,
+        "Добавить экземпляр в сцену",
+        Action::BrowserInstanceScene,
+        Look::Regular,
+    );
+    let reveal = control(
+        commands,
+        menu,
+        Action::BrowserRevealEntry,
+        Look::Regular,
+        Node {
+            width: percent(100),
+            height: px(34),
+            padding: UiRect::axes(px(9), px(5)),
+            ..row(6.0)
+        },
+    );
+    commands
+        .entity(reveal)
+        .insert(AccessibleLabel("Показать в проводнике".into()));
+    icons::themed(commands, reveal, icons::Glyph::FolderOpen, 16.0);
+    text(
+        commands,
+        reveal,
+        font_handle,
+        "Показать в проводнике",
+        13.0,
+        TEXT,
+    );
     let rename = control(
         commands,
         menu,
@@ -626,8 +662,10 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
             primitives.trigger,
         ],
         open,
+        instance,
         open_icon,
         open_label,
+        reveal,
         rename,
         duplicate,
         shown_entry: None,
@@ -1152,6 +1190,41 @@ pub(in crate::editor) fn update(
                     }
                 }
             }
+            Action::BrowserRevealEntry if allowed && context.is_menu() => {
+                if let Some(entry) = context
+                    .menu_entry
+                    .filter(|entry| entry.revision == browser.scan_revision)
+                {
+                    let result =
+                        crate::editor::file_moves::entry_path(&editor, &browser, entry.entry)
+                            .and_then(|path| explorer::open(&editor.root, &path));
+                    match result {
+                        Ok(()) => browser.error = None,
+                        Err(error) => {
+                            let message = format!("Не удалось открыть проводник · {error}");
+                            editor.status = message.clone();
+                            browser.error = Some(message);
+                        }
+                    }
+                }
+                context.phase = Phase::Closed;
+            }
+            Action::BrowserInstanceScene if allowed && context.is_menu() => {
+                if editor.has_scene()
+                    && editor.ready
+                    && editor.definition().is_native()
+                    && let Some(entry) = context
+                        .menu_entry
+                        .filter(|e| e.revision == browser.scan_revision)
+                    && let browser::Entry::Scene { room, .. } = entry.entry
+                {
+                    commands.write_message(Action::Hierarchy(
+                        crate::editor::scene_hierarchy::HierarchyAction::Insert(room),
+                    ));
+                }
+                context.phase = Phase::Closed;
+                context.suppress_release = false;
+            }
             Action::BrowserOpenEntry if allowed && context.is_menu() => {
                 if let Some(entry) = context
                     .menu_entry
@@ -1493,12 +1566,14 @@ pub(in crate::editor) fn refresh(
             };
         }
     }
-    if let Ok(mut node) = nodes.get_mut(interface.open) {
-        node.display = if has_entry {
-            Display::Flex
-        } else {
-            Display::None
-        };
+    for entity in [interface.open, interface.reveal] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            node.display = if has_entry {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
     }
     for entity in [interface.rename, interface.duplicate] {
         if let Ok(mut node) = nodes.get_mut(entity) {
@@ -1508,6 +1583,10 @@ pub(in crate::editor) fn refresh(
                 Display::None
             };
         }
+    }
+    if let Ok(mut node) = nodes.get_mut(interface.instance) {
+        node.display=if editor.has_scene() && editor.ready && !editor.asset_viewer_open() && editor.definition().is_native()
+            && context.menu_entry.is_some_and(|e|matches!(e.entry,browser::Entry::Scene {room,..} if room!=editor.room && editor.project.scenes.get(room).is_some_and(|s|s.is_native()))) {Display::Flex}else{Display::None};
     }
     let (open_label, glyph) = match context.menu_entry.map(|entry| (entry.entry, entry.action)) {
         Some((browser::Entry::Folder(_), _)) => ("Открыть папку", icons::Glyph::FolderOpen),

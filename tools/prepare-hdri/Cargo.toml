@@ -1,0 +1,25 @@
+[package]
+name = "prepare-hdri"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+
+# Offline asset tooling must not compile the editor or depend on its build lock.
+[workspace]
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["hdr"] }
+half = "2.7"
+ruzstd = "0.9.1"
+
+[dev-dependencies]
+ktx2 = "0.5"
+
+[profile.dev]
+opt-level = 2
+debug = 0
+incremental = false
+
+[profile.release]
+debug = 0

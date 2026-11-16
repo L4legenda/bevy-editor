@@ -36,6 +36,8 @@ pub(in crate::editor) struct EditUi {
     size_value: Entity,
     size_menu: Entity,
     size_title: Entity,
+    hardness_group: Entity,
+    pencil_shapes: Entity,
     size_shown: bool,
     size_input: Entity,
     size_original: Option<f32>,
@@ -362,6 +364,46 @@ pub(in crate::editor) fn setup(
         size_input,
         "Размер кисти",
     );
+    let pencil_shapes = node(
+        commands,
+        size_menu,
+        Node {
+            width: percent(100),
+            justify_content: JustifyContent::SpaceBetween,
+            ..row(6.0)
+        },
+    );
+    text(commands, pencil_shapes, font_handle, "Форма", 11.0, MUTED);
+    let shape_buttons = node(commands, pencil_shapes, row(4.0));
+    for (title, shape) in [
+        ("Круг", PencilShape::Round),
+        ("Квадрат", PencilShape::Square),
+    ] {
+        let item = button(
+            commands,
+            shape_buttons,
+            font_handle,
+            title,
+            Action::ImageEdit(EditAction::PencilShape(shape)),
+            Look::Regular,
+        );
+        commands
+            .entity(item)
+            .insert(AccessibleLabel(format!("Форма карандаша · {title}")));
+        layers::ux::help(
+            commands,
+            item,
+            match shape {
+                PencilShape::Round => {
+                    "Круглый отпечаток из целых пикселей. Предпросмотр показывает, какие пиксели закрасит карандаш."
+                }
+                PencilShape::Square => {
+                    "Квадратный отпечаток без сглаживания. Закрашивает все пиксели внутри квадрата выбранного размера."
+                }
+            },
+        );
+    }
+    let mut hardness_group = Entity::PLACEHOLDER;
     for (title, binding, range) in [
         ("Жёсткость", Binding::Hardness, (0.0, 1.0)),
         ("Непрозрачность кисти", Binding::BrushOpacity, (0.01, 1.0)),
@@ -374,6 +416,9 @@ pub(in crate::editor) fn setup(
                 ..column(4.0)
             },
         );
+        if matches!(binding, Binding::Hardness) {
+            hardness_group = setting;
+        }
         slider(commands, setting, font_handle, title, binding, range);
     }
     let selector = surface(
@@ -559,12 +604,12 @@ pub(in crate::editor) fn setup(
     }
     let paint_menu = surface(
         commands,
-        tools,
+        paint_group,
         Node {
             display: Display::None,
             position_type: PositionType::Absolute,
-            left: px(49),
-            top: px(7),
+            left: px(42),
+            top: px(0),
             width: px(230),
             padding: UiRect::all(px(5)),
             border: UiRect::all(px(1)),
@@ -786,6 +831,8 @@ pub(in crate::editor) fn setup(
         size_value,
         size_menu,
         size_title,
+        hardness_group,
+        pencil_shapes,
         size_shown: false,
         size_input,
         size_original: None,
@@ -1001,6 +1048,18 @@ pub(in crate::editor) fn refresh(
     mut colors: Query<&mut BackgroundColor>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
+    for (entity, visible) in [
+        (ui.hardness_group, viewer.edit.tool != PhotoTool::Pencil),
+        (ui.pencil_shapes, viewer.edit.tool == PhotoTool::Pencil),
+    ] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            node.display = if visible {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
     if let Ok(mut group) = nodes.get_mut(ui.size_group) {
         group.display = if editing && viewer.edit.sizeable() {
             Display::Flex
@@ -1202,6 +1261,7 @@ pub(in crate::editor) fn refresh(
         viewer.brush_cursor.filter(|_| !viewer.native_brush_cursor),
         position,
         viewer.edit.resizing_brush().then_some(viewer.edit.size),
+        viewer.edit.tool == PhotoTool::Pencil,
     );
     let pipette = canvas.single().ok().and_then(|(node, transform)| {
         let min =

@@ -1,0 +1,14 @@
+{
+  "format":"bevy_scene",
+  "version":1,
+  "id":"93cb6f27-7a61-4a6f-a694-0ebcc2c0c026",
+  "name":"Две лампы",
+  "settings":{"demo.note":"Data-only composition example; not an editor startup scene"},
+  "resources":{
+    "lamp":{"kind":"scene","path":"lamp.scene","uid":"c5cad6ad-c6a8-43e1-90a4-568e0d22e4c9"}
+  },
+  "entities":[
+    {"id":"desk_lamp","name":"Настольная лампа","transform":{"translation":[1.0,0.0,2.0]},"instance":{"resource":"lamp"}},
+    {"id":"hall_lamp","name":"Лампа в коридоре","transform":{"translation":[-3.0,0.0,0.0]},"instance":{"resource":"lamp","overrides":{"bulb":{"components":{"light":{"color":[0.7,0.8,1.0],"intensity":1600.0}}}}}}
+  ]
+}

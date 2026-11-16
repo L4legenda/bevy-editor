@@ -62,7 +62,9 @@ pub(super) fn create(root: &Path, parent: &Path, name: &str) -> Result<PathBuf, 
             ..default()
         };
         document.validate(root).map_err(|error| error.to_string())?;
-        let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+        let bytes = document
+            .encode_document("new.scene", None)
+            .map_err(|error| error.to_string())?;
         let destination = directory.join(&filename);
         let mut file = match fs::OpenOptions::new()
             .write(true)
@@ -73,10 +75,7 @@ pub(super) fn create(root: &Path, parent: &Path, name: &str) -> Result<PathBuf, 
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("Не удалось создать сцену: {error}")),
         };
-        let result = file
-            .write_all(&bytes)
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.sync_all());
+        let result = file.write_all(&bytes).and_then(|_| file.sync_all());
         if let Err(error) = result {
             drop(file);
             let _ = fs::remove_file(&destination);

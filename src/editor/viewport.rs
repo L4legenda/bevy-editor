@@ -592,7 +592,7 @@ pub(super) fn allowed(editor: &Editor, selection: Selection, tool: Tool, axis: u
     };
     if editor.selection == Some(selection) {
         editor
-            .selected_targets()
+            .transform_targets()
             .into_iter()
             .all(|target| editor.field_allowed(target, field))
     } else {
@@ -929,6 +929,7 @@ pub(super) fn manipulate(
     if let Some(drag) = pointer.drag.take() {
         if keys.just_pressed(KeyCode::Escape) || !window.focused {
             editor.edits = drag.before;
+            editor.sync_hierarchy_metadata();
             pointer.group_start.clear();
         } else if !mouse.pressed(MouseButton::Left) {
             editor.finish_edit(drag.before);
@@ -1008,7 +1009,12 @@ pub(super) fn manipulate(
                     && pose.translation.abs().max_element() <= 1000.0
                     && crate::Pose::from(pose).valid()
                 {
-                    if pointer.group_start.len() <= 1 {
+                    if pointer.group_start.len() <= 1
+                        && pointer
+                            .group_start
+                            .first()
+                            .is_none_or(|(target, _)| *target == drag.selection)
+                    {
                         editor.set_pose(drag.selection, pose);
                     } else {
                         let mut updates = Vec::new();
@@ -1039,9 +1045,7 @@ pub(super) fn manipulate(
                             crate::Pose::from(*pose).valid()
                                 && pose.translation.abs().max_element() <= 1000.0
                         }) {
-                            for (target, pose) in updates {
-                                editor.set_pose(target, pose);
-                            }
+                            editor.set_poses(&updates);
                         }
                     }
                 }
@@ -1128,7 +1132,7 @@ pub(super) fn manipulate(
             && mouse.just_pressed(MouseButton::Left)
         {
             pointer.group_start = editor
-                .selected_targets()
+                .transform_targets()
                 .into_iter()
                 .filter_map(|target| editor.pose(target).map(|p| (target, p.transform())))
                 .collect();
@@ -1192,6 +1196,9 @@ pub(super) fn manipulate(
     }
 
     let camera_hit = shots(&editor).find(|&shot| {
+        if editor.object_hidden(Selection::Camera(shot)) {
+            return false;
+        }
         let position = editor.camera(shot).pose.transform().translation;
         position.distance_squared(view.translation) > 0.04
             && camera
@@ -1257,6 +1264,9 @@ pub(super) fn draw(
     }
     super::lighting_gizmos::draw(&editor, camera, view, &mut handles);
     for shot in shots(&editor) {
+        if editor.object_hidden(Selection::Camera(shot)) {
+            continue;
+        }
         let placement = editor.camera(shot);
         let pose = placement.pose.transform();
         if pose.translation.distance_squared(view.translation) <= 0.04 {

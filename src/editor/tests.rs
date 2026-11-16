@@ -209,11 +209,25 @@ fn object_eye_keeps_scene_state_separate_and_blocks_invalid_or_modal_actions() {
     for invalid in [
         Selection::Model(u32::MAX),
         Selection::Imported(100),
-        Selection::Camera(0),
+        Selection::Camera(usize::MAX),
     ] {
         action(&mut app, Action::ToggleVisibility(invalid));
         assert!(!app.world().resource::<Editor>().object_hidden(invalid));
     }
+    let before = app.world().resource::<Editor>().edits.clone();
+    action(&mut app, Action::ToggleVisibility(Selection::Camera(0)));
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .object_hidden(Selection::Camera(0))
+    );
+    assert_eq!(app.world().resource::<Editor>().edits, before);
+    action(&mut app, Action::ToggleVisibility(Selection::Camera(0)));
+    assert!(
+        !app.world()
+            .resource::<Editor>()
+            .object_hidden(Selection::Camera(0))
+    );
 }
 
 #[test]

@@ -44,6 +44,7 @@ struct Job {
 #[derive(Resource, Default)]
 pub(in crate::editor) struct PlacementPreview {
     job: Option<Job>,
+    scene_contact: Option<Vec3>,
 }
 
 #[derive(SystemParam)]
@@ -59,6 +60,7 @@ pub(in crate::editor) struct PlacementRay<'w, 's> {
 }
 impl PlacementPreview {
     fn clear(&mut self, commands: &mut Commands) {
+        self.scene_contact = None;
         if let Some(job) = self.job.take() {
             commands.entity(job.root).try_despawn();
         }
@@ -201,6 +203,46 @@ pub(in crate::editor) fn update(
     let entry = released
         .map(|(entry, _)| entry)
         .or_else(|| source.map(|source| source.entry));
+    if let Some(entry @ Entry::Scene { .. }) = entry {
+        preview.clear(&mut commands);
+        let cursor = released
+            .map(|(_, cursor)| cursor)
+            .or_else(|| drag.scene_cursor());
+        let point = cursor.and_then(|cursor| {
+            if !ui::scene_input_rect(&window, &motion, &editor.sidebar).contains(cursor) {
+                return None;
+            }
+            if !editor.pilot
+                && matches!(editor.selection, Some(Selection::Camera(_)))
+                && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor)
+            {
+                return None;
+            }
+            let (camera, view) = ray.camera.single().ok()?;
+            drop_point(
+                camera,
+                view,
+                cursor - ui::viewport_rect(&window, &editor.sidebar).min,
+                &mut ray.meshes,
+                &scene,
+                &ray.parents,
+                editor.snap,
+            )
+        });
+        preview.scene_contact = point;
+        if released.is_some()
+            && let Some(point) = point
+        {
+            if let Some(error) = numeric.as_ref().and_then(|n| n.error_message()) {
+                editor.status = error.into();
+            } else {
+                apply_asset_drop(&mut editor, &browser, entry, point, None);
+            }
+            preview.scene_contact = None;
+        }
+        return;
+    }
+    preview.scene_contact = None;
     if let Some(entry) = entry {
         let Some(asset) = browser.model_asset(&editor.project.catalog, entry) else {
             preview.clear(&mut commands);
@@ -332,6 +374,16 @@ pub(in crate::editor) fn draw(
     preview: Res<PlacementPreview>,
     mut gizmos: Gizmos<viewport::TransformGizmos>,
 ) {
+    if let Some(point) = preview.scene_contact {
+        gizmos.circle(
+            Isometry3d::new(
+                point + Vec3::Y * 0.012,
+                Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+            ),
+            0.3,
+            COLOR,
+        );
+    }
     let Some(job) = &preview.job else {
         return;
     };
@@ -550,6 +602,7 @@ mod pending_tests {
             .resource_mut::<Assets<WorldAsset>>()
             .add(WorldAsset::new(World::new()));
         app.insert_resource(PlacementPreview {
+            scene_contact: None,
             job: Some(Job {
                 root,
                 handle,

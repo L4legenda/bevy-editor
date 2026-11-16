@@ -831,7 +831,11 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         doc.revision += 1;
                     }
                 }
-                if session.channel == 4 {
+                if session.channel == 4
+                    && materials
+                        .get(&gpu.material)
+                        .is_some_and(|m| m.alpha_mode != AlphaMode::Blend)
+                {
                     if let Some(mut material) = materials.get_mut(&gpu.material) {
                         material.alpha_mode = AlphaMode::Blend;
                     }

@@ -4,7 +4,7 @@ use super::*;
 use bevy::{
     asset::AssetId,
     render::{
-        ExtractSchedule, MainWorld, Render, RenderApp, RenderSystems,
+        ExtractSchedule, MainWorld, Render, RenderApp, RenderStartup, RenderSystems,
         render_asset::RenderAssets,
         render_resource::*,
         renderer::{RenderDevice, RenderQueue},
@@ -134,6 +134,7 @@ impl Plugin for PluginGpu {
             render
                 .init_resource::<Pending>()
                 .init_resource::<State>()
+                .add_systems(RenderStartup, initialize)
                 .add_systems(ExtractSchedule, extract)
                 .add_systems(
                     Render,
@@ -144,6 +145,9 @@ impl Plugin for PluginGpu {
                 );
         }
     }
+}
+fn initialize(mut state: ResMut<State>, device: Res<RenderDevice>) {
+    state.pipelines = Some(Pipelines::new(&device));
 }
 fn extract(mut world: ResMut<MainWorld>, mut pending: ResMut<Pending>) {
     let mut queue = world.resource_mut::<Queue>();

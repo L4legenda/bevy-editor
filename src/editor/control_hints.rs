@@ -199,6 +199,9 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::BrowserNewImage => "Создать PNG-изображение с белым фоном в выбранной папке.".into(),
         Action::BrowserNewScene => "Создать пустую сцену в выбранной папке.".into(),
         Action::BrowserOpenEntry => "Открыть выбранный файл или папку.".into(),
+        Action::BrowserRevealEntry => {
+            "Открыть папку в проводнике или показать выбранный файл в содержащей его папке.".into()
+        }
         Action::BrowserCreateScene => "Enter · Создать сцену.".into(),
         Action::BrowserDialogueMenu => "Создать диалог или персонажа в этой папке · наведите курсор для выбора документа.".into(),
         Action::BrowserPrimitiveMenu => "Создать 3D-фигуру в этой папке · наведите курсор для выбора фигуры.".into(),

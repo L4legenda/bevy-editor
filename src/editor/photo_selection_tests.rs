@@ -1,4 +1,38 @@
 use super::*;
+
+#[test]
+fn background_transform_matches_native_pixels_and_retains_one_history_step() {
+    let fixture = Fixture::new();
+    let mut doc = PhotoDocument::load(&fixture.0).unwrap();
+    doc.layer_command("select.rect", json!({"x":4,"y":4,"width":16,"height":12}))
+        .unwrap();
+    let original = doc.composite().pixels;
+    let history = doc.undo.len();
+    let frame = doc.transform_frame().unwrap();
+    let mut edit = doc.begin_move();
+    let quad = [[7.0, 6.0], [26.0, 7.0], [23.0, 24.0], [6.0, 22.0]];
+    let (document, pixels, changed) = doc.transform_job(&edit, frame, quad, false)().unwrap();
+    assert_eq!(
+        doc.composite().pixels,
+        original,
+        "A worker must not mutate the live document"
+    );
+    doc.preview_transform(&mut edit, frame, quad, false)
+        .unwrap();
+    let expected = doc.composite().pixels;
+    assert_eq!(pixels.pixels, expected);
+    doc.accept_transform(&mut edit, document, changed);
+    assert_eq!(doc.composite().pixels, expected);
+    assert_eq!(doc.undo.len(), history + 1);
+    doc.undo();
+    assert_eq!(doc.composite().pixels, original);
+    doc.redo();
+    assert_eq!(doc.composite().pixels, expected);
+    doc.cancel_move(&mut edit);
+    assert_eq!(doc.composite().pixels, original);
+    assert_eq!(doc.undo.len(), history);
+}
+
 fn at(doc: &PhotoDocument, x: i32, y: i32) -> [u8; 4] {
     let image = doc.composite_region(Rect::new(x, y, x + 1, y + 1));
     image.pixels[..4].try_into().unwrap()

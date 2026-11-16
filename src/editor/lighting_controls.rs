@@ -656,6 +656,7 @@ pub(crate) fn input(
         if let Some(drag) = state.drag.take() {
             if Some((drag.room, drag.selection)) == context {
                 editor.edits = drag.before;
+                editor.sync_hierarchy_metadata();
             }
             if let Some((entity, hsv)) = drag.picker
                 && let Ok((_, mut picker)) = pickers.get_mut(entity)

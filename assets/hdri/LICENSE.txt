@@ -16,7 +16,7 @@ industrial_sunset_02_puresky     https://polyhaven.com/a/industrial_sunset_02_pu
 phalzer_forest_01               https://polyhaven.com/a/phalzer_forest_01
 moonless_golf                   https://polyhaven.com/a/moonless_golf
 
-Diffuse irradiance and GGX specular cubemaps were prepared with
-tools/prepare_hdri.py. Resolution: diffuse 32, specular 256 (9 roughness
+Diffuse irradiance and GGX specular cubemaps can be rebuilt with the Rust tool
+tools/prepare-hdri (see its README). Resolution: diffuse 32, specular 256 (9 roughness
 levels). Linear RGBA16F, KTX2 with lossless Zstandard supercompression.
 The maps may be used, modified and redistributed, including commercially.

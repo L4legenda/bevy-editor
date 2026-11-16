@@ -153,9 +153,11 @@ fn can_place(entry: Entry, browser: &Browser, editor: &Editor) -> bool {
     editor.has_scene()
         && !editor.asset_viewer_open()
         && editor.ready
-        && browser
-            .model_asset(&editor.project.catalog, entry)
-            .is_some()
+        && ((editor.definition().is_native()
+            && matches!(entry,Entry::Scene {room,..} if room!=editor.room && editor.project.scenes.get(room).is_some_and(|s|s.is_native())))
+            || browser
+                .model_asset(&editor.project.catalog, entry)
+                .is_some())
 }
 
 fn scene_target_contains(

@@ -10,6 +10,8 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(super) enum ObjectKey {
+    Entity(String),
+    Camera(String),
     Imported(String),
     Model(u32),
     Light(u32),
@@ -68,7 +70,26 @@ fn save(root: &Path, file: &str, hidden: &HashSet<ObjectKey>) -> io::Result<()> 
 
 impl Editor {
     fn object_key(&self, target: Selection) -> Option<ObjectKey> {
+        if let Some(key) = self.hierarchy_key(target) {
+            let node = self.edits.hierarchy.as_ref()?.node(key)?;
+            return Some(if node.inherited() {
+                ObjectKey::Entity(node.entity.id.clone())
+            } else if node.entity.model.is_some() {
+                ObjectKey::Model(crate::scene_io::number(&node.entity.id, "model"))
+            } else if node.entity.components.contains_key("light") {
+                ObjectKey::Light(crate::scene_io::number(&node.entity.id, "light"))
+            } else if let Some(camera) = &node.camera {
+                ObjectKey::Camera(camera.clone())
+            } else {
+                ObjectKey::Entity(node.entity.id.clone())
+            });
+        }
         match target {
+            Selection::Camera(shot) => self
+                .definition()
+                .cameras
+                .get(shot)
+                .map(|c| ObjectKey::Camera(c.id.clone())),
             Selection::Imported(index) => self
                 .imported
                 .get(index)
@@ -79,8 +100,39 @@ impl Editor {
         }
     }
 
+    pub(super) fn visibility_inherited(&self, target: Selection) -> bool {
+        if self
+            .hidden_objects
+            .get(&self.room)
+            .is_none_or(|objects| objects.is_empty())
+        {
+            return false;
+        }
+        if let Some(key) = self.hierarchy_key(target)
+            && let Some(graph) = &self.edits.hierarchy
+        {
+            let mut parent = graph.parent(key);
+            while let Some(node) = parent {
+                let selection = self.hierarchy_selection(node.key);
+                if self.object_key(selection).is_some_and(|key| {
+                    self.hidden_objects
+                        .get(&self.room)
+                        .is_some_and(|h| h.contains(&key))
+                }) {
+                    return true;
+                }
+                parent = graph.parent(node.key);
+            }
+        }
+        false
+    }
+
+    pub(super) fn can_toggle_visibility(&self, target: Selection) -> bool {
+        self.object_key(target).is_some() && !self.visibility_inherited(target)
+    }
     pub(super) fn object_hidden(&self, target: Selection) -> bool {
-        self.object_deleted(target)
+        self.visibility_inherited(target)
+            || self.object_deleted(target)
             || self.object_key(target).is_some_and(|key| {
                 self.hidden_objects
                     .get(&self.room)
@@ -89,6 +141,10 @@ impl Editor {
     }
 
     pub(super) fn toggle_visibility(&mut self, target: Selection) {
+        if self.visibility_inherited(target) {
+            self.status = "Объект скрыт родителем · сначала покажите родителя".into();
+            return;
+        }
         let Some(key) = self.object_key(target) else {
             return;
         };
@@ -133,7 +189,11 @@ pub(super) fn sync(
     // Explicitly visible children bypass Bevy's inherited visibility, so hide
     // the complete hierarchy and restore every original value on showing it.
     let mut hidden = std::collections::HashSet::new();
-    for (target, entity) in imported.chain(models) {
+    let groups = scene
+        .spatial
+        .iter()
+        .map(|(&key, &entity)| (editor.hierarchy_selection(key), entity));
+    for (target, entity) in imported.chain(models).chain(groups) {
         if editor.object_hidden(target) {
             hidden.insert(entity);
             hidden.extend(children.iter_descendants(entity));

@@ -2,6 +2,8 @@
 use super::*;
 use crate::editor::photo_document::{LayerMove, SelectionTool};
 use serde_json::json;
+#[path = "image_transform_preview.rs"]
+pub(in crate::editor) mod live;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::editor) enum Mode {
@@ -88,6 +90,9 @@ pub(in crate::editor) struct Transform {
     pub quad: [Vec2; 4],
     original: LayerMove,
     drag: Option<Drag>,
+    pub(super) live: Option<live::Live>,
+    pub(super) deferred: bool,
+    applied_quad: [Vec2; 4],
 }
 struct Drag {
     hit: usize,
@@ -161,6 +166,15 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
         SelectionAction::Nearest => {
             state.selection.nearest ^= true;
             if let Some(transform) = state.selection.transform.as_mut()
+                && transform.live.as_ref().is_some_and(live::Live::usable)
+                && (transform.drag.is_some()
+                    || transform.deferred
+                    || live::Live::needs_job(transform.frame, transform.quad))
+            {
+                transform.deferred = true;
+                return;
+            }
+            if let Some(transform) = state.selection.transform.as_mut()
                 && let Some(session) = state.sessions.get_mut(&transform.id)
                 && let Err(error) = session.doc.preview_transform(
                     &mut transform.original,
@@ -185,6 +199,9 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
                             quad: frame_quad(frame),
                             original: doc.begin_move(),
                             drag: None,
+                            live: live::Live::new(doc, frame),
+                            deferred: false,
+                            applied_quad: frame_quad(frame),
                         });
                     } else {
                         state.error = Some(
@@ -195,6 +212,9 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
             }
         }
         SelectionAction::Apply => {
+            if !finish_pending(state) {
+                return;
+            }
             state.selection.transform = None;
             state.selection.draft = None;
             state.select_tool(PhotoTool::Move);
@@ -232,7 +252,7 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
                 } else {
                     [d, c, b, a]
                 };
-                preview(state, quad);
+                preview(state, quad, false);
             }
         }
         SelectionAction::Rotate(degrees) => {
@@ -245,7 +265,7 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
                 let quad = transform
                     .quad
                     .map(|point| center + rotation * (point - center));
-                preview(state, quad);
+                preview(state, quad, false);
             }
         }
         SelectionAction::Nudge(x, y) => {
@@ -253,6 +273,7 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
                 preview(
                     state,
                     transform.quad.map(|p| p + Vec2::new(x as f32, y as f32)),
+                    false,
                 );
             } else if let Some(session) = state.sessions.get_mut(&id) {
                 if let Err(error) = session.doc.layer_command(
@@ -329,17 +350,27 @@ pub fn hit(quad: [Vec2; 4], point: Vec2, scale: f32) -> Option<usize> {
         None
     }
 }
-fn preview(state: &mut State, quad: [Vec2; 4]) {
+fn preview(state: &mut State, quad: [Vec2; 4], interactive: bool) {
     let nearest = state.selection.nearest;
     let Some(transform) = state.selection.transform.as_mut() else {
         return;
     };
-    if transform
+    let same = transform
         .quad
         .iter()
         .zip(quad)
-        .all(|(a, b)| a.distance_squared(b) < 0.000001)
-    {
+        .all(|(a, b)| a.distance_squared(b) < 0.000001);
+    if same && (!transform.deferred || interactive) {
+        return;
+    }
+    if let Err(error) = PhotoDocument::check_transform(quad.map(|p| p.to_array())) {
+        state.error = Some(error);
+        return;
+    }
+    if interactive && transform.live.as_ref().is_some_and(live::Live::usable) {
+        transform.quad = quad;
+        transform.deferred = true;
+        state.error = None;
         return;
     }
     if let Some(session) = state.sessions.get_mut(&transform.id) {
@@ -351,6 +382,8 @@ fn preview(state: &mut State, quad: [Vec2; 4]) {
         ) {
             Ok(()) => {
                 transform.quad = quad;
+                transform.deferred = false;
+                transform.applied_quad = quad;
                 state.error = None;
             }
             Err(error) => {
@@ -364,6 +397,91 @@ fn preview(state: &mut State, quad: [Vec2; 4]) {
             }
         }
     }
+}
+
+pub(super) fn poll(state: &mut State) {
+    if let Some(t) = state.selection.transform.as_mut()
+        && let Some(session) = state.sessions.get_mut(&t.id)
+        && let Some(live) = &mut t.live
+    {
+        live.poll(session.doc.revision);
+        if let Some((quad, nearest, revision, result)) = live.poll_commit()
+            && t.drag.is_none()
+            && t.deferred
+            && t.quad == quad
+            && state.selection.nearest == nearest
+        {
+            if revision != session.doc.revision {
+                live.disable();
+                t.deferred = false;
+                t.quad = t.applied_quad;
+            } else {
+                match result {
+                    Ok((document, image, changed)) => {
+                        session
+                            .doc
+                            .accept_transform(&mut t.original, document, changed);
+                        session.prepared =
+                            Some((session.doc.revision, session.doc.view_revision, image));
+                        t.applied_quad = quad;
+                        t.deferred = false;
+                        state.error = None;
+                    }
+                    Err(error) => {
+                        live.disable();
+                        t.deferred = false;
+                        t.quad = t.applied_quad;
+                        state.error = Some(error);
+                    }
+                }
+            }
+        }
+        if t.drag.is_none() && t.deferred && live.usable() && live::Live::needs_job(t.frame, t.quad)
+        {
+            live.commit(
+                &session.doc,
+                &t.original,
+                t.frame,
+                t.quad,
+                state.selection.nearest,
+            );
+        }
+    }
+}
+
+pub(super) fn finish_pending(state: &mut State) -> bool {
+    let Some(t) = state.selection.transform.as_mut().filter(|t| t.deferred) else {
+        return true;
+    };
+    t.drag = None;
+    if let Some(live) = &mut t.live {
+        live.cancel_commit();
+    }
+    let quad = t.quad;
+    preview(state, quad, false);
+    !state
+        .selection
+        .transform
+        .as_ref()
+        .is_some_and(|t| t.deferred)
+}
+
+fn release(state: &mut State) {
+    if let Some(t) = state.selection.transform.as_mut().filter(|t| t.deferred)
+        && let Some(live) = t.live.as_mut().filter(|l| l.usable())
+        && live::Live::needs_job(t.frame, t.quad)
+        && let Some(session) = state.sessions.get(&t.id)
+    {
+        live.commit(
+            &session.doc,
+            &t.original,
+            t.frame,
+            t.quad,
+            state.selection.nearest,
+        );
+        return;
+    }
+    finish_pending(state);
 }
 
 /// Stop a dragged corner just before a quad folds, as PhotoCraft does.
@@ -822,15 +940,23 @@ pub(super) fn pointer(
         }
     }
     if let Some(quad) = pending {
-        preview(state, quad);
+        preview(state, quad, true);
     }
     if !mouse.pressed(MouseButton::Left)
         && let Some(transform) = state.selection.transform.as_mut()
     {
         transform.drag = None;
     }
+    if !mouse.pressed(MouseButton::Left) {
+        release(state);
+    }
     if let Some(tab) = editor.image_tabs.iter_mut().find(|t| t.id == id) {
-        tab.dirty = state.sessions.get(&id).is_some_and(|s| s.doc.dirty());
+        tab.dirty = state.sessions.get(&id).is_some_and(|s| s.doc.dirty())
+            || state
+                .selection
+                .transform
+                .as_ref()
+                .is_some_and(|t| t.id == id && t.deferred);
     }
     true
 }

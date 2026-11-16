@@ -4,6 +4,8 @@ use crate::editor::photo_document::PhotoTool;
 use bevy::window::{CustomCursor, CustomCursorImage, RawHandleWrapper, SystemCursorIcon};
 use std::collections::VecDeque;
 
+#[path = "image_pencil_preview.rs"]
+pub(super) mod pencil;
 #[path = "image_pipette_cursor.rs"]
 mod pipette;
 #[path = "image_pipette_preview.rs"]
@@ -385,11 +387,25 @@ pub(in crate::editor) fn cursor(
                     cursor
                 }
             });
+        if viewer.edit.tool == PhotoTool::Pencil
+            && let (Some(position), Some(dimensions)) = (position, viewer.dimensions)
+        {
+            let image = viewer.image_rect(dimensions, rect);
+            let half = image.size() / dimensions.as_vec2() * viewer.edit.size * 0.5;
+            if (position + half).cmple(image.min).any() || (position - half).cmpge(image.max).any()
+            {
+                // There are no paintable cells to preview here. Keep a visible
+                // pointer over the surrounding workspace instead of hiding it.
+                return CursorIcon::from(SystemCursorIcon::Default);
+            }
+        }
         // Pixel tools show the cell they will touch, rather than an outline sliding inside it.
         let (icon, full) = cache.cursor_with_overlay(
             tip,
             &mut images,
-            resize_center.is_some() || (pixel_tool && tip.outline()),
+            resize_center.is_some()
+                || viewer.edit.tool == PhotoTool::Pencil
+                || (pixel_tool && tip.outline()),
         );
         viewer.brush_cursor = Some(tip);
         viewer.brush_cursor_position = position;
@@ -540,6 +556,7 @@ impl Overlay {
         tip: Option<Tip>,
         position: Option<Vec2>,
         resize: Option<f32>,
+        pixels: bool,
     ) {
         let shown = tip.zip(position);
         if let Ok(mut readout) = nodes.get_mut(self.readout) {
@@ -574,7 +591,7 @@ impl Overlay {
         }
         if let Some((tip, _)) = shown {
             if let Ok(mut cross) = nodes.get_mut(self.cross) {
-                cross.display = if tip.outline() {
+                cross.display = if tip.outline() || pixels {
                     Display::None
                 } else {
                     Display::Flex
@@ -582,7 +599,7 @@ impl Overlay {
             }
             for (entity, stroke) in self.rings.into_iter().zip([3.0, 1.0]) {
                 if let Ok(mut ring) = nodes.get_mut(entity) {
-                    ring.display = if tip.outline() {
+                    ring.display = if tip.outline() && !pixels {
                         Display::Flex
                     } else {
                         Display::None

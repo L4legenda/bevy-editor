@@ -28,7 +28,7 @@ target/
 # Local edits to the bundled example scenes.
 /examples/assets/levels/
 
-# Local editor preferences and session trash within asset roots.
+# Local editor preferences, scene locks and session trash within asset roots.
 **/.bevy-editor/
 **/.bevy-editor-trash/
 **/.bevy-editor-move-*
@@ -42,7 +42,10 @@ target/
 *.rej
 *.swp
 *.swo
+*.stackdump
+*.dmp
 *~
+.cache/
 __pycache__/
 *.py[cod]
 .venv/
@@ -57,11 +60,16 @@ CMakeCache.txt
 .idea/
 .vscode/
 .vs/
+*.suo
+*.user
 .env
 .env.*
 !.env.example
 !.env.sample
 !.env.template
+
+# Godot import cache from local scene-format audit projects.
+.godot/
 
 # Runtime and tool logs.
 *.log

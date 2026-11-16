@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn duplicated_modern_scene_gets_a_new_uuid_and_keeps_local_entity_ids() {
+    let files = Fixture::new();
+    let mut scene = crate::scene_format::Scene::new("Original");
+    scene
+        .entities
+        .push(crate::scene_format::Entity::new("stable"));
+    files.write("original.scene", &scene.to_source().unwrap());
+    let copy = duplicate(&files.0, Path::new("original.scene")).unwrap();
+    let duplicated =
+        crate::scene_format::Scene::from_slice(&fs::read(files.0.join(copy)).unwrap()).unwrap();
+    assert_ne!(duplicated.id, scene.id);
+    assert_eq!(duplicated.entities, scene.entities);
+    assert_eq!(
+        crate::scene_format::Scene::from_slice(&fs::read(files.0.join("original.scene")).unwrap())
+            .unwrap(),
+        scene
+    );
+    files.clean_staging();
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {

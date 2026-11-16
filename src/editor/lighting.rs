@@ -158,6 +158,14 @@ fn set_environment_number(environment: &mut SceneLighting, field: EnvironmentFie
 
 impl Editor {
     pub(super) fn light(&self, id: u32) -> Option<&SceneLight> {
+        if self.edits.hierarchy.is_some() {
+            return self
+                .edits
+                .lights
+                .binary_search_by_key(&id, |light| light.id)
+                .ok()
+                .map(|i| &self.edits.lights[i]);
+        }
         self.edits.lights.iter().find(|light| light.id == id)
     }
 

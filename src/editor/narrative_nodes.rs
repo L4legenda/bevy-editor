@@ -8,7 +8,6 @@ const START_LABEL_HEIGHT: f32 = 14.0;
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum NodeAction {
     Speaker,
-    Portrait,
     AddChoice,
     RemoveChoice(usize),
     Disconnect(usize),
@@ -19,7 +18,6 @@ impl NodeAction {
     pub(super) fn action(self) -> NarrativeAction {
         match self {
             Self::Speaker => NarrativeAction::Speaker,
-            Self::Portrait => NarrativeAction::Portrait,
             Self::AddChoice => NarrativeAction::AddChoice,
             Self::RemoveChoice(i) => NarrativeAction::RemoveChoice(i),
             Self::Disconnect(i) => NarrativeAction::Disconnect(i),
@@ -474,54 +472,88 @@ pub(super) fn spawn(
                         ..row(6.0)
                     },
                 );
-                let who = act(
+                let who = control(
                     commands,
                     speaker_row,
-                    font,
-                    speaker(editor, n),
-                    local(n.id, NodeAction::Speaker),
-                    false,
+                    Action::Narrative(local(n.id, NodeAction::Speaker)),
+                    Look::Regular,
+                    Node {
+                        height: px(32),
+                        padding: UiRect::horizontal(px(8)),
+                        border: UiRect::all(px(1)),
+                        border_radius: BorderRadius::all(px(7)),
+                        ..row(6.)
+                    },
                 );
                 full_button(commands, who);
-                commands.entity(who).insert(AccessibleLabel(format!(
-                    "Выбрать говорящего ноды #{}",
-                    n.id
-                )));
-                commands.entity(who).insert(speaker_menu::Anchor(n.id));
-                node(
+                commands.entity(who).insert((
+                    AccessibleLabel(format!("Выбрать говорящего ноды #{}", n.id)),
+                    speaker_menu::Anchor(n.id),
+                ));
+                let avatar = surface(
                     commands,
                     who,
                     Node {
-                        flex_grow: 1.0,
+                        width: px(28),
+                        height: px(28),
+                        flex_shrink: 0.,
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        border_radius: BorderRadius::MAX,
+                        overflow: Overflow::clip(),
                         ..default()
                     },
+                    WELL,
                 );
-                icons::spawn(commands, who, icons::Glyph::ChevronDown, 13.0, MUTED);
-                if let Some(c) = n.speaker.as_ref().and_then(|p| character(editor, p)) {
-                    let pick = control(
-                        commands,
-                        speaker_row,
-                        Action::Narrative(local(n.id, NodeAction::Portrait)),
-                        Look::Regular,
-                        Node {
-                            width: px(34),
-                            height: px(32),
-                            border: UiRect::all(px(1)),
-                            border_radius: BorderRadius::all(px(6)),
-                            overflow: Overflow::clip(),
-                            justify_content: JustifyContent::Center,
-                            ..row(0.0)
-                        },
-                    );
-                    commands
-                        .entity(pick)
-                        .insert(AccessibleLabel(format!("Выбрать портрет ноды #{}", n.id)));
-                    if let Some(p) = c.portraits.get(n.portrait) {
-                        portrait(commands, pick, server, &editor.root, &p.path, 30.0);
+                commands.entity(avatar).insert((
+                    Pickable::IGNORE,
+                    AccessibleLabel(format!("Выбрать портрет ноды #{}", n.id)),
+                ));
+                if let Some(c) = n.speaker.as_ref().and_then(|path| character(editor, path)) {
+                    if let Some(p) = c.portraits.get(n.portrait).or(c.portraits.first()) {
+                        portrait(commands, avatar, server, &editor.root, &p.path, 28.);
                     } else {
-                        icons::spawn(commands, pick, icons::Glyph::Image, 18.0, MUTED);
+                        text(
+                            commands,
+                            avatar,
+                            font,
+                            c.name
+                                .chars()
+                                .next()
+                                .unwrap_or('?')
+                                .to_uppercase()
+                                .to_string(),
+                            14.,
+                            BLUE,
+                        );
                     }
+                } else {
+                    text(commands, avatar, font, "+", 17., FOCUS);
                 }
+                let name = text(
+                    commands,
+                    who,
+                    font,
+                    if n.speaker.is_some() {
+                        speaker(editor, n)
+                    } else {
+                        "Выбрать персонажа".into()
+                    },
+                    14.,
+                    TEXT,
+                );
+                commands.entity(name).insert((
+                    TextLayout::no_wrap(),
+                    Node {
+                        flex_grow: 1.,
+                        flex_basis: px(0),
+                        min_width: px(0),
+                        overflow: Overflow::clip(),
+                        ..default()
+                    },
+                ));
+                icons::spawn(commands, who, icons::Glyph::ChevronDown, 13., MUTED);
+                picker_fx::layer(commands, who, 2, false, None, n.id);
                 node_field(
                     commands,
                     body,

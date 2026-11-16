@@ -187,7 +187,7 @@ pub(super) fn spawn_native(
     commands: &mut Commands,
     snapshot: &SceneSnapshot,
     parent: Entity,
-) -> Entity {
+) -> (Entity, std::collections::HashMap<u32, Entity>) {
     let root = commands
         .spawn((
             snapshot.clone(),
@@ -198,6 +198,19 @@ pub(super) fn spawn_native(
             ChildOf(parent),
         ))
         .id();
+    let spatial = snapshot
+        .edits
+        .hierarchy
+        .as_ref()
+        .map(|h| h.spawn(commands))
+        .unwrap_or_default();
+    if let Some(graph) = &snapshot.edits.hierarchy {
+        for n in &graph.nodes {
+            if n.entity.parent.is_none() {
+                commands.entity(spatial[&n.key]).insert(ChildOf(root));
+            }
+        }
+    }
     for light in &snapshot.edits.lights {
         let mut light = light.clone();
         if snapshot
@@ -213,8 +226,13 @@ pub(super) fn spawn_native(
         commands
             .entity(entity)
             .insert((ChildOf(root), RenderLayers::layer(super::LAYER)));
+        if let Some(parent) = spatial.get(&light.id) {
+            commands
+                .entity(entity)
+                .insert((Transform::IDENTITY, ChildOf(*parent)));
+        }
     }
-    root
+    (root, spatial)
 }
 
 pub(super) fn prepare(

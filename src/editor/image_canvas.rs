@@ -25,6 +25,33 @@ pub(in crate::editor) struct CanvasMaterial {
     pub selection_style: Vec4,
     #[uniform(6)]
     pub preview_rect: Vec4,
+    #[texture(7)]
+    #[sampler(8)]
+    pub transform_under: Option<Handle<Image>>,
+    #[texture(9)]
+    #[sampler(10)]
+    pub transform_moving: Option<Handle<Image>>,
+    #[texture(11)]
+    #[sampler(12)]
+    pub transform_above: Option<Handle<Image>>,
+    #[uniform(13)]
+    pub transform_rows: [Vec4; 3],
+    #[uniform(14)]
+    pub transform_source: Vec4,
+    #[uniform(15)]
+    pub transform_style: Vec4,
+    #[uniform(16)]
+    pub transform_frame: Vec4,
+    #[texture(17)]
+    #[sampler(18)]
+    pub transform_selection: Option<Handle<Image>>,
+    #[texture(19)]
+    #[sampler(20)]
+    pub pencil_mask: Option<Handle<Image>>,
+    #[uniform(21)]
+    pub pencil_rect: Vec4,
+    #[uniform(22)]
+    pub pencil_color: Vec4,
 }
 
 impl UiMaterial for CanvasMaterial {
@@ -41,6 +68,12 @@ impl Plugin for ImageCanvasPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "image_canvas.wesl");
         app.add_plugins(UiMaterialPlugin::<CanvasMaterial>::default());
+        app.add_systems(
+            Update,
+            super::tool_cursor::pencil::refresh
+                .after(super::tool_cursor::cursor)
+                .after(super::refresh),
+        );
         // UUID handles have no generation and cannot fail insertion.
         let _ = app
             .world_mut()

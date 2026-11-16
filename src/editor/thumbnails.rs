@@ -617,7 +617,7 @@ pub(super) fn update(
             _ => None,
         };
         if let Some(snapshot) = native {
-            let root = scene::spawn_native(&mut commands, snapshot, job.root);
+            let (root, spatial) = scene::spawn_native(&mut commands, snapshot, job.root);
             job.instances.push(root);
             for model in &snapshot.edits.models {
                 let root = crate::runtime::spawn_model(&mut commands, &assets, model);
@@ -625,6 +625,11 @@ pub(super) fn update(
                     .entity(root)
                     .insert(ChildOf(job.root))
                     .observe(scene::prepare);
+                if let Some(parent) = spatial.get(&model.id) {
+                    commands
+                        .entity(root)
+                        .insert((Transform::IDENTITY, ChildOf(*parent)));
+                }
                 job.instances.push(root);
                 job.models.push(crate::runtime::load_model(&assets, model));
             }

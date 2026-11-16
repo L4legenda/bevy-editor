@@ -1,0 +1,14 @@
+{
+  "format":"bevy_scene",
+  "version":1,
+  "id":"c5cad6ad-c6a8-43e1-90a4-568e0d22e4c9",
+  "name":"Лампа",
+  "settings":{},
+  "resources":{
+    "material":{"kind":"data","data":{"color":[0.2,0.3,0.4],"roughness":0.8}}
+  },
+  "entities":[
+    {"id":"body","name":"Корпус","components":{"demo.Material":{"$resource":"material"}}},
+    {"id":"bulb","name":"Свет","parent":"body","transform":{"translation":[0.0,1.2,0.0]},"components":{"light":{"color":[1.0,0.8,0.6],"intensity":800.0}}}
+  ]
+}

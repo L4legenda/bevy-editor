@@ -89,6 +89,9 @@ fn remap_string(path: &mut String, from: &Path, to: &Path) {
 }
 
 fn remap_edits(edits: &mut RoomEdits, from: &Path, to: &Path) {
+    if let Some(graph) = &mut edits.hierarchy {
+        std::sync::Arc::make_mut(graph).remap_paths(from, to);
+    }
     for model in &mut edits.models {
         remap_string(&mut model.asset, from, to);
     }
@@ -488,12 +491,18 @@ fn prepare_to(
         validate_edit_paths(&edits, &from, &to)?;
         let mut new_edits = edits.clone();
         remap_edits(&mut new_edits, &from, &to);
-        if new_edits == edits {
+        let original = fs::read(&absolute)?;
+        let updated = if crate::scene_io::modern(&original)? {
+            crate::scene_io::remap_paths(&original, &from, &to)?
+        } else {
+            if new_edits == edits {
+                continue;
+            }
+            new_edits.encode_document(&scene.file, Some(&original))?
+        };
+        if updated == original {
             continue;
         }
-        let original = fs::read(&absolute)?;
-        let mut updated = serde_json::to_vec_pretty(&new_edits).map_err(io::Error::other)?;
-        updated.push(b'\n');
         rewrites.push(Rewrite {
             before: original_path,
             after: PathBuf::from(&scene.file),
@@ -1301,6 +1310,22 @@ mod tests {
             cameras: editor.project.scenes[0].cameras.clone(),
         });
         edits.write(&files.0, "scenes/room.scene").unwrap();
+        let mut source = crate::scene_format::Scene::from_slice(
+            &fs::read(files.0.join("scenes/room.scene")).unwrap(),
+        )
+        .unwrap();
+        source
+            .entities
+            .iter_mut()
+            .find(|entity| entity.model.is_some())
+            .unwrap()
+            .components
+            .insert("plugin.Future".into(), serde_json::json!({"keep": true}));
+        fs::write(
+            files.0.join("scenes/room.scene"),
+            source.to_source().unwrap(),
+        )
+        .unwrap();
         editor.edits = edits.clone();
         editor.saved = edits;
         fs::write(
@@ -1315,6 +1340,24 @@ mod tests {
         let saved = editor.project.read_scene(0).unwrap();
         assert_eq!(saved.models[0].asset, "archive/chair.glb");
         assert!(saved.scene.is_some());
+        let moved = crate::scene_format::Scene::from_slice(
+            &fs::read(files.0.join("scenes/room.scene")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(moved.id, source.id);
+        assert_eq!(
+            moved.resources.keys().collect::<Vec<_>>(),
+            source.resources.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            moved
+                .entities
+                .iter()
+                .find(|entity| entity.model.is_some())
+                .unwrap()
+                .components["plugin.Future"]["keep"],
+            true
+        );
         let file = browser
             .files
             .iter()
@@ -1329,6 +1372,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(editor.project.scenes[0].file, "archive/room.scene");
+        let relocated = crate::scene_format::Scene::from_slice(
+            &fs::read(files.0.join("archive/room.scene")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(relocated.id, source.id);
         let reopened = EditorProject::load(&files.0).unwrap();
         assert!(reopened.scenes[0].is_native());
         assert_eq!(reopened.read_scene(0).unwrap(), saved);

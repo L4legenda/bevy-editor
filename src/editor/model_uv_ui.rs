@@ -252,7 +252,7 @@ pub(super) fn setup(
         inspector,
         &interface.font,
         "Развёртка",
-        "PartUV Geometric автоматически выбирает швы и создаёт UV-острова. Расчёт выполняется локально на CPU. При первом запуске инструмент установится автоматически.",
+        "PartUV Geometric автоматически выбирает швы и создаёт UV-острова. Нативный движок Rust + C++ входит в редактор и работает локально на CPU. Дополнительная установка не нужна.",
     );
     let choices = wrapping(&mut commands, unwrap);
     for (index, label) in ["Точнее", "Баланс", "Меньше швов"].into_iter().enumerate()

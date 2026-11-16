@@ -155,6 +155,8 @@ void AddMeshJoin(Atlas *atlas);
 
 struct UvMeshDecl
 {
+	// Bevy extension: caller has already identified this whole UV island.
+	bool preserveInputChart = false;
 	const void *vertexUvData = nullptr;
 	const void *indexData = nullptr; // optional
 	const uint32_t *faceMaterialData = nullptr; // Optional. Overlapping UVs should be assigned a different material. Must be indexCount / 3 in length.
@@ -196,6 +198,10 @@ void ComputeCharts(Atlas *atlas, ChartOptions options = ChartOptions());
 
 struct PackOptions
 {
+	// Bevy extension: keep a common isotropic scale, without per-axis texel snapping.
+	bool preserveChartShape = false;
+	// Bevy extension: alternate 180-degree orientations when axis alignment is off.
+	bool rotateAlternateCharts = false;
 	// Charts larger than this will be scaled down. 0 means no limit.
 	uint32_t maxChartSize = 0;
 

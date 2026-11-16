@@ -1,0 +1,2262 @@
+{
+  "method": {
+    "platform": "Windows-10-10.0.19045-SP0",
+    "cpu": "AMD Ryzen 7 2700X, 8 cores / 16 threads",
+    "engine": "4.7-stable (official)",
+    "rust": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "rust_profile": "release",
+    "godot_cache": "warm OS pages, CACHE_MODE_IGNORE_DEEP, 7 retained samples",
+    "rust_cache": "in-memory bytes; warm-up, 21/11 read samples, 5 encode samples",
+    "caution": "Other user builds ran on this machine; medians are workload-specific, not a cross-engine ranking."
+  },
+  "source_unchanged": true,
+  "inventory_totals": {
+    "files": 94,
+    "bytes": 1415052,
+    "nodes": 3169,
+    "external_resources": 1406,
+    "local_resources": 615
+  },
+  "godot_checks": [
+    {
+      "detail": null,
+      "name": "pack res://ownership.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://ownership.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "ownership excludes unowned runtime nodes",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://roundtrip.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://roundtrip.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "unicode and float roundtrip",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "node reference resolves before rename",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "runtime rename leaves a stored NodePath stale",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://roundtrip.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://roundtrip.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "unchanged instance saves deterministically",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "default values omitted from source",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://unknown_saved.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://unknown_saved.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://sharing_false.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://sharing_false.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "resource identity local=false",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "material mutation isolation local=false",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://sharing_true.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://sharing_true.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "resource identity local=true",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "material mutation isolation local=true",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://base.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://base.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://composed.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://composed.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "composition stores an instance reference",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "resource loader reuses cached identity",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "pack res://base.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "save res://base.tscn",
+      "passed": true
+    },
+    {
+      "detail": 7.0,
+      "name": "unmodified instance inherits base updates",
+      "passed": true
+    },
+    {
+      "detail": 3.0,
+      "name": "explicit override survives base updates",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_100.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.tscn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_100.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.scn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_100.compressed.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_100.compressed.scn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_1000.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.tscn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_1000.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.scn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_1000.compressed.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_1000.compressed.scn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_10000.tscn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.tscn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_10000.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.scn sample 7",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark save res://bench_10000.compressed.scn",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 0",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 1",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 2",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 3",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 4",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 5",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 6",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "benchmark instance count res://bench_10000.compressed.scn sample 7",
+      "passed": true
+    }
+  ],
+  "godot_findings": {
+    "unknown_property_accepted": true,
+    "unknown_property_preserved": false,
+    "saved_in_memory_resource_path": ""
+  },
+  "godot_benchmarks": [
+    {
+      "bytes": 13236,
+      "entities": 100,
+      "format": "tscn",
+      "instantiate_median_us": 138.0,
+      "instantiate_samples_us": [
+        123,
+        134,
+        136,
+        138,
+        138,
+        141,
+        244
+      ],
+      "load_median_us": 2620.0,
+      "load_samples_us": [
+        2549,
+        2581,
+        2606,
+        2620,
+        2694,
+        2878,
+        3381
+      ],
+      "pack_us": 2480,
+      "samples": 7,
+      "save_us": 1525
+    },
+    {
+      "bytes": 11146,
+      "entities": 100,
+      "format": "scn",
+      "instantiate_median_us": 103.0,
+      "instantiate_samples_us": [
+        101,
+        101,
+        102,
+        103,
+        104,
+        105,
+        120
+      ],
+      "load_median_us": 395.0,
+      "load_samples_us": [
+        381,
+        390,
+        393,
+        395,
+        399,
+        454,
+        473
+      ],
+      "pack_us": 2480,
+      "samples": 7,
+      "save_us": 1112
+    },
+    {
+      "bytes": 1653,
+      "entities": 100,
+      "format": "compressed.scn",
+      "instantiate_median_us": 103.0,
+      "instantiate_samples_us": [
+        102,
+        102,
+        103,
+        103,
+        103,
+        107,
+        109
+      ],
+      "load_median_us": 375.0,
+      "load_samples_us": [
+        355,
+        357,
+        368,
+        375,
+        377,
+        395,
+        491
+      ],
+      "pack_us": 2480,
+      "samples": 7,
+      "save_us": 590
+    },
+    {
+      "bytes": 133140,
+      "entities": 1000,
+      "format": "tscn",
+      "instantiate_median_us": 1504.0,
+      "instantiate_samples_us": [
+        1343,
+        1373,
+        1395,
+        1504,
+        1568,
+        1613,
+        1640
+      ],
+      "load_median_us": 23035.0,
+      "load_samples_us": [
+        22181,
+        22876,
+        22946,
+        23035,
+        23303,
+        23703,
+        24630
+      ],
+      "pack_us": 18607,
+      "samples": 7,
+      "save_us": 9627
+    },
+    {
+      "bytes": 107446,
+      "entities": 1000,
+      "format": "scn",
+      "instantiate_median_us": 1469.0,
+      "instantiate_samples_us": [
+        1385,
+        1412,
+        1450,
+        1469,
+        1484,
+        1527,
+        1907
+      ],
+      "load_median_us": 2246.0,
+      "load_samples_us": [
+        2082,
+        2103,
+        2208,
+        2246,
+        2441,
+        2578,
+        2596
+      ],
+      "pack_us": 18607,
+      "samples": 7,
+      "save_us": 1753
+    },
+    {
+      "bytes": 11572,
+      "entities": 1000,
+      "format": "compressed.scn",
+      "instantiate_median_us": 1413.0,
+      "instantiate_samples_us": [
+        1039,
+        1164,
+        1387,
+        1413,
+        1423,
+        1521,
+        1698
+      ],
+      "load_median_us": 1840.0,
+      "load_samples_us": [
+        1471,
+        1734,
+        1823,
+        1840,
+        1942,
+        2019,
+        2340
+      ],
+      "pack_us": 18607,
+      "samples": 7,
+      "save_us": 1703
+    },
+    {
+      "bytes": 1350410,
+      "entities": 10000,
+      "format": "tscn",
+      "instantiate_median_us": 16537.0,
+      "instantiate_samples_us": [
+        15743,
+        16045,
+        16331,
+        16537,
+        16578,
+        17043,
+        17772
+      ],
+      "load_median_us": 217294.0,
+      "load_samples_us": [
+        213252,
+        213616,
+        214389,
+        217294,
+        219748,
+        221776,
+        225824
+      ],
+      "pack_us": 200773,
+      "samples": 7,
+      "save_us": 102254
+    },
+    {
+      "bytes": 1079446,
+      "entities": 10000,
+      "format": "scn",
+      "instantiate_median_us": 14358.0,
+      "instantiate_samples_us": [
+        13529,
+        13887,
+        14273,
+        14358,
+        14464,
+        14506,
+        14589
+      ],
+      "load_median_us": 14832.0,
+      "load_samples_us": [
+        14416,
+        14616,
+        14793,
+        14832,
+        15015,
+        15281,
+        15739
+      ],
+      "pack_us": 200773,
+      "samples": 7,
+      "save_us": 16255
+    },
+    {
+      "bytes": 109640,
+      "entities": 10000,
+      "format": "compressed.scn",
+      "instantiate_median_us": 14093.0,
+      "instantiate_samples_us": [
+        13694,
+        13952,
+        13982,
+        14093,
+        14183,
+        14576,
+        15369
+      ],
+      "load_median_us": 10655.0,
+      "load_samples_us": [
+        10509,
+        10529,
+        10543,
+        10655,
+        11012,
+        11044,
+        12666
+      ],
+      "pack_us": 200773,
+      "samples": 7,
+      "save_us": 12132
+    }
+  ],
+  "rust_benchmarks": [
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "legacy_typed_parse_only",
+      "bytes": 35507,
+      "median_us": 164.9,
+      "p95_us": 191.7,
+      "samples_us": [
+        126.2,
+        149.29999999999998,
+        157.2,
+        158.0,
+        159.1,
+        159.8,
+        160.9,
+        161.4,
+        162.0,
+        164.5,
+        164.9,
+        165.6,
+        165.7,
+        166.3,
+        167.4,
+        175.60000000000002,
+        176.5,
+        179.0,
+        187.5,
+        191.7,
+        210.9
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "source_parse_validate",
+      "bytes": 15374,
+      "median_us": 192.6,
+      "p95_us": 253.00000000000003,
+      "samples_us": [
+        159.4,
+        176.79999999999998,
+        183.5,
+        184.79999999999998,
+        184.9,
+        187.1,
+        188.1,
+        189.6,
+        191.39999999999998,
+        192.20000000000002,
+        192.6,
+        192.9,
+        193.4,
+        193.9,
+        199.29999999999998,
+        201.29999999999998,
+        206.0,
+        213.1,
+        240.8,
+        253.00000000000003,
+        254.5
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "packed_checked_view",
+      "bytes": 10272,
+      "median_us": 34.8,
+      "p95_us": 37.2,
+      "samples_us": [
+        33.0,
+        33.300000000000004,
+        34.0,
+        34.1,
+        34.199999999999996,
+        34.199999999999996,
+        34.3,
+        34.5,
+        34.8,
+        34.8,
+        34.8,
+        35.2,
+        35.2,
+        35.7,
+        35.9,
+        35.9,
+        36.5,
+        36.6,
+        37.0,
+        37.2,
+        46.1
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "lz4_checked_view",
+      "bytes": 3193,
+      "median_us": 39.7,
+      "p95_us": 45.5,
+      "samples_us": [
+        35.7,
+        36.8,
+        37.2,
+        37.6,
+        37.8,
+        38.0,
+        38.099999999999994,
+        38.099999999999994,
+        38.5,
+        39.0,
+        39.7,
+        39.7,
+        40.7,
+        41.699999999999996,
+        41.8,
+        42.3,
+        42.5,
+        42.6,
+        43.099999999999994,
+        45.5,
+        47.2
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "packed_full_materialize",
+      "bytes": 10272,
+      "median_us": 161.7,
+      "p95_us": 203.9,
+      "samples_us": [
+        138.2,
+        144.6,
+        144.79999999999998,
+        145.5,
+        148.2,
+        154.3,
+        154.79999999999998,
+        155.7,
+        160.6,
+        161.29999999999998,
+        161.7,
+        162.10000000000002,
+        163.39999999999998,
+        164.20000000000002,
+        166.89999999999998,
+        168.9,
+        169.0,
+        169.6,
+        185.60000000000002,
+        203.9,
+        208.0
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "source_encode_validate",
+      "bytes": 15374,
+      "median_us": 91.10000000000001,
+      "p95_us": 94.4,
+      "samples_us": [
+        74.0,
+        83.6,
+        91.10000000000001,
+        93.0,
+        94.4
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "compile_validate",
+      "bytes": 10272,
+      "median_us": 160.6,
+      "p95_us": 212.20000000000002,
+      "samples_us": [
+        141.7,
+        151.8,
+        160.6,
+        194.9,
+        212.20000000000002
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "transforms",
+      "format": "lz4_encode_validate",
+      "bytes": 3193,
+      "median_us": 63.0,
+      "p95_us": 95.60000000000001,
+      "samples_us": [
+        47.3,
+        51.5,
+        63.0,
+        66.9,
+        95.60000000000001
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "source_parse_validate",
+      "bytes": 30874,
+      "median_us": 533.4,
+      "p95_us": 562.8000000000001,
+      "samples_us": [
+        506.79999999999995,
+        513.9,
+        517.1,
+        521.5,
+        524.7,
+        525.6,
+        526.5,
+        528.1,
+        532.2,
+        533.4,
+        533.4,
+        537.4000000000001,
+        538.4,
+        542.0,
+        545.3,
+        548.3000000000001,
+        554.8000000000001,
+        561.6,
+        562.3,
+        562.8000000000001,
+        637.9
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "packed_checked_view",
+      "bytes": 10348,
+      "median_us": 36.4,
+      "p95_us": 37.9,
+      "samples_us": [
+        34.7,
+        34.7,
+        34.9,
+        35.4,
+        35.5,
+        35.800000000000004,
+        36.199999999999996,
+        36.199999999999996,
+        36.199999999999996,
+        36.199999999999996,
+        36.4,
+        36.5,
+        36.5,
+        36.5,
+        36.5,
+        36.6,
+        36.699999999999996,
+        36.699999999999996,
+        37.1,
+        37.9,
+        44.199999999999996
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "lz4_checked_view",
+      "bytes": 3276,
+      "median_us": 41.9,
+      "p95_us": 44.5,
+      "samples_us": [
+        40.800000000000004,
+        41.0,
+        41.0,
+        41.1,
+        41.300000000000004,
+        41.4,
+        41.5,
+        41.5,
+        41.8,
+        41.9,
+        41.9,
+        42.1,
+        42.1,
+        42.1,
+        42.7,
+        42.8,
+        42.8,
+        42.9,
+        43.4,
+        44.5,
+        56.9
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "packed_full_materialize",
+      "bytes": 10348,
+      "median_us": 422.6,
+      "p95_us": 447.1,
+      "samples_us": [
+        399.4,
+        403.8,
+        409.7,
+        414.0,
+        414.4,
+        416.0,
+        417.7,
+        418.9,
+        419.2,
+        422.6,
+        422.6,
+        426.2,
+        427.2,
+        429.7,
+        431.7,
+        432.4,
+        435.1,
+        442.5,
+        444.40000000000003,
+        447.1,
+        476.0
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "source_encode_validate",
+      "bytes": 30874,
+      "median_us": 127.30000000000001,
+      "p95_us": 152.20000000000002,
+      "samples_us": [
+        120.60000000000001,
+        120.89999999999999,
+        127.30000000000001,
+        139.8,
+        152.20000000000002
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "compile_validate",
+      "bytes": 10348,
+      "median_us": 247.8,
+      "p95_us": 274.0,
+      "samples_us": [
+        218.0,
+        240.9,
+        247.8,
+        249.5,
+        274.0
+      ]
+    },
+    {
+      "entities": 100,
+      "profile": "components",
+      "format": "lz4_encode_validate",
+      "bytes": 3276,
+      "median_us": 40.3,
+      "p95_us": 57.7,
+      "samples_us": [
+        38.800000000000004,
+        39.8,
+        40.3,
+        41.9,
+        57.7
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "legacy_typed_parse_only",
+      "bytes": 357619,
+      "median_us": 1214.5,
+      "p95_us": 1731.8999999999999,
+      "samples_us": [
+        1133.8999999999999,
+        1137.4,
+        1141.4,
+        1146.8,
+        1147.5,
+        1150.0,
+        1152.1999999999998,
+        1164.6,
+        1168.8,
+        1177.5,
+        1214.5,
+        1218.1,
+        1221.5,
+        1520.3,
+        1591.9,
+        1624.4,
+        1630.1,
+        1646.0,
+        1696.8,
+        1731.8999999999999,
+        1787.6000000000001
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "source_parse_validate",
+      "bytes": 152984,
+      "median_us": 1640.8,
+      "p95_us": 2619.1,
+      "samples_us": [
+        1445.5,
+        1462.2,
+        1468.8,
+        1483.8,
+        1505.7,
+        1507.6,
+        1510.8000000000002,
+        1548.7,
+        1575.4,
+        1637.8,
+        1640.8,
+        1763.1999999999998,
+        1881.5,
+        2250.7,
+        2303.7000000000003,
+        2458.8,
+        2466.9,
+        2536.3,
+        2614.3,
+        2619.1,
+        2702.6
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "packed_checked_view",
+      "bytes": 99372,
+      "median_us": 327.2,
+      "p95_us": 359.2,
+      "samples_us": [
+        308.3,
+        310.5,
+        310.7,
+        318.8,
+        321.6,
+        323.09999999999997,
+        323.3,
+        324.20000000000005,
+        326.5,
+        326.6,
+        327.2,
+        331.7,
+        333.0,
+        340.8,
+        341.0,
+        341.1,
+        345.5,
+        346.8,
+        353.3,
+        359.2,
+        381.7
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "lz4_checked_view",
+      "bytes": 25807,
+      "median_us": 377.5,
+      "p95_us": 404.70000000000005,
+      "samples_us": [
+        358.0,
+        362.5,
+        364.5,
+        364.5,
+        369.1,
+        369.7,
+        372.2,
+        372.7,
+        376.3,
+        377.1,
+        377.5,
+        379.40000000000003,
+        379.5,
+        380.7,
+        383.0,
+        385.2,
+        386.8,
+        388.5,
+        389.2,
+        404.70000000000005,
+        421.5
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "packed_full_materialize",
+      "bytes": 99372,
+      "median_us": 1245.7,
+      "p95_us": 1320.3,
+      "samples_us": [
+        1194.6999999999998,
+        1197.6999999999998,
+        1198.8000000000002,
+        1203.8000000000002,
+        1224.4,
+        1228.9,
+        1229.8999999999999,
+        1231.8999999999999,
+        1233.0,
+        1244.0,
+        1245.7,
+        1262.8,
+        1268.0,
+        1271.0,
+        1274.6999999999998,
+        1286.6,
+        1288.1,
+        1293.0,
+        1314.6,
+        1320.3,
+        1815.8
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "source_encode_validate",
+      "bytes": 152984,
+      "median_us": 697.6,
+      "p95_us": 714.8000000000001,
+      "samples_us": [
+        695.8,
+        696.3,
+        697.6,
+        698.0,
+        714.8000000000001
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "compile_validate",
+      "bytes": 99372,
+      "median_us": 1664.6,
+      "p95_us": 1817.2,
+      "samples_us": [
+        1628.3999999999999,
+        1633.3000000000002,
+        1664.6,
+        1703.0,
+        1817.2
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "transforms",
+      "format": "lz4_encode_validate",
+      "bytes": 25807,
+      "median_us": 449.7,
+      "p95_us": 552.7,
+      "samples_us": [
+        438.1,
+        439.0,
+        449.7,
+        454.8,
+        552.7
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "source_parse_validate",
+      "bytes": 307984,
+      "median_us": 4446.099999999999,
+      "p95_us": 6190.8,
+      "samples_us": [
+        3878.2999999999997,
+        4028.2,
+        4118.5,
+        4127.5,
+        4195.9,
+        4216.2,
+        4250.2,
+        4353.3,
+        4361.5,
+        4380.700000000001,
+        4446.099999999999,
+        4628.8,
+        4638.599999999999,
+        4649.0,
+        4772.9,
+        4798.700000000001,
+        4947.2,
+        5686.1,
+        5728.4,
+        6190.8,
+        6454.1
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "packed_checked_view",
+      "bytes": 99448,
+      "median_us": 229.29999999999998,
+      "p95_us": 236.8,
+      "samples_us": [
+        228.4,
+        228.6,
+        228.7,
+        228.8,
+        228.8,
+        228.8,
+        228.9,
+        229.0,
+        229.10000000000002,
+        229.29999999999998,
+        229.29999999999998,
+        230.10000000000002,
+        231.20000000000002,
+        231.9,
+        232.1,
+        232.5,
+        232.5,
+        233.60000000000002,
+        234.2,
+        236.8,
+        274.8
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "lz4_checked_view",
+      "bytes": 25888,
+      "median_us": 261.6,
+      "p95_us": 345.09999999999997,
+      "samples_us": [
+        260.9,
+        261.0,
+        261.1,
+        261.1,
+        261.2,
+        261.2,
+        261.40000000000003,
+        261.40000000000003,
+        261.40000000000003,
+        261.6,
+        261.6,
+        261.8,
+        262.4,
+        263.90000000000003,
+        264.7,
+        265.09999999999997,
+        267.90000000000003,
+        271.9,
+        287.7,
+        345.09999999999997,
+        345.6
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "packed_full_materialize",
+      "bytes": 99448,
+      "median_us": 3235.9,
+      "p95_us": 4376.1,
+      "samples_us": [
+        2724.2,
+        2898.8,
+        2901.0,
+        2943.2999999999997,
+        3090.2999999999997,
+        3111.3999999999996,
+        3126.2999999999997,
+        3199.7000000000003,
+        3201.2999999999997,
+        3205.7000000000003,
+        3235.9,
+        3422.3,
+        3464.8,
+        3707.1,
+        3805.2,
+        3981.3,
+        4190.6,
+        4267.7,
+        4320.0,
+        4376.1,
+        4989.3
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "source_encode_validate",
+      "bytes": 307984,
+      "median_us": 1922.0,
+      "p95_us": 2484.9,
+      "samples_us": [
+        1804.1000000000001,
+        1875.5,
+        1922.0,
+        2108.8,
+        2484.9
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "compile_validate",
+      "bytes": 99448,
+      "median_us": 2457.2000000000003,
+      "p95_us": 4248.5,
+      "samples_us": [
+        1942.6000000000001,
+        2325.2,
+        2457.2000000000003,
+        2537.9,
+        4248.5
+      ]
+    },
+    {
+      "entities": 1000,
+      "profile": "components",
+      "format": "lz4_encode_validate",
+      "bytes": 25888,
+      "median_us": 299.40000000000003,
+      "p95_us": 346.5,
+      "samples_us": [
+        291.5,
+        293.1,
+        299.40000000000003,
+        299.5,
+        346.5
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "legacy_typed_parse_only",
+      "bytes": 3614721,
+      "median_us": 11843.5,
+      "p95_us": 16281.8,
+      "samples_us": [
+        10932.900000000001,
+        11016.800000000001,
+        11185.699999999999,
+        11323.400000000001,
+        11325.699999999999,
+        11409.199999999999,
+        11450.9,
+        11516.3,
+        11561.800000000001,
+        11820.300000000001,
+        11843.5,
+        12048.1,
+        12172.8,
+        12260.2,
+        12414.9,
+        12614.9,
+        12950.400000000001,
+        15234.599999999999,
+        16058.900000000001,
+        16281.8,
+        17755.199999999997
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "source_parse_validate",
+      "bytes": 1547084,
+      "median_us": 28438.8,
+      "p95_us": 32855.5,
+      "samples_us": [
+        17022.6,
+        18481.899999999998,
+        24115.399999999998,
+        26605.7,
+        26650.9,
+        27008.600000000002,
+        27033.5,
+        27690.800000000003,
+        27852.399999999998,
+        28227.5,
+        28438.8,
+        28698.600000000002,
+        29711.0,
+        30455.4,
+        30530.2,
+        30928.8,
+        31427.6,
+        31660.6,
+        31799.399999999998,
+        32855.5,
+        34299.4
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "packed_checked_view",
+      "bytes": 999372,
+      "median_us": 4556.400000000001,
+      "p95_us": 6968.6,
+      "samples_us": [
+        3346.7000000000003,
+        3381.7000000000003,
+        3498.2,
+        3568.8999999999996,
+        3807.6,
+        3842.7000000000003,
+        4192.4,
+        4209.3,
+        4214.7,
+        4296.6,
+        4556.400000000001,
+        4908.400000000001,
+        5002.099999999999,
+        5302.5,
+        5595.1,
+        5632.9,
+        6188.8,
+        6250.099999999999,
+        6592.1,
+        6968.6,
+        12151.4
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "lz4_checked_view",
+      "bytes": 255529,
+      "median_us": 5264.7,
+      "p95_us": 7245.0,
+      "samples_us": [
+        4512.7,
+        4604.2,
+        4709.2,
+        4773.7,
+        4806.6,
+        4920.1,
+        5012.7,
+        5117.799999999999,
+        5206.2,
+        5225.3,
+        5264.7,
+        5334.400000000001,
+        5380.099999999999,
+        5503.2,
+        5736.3,
+        6205.2,
+        6220.200000000001,
+        6523.9,
+        7236.5,
+        7245.0,
+        8937.199999999999
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "packed_full_materialize",
+      "bytes": 999372,
+      "median_us": 26876.0,
+      "p95_us": 30955.5,
+      "samples_us": [
+        21316.5,
+        21545.100000000002,
+        21613.1,
+        22624.2,
+        22653.4,
+        22691.5,
+        24294.300000000003,
+        25150.5,
+        26607.7,
+        26848.899999999998,
+        26876.0,
+        27251.1,
+        27264.7,
+        27911.7,
+        28047.4,
+        28068.4,
+        28366.6,
+        29579.7,
+        30071.7,
+        30955.5,
+        34901.4
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "source_encode_validate",
+      "bytes": 1547084,
+      "median_us": 18431.1,
+      "p95_us": 24041.1,
+      "samples_us": [
+        15051.3,
+        16433.199999999997,
+        18431.1,
+        22546.5,
+        24041.1
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "compile_validate",
+      "bytes": 999372,
+      "median_us": 34297.8,
+      "p95_us": 39875.8,
+      "samples_us": [
+        30456.3,
+        33825.4,
+        34297.8,
+        39455.5,
+        39875.8
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "transforms",
+      "format": "lz4_encode_validate",
+      "bytes": 255529,
+      "median_us": 5247.1,
+      "p95_us": 5614.0,
+      "samples_us": [
+        4079.0999999999995,
+        4565.6,
+        5247.1,
+        5544.5,
+        5614.0
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "source_parse_validate",
+      "bytes": 3097084,
+      "median_us": 39510.9,
+      "p95_us": 52579.2,
+      "samples_us": [
+        36839.5,
+        37006.6,
+        37031.4,
+        37781.799999999996,
+        37959.100000000006,
+        37977.700000000004,
+        38595.8,
+        38746.299999999996,
+        38834.100000000006,
+        38901.6,
+        39510.9,
+        39620.200000000004,
+        39959.5,
+        41499.7,
+        41815.2,
+        42939.8,
+        45089.4,
+        46363.799999999996,
+        50498.4,
+        52579.2,
+        54310.1
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "packed_checked_view",
+      "bytes": 999448,
+      "median_us": 2067.7999999999997,
+      "p95_us": 2115.5,
+      "samples_us": [
+        2044.7,
+        2046.8999999999999,
+        2047.7999999999997,
+        2049.2000000000003,
+        2049.3999999999996,
+        2053.1,
+        2058.7999999999997,
+        2062.2000000000003,
+        2065.8999999999996,
+        2067.5,
+        2067.7999999999997,
+        2071.2,
+        2075.3999999999996,
+        2076.1,
+        2078.2999999999997,
+        2079.1,
+        2086.7,
+        2096.6,
+        2105.2000000000003,
+        2115.5,
+        2162.5
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "lz4_checked_view",
+      "bytes": 255627,
+      "median_us": 2566.2,
+      "p95_us": 2877.7999999999997,
+      "samples_us": [
+        2205.0,
+        2246.9,
+        2314.2000000000003,
+        2503.6,
+        2520.1,
+        2520.5,
+        2524.1,
+        2525.9,
+        2530.6,
+        2555.2999999999997,
+        2566.2,
+        2572.1,
+        2614.2000000000003,
+        2617.2999999999997,
+        2618.1,
+        2624.0,
+        2644.8,
+        2678.3,
+        2680.9,
+        2877.7999999999997,
+        3151.4
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "packed_full_materialize",
+      "bytes": 999448,
+      "median_us": 34536.8,
+      "p95_us": 40825.8,
+      "samples_us": [
+        32334.2,
+        32447.999999999996,
+        33246.8,
+        33315.200000000004,
+        33413.0,
+        33954.7,
+        34112.700000000004,
+        34181.200000000004,
+        34298.299999999996,
+        34363.1,
+        34536.8,
+        34813.6,
+        34874.799999999996,
+        35089.200000000004,
+        36151.700000000004,
+        36524.2,
+        36527.1,
+        38022.7,
+        38178.200000000004,
+        40825.8,
+        42460.6
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "source_encode_validate",
+      "bytes": 3097084,
+      "median_us": 21452.6,
+      "p95_us": 24915.8,
+      "samples_us": [
+        20701.600000000002,
+        20937.2,
+        21452.6,
+        23744.3,
+        24915.8
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "compile_validate",
+      "bytes": 999448,
+      "median_us": 41103.2,
+      "p95_us": 52930.7,
+      "samples_us": [
+        37807.2,
+        41085.700000000004,
+        41103.2,
+        47016.4,
+        52930.7
+      ]
+    },
+    {
+      "entities": 10000,
+      "profile": "components",
+      "format": "lz4_encode_validate",
+      "bytes": 255627,
+      "median_us": 4299.5,
+      "p95_us": 5234.400000000001,
+      "samples_us": [
+        3863.2,
+        3998.2000000000003,
+        4299.5,
+        5166.099999999999,
+        5234.400000000001
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "legacy_typed_parse_only",
+      "bytes": 36545723,
+      "median_us": 116142.9,
+      "p95_us": 129845.09999999999,
+      "samples_us": [
+        109946.9,
+        110440.8,
+        112649.6,
+        113370.0,
+        114610.7,
+        116142.9,
+        120838.9,
+        121639.9,
+        122183.20000000001,
+        126865.8,
+        129845.09999999999
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "source_parse_validate",
+      "bytes": 15668084,
+      "median_us": 141526.90000000002,
+      "p95_us": 156766.19999999998,
+      "samples_us": [
+        136708.2,
+        137124.1,
+        137608.1,
+        137705.0,
+        138955.4,
+        141526.90000000002,
+        142272.5,
+        142842.69999999998,
+        145652.0,
+        147673.30000000002,
+        156766.19999999998
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "packed_checked_view",
+      "bytes": 10089372,
+      "median_us": 26946.0,
+      "p95_us": 32018.3,
+      "samples_us": [
+        25698.9,
+        26016.0,
+        26037.3,
+        26650.0,
+        26681.7,
+        26946.0,
+        29622.9,
+        29754.1,
+        31514.399999999998,
+        31975.000000000004,
+        32018.3
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "lz4_checked_view",
+      "bytes": 2556463,
+      "median_us": 32379.9,
+      "p95_us": 36685.1,
+      "samples_us": [
+        31071.100000000002,
+        31337.9,
+        31644.5,
+        31981.1,
+        32044.2,
+        32379.9,
+        32897.299999999996,
+        34552.3,
+        35079.399999999994,
+        36177.2,
+        36685.1
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "packed_full_materialize",
+      "bytes": 10089372,
+      "median_us": 126117.5,
+      "p95_us": 140416.6,
+      "samples_us": [
+        115436.9,
+        117346.40000000001,
+        123477.3,
+        125430.8,
+        125710.4,
+        126117.5,
+        127025.1,
+        128307.8,
+        128660.9,
+        130672.90000000001,
+        140416.6
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "source_encode_validate",
+      "bytes": 15668084,
+      "median_us": 88820.6,
+      "p95_us": 91786.2,
+      "samples_us": [
+        84215.0,
+        85496.9,
+        88820.6,
+        91273.40000000001,
+        91786.2
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "compile_validate",
+      "bytes": 10089372,
+      "median_us": 206127.9,
+      "p95_us": 212345.9,
+      "samples_us": [
+        192809.1,
+        203356.5,
+        206127.9,
+        212286.6,
+        212345.9
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "transforms",
+      "format": "lz4_encode_validate",
+      "bytes": 2556463,
+      "median_us": 42312.799999999996,
+      "p95_us": 49120.6,
+      "samples_us": [
+        38354.600000000006,
+        40317.1,
+        42312.799999999996,
+        44432.600000000006,
+        49120.6
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "source_parse_validate",
+      "bytes": 31168084,
+      "median_us": 367311.80000000005,
+      "p95_us": 383830.89999999997,
+      "samples_us": [
+        354467.5,
+        356981.5,
+        360209.2,
+        363335.89999999997,
+        366638.39999999997,
+        367311.80000000005,
+        368115.39999999997,
+        369108.0,
+        372041.2,
+        373427.5,
+        383830.89999999997
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "packed_checked_view",
+      "bytes": 10089448,
+      "median_us": 26525.0,
+      "p95_us": 28879.7,
+      "samples_us": [
+        25041.399999999998,
+        25896.2,
+        26047.600000000002,
+        26050.0,
+        26227.0,
+        26525.0,
+        26837.0,
+        26952.5,
+        27238.8,
+        27338.7,
+        28879.7
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "lz4_checked_view",
+      "bytes": 2556727,
+      "median_us": 31047.9,
+      "p95_us": 36628.6,
+      "samples_us": [
+        28096.2,
+        28777.7,
+        28979.100000000002,
+        29918.899999999998,
+        30505.399999999998,
+        31047.9,
+        31399.1,
+        31652.600000000002,
+        32019.3,
+        33727.7,
+        36628.6
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "packed_full_materialize",
+      "bytes": 10089448,
+      "median_us": 312158.0,
+      "p95_us": 325594.1,
+      "samples_us": [
+        295473.0,
+        301547.10000000003,
+        302410.10000000003,
+        304463.6,
+        310702.9,
+        312158.0,
+        319367.4,
+        321234.10000000003,
+        321928.8,
+        323225.2,
+        325594.1
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "source_encode_validate",
+      "bytes": 31168084,
+      "median_us": 192419.7,
+      "p95_us": 198309.90000000002,
+      "samples_us": [
+        185487.6,
+        191671.0,
+        192419.7,
+        194680.8,
+        198309.90000000002
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "compile_validate",
+      "bytes": 10089448,
+      "median_us": 350144.0,
+      "p95_us": 368808.6,
+      "samples_us": [
+        343218.8,
+        349493.3,
+        350144.0,
+        350521.1,
+        368808.6
+      ]
+    },
+    {
+      "entities": 100000,
+      "profile": "components",
+      "format": "lz4_encode_validate",
+      "bytes": 2556727,
+      "median_us": 34925.9,
+      "p95_us": 37251.3,
+      "samples_us": [
+        34036.0,
+        34094.0,
+        34925.9,
+        35823.6,
+        37251.3
+      ]
+    }
+  ],
+  "git_merge_checks": {
+    "property_lines": {
+      "merged_without_conflict": true,
+      "conflicts": 0
+    },
+    "compact_entity_lines": {
+      "merged_without_conflict": false,
+      "conflicts": 1
+    },
+    "tscn_property_lines": {
+      "merged_without_conflict": true,
+      "conflicts": 0
+    }
+  },
+  "inline_animation_example": {
+    "scene_bytes": 366959,
+    "animation_bytes": 357183,
+    "animations": 13
+  },
+  "verification": {
+    "Контрактные тесты ядра": "22 пройдены, включая 5000 случайных некорректных входов",
+    "Совместимость, миграция и бинарное чтение без editor": "11 пройдены",
+    "Регрессионные тесты сцен в редакторе": "49 пройдены, 12 GPU-тестов пропущены в обычном запуске",
+    "Отдельная GPU-проверка открытия, правки, сохранения и превью": "1 пройдена с GLB и скопированной HDRI, ошибок загрузки ассетов нет",
+    "Статические проверки": "cargo fmt --check, cargo clippy --all-targets -D warnings, git diff --check пройдены для формата",
+    "CLI-компиляция композиции": "6 сущностей, 2 ресурса; raw 1621 байт, LZ4 1044 байта",
+    "Общая рабочая папка": "повторный общий build во время проверки встречал ошибки параллельных изменений редактора изображений; GPU-тест выполнен на актуальном собранном тестовом бинарнике"
+  }
+}

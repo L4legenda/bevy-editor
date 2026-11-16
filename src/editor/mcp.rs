@@ -261,6 +261,7 @@ fn process(
 
 fn object_id(editor: &Editor, target: Selection) -> String {
     let suffix = match target {
+        Selection::Node(key) => format!("node:{key}"),
         Selection::Imported(index) => format!("imported:{}", editor.imported[index].name),
         Selection::Model(id) => format!("model:{id}"),
         Selection::Camera(index) => format!("camera:{}", editor.definition().cameras[index].id),
@@ -280,6 +281,16 @@ fn resolve(editor: &Editor, id: &str) -> Result<Selection, String> {
             .iter()
             .position(|node| node.name == name)
             .map(Selection::Imported)
+    } else if let Some(key) = suffix
+        .strip_prefix("node:")
+        .and_then(|id| id.parse::<u32>().ok())
+    {
+        editor
+            .edits
+            .hierarchy
+            .as_ref()
+            .and_then(|h| h.node(key))
+            .map(|_| Selection::Node(key))
     } else if let Some(id) = suffix
         .strip_prefix("model:")
         .and_then(|id| id.parse::<u32>().ok())
@@ -312,6 +323,7 @@ fn transform_json(pose: crate::Pose) -> Value {
 
 fn object(editor: &Editor, target: Selection) -> Value {
     let kind = match target {
+        Selection::Node(_) => "node",
         Selection::Imported(_) => "imported",
         Selection::Model(_) => "model",
         Selection::Camera(_) => "camera",
@@ -324,6 +336,18 @@ fn object(editor: &Editor, target: Selection) -> Value {
         "editable": { "position": (0..3).map(|axis| editor.field_allowed(target, Field::Position(axis))).collect::<Vec<_>>(),
             "rotation": (0..3).map(|axis| editor.field_allowed(target, Field::Rotation(axis))).collect::<Vec<_>>(),
             "scale": (0..3).map(|axis| editor.field_allowed(target, Field::Scale(axis))).collect::<Vec<_>>() } });
+    if let Some(key) = editor.hierarchy_key(target) {
+        let h = editor.edits.hierarchy.as_ref().unwrap();
+        let n = h.node(key).unwrap();
+        value["parent"] = json!(
+            h.parent(key)
+                .map(|n| object_id(editor, editor.hierarchy_selection(n.key)))
+        );
+        value["local_transform"] = transform_json(n.local());
+        value["scene_instance"] = json!(n.instance);
+        value["inherited"] = json!(n.inherited());
+        value["overridden"] = json!(h.overridden(key));
+    }
     match target {
         Selection::Light(id) => value["light"] = json!(editor.light(id)),
         Selection::Camera(shot) => {
@@ -454,6 +478,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             .chain(editor.edits.models.iter().map(|model| Selection::Model(model.id)))
             .chain((0..editor.definition().cameras.len()).map(Selection::Camera))
             .chain(editor.edits.lights.iter().map(|light| Selection::Light(light.id)))
+            .chain(editor.edits.hierarchy.iter().flat_map(|h|h.nodes.iter().filter(|n|n.entity.model.is_none()&&n.camera.is_none()&&!n.entity.components.contains_key("light")).map(|n|Selection::Node(n.key))))
             .chain([Selection::Environment]).map(|target| object(editor, target)), args),
         Command::Assets(args) => page(editor.project.catalog.iter().map(|item| json!({
             "asset": item.asset, "name": item.label, "category": item.category, "solid": item.solid
@@ -524,6 +549,11 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
         }
         Command::Remove(args) => {
             let target = resolve(editor, &args.object_id)?;
+            if let Some(key)=editor.hierarchy_key(target){
+                let before=editor.edits.clone();
+                editor.edit_hierarchy(|h|h.delete(&[key])).ok_or_else(||editor.status.clone())?;
+                editor.finish_edit(before);return Ok(state(editor));
+            }
             if !matches!(target, Selection::Model(_) | Selection::Light(_)) { return Err("Only added models and lights can be removed; hide imported objects instead".into()); }
             let before = editor.edits.clone();
             match target {
@@ -558,11 +588,14 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             Ok(state(editor))
         }
         Command::Undo | Command::Redo => {
+            let selected=editor.hierarchy_selection_snapshot();
             let redo = matches!(command, Command::Redo);
             let history = if redo { &mut editor.redo } else { &mut editor.undo };
             let edits = history.pop().ok_or(if redo { "Nothing to redo" } else { "Nothing to undo" })?;
             let previous = std::mem::replace(&mut editor.edits, edits);
             if redo { editor.undo.push(previous); } else { editor.redo.push(previous); }
+            editor.sync_hierarchy_metadata();
+            editor.restore_hierarchy_selection(selected);
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }

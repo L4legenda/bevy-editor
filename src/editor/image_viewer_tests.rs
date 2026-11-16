@@ -26,6 +26,8 @@ mod layer_ux;
 mod painting;
 #[path = "image_panel_resize_tests.rs"]
 mod panel_sizing;
+#[path = "image_pencil_tests.rs"]
+mod pencil;
 #[path = "image_canvas_tests.rs"]
 mod pixel_canvas;
 #[path = "image_eraser_tests.rs"]
@@ -775,8 +777,10 @@ fn click_control_offset(
         controls
             .iter(world)
             .find_map(|(control, node, transform)| {
-                (wanted(control.action) && !node.is_empty())
-                    .then_some(transform.affine().translation + node.size() * relative_offset)
+                (wanted(control.action) && !node.is_empty()).then_some(
+                    (transform.affine().translation + node.size() * relative_offset)
+                        * node.inverse_scale_factor(),
+                )
             })
             .expect("Missing document tab control")
     };

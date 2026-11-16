@@ -16,6 +16,10 @@ mod filenames;
 mod links;
 #[path = "narrative_nodes.rs"]
 mod nodes;
+#[path = "narrative_picker_fx.rs"]
+mod picker_fx;
+#[path = "narrative_portraits.rs"]
+mod portraits;
 #[path = "narrative_speaker.rs"]
 mod speaker_menu;
 #[path = "narrative_text.rs"]
@@ -170,6 +174,7 @@ impl Plugin for NarrativePlugin {
         embedded_asset!(app, "narrative_canvas.wesl");
         connection_paint::register(app);
         effects::register(app);
+        picker_fx::register(app);
         app.add_plugins(UiMaterialPlugin::<CanvasMaterial>::default())
             .init_resource::<CanvasPaint>()
             .init_resource::<links::State>()
@@ -207,6 +212,7 @@ impl Plugin for NarrativePlugin {
         .add_systems(Update, refresh.after(super::refresh))
         .add_systems(Update, effects::animate.after(refresh))
         .add_systems(Update, speaker_menu::refresh.after(refresh))
+        .add_systems(Update, picker_fx::animate.after(speaker_menu::refresh))
         .add_systems(
             Update,
             (
@@ -758,6 +764,7 @@ fn actions(
                     | NarrativeAction::SetPortrait(_)
                     | NarrativeAction::Target(_)
                     | NarrativeAction::Open(_)
+                    | NarrativeAction::File(_)
                     | NarrativeAction::Close(_)
                     | NarrativeAction::CloseCurrent
                     | NarrativeAction::Save
@@ -778,6 +785,41 @@ fn actions(
         } else {
             action
         };
+        if matches!(action, NarrativeAction::Portrait) {
+            if matches!(editor.narrative.current().map(|doc| (&doc.content, doc.selected)), Some((Content::Dialogue(d), id)) if d.node(id).is_some_and(|n| n.kind == NodeKind::Line && n.speaker.is_some()))
+            {
+                ui.picker = Some(Picker::Portrait);
+                ui.modal_key.clear();
+                ui.linking = None;
+                ui.clear_node_drag();
+                ui.panning = false;
+                focus.clear();
+            }
+            continue;
+        }
+        if let NarrativeAction::SetSpeaker(index) = action {
+            if let Some(selection) = speaker_menu::select(&mut editor, &browser, index) {
+                ui.picker = selection.portraits.then_some(Picker::Portrait);
+                ui.search.clear();
+                ui.last_edit = None;
+                if selection.changed || selection.portraits {
+                    ui.generation += 1;
+                }
+                focus.clear();
+            }
+            continue;
+        }
+        if let NarrativeAction::SetPortrait(index) = action {
+            if let Some(changed) = portraits::select(&mut editor, index) {
+                ui.picker = None;
+                ui.last_edit = None;
+                if changed {
+                    ui.generation += 1;
+                }
+                focus.clear();
+            }
+            continue;
+        }
         ui.last_edit = None;
         match action {
             NarrativeAction::Create(character) => {
@@ -916,13 +958,14 @@ fn actions(
                     NarrativeAction::Speaker => {
                         ui.picker = Some(Picker::Speaker);
                         ui.search.clear();
+                        ui.linking = None;
+                        ui.clear_node_drag();
+                        ui.panning = false;
+                        focus.clear();
                     }
                     NarrativeAction::AddPortrait => {
                         ui.picker = Some(Picker::Image);
                         ui.search.clear();
-                    }
-                    NarrativeAction::Portrait => {
-                        ui.picker = Some(Picker::Portrait);
                     }
                     NarrativeAction::Link(id, choice) => {
                         ui.linking = if ui.linking == Some((id, choice)) {
@@ -1021,9 +1064,7 @@ fn actions(
                     }
                     NarrativeAction::AddChoice
                     | NarrativeAction::RemoveChoice(_)
-                    | NarrativeAction::Disconnect(_)
-                    | NarrativeAction::SetSpeaker(_)
-                    | NarrativeAction::SetPortrait(_) => {
+                    | NarrativeAction::Disconnect(_) => {
                         if matches!(
                             action,
                             NarrativeAction::RemoveChoice(_) | NarrativeAction::Disconnect(_)
@@ -1033,26 +1074,6 @@ fn actions(
                         if let NarrativeAction::Disconnect(i) = action {
                             if !matches!(&doc.content, Content::Dialogue(d) if d.node(doc.selected).and_then(|n| n.choices.get(i)).is_some_and(|c| c.target.is_some()))
                             {
-                                continue;
-                            }
-                        }
-                        if let NarrativeAction::SetSpeaker(index) = action {
-                            let path =
-                                match index {
-                                    Some(i) => {
-                                        let Some(file) = browser.files.get(i).filter(|f| {
-                                            f.extension.eq_ignore_ascii_case("dcharacter")
-                                        }) else {
-                                            continue;
-                                        };
-                                        Some(file.path.to_string_lossy().replace('\\', "/"))
-                                    }
-                                    None => None,
-                                };
-                            if matches!(&doc.content, Content::Dialogue(d) if d.node(doc.selected).is_some_and(|n| n.speaker == path))
-                            {
-                                ui.picker = None;
-                                focus.clear();
                                 continue;
                             }
                         }
@@ -1080,17 +1101,6 @@ fn actions(
                                         if let Some(c) = n.choices.get_mut(i) {
                                             c.target = None;
                                         }
-                                    }
-                                    NarrativeAction::SetSpeaker(index) => {
-                                        n.speaker = index
-                                            .and_then(|i| browser.files.get(i))
-                                            .map(|f| f.path.to_string_lossy().replace('\\', "/"));
-                                        n.portrait = 0;
-                                        ui.picker = None;
-                                    }
-                                    NarrativeAction::SetPortrait(i) => {
-                                        n.portrait = i;
-                                        ui.picker = None;
                                     }
                                     _ => {}
                                 }
@@ -1493,9 +1503,10 @@ fn portrait(
             },
             WELL,
         );
-        commands
-            .entity(p)
-            .insert(AccessibleLabel("Портрет не найден".into()));
+        commands.entity(p).insert((
+            AccessibleLabel("Портрет не найден".into()),
+            Pickable::IGNORE,
+        ));
         icons::spawn(
             commands,
             p,
@@ -1553,6 +1564,8 @@ fn modal(
         handle,
         if ui.preview {
             "ПРЕДПРОСМОТР ДИАЛОГА"
+        } else if ui.picker == Some(Picker::Portrait) {
+            "ПОРТРЕТ ПЕРСОНАЖА"
         } else {
             "ВЫБОР РЕСУРСА"
         },
@@ -1701,39 +1714,7 @@ fn modal(
             );
             commands.entity(list).insert((Scroller, ImageResults));
         }
-        Some(Picker::Portrait) => {
-            if let Content::Dialogue(d) = &doc.content {
-                if let Some(c) = d
-                    .node(doc.selected)
-                    .and_then(|n| n.speaker.as_ref())
-                    .and_then(|p| character(editor, p))
-                {
-                    text(commands, parent, handle, "Выражение персонажа", 23.0, TEXT);
-                    for (i, p) in c.portraits.iter().enumerate() {
-                        let row = node(commands, parent, row(12.0));
-                        portrait(commands, row, server, &editor.root, &p.path, 64.0);
-                        act(
-                            commands,
-                            row,
-                            handle,
-                            &p.label,
-                            NarrativeAction::SetPortrait(i),
-                            false,
-                        );
-                    }
-                    if c.portraits.is_empty() {
-                        wrapped(
-                            commands,
-                            parent,
-                            handle,
-                            "У персонажа ещё нет портретов. Добавьте их во вкладке .dcharacter.",
-                            14.0,
-                            MUTED,
-                        );
-                    }
-                }
-            }
-        }
+        Some(Picker::Portrait) => {}
         Some(Picker::Target) => {
             text(commands, parent, handle, "Куда ведёт ответ?", 23.0, TEXT);
             if let Content::Dialogue(d) = &doc.content {
@@ -2027,7 +2008,7 @@ fn refresh(
     );
     let shown = ui
         .picker
-        .is_some_and(|p| p != Picker::Speaker && p != Picker::Text)
+        .is_some_and(|p| p != Picker::Speaker && p != Picker::Portrait && p != Picker::Text)
         || ui.preview;
     if let Ok(mut n) = nodes.get_mut(ui.overlay) {
         n.display = if shown { Display::Flex } else { Display::None };

@@ -834,7 +834,17 @@ fn file_icon(
         None
     };
     if let Some(glyph) = artwork {
-        return icons::spawn(commands, parent, glyph, PREVIEW_HEIGHT * 0.9, Color::WHITE);
+        let icon = icons::spawn(commands, parent, glyph, PREVIEW_HEIGHT * 0.9, Color::WHITE);
+        commands
+            .entity(icon)
+            .insert(UiTransform::from_translation(Val2::percent(-50, -50)))
+            .entry::<Node>()
+            .and_modify(|mut node| {
+                node.position_type = PositionType::Absolute;
+                node.left = percent(50);
+                node.top = percent(50);
+            });
+        return icon;
     }
     let icon = node(
         commands,
@@ -876,6 +886,22 @@ fn file_icon(
         MUTED,
     );
     icon
+}
+
+fn file_picture(commands: &mut Commands, well: Entity, file: usize, revision: u64) {
+    commands.spawn((
+        FileImage(file, revision),
+        ImageNode::default(),
+        Pickable::IGNORE,
+        Node {
+            display: Display::None,
+            width: px(0),
+            height: px(0),
+            border_radius: BorderRadius::top(px(9)),
+            ..default()
+        },
+        ChildOf(well),
+    ));
 }
 
 pub(super) fn file_size(bytes: u64) -> String {
@@ -1103,22 +1129,18 @@ pub(crate) fn refresh(
                         ImagePlaceholder(index, browser.scan_revision),
                         Visibility::Inherited,
                     ));
-                    commands.spawn((
-                        FileImage(index, browser.scan_revision),
-                        ImageNode::default(),
-                        Pickable::IGNORE,
-                        Node {
-                            display: Display::None,
-                            width: px(0),
-                            height: px(0),
-                            border_radius: BorderRadius::top(px(9)),
-                            ..default()
-                        },
-                        ChildOf(well),
-                    ));
+                    file_picture(&mut commands, well, index, browser.scan_revision);
                     format!("{} · Загрузка…", file.extension.to_uppercase())
                 } else {
-                    file_icon(&mut commands, well, &interface.font, &file.extension);
+                    let placeholder =
+                        file_icon(&mut commands, well, &interface.font, &file.extension);
+                    if file.extension.eq_ignore_ascii_case("dcharacter") {
+                        commands.entity(placeholder).insert((
+                            ImagePlaceholder(index, browser.scan_revision),
+                            Visibility::Inherited,
+                        ));
+                        file_picture(&mut commands, well, index, browser.scan_revision);
+                    }
                     format!(
                         "{} · {}",
                         if file.extension.eq_ignore_ascii_case("dialog") {
@@ -1219,6 +1241,7 @@ pub(crate) fn update_files(
     }
     for (file, mut image, mut node) in &mut pictures {
         if file.1 != browser.scan_revision {
+            node.display = Display::None;
             continue;
         }
         if let Some(preview) = previews.get(file.0)
@@ -1240,6 +1263,10 @@ pub(crate) fn update_files(
             if node.display != Display::Flex {
                 node.display = Display::Flex;
             }
+        } else {
+            // Reveal the SVG immediately when a portrait changes or is removed.
+            node.display = Display::None;
+            image.image = Handle::default();
         }
     }
     let selected = cards
@@ -1274,6 +1301,7 @@ pub(crate) fn update_files(
                 let file = &browser.files[index];
                 let dimensions = previews
                     .get(index)
+                    .filter(|_| matches!(entry, Entry::Image(_)))
                     .and_then(|preview| preview.dimensions)
                     .map_or(String::new(), |size| {
                         format!(" · {} × {} px", size.x, size.y)

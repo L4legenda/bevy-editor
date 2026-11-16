@@ -4,6 +4,8 @@ mod answers_workflow;
 mod drag_workflow;
 #[path = "narrative_effects_tests.rs"]
 mod effects_workflow;
+#[path = "narrative_portraits_tests.rs"]
+mod portraits_workflow;
 #[path = "narrative_reorder_tests.rs"]
 mod reorder_workflow;
 use super::*;
@@ -1267,6 +1269,7 @@ fn speaker_dropdown(
     edit_text(app, DraftField::Search, "Астр");
     click(app, window, "Выбрать персонажа: Астра");
     assert_eq!(selected_speaker(app), Some("Астра.dcharacter".into()));
+    action(app, NarrativeAction::SetPortrait(0));
     app.world_mut()
         .resource_mut::<Editor>()
         .narrative
@@ -1847,6 +1850,7 @@ fn gpu_narrative_workflow() {
         .len();
     click(&mut app, window, "Выбрать говорящего ноды #1");
     click(&mut app, window, "Выбрать персонажа: Астра");
+    action(&mut app, NarrativeAction::SetPortrait(1));
     if let Content::Dialogue(d) = &app
         .world()
         .resource::<Editor>()

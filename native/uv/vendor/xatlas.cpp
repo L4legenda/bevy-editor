@@ -6211,6 +6211,20 @@ struct ComputeUvMeshChartsTask
 		// A vertex can only be assigned to one chart.
 		m_mesh->vertexToChartMap.resize(vertexCount);
 		m_mesh->vertexToChartMap.fill(UINT32_MAX);
+		// Bevy: preserve caller-defined islands, including zero-area connectors.
+		// The caller validates finite UVs and supplies one island per UV mesh.
+		if (m_mesh->decl.preserveInputChart && faceCount > 0) {
+			UvMeshChart *chart = XA_NEW(MemTag::Default, UvMeshChart);
+			chart->material = 0;
+			m_mesh->charts.push_back(chart);
+			m_faceAssigned.zeroOutMemory();
+			for (uint32_t f = 0; f < faceCount; f++) {
+				if (m_progress->cancel) return;
+				addFaceToChart(0, f);
+				m_progress->increment(1);
+			}
+			return;
+		}
 		// Map vertex UV to edge. Face is then edge / 3.
 		for (uint32_t i = 0; i < indexCount; i++)
 			m_uvToEdgeMap.add(m_mesh->texcoords[m_mesh->indices[i]]);
@@ -8259,6 +8273,18 @@ struct Atlas
 			for (uint32_t v = 0; v < chart->uniqueVertexCount(); v++)
 				boundingBox.appendBoundaryVertex(chart->uniqueVertexAt(v));
 			boundingBox.compute();
+			// Bevy: all hull edges of a tiny island may fall below kEpsilon,
+			// leaving a zero axis. Use the original axes instead of collapsing UVs.
+			if (mesh->mesh->decl.preserveInputChart && dot(boundingBox.majorAxis, boundingBox.majorAxis) < 0.5f) {
+				boundingBox.majorAxis = Vector2(1.0f, 0.0f);
+				boundingBox.minorAxis = Vector2(0.0f, 1.0f);
+				boundingBox.minCorner = Vector2(FLT_MAX, FLT_MAX);
+				boundingBox.maxCorner = Vector2(-FLT_MAX, -FLT_MAX);
+				for (uint32_t v = 0; v < chart->uniqueVertexCount(); v++) {
+					boundingBox.minCorner = min(boundingBox.minCorner, chart->uniqueVertexAt(v));
+					boundingBox.maxCorner = max(boundingBox.maxCorner, chart->uniqueVertexAt(v));
+				}
+			}
 			chart->majorAxis = boundingBox.majorAxis;
 			chart->minorAxis = boundingBox.minorAxis;
 			chart->minCorner = boundingBox.minCorner;
@@ -8314,15 +8340,20 @@ struct Atlas
 			Chart *chart = m_charts[c];
 			// Compute chart scale
 			float scale = 1.0f;
-			if (chart->parametricArea != 0.0f) {
+			if (options.preserveChartShape) {
+				scale = m_texelsPerUnit;
+			} else if (chart->parametricArea != 0.0f) {
 				scale = sqrtf(chart->surfaceArea / chart->parametricArea) * m_texelsPerUnit;
 				XA_ASSERT(isFinite(scale));
 			}
 			// Translate, rotate and scale vertices. Compute extents.
 			Vector2 minCorner(FLT_MAX, FLT_MAX);
+			const bool flip = options.rotateAlternateCharts && (c % 2) != 0 && !options.rotateChartsToAxis;
 			if (!options.rotateChartsToAxis) {
-				for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++)
-					minCorner = min(minCorner, chart->uniqueVertexAt(i));
+				for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++) {
+					const Vector2 p = chart->uniqueVertexAt(i);
+					minCorner = min(minCorner, flip ? Vector2(-p.x, -p.y) : p);
+				}
 			}
 			Vector2 extents(0.0f);
 			for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++) {
@@ -8334,6 +8365,7 @@ struct Atlas
 					texcoord.y = y;
 					texcoord -= chart->minCorner;
 				} else {
+					if (flip) texcoord = Vector2(-texcoord.x, -texcoord.y);
 					texcoord -= minCorner;
 				}
 				texcoord *= scale;
@@ -8343,7 +8375,7 @@ struct Atlas
 			}
 			XA_DEBUG_ASSERT(extents.x >= 0 && extents.y >= 0);
 			// Scale the charts to use the entire texel area available. So, if the width is 0.1 we could scale it to 1 without increasing the lightmap usage and making a better use of it. In many cases this also improves the look of the seams, since vertices on the chart boundaries have more chances of being aligned with the texel centers.
-			if (extents.x > 0.0f && extents.y > 0.0f) {
+			if (!options.preserveChartShape && extents.x > 0.0f && extents.y > 0.0f) {
 				// Block align: align all chart extents to 4x4 blocks, but taking padding and texel center offset into account.
 				const int blockAlignSizeOffset = options.padding * 2 + 1;
 				int width = ftoi_ceil(extents.x);
@@ -8455,6 +8487,21 @@ struct Atlas
 				args.chartBitImage = &chartImage;
 				args.chartBitImageRotated = options.rotateCharts ? &chartImageRotated : nullptr;
 				raster::drawTriangle(Vector2((float)chartImage.width(), (float)chartImage.height()), vertices, drawTriangleCallback, &args);
+				// Bevy: reserve even collapsed edges and needle tips. Triangle AA can
+				// omit these, leaving their restored corners outside the packed mask.
+				if (options.preserveChartShape) {
+					for (uint32_t e = 0; e < 3; e++) {
+						const Vector2 a = vertices[e], b = vertices[(e + 1) % 3];
+						const uint32_t steps = max(1u, (uint32_t)ceilf(max(fabsf(b.x-a.x), fabsf(b.y-a.y)) * 2.0f));
+						for (uint32_t s = 0; s <= steps; s++) {
+							const float t = float(s) / float(steps);
+							const Vector2 p(a.x + (b.x-a.x)*t, a.y + (b.y-a.y)*t);
+							const uint32_t x = min(chartImage.width()-1, (uint32_t)max(0.0f, floorf(p.x)));
+							const uint32_t y = min(chartImage.height()-1, (uint32_t)max(0.0f, floorf(p.y)));
+							drawTriangleCallback(&args, x, y);
+						}
+					}
+				}
 			}
 			// Expand chart by pixels sampled by bilinear interpolation.
 			if (options.bilinear)
@@ -8661,6 +8708,7 @@ private:
 	{
 		const int stepSize = options.blockAlign ? 4 : 1;
 		int best_metric = INT_MAX;
+		uint32_t candidates = 0;
 		// Try two different orientations.
 		for (int r = 0; r < 2; r++) {
 			int cw = chartBitImage->width();
@@ -8675,6 +8723,13 @@ private:
 				if (maxResolution > 0 && y > (int)maxResolution - ch)
 					break;
 				for (int x = (y == startPosition.y ? startPosition.x : 0); x <= w + stepSize; x += stepSize) {
+					// Bevy: bound work on large concave masks. Retain the best valid
+					// placement, or use the standard random search if none was found.
+					if (options.preserveChartShape && ++candidates > 16384) {
+						if (best_metric != INT_MAX) return true;
+						return findChartLocation_random(options, atlasBitImage, chartBitImage, chartBitImageRotated,
+							w, h, best_x, best_y, best_w, best_h, best_r, 4096, maxResolution);
+					}
 					if (maxResolution > 0 && x > (int)maxResolution - cw)
 						break;
 					// Early out if metric is not better.

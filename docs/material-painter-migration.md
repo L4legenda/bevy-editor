@@ -32,8 +32,9 @@ license are in `vendor/material-painter`. The workspace uses our Bevy UI and ico
 - Texture channels are color, roughness, metallic, height (converted to normal
   detail), opacity, emission, normals and specular. The current Bevy preview uses
   an averaged specular level; the GLB stores its per-pixel specular texture.
-- Compositing and brush rasterization run on the compute pool. Bevy image handles
-  update the isolated model material without modifying scene asset materials.
+- Live brush rasterization and compositing run on Bevy's GPU device. Geometry
+  preparation and CPU document snapshots use the compute pool. Scene asset
+  materials remain isolated from the model's working material.
 - Save / Ctrl+S uses the model's existing atomic GLB save path. Standard glTF
   textures contain the flattened result, while versioned primitive extras point
   to losslessly compressed base textures and layer buffers in the same GLB.
@@ -58,26 +59,40 @@ each result. At 1024px that uploaded 36 MiB per batch and repeatedly prepared GP
 textures/bind groups. Rebuilding layer panels and copying/comparing pixel buffers
 on the main thread added stalls.
 
-The Bevy path now uses cached camera transforms, projected triangle bins, batched
-stamp coverage, per-stroke visibility caching and allocation-free BVH traversal.
-Preparation stays on the compute worker. Only damaged channel rectangles are
-composited and queued through the existing `image_texture::TextureUploads` bridge;
-the GPU texture allocations stay stable. Layer snapshots are published at stroke
-boundaries, and pixel buffers are compared by shared snapshot identity in document
-state. Holding a still brush enqueues no stamps. Rasterization remains on the CPU;
-this change does not claim to port upstream's complete GPU engine.
+The live path now uses resident GPU buffers and the application's existing render
+device/queue, with no second graphics context:
 
-`model_paint_benchmark_40k_triangles` compares the original rasterizer and full
-compositing with the incremental path at 1024px. Correctness tests compare pixels,
-normal-map borders and channel patches. The native UI regression also checks that
-pointer motion neither modifies full Image assets nor rebuilds the layer panel,
-and still saves/reopens the same editable GLB layers.
+1. Prepare transformed triangle vertices on a worker. Render depth and object/face
+   IDs for the stroke view; the UV pass supports ordinary and overlapping UVs.
+2. Rasterize screen/UV brush coverage into a persistent floating-point mask. Flow
+   accumulates there. Only stamp coordinates and brush uniforms cross from CPU to
+   GPU while drawing; a stationary brush enqueues no extra work.
+3. A compute shader applies that mask to a GPU copy of the layer taken at stroke
+   start, preserving opacity caps and straight-alpha erasing. Visible layers in
+   the active channel are then composited on GPU.
+4. GPU passes pack color/opacity and metallic/roughness, derive height/normal detail,
+   and copy into the existing material/2D preview textures without recreating them.
+5. At release, asynchronously copy the active layer to a readback buffer. A worker
+   checks changes and publishes one undo transaction into the existing CPU/GLB
+   document. GPU submission order and stroke IDs preserve consecutive strokes.
+   Save/close wait for outstanding snapshots; runtime code never waits on the GPU.
+
+Shader pipelines are created at renderer startup, before the first brush press.
+Initial previews and standalone layer configuration/undo still use the CPU
+compositor; they are not on the interactive stamp path. The old CPU rasterizers
+remain under `cfg(test)` as correctness/performance references.
+
+Native GPU tests cover live color before any CPU readback, all eight channels,
+occlusion, erasing/fill, orthographic views, stable image allocations, history and
+GLB save/reopen. `gpu_model_paint_benchmark_40k` measures a held stroke over 40,000
+triangles and asserts zero readbacks during drawing; the earlier CPU benchmark
+remains available for comparison.
 
 ## Remaining functional migration
 
 | Feature | Source modules | Integration boundary |
 |---|---|---|
-| Folder parenting, masks, blend modes, GPU compositing/undo | `engine.rs`, `engine/`, `textures.rs`, `undo.rs`, `shaders/` | Extend the current editable texture sets; optional GPU backend |
+| Folder parenting, masks, additional blend modes, GPU-resident history | `engine.rs`, `engine/`, `textures.rs`, `undo.rs`, `shaders/` | Extend the current editable texture sets and GPU path |
 | Pressure, stabilization, symmetry, alpha tips, extra projections and paths | `app/view_input`, `brushes.rs`, `polyfill.rs`, `app/path_tool.rs` | Extend native viewport painting and tablet events |
 | UDIM and additional mesh formats | `app/texture_sets.rs`, `mesh.rs`, `import.rs`, `unwrap.rs` | Existing GLB documents and UV workspace |
 | Mesh-map and high-poly/cage baking | `bake.rs`, `bake_cache.rs`, `cage.rs`, `app/cage_paint.rs` | Background preparation, incremental GPU jobs and cancellation |

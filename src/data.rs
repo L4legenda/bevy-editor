@@ -1,4 +1,4 @@
-//! Version 0.1 level documents. Models are references to shared GLB assets.
+//! Versioned native scene documents and legacy GLB edit compatibility.
 use bevy::{math::Affine3A, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -113,7 +113,7 @@ pub struct SceneSettings {
 }
 
 pub(crate) fn document_path(path: &str) -> bool {
-    relative_path(path, "scene") || relative_path(path, "json")
+    relative_path(path, "scene") || relative_path(path, "json") || relative_path(path, "sceneb")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -145,6 +145,9 @@ pub struct PlacedModel {
 #[serde(default, deny_unknown_fields)]
 #[serde(bound(deserialize = "K: Ord + Deserialize<'de>"))]
 pub struct LevelEdits<K: Ord = String> {
+    /// Authoring graph and dependency snapshots. Shared by document history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hierarchy: Option<std::sync::Arc<crate::hierarchy::SceneHierarchy>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene: Option<SceneSettings>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -170,6 +173,7 @@ pub struct LevelEdits<K: Ord = String> {
 impl<K: Ord> Default for LevelEdits<K> {
     fn default() -> Self {
         Self {
+            hierarchy: None,
             scene: None,
             nodes: BTreeMap::new(),
             cameras: BTreeMap::new(),
@@ -204,7 +208,7 @@ impl<K: Ord> LevelEdits<K> {
             Err(error) => return Err(error),
         };
         let path = root.join(resolved);
-        let bytes = match fs::read(&path) {
+        let bytes = match read_document_bytes(&path, relative_path(file, "sceneb")) {
             Ok(bytes) => bytes,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound && relative_path(file, "json") =>
@@ -213,7 +217,15 @@ impl<K: Ord> LevelEdits<K> {
             }
             Err(error) => return Err(error),
         };
-        let edits: Self = serde_json::from_slice(&bytes).map_err(|error| {
+        let decoded = if relative_path(file, "sceneb") {
+            crate::scene_io::decode_packed(&bytes)
+        } else if relative_path(file, "scene") && crate::scene_io::modern(&bytes)? {
+            crate::scene_io::decode(&bytes, root)
+        } else {
+            serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
+                .map_err(io::Error::other)
+        };
+        let edits: Self = decoded.map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {error}", path.display()),
@@ -231,6 +243,7 @@ impl<K: Ord> LevelEdits<K> {
 
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        let model_ids: HashSet<_> = self.models.iter().map(|model| model.id).collect();
         if self
             .model_names
             .values()
@@ -245,10 +258,7 @@ impl<K: Ord> LevelEdits<K> {
                 .keys()
                 .chain(self.deleted_nodes.iter())
                 .any(String::is_empty)
-            || self
-                .model_names
-                .keys()
-                .any(|id| !self.models.iter().any(|model| model.id == *id))
+            || self.model_names.keys().any(|id| !model_ids.contains(id))
         {
             return Err(invalid("Invalid scene object name".into()));
         }
@@ -295,11 +305,14 @@ impl<K: Ord> LevelEdits<K> {
             }
         }
         let mut ids = HashSet::new();
+        let mut asset_exists = BTreeMap::new();
         for model in &self.models {
             if !relative_path(&model.asset, "glb")
-                || !redirects
-                    .resolve(&model.asset)
-                    .is_ok_and(|path| root.join(path).is_file())
+                || !*asset_exists.entry(&model.asset).or_insert_with(|| {
+                    redirects
+                        .resolve(&model.asset)
+                        .is_ok_and(|path| root.join(path).is_file())
+                })
                 || !ids.insert(model.id)
                 || !model.pose.valid()
                 || model.bounds.is_some_and(|bounds| !bounds.valid())
@@ -317,8 +330,6 @@ impl<K: Ord> LevelEdits<K> {
     where
         K: Serialize,
     {
-        use std::io::Write;
-
         self.validate(root)?;
         if relative_path(file, "scene") && self.scene.is_none() {
             return Err(io::Error::new(
@@ -326,7 +337,7 @@ impl<K: Ord> LevelEdits<K> {
                 "Scene metadata is missing",
             ));
         }
-        if !document_path(file) {
+        if !relative_path(file, "scene") && !relative_path(file, "json") {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Invalid document path",
@@ -334,23 +345,30 @@ impl<K: Ord> LevelEdits<K> {
         }
         fs::create_dir_all(root)?;
         let path = root.join(crate::asset_paths::resolve_asset_path(root, file)?);
-        fs::create_dir_all(path.parent().expect("room file has a parent"))?;
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        let written = (|| {
-            serde_json::to_writer_pretty(&mut file, self)?;
-            file.write_all(b"\n")?;
-            file.sync_all()
-        })();
-        drop(file);
-        let result = written.and_then(|()| fs::rename(&temp, &path));
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
+        let previous = match read_document_bytes(&path, false) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let bytes = self.encode_document(file, previous.as_deref())?;
+        let expected = previous.as_deref().map_or(
+            bevy_scene_format::Revision::Missing,
+            bevy_scene_format::Revision::of,
+        );
+        bevy_scene_format::atomic_write(&path, &bytes, expected).map(|_| ())
+    }
+
+    pub(crate) fn encode_document(&self, file: &str, previous: Option<&[u8]>) -> io::Result<Vec<u8>>
+    where
+        K: Serialize,
+    {
+        if relative_path(file, "scene") {
+            crate::scene_io::encode(self, previous)
+        } else {
+            let mut bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+            bytes.push(b'\n');
+            Ok(bytes)
         }
-        result
     }
 
     pub fn anchor(&self, node: &str, point: Vec3) -> Vec3 {
@@ -367,4 +385,13 @@ impl<K: Ord> LevelEdits<K> {
             facing.x.atan2(facing.z)
         })
     }
+}
+
+fn read_document_bytes(path: &Path, packed: bool) -> io::Result<Vec<u8>> {
+    let limit = if packed {
+        512 * 1024 * 1024
+    } else {
+        bevy_scene_format::MAX_SOURCE_BYTES
+    };
+    bevy_scene_format::read_limited(path, limit)
 }

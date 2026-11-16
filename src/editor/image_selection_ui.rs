@@ -34,6 +34,7 @@ struct ToolsUi {
     mask_hash: Option<u64>,
     mask_source: Option<Surface>,
     mask_image: Option<Handle<Image>>,
+    transform_images: selection::live::Textures,
 }
 pub(in crate::editor) struct ImageSelectionPlugin;
 impl Plugin for ImageSelectionPlugin {
@@ -171,8 +172,6 @@ pub fn setup(
         ("Волшебная палочка · W", SelectionTool::Wand),
         ("Быстрое выделение", SelectionTool::Quick),
         ("Выделение объекта", SelectionTool::Object),
-        ("Одна строка", SelectionTool::Row),
-        ("Один столбец", SelectionTool::Column),
     ] {
         let e = item(commands, selection_menu, font, label, Op::Tool(tool));
         commands.entity(e).entry::<Node>().and_modify(|mut n| {
@@ -312,6 +311,7 @@ pub fn setup(
         mask_hash: None,
         mask_source: None,
         mask_image: None,
+        transform_images: Default::default(),
     });
 }
 fn popup_input(
@@ -351,7 +351,7 @@ fn popup_input(
 fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
-    viewer: Res<ImageViewer>,
+    mut viewer: ResMut<ImageViewer>,
     mut ui: ResMut<ToolsUi>,
     window: Single<&Window, With<PrimaryWindow>>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
@@ -363,6 +363,30 @@ fn refresh(
     mut materials: ResMut<Assets<super::super::CanvasMaterial>>,
     time: Res<Time>,
 ) {
+    let enabled = viewer.edit.editing(editor.viewing_image);
+    let source = viewer.image.clone();
+    let dimensions = viewer.dimensions;
+    let revision = viewer
+        .edit
+        .document(editor.viewing_image)
+        .map(|d| d.revision);
+    let nearest = viewer.edit.selection.nearest;
+    if let Some(mut material) = materials.get_mut(&super::super::canvas_material::HANDLE) {
+        ui.transform_images.sync(
+            viewer
+                .edit
+                .selection
+                .transform
+                .as_mut()
+                .filter(|t| Some(t.id) == editor.viewing_image && enabled),
+            source.as_ref(),
+            dimensions,
+            revision,
+            &mut images,
+            &mut material,
+            nearest,
+        );
+    }
     let state = &viewer.edit;
     let tools = &state.selection;
     let editing = state.editing(editor.viewing_image);

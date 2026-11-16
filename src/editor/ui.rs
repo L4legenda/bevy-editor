@@ -42,6 +42,8 @@ mod confirmation;
 mod control_hints;
 #[path = "play_ui.rs"]
 mod play_ui;
+#[path = "scene_hierarchy_ui.rs"]
+mod scene_hierarchy_ui;
 pub(super) use play_ui::update as refresh_play;
 #[path = "drawer.rs"]
 mod drawer;
@@ -145,7 +147,7 @@ enum Look {
 
 #[derive(Component)]
 pub(super) struct Control {
-    action: Action,
+    pub(super) action: Action,
     look: Look,
 }
 
@@ -173,6 +175,7 @@ pub(super) struct Interface {
     dirty: Entity,
     selected: Entity,
     kind: Entity,
+    hierarchy_info: Entity,
     perspective: Entity,
     lens_label: Entity,
     transforms: Entity,
@@ -191,6 +194,19 @@ pub(super) struct OutlineState {
     hidden: Vec<bool>,
     objects: Vec<(Selection, String, bool)>,
     lights: Vec<(u32, String, bool, crate::lighting::LightKind)>,
+    hierarchy: Vec<(
+        u32,
+        Option<String>,
+        String,
+        bool,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    )>,
+    hierarchy_selection: Option<Selection>,
+    hierarchy_parenting: Option<(Room, u32)>,
 }
 
 pub(super) fn viewport_rect(window: &Window, sidebar: &SidebarLayout) -> Rect {
@@ -666,6 +682,7 @@ pub(super) fn setup(
         TEXT,
     );
     let kind = text(&mut commands, inspector, &font, "", 12.0, MUTED);
+    let hierarchy_info = node(&mut commands, inspector, column(4.0));
     lighting_ui::setup(&mut commands, header, inspector, root, &font, &mut images);
     let transforms = node(&mut commands, inspector, column(6.0));
     transform_row(&mut commands, transforms, &font, "Позиция", Field::Position);
@@ -756,6 +773,7 @@ pub(super) fn setup(
         dirty,
         selected,
         kind,
+        hierarchy_info,
         perspective,
         lens_label,
         transforms,
@@ -789,6 +807,7 @@ fn outline_entry(
         .and_modify(|mut node| node.padding.left = px(26));
     let color = if enabled { AMBER } else { MUTED };
     let glyph = match selection {
+        Selection::Node(_) => icons::Glyph::Layers,
         Selection::Environment => icons::Glyph::Globe,
         Selection::Camera(_) => icons::Glyph::Camera,
         Selection::Imported(_) | Selection::Model(_) => icons::Glyph::Box,
@@ -1047,6 +1066,8 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                 | Action::BrowserCancelPopup
                 | Action::BrowserDeleteFile
                 | Action::BrowserOpenEntry
+                | Action::BrowserRevealEntry
+                | Action::BrowserInstanceScene
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
@@ -1054,6 +1075,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         );
     }
     match action {
+        Action::Hierarchy(action) => super::scene_hierarchy::available(editor, action),
         Action::ImageEdit(_) => editor.viewing_image.is_some(),
         Action::ImageView(ImageAction::Previous) => {
             editor.viewing_image.is_some()
@@ -1081,6 +1103,8 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         | Action::BrowserNewImage
         | Action::BrowserNewScene
         | Action::BrowserOpenEntry
+        | Action::BrowserRevealEntry
+        | Action::BrowserInstanceScene
         | Action::BrowserRenameFile
         | Action::BrowserConfirmRename
         | Action::BrowserDuplicateFile
@@ -1103,9 +1127,10 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                     })
         }
         Action::Select(_) => editor.has_scene() && editor.ready && editor.tool == Tool::Universal,
-        Action::LocalSpace | Action::Snap | Action::ToggleVisibility(_) => {
-            editor.has_scene() && editor.ready
+        Action::ToggleVisibility(target) => {
+            editor.has_scene() && editor.ready && editor.can_toggle_visibility(target)
         }
+        Action::LocalSpace | Action::Snap => editor.has_scene() && editor.ready,
         Action::Lighting(_) | Action::LightMenu | Action::LightAdvanced => {
             editor.has_scene() && editor.ready
         }
@@ -1858,6 +1883,7 @@ pub(super) fn refresh(
                 .iter()
                 .map(|light| Selection::Light(light.id)),
         )
+        .chain(viewport::shots(&editor).map(Selection::Camera))
         .map(|target| editor.object_hidden(target))
         .collect();
     let lights: Vec<_> = editor
@@ -1866,6 +1892,29 @@ pub(super) fn refresh(
         .iter()
         .map(|light| (light.id, light.name.clone(), light.enabled, light.kind))
         .collect();
+    let hierarchy = editor
+        .edits
+        .hierarchy
+        .as_ref()
+        .map(|h| {
+            h.nodes
+                .iter()
+                .map(|n| {
+                    (
+                        n.key,
+                        n.entity.parent.clone(),
+                        editor.label(editor.hierarchy_selection(n.key)),
+                        editor.hierarchy_collapsed.contains(&(editor.room, n.key)),
+                        h.overridden(n.key),
+                        n.entity.model.clone(),
+                        n.camera.clone(),
+                        n.instance.clone(),
+                        editor.object_hidden(editor.hierarchy_selection(n.key)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     if outline.room != room
         || outline.model != editor.viewing_model
         || outline.imported != editor.imported.len()
@@ -1873,6 +1922,9 @@ pub(super) fn refresh(
         || outline.hidden != hidden
         || outline.objects != objects
         || outline.lights != lights
+        || outline.hierarchy != hierarchy
+        || outline.hierarchy_selection != editor.selection
+        || outline.hierarchy_parenting != editor.hierarchy_parenting
     {
         *outline = OutlineState {
             room,
@@ -1882,6 +1934,9 @@ pub(super) fn refresh(
             hidden,
             objects,
             lights,
+            hierarchy,
+            hierarchy_selection: editor.selection,
+            hierarchy_parenting: editor.hierarchy_parenting,
         };
         commands
             .entity(interface.outliner)
@@ -1901,7 +1956,12 @@ pub(super) fn refresh(
         };
         if editor.viewing_model.is_some() {
             // The model document supplies its own object list after this refresh.
+        } else if editor.has_scene() && editor.edits.hierarchy.is_some() {
+            scene_hierarchy_ui::tree(&mut commands, interface.outliner, &interface.font, &editor);
         } else if editor.has_scene() {
+            if editor.definition().is_native() {
+                scene_hierarchy_ui::toolbar(&mut commands, interface.outliner, &interface.font);
+            }
             heading(&mut commands, "ОСВЕЩЕНИЕ");
             outline_entry(
                 &mut commands,
@@ -1925,14 +1985,12 @@ pub(super) fn refresh(
             heading(&mut commands, "КАМЕРЫ");
             for shot in viewport::shots(&editor) {
                 let target = Selection::Camera(shot);
-                outline_entry(
+                object_outline_entry(
                     &mut commands,
                     interface.outliner,
                     &interface.font,
-                    &editor.label(target),
+                    &editor,
                     target,
-                    None,
-                    true,
                 );
             }
             heading(&mut commands, "ОБЪЕКТЫ СЦЕНЫ");
@@ -1965,6 +2023,15 @@ pub(super) fn refresh(
         } else {
             heading(&mut commands, "НЕТ ОТКРЫТОЙ СЦЕНЫ");
         }
+        commands
+            .entity(interface.hierarchy_info)
+            .despawn_related::<Children>();
+        scene_hierarchy_ui::inspector(
+            &mut commands,
+            interface.hierarchy_info,
+            &interface.font,
+            &editor,
+        );
     }
 
     let mut set_label = |entity, content: &str, color| {
@@ -2079,6 +2146,7 @@ pub(super) fn refresh(
         };
         set_label(interface.selected, &title, TEXT);
         let kind = match target {
+            Selection::Node(_) => "Группа или экземпляр вложенной сцены",
             Selection::Camera(_) => "Игровой ракурс",
             Selection::Imported(_) if !editor.field_allowed(target, Field::Position(1)) => {
                 "Ограничения трансформации проекта"
@@ -2253,12 +2321,7 @@ pub(super) fn refresh(
             Action::Pilot | Action::Align => camera,
             Action::Play => play_ui::visible(&editor),
             Action::Delete => editor.deletable_targets(),
-            Action::Duplicate => {
-                matches!(
-                    editor.selection,
-                    Some(Selection::Model(_) | Selection::Light(_))
-                )
-            }
+            Action::Duplicate => editor.batch_editable(),
             _ => true,
         };
         let display = if visible {

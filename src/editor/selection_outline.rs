@@ -115,6 +115,7 @@ pub(super) fn draw(
         .selected_targets()
         .into_iter()
         .filter_map(|target| match target {
+            Selection::Node(key) => scene.spatial.get(&key).copied(),
             Selection::Imported(index) => editor.imported.get(index).map(|node| node.entity),
             Selection::Model(id) => scene.models.get(&id).map(|(entity, _)| *entity),
             _ => None,

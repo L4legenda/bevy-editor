@@ -105,7 +105,6 @@ fn uv_before_after_is_view_only_and_does_not_overwrite_newer_edits() {
 }
 
 #[test]
-#[ignore = "requires local PartUV runtime; runs the real CPU worker and validates UV provenance"]
 fn uv_partuv_real_worker_preserves_cube_corners() {
     let mesh = object().geometry;
     let input = topology::input(&mesh, 1.25, 1024, 4).unwrap();
@@ -122,7 +121,7 @@ fn uv_partuv_real_worker_preserves_cube_corners() {
 }
 
 #[test]
-#[ignore = "requires GPU and local PartUV; tests real UV mode, split view, background job, selection, undo and GLB save"]
+#[ignore = "requires GPU; tests bundled native UV, split view, background job, selection, undo and GLB save"]
 fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
     use crate::editor::{
         Editor,
@@ -208,6 +207,16 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
     let original = app.world().resource::<State>().documents[&0]
         .objects
         .clone();
+    if std::env::var_os("BEVY_EDITOR_UV_QA_LAYOUT_ONLY").is_none() {
+        let request = topology::input(&original[0].geometry, 1.25, 2048, 8)
+            .unwrap()
+            .request;
+        serde_json::to_writer(
+            std::fs::File::create(out.join("native-character-request.json")).unwrap(),
+            &request,
+        )
+        .unwrap();
+    }
     capture_when(&mut app, &target, &out.join("01-uv-before.png"), |_| true);
     if std::env::var_os("BEVY_EDITOR_UV_QA_LAYOUT_ONLY").is_some() {
         capture_when(

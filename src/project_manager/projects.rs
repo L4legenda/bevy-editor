@@ -276,7 +276,7 @@ pub(super) fn create_project(
         }
         write(
             "assets/scenes/main.scene",
-            &serde_json::to_vec_pretty(&edits).map_err(io::Error::other)?,
+            &edits.encode_document("main.scene", None)?,
         )?;
         write(
             PROJECT_FILE_NAME,

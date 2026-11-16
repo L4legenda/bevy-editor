@@ -35,6 +35,13 @@ pub(in crate::editor) enum EraserMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum PencilShape {
+    #[default]
+    Round,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::editor) enum ToolMenu {
     #[default]
     Paint,
@@ -49,6 +56,7 @@ pub(in crate::editor) enum EditAction {
     Tool(PhotoTool),
     EraserMode(EraserMode),
     DrawingTool,
+    PencilShape(PencilShape),
     PaintMenu,
     EraserMenu,
     Save,
@@ -83,6 +91,7 @@ struct Session {
     pub doc: PhotoDocument,
     pub editing: bool,
     rendered: Option<(u64, u64)>,
+    prepared: Option<(u64, u64, photocraft_raster::Rgba8Image)>,
 }
 struct Opening {
     id: usize,
@@ -134,6 +143,7 @@ pub(in crate::editor) struct State {
     eraser_size: f32,
     pixel_eraser_size: f32,
     pub eraser_mode: EraserMode,
+    pub pencil_shape: PencilShape,
     pub tool: PhotoTool,
     pub size: f32,
     pub hardness: f32,
@@ -196,6 +206,7 @@ impl State {
                 self.tool == PhotoTool::Eraser && self.eraser_mode == mode
             }
             EditAction::DrawingTool => matches!(self.tool, PhotoTool::Brush | PhotoTool::Pencil),
+            EditAction::PencilShape(shape) => self.pencil_shape == shape,
             EditAction::PaintMenu => self.paint_menu && self.tool_menu == ToolMenu::Paint,
             EditAction::EraserMenu => self.paint_menu && self.tool_menu == ToolMenu::Eraser,
             EditAction::SizeMenu => self.size_menu,
@@ -270,7 +281,14 @@ impl State {
             }
             EditAction::Selection(_) => self.editing(id),
             EditAction::Menu | EditAction::View | EditAction::Edit => true,
-            EditAction::Save => doc.is_some_and(PhotoDocument::dirty),
+            EditAction::Save => {
+                doc.is_some_and(PhotoDocument::dirty)
+                    || self
+                        .selection
+                        .transform
+                        .as_ref()
+                        .is_some_and(|t| Some(t.id) == id && t.deferred)
+            }
             EditAction::Undo => doc.is_some_and(PhotoDocument::can_undo),
             EditAction::Redo => doc.is_some_and(PhotoDocument::can_redo),
             EditAction::DeleteLayer => doc.is_some_and(|d| d.active_layer().is_some()),
@@ -306,7 +324,9 @@ impl State {
             || (self.tool == PhotoTool::Eraser && self.eraser_mode == EraserMode::Pixel)
     }
     pub fn pixel_square(&self) -> bool {
-        self.pixel_tool() && self.size.round().max(1.0) <= 3.0
+        self.pixel_tool()
+            && (self.size.round().max(1.0) <= 3.0
+                || self.tool == PhotoTool::Pencil && self.pencil_shape == PencilShape::Square)
     }
     pub fn snap_point(&self, point: Vec2) -> Vec2 {
         if self.pixel_tool() {
@@ -348,6 +368,9 @@ impl State {
     }
     fn select_tool(&mut self, tool: PhotoTool) {
         if self.tool != tool {
+            if !selection::finish_pending(self) {
+                return;
+            }
             self.selection.transform = None;
             self.selection.draft = None;
             self.selection.menu = 0;
@@ -375,6 +398,7 @@ impl State {
             background: self.background(),
             erase: self.tool == PhotoTool::Eraser,
             aliased: pencil,
+            square: self.tool == PhotoTool::Pencil && self.pencil_shape == PencilShape::Square,
             ..Default::default()
         }
     }
@@ -385,6 +409,9 @@ impl State {
         )));
     }
     fn save(&mut self, id: usize, editor: &mut Editor) {
+        if !selection::finish_pending(self) {
+            return;
+        }
         layers::finish_preview(self, true);
         self.layers.form = None;
         self.selection.transform = None;
@@ -442,7 +469,15 @@ pub(super) fn update(
         .as_ref()
         .is_some_and(|t| Some(t.id) != editor.viewing_image)
     {
-        state.selection.transform = None;
+        if state
+            .selection
+            .transform
+            .as_ref()
+            .is_some_and(|t| !state.sessions.contains_key(&t.id))
+            || selection::finish_pending(state)
+        {
+            state.selection.transform = None;
+        }
     }
     if state
         .selection
@@ -478,6 +513,7 @@ pub(super) fn update(
                             doc,
                             editing: true,
                             rendered: None,
+                            prepared: None,
                         },
                     );
                     state.error = None;
@@ -538,6 +574,7 @@ pub(super) fn update(
                     | EditAction::Size(_)
                     | EditAction::Hardness(_)
                     | EditAction::BrushOpacity(_)
+                    | EditAction::PencilShape(_)
             )
         ) {
             state.size_menu = false;
@@ -594,6 +631,26 @@ pub(super) fn update(
         let Some(id) = editor.viewing_image else {
             continue;
         };
+        // A layer edit or leaving Edit mode must first retain a pending GPU drag.
+        if matches!(
+            action,
+            EditAction::View
+                | EditAction::Layers(_)
+                | EditAction::AddLayer
+                | EditAction::DeleteLayer
+                | EditAction::SelectLayer(_)
+                | EditAction::Visible(_)
+                | EditAction::Opacity(..)
+        ) && state.selection.transform.is_some()
+        {
+            if !selection::finish_pending(state) {
+                continue;
+            }
+            state.selection.transform = None;
+            if state.tool == PhotoTool::Transform {
+                state.select_tool(PhotoTool::Move);
+            }
+        }
         match action {
             EditAction::Undo if state.layers.preview.is_some() => {
                 layers::finish_preview(state, false);
@@ -677,6 +734,10 @@ pub(super) fn update(
                 state.paint_menu = false;
             }
             EditAction::DrawingTool => state.select_tool(state.drawing_tool),
+            EditAction::PencilShape(shape) => {
+                state.pencil_shape = shape;
+                state.gesture = None;
+            }
             EditAction::PaintMenu | EditAction::EraserMenu => {
                 let menu = if matches!(action, EditAction::EraserMenu) {
                     ToolMenu::Eraser
@@ -839,7 +900,12 @@ pub(super) fn update(
         layers::preview(state, id);
     }
     for tab in &mut editor.image_tabs {
-        tab.dirty = state.sessions.get(&tab.id).is_some_and(|s| s.doc.dirty());
+        tab.dirty = state.sessions.get(&tab.id).is_some_and(|s| s.doc.dirty())
+            || state
+                .selection
+                .transform
+                .as_ref()
+                .is_some_and(|t| t.id == tab.id && t.deferred);
     }
 }
 
@@ -849,6 +915,7 @@ pub(super) fn sync(
     images: &mut Assets<Image>,
     mut uploads: Option<&mut crate::editor::image_texture::TextureUploads>,
 ) {
+    selection::poll(&mut viewer.edit);
     let state = &mut viewer.edit;
     if let Some(id) = editor.viewing_image
         && let Some(session) = state.sessions.get_mut(&id)
@@ -889,7 +956,14 @@ pub(super) fn sync(
                 session.rendered = Some((session.doc.revision, session.doc.view_revision));
                 return;
             }
-            let composite = session.doc.preview();
+            let composite = session
+                .prepared
+                .take()
+                .filter(|(revision, view, _)| {
+                    (*revision, *view) == (session.doc.revision, session.doc.view_revision)
+                })
+                .map(|(_, _, image)| image)
+                .unwrap_or_else(|| session.doc.preview());
             let size = UVec2::new(composite.width, composite.height);
             let decoded = if size.max_element() > MAX_TEXTURE {
                 let rgba = image::RgbaImage::from_raw(size.x, size.y, composite.pixels)

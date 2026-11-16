@@ -287,6 +287,7 @@ pub(in crate::editor) fn input(
                     && same_scene
                 {
                     editor.edits = scene.before.clone();
+                    editor.sync_hierarchy_metadata();
                 }
                 keys.clear_just_pressed(KeyCode::Escape);
                 scrub.suppressed = true;

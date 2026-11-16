@@ -128,10 +128,12 @@ impl Editor {
         }
         self.room = room;
         self.edits = document.edits;
+        self.sync_hierarchy_metadata();
         self.saved = document.saved;
         self.undo = document.undo;
         self.redo = document.redo;
         self.selection = document.selection;
+        self.hierarchy_parenting = None;
         self.restore_selection = document.imported_selection;
         self.view = document.view;
         self.pivot = document.pivot;

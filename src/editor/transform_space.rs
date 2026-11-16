@@ -12,6 +12,16 @@ impl Editor {
     }
 
     pub(super) fn inspector_pose(&self, target: Selection) -> Option<Transform> {
+        if self.local_space
+            && let Some(key) = self.hierarchy_key(target)
+        {
+            return self
+                .edits
+                .hierarchy
+                .as_ref()?
+                .node(key)
+                .map(|n| n.local().transform());
+        }
         let world = self.pose(target)?.transform();
         if self.local_space
             && let Selection::Imported(index) = target
@@ -26,6 +36,12 @@ impl Editor {
     }
 
     pub(super) fn set_inspector_pose(&mut self, target: Selection, pose: Transform, field: Field) {
+        if self.local_space
+            && let Some(key) = self.hierarchy_key(target)
+        {
+            self.edit_hierarchy(|h| h.set_local(key, pose.into()));
+            return;
+        }
         let mut world = pose;
         if self.local_space
             && let Selection::Imported(index) = target
