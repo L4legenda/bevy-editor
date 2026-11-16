@@ -226,7 +226,10 @@ fn browser_delete_exit_cancel_retains_trash_until_discard_is_confirmed() {
     app.world_mut()
         .resource_mut::<Deletion>()
         .history
-        .push(deleted);
+        .push(DeletedFile {
+            file: deleted,
+            material: Handle::default(),
+        });
     {
         let mut editor = app.world_mut().resource_mut::<Editor>();
         let camera = editor.project.scenes[0].cameras[0].clone();
@@ -371,6 +374,222 @@ mod gpu {
     }
 
     #[test]
+    #[ignore = "requires GPU; verifies protected model feedback, retries, cleanup and deletion after tab close"]
+    fn gpu_browser_delete_open_model_shows_protective_shader_and_keeps_file() {
+        fn copy_assets(source: &std::path::Path, destination: &std::path::Path) {
+            std::fs::create_dir_all(destination).unwrap();
+            for entry in std::fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    copy_assets(&entry.path(), &destination.join(entry.file_name()));
+                } else {
+                    std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        let files = Files::new();
+        let mut project = crate::EditorProject::load(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+        )
+        .unwrap();
+        copy_assets(&project.asset_root, &files.0);
+        project.asset_root = files.0.clone();
+        let source = files.0.join(&project.catalog[0].asset);
+        let bytes = std::fs::read(&source).unwrap();
+        let (mut app, window, target) = lighting_ui_render::fixture_project(project);
+        app.world_mut().write_message(Action::ViewModel(0));
+        warm(&mut app, 50);
+        app.world_mut().resource_mut::<Editor>().drawer = true;
+        {
+            let mut browser = app.world_mut().resource_mut::<Browser>();
+            let models = browser
+                .folders
+                .iter()
+                .position(|f| f.path == std::path::Path::new("models"))
+                .unwrap();
+            browser.navigate(models);
+        }
+        warm(&mut app, 48);
+        let entity = {
+            let world = app.world_mut();
+            world
+                .query::<(Entity, &drawer::FileCard)>()
+                .iter(world)
+                .find_map(|(entity, card)| matches!(card.0, Entry::Model(0)).then_some(entity))
+                .unwrap()
+        };
+        let card_rect = rect(&app, entity);
+        let scene = app.world().resource::<Editor>().edits.clone();
+        let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/delete-blocked-qa");
+        std::fs::create_dir_all(&output).unwrap();
+        capture_when(&mut app, &target, &output.join("00-before.png"), |_| true);
+        click(&mut app, window, card_rect.center(), MouseButton::Right);
+        assert!(app.world().resource::<BrowserContext>().phase == Phase::Menu);
+        let remove = app.world().resource::<Menu>().remove;
+        app.world_mut().trigger(Activate { entity: remove });
+        warm(&mut app, 3);
+        let root = app
+            .world()
+            .resource::<blocked::Feedback>()
+            .active
+            .as_ref()
+            .unwrap()
+            .root;
+        assert_eq!(app.world().get::<ChildOf>(root).unwrap().parent(), entity);
+        assert!(app.world().get::<Control>(entity).is_some());
+        assert!(app.world().resource::<Deletion>().pending.is_none());
+        assert!(app.world().resource::<Deletion>().history.is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert!(
+            app.world()
+                .resource::<Editor>()
+                .status
+                .contains("сначала закройте вкладку")
+        );
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::ZERO,
+        ));
+        let mut frames = Vec::new();
+        for (index, age) in [0.16, 0.55, 1.3, 2.2].into_iter().enumerate() {
+            app.world_mut()
+                .resource_mut::<blocked::Feedback>()
+                .active
+                .as_mut()
+                .unwrap()
+                .age = age;
+            warm(&mut app, 2);
+            frames.push(capture_when(
+                &mut app,
+                &target,
+                &output.join(format!("0{}-protected.png", index + 1)),
+                |_| true,
+            ));
+        }
+        let changed = frames[0]
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| {
+                card_rect.contains(Vec2::new(*x as f32, *y as f32))
+                    && pixel
+                        .0
+                        .iter()
+                        .zip(frames[1].get_pixel(*x, *y).0)
+                        .take(3)
+                        .any(|(&a, b)| a.abs_diff(b) > 12)
+            })
+            .count();
+        assert!(
+            changed > 100,
+            "The protective shader must visibly animate: {changed} pixels"
+        );
+        assert!(
+            frames[1]
+                .enumerate_pixels()
+                .filter(|(x, y, p)| {
+                    card_rect.contains(Vec2::new(*x as f32, *y as f32))
+                        && p[0] > 170
+                        && p[1] > 65
+                        && u16::from(p[0]) > u16::from(p[2]) + 30
+                })
+                .count()
+                > 100,
+            "The protective seal and border must be visibly warm and luminous"
+        );
+        click(&mut app, window, card_rect.center(), MouseButton::Left);
+        keyboard(
+            &mut app,
+            window,
+            KeyCode::Delete,
+            Key::Delete,
+            ButtonState::Pressed,
+        );
+        keyboard(
+            &mut app,
+            window,
+            KeyCode::Delete,
+            Key::Delete,
+            ButtonState::Released,
+        );
+        assert_eq!(
+            app.world()
+                .resource::<blocked::Feedback>()
+                .active
+                .as_ref()
+                .unwrap()
+                .root,
+            root
+        );
+        assert!(
+            app.world()
+                .resource::<blocked::Feedback>()
+                .active
+                .as_ref()
+                .unwrap()
+                .age
+                < 0.1
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&MaterialNode<blocked::BlockedMaterial>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        app.world_mut()
+            .resource_mut::<blocked::Feedback>()
+            .active
+            .as_mut()
+            .unwrap()
+            .age = blocked::DURATION;
+        warm(&mut app, 3);
+        assert!(app.world().resource::<blocked::Feedback>().active.is_none());
+        assert!(app.world().get_entity(root).is_err());
+        keyboard(
+            &mut app,
+            window,
+            KeyCode::Delete,
+            Key::Delete,
+            ButtonState::Pressed,
+        );
+        keyboard(
+            &mut app,
+            window,
+            KeyCode::Delete,
+            Key::Delete,
+            ButtonState::Released,
+        );
+        assert!(app.world().resource::<blocked::Feedback>().active.is_some());
+        app.world_mut().resource_mut::<Editor>().drawer = false;
+        warm(&mut app, 3);
+        assert!(app.world().resource::<blocked::Feedback>().active.is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(app.world().resource::<Editor>().edits, scene);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(1.0 / 60.0),
+        ));
+        app.world_mut().resource_mut::<Editor>().drawer = true;
+        warm(&mut app, 20);
+        app.world_mut().write_message(Action::CloseModelTab(0));
+        warm(&mut app, 5);
+        assert!(!app.world().resource::<Editor>().model_tabs.contains(&0));
+        let card_rect = rect(&app, entity);
+        click(&mut app, window, card_rect.center(), MouseButton::Right);
+        app.world_mut().trigger(Activate { entity: remove });
+        for _ in 0..90 {
+            frame(&mut app);
+            if !app.world().resource::<Deletion>().history.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !source.exists(),
+            "After closing its tab, the model must be deletable"
+        );
+        assert!(app.world().resource::<blocked::Feedback>().active.is_none());
+        assert_eq!(app.world().resource::<Deletion>().history.len(), 1);
+        eprintln!("Protected deletion screenshots: {}", output.display());
+    }
+
+    #[test]
     #[ignore = "requires GPU adapter; captures the actual card shader and exercises delete/restore input"]
     fn gpu_browser_delete_black_hole_consumes_card_and_restores_file() {
         let files = Files::new();
@@ -477,6 +696,9 @@ mod gpu {
                 .any(|file| file.filename == "nebula.png")
         );
         assert_eq!(app.world().resource::<Editor>().edits, edits);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::ZERO,
+        ));
         keyboard(
             &mut app,
             window,
@@ -509,6 +731,67 @@ mod gpu {
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
         assert!(app.world().resource::<Deletion>().history.is_empty());
         let entity = card(&mut app, "nebula.png");
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Hidden,
+            "The real card must stay hidden while the black hole ejects its snapshot"
+        );
+        let mut colored = Vec::new();
+        for (index, progress) in [(5, 0.12), (6, 0.42), (7, 0.75)] {
+            let material = {
+                let mut deletion = app.world_mut().resource_mut::<Deletion>();
+                let restoring = deletion.restoring.as_mut().expect("Restore must animate");
+                restoring.age = DURATION * progress;
+                restoring.material.clone()
+            };
+            warm(&mut app, 3);
+            let state = app
+                .world()
+                .resource::<Assets<BlackHoleMaterial>>()
+                .get(&material)
+                .unwrap()
+                .state;
+            assert!((state.x - (1.0 - progress)).abs() < 0.001);
+            let image = capture_when(
+                &mut app,
+                &target,
+                &output.join(format!("0{index}-ejecting.png")),
+                |_| true,
+            );
+            let destination = rect(&app, entity);
+            if index == 6 {
+                let centre = destination.center().as_uvec2();
+                let pixel = image.get_pixel(centre.x, centre.y).0;
+                assert!(
+                    pixel[0] < 45 && pixel[1] < 45 && pixel[2] < 45,
+                    "Restoration must emerge from a black event horizon: {pixel:?}"
+                );
+            }
+            colored.push(
+                image
+                    .enumerate_pixels()
+                    .filter(|(x, y, pixel)| {
+                        destination.contains(Vec2::new(*x as f32, *y as f32))
+                            && pixel[0] > 180
+                            && pixel[1] > 65
+                    })
+                    .count(),
+            );
+        }
+        assert!(
+            colored[2] > colored[1] + 100,
+            "The restored snapshot must expand out of the hole: {colored:?}"
+        );
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(1.0 / 60.0),
+        ));
+        warm(&mut app, 60);
+        assert!(app.world().resource::<Deletion>().restoring.is_none());
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Inherited
+        );
+        capture_when(&mut app, &target, &output.join("08-restored.png"), |_| true);
         let point = rect(&app, entity).center();
         click(&mut app, window, point, MouseButton::Left);
         keyboard(
@@ -525,7 +808,28 @@ mod gpu {
             Key::Delete,
             ButtonState::Released,
         );
-        warm(&mut app, 100);
+        for _ in 0..90 {
+            frame(&mut app);
+            if app
+                .world()
+                .resource::<Deletion>()
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.effect.is_some())
+            {
+                break;
+            }
+        }
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::ZERO,
+        ));
+        app.world_mut()
+            .resource_mut::<Deletion>()
+            .pending
+            .as_mut()
+            .unwrap()
+            .age = DURATION * 0.42;
+        warm(&mut app, 3);
         assert!(!source.exists());
         assert_eq!(
             app.world().resource::<Editor>().edits,
@@ -537,10 +841,55 @@ mod gpu {
                 .query::<&MaterialNode<BlackHoleMaterial>>()
                 .iter(app.world())
                 .count(),
-            0
+            1
         );
+        let effect = app
+            .world()
+            .resource::<Deletion>()
+            .pending
+            .as_ref()
+            .unwrap()
+            .effect
+            .as_ref()
+            .unwrap()
+            .0;
         app.world_mut().write_message(Action::BrowserRestoreFile);
         warm(&mut app, 8);
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        let entity = card(&mut app, "nebula.png");
+        assert!(app.world().resource::<Deletion>().restoring.is_some());
+        let restoring = app
+            .world()
+            .resource::<Deletion>()
+            .restoring
+            .as_ref()
+            .unwrap();
+        assert_eq!(restoring.effect, Some(effect));
+        let progress = app
+            .world()
+            .resource::<Assets<BlackHoleMaterial>>()
+            .get(&restoring.material)
+            .unwrap()
+            .state
+            .x;
+        assert!(
+            (progress - 0.42).abs() < 0.001,
+            "Undo during consumption must reverse from the current frame"
+        );
+        app.world_mut().resource_mut::<Editor>().drawer = false;
+        warm(&mut app, 2);
+        assert!(app.world().resource::<Deletion>().restoring.is_none());
+        assert_eq!(
+            *app.world().get::<Visibility>(entity).unwrap(),
+            Visibility::Inherited,
+            "Closing the browser must not leave a restored card hidden"
+        );
+        assert_eq!(
+            app.world_mut()
+                .query::<&MaterialNode<BlackHoleMaterial>>()
+                .iter(app.world())
+                .count(),
+            0
+        );
     }
 }

@@ -10,7 +10,7 @@ use bevy::{
     },
     picking::{events::PointerClick, hover::Hovered, pointer::PointerButton},
     prelude::*,
-    text::{EditableText, TextCursorStyle, TextReadWriteMode},
+    text::{EditableText, TextReadWriteMode},
     ui::{ComputedNode, InteractionDisabled, Pressed, UiGlobalTransform},
     ui_widgets::{Activate, Button, TextInput},
     window::PrimaryWindow,
@@ -19,7 +19,11 @@ use bevy::{
 use super::Room;
 use crate::{project::LensKind, ui_theme::*};
 
-use super::{Action, Editor, Field, Reset, Selection, Tool, browser::Browser, starfield, viewport};
+use super::{
+    Action, Editor, Field, Reset, Selection, Tool,
+    browser::{self, Browser},
+    starfield, viewport,
+};
 
 #[cfg(test)]
 #[path = "asset_activation_tests.rs"]
@@ -36,6 +40,9 @@ mod camera_preview;
 mod confirmation;
 #[path = "control_hints.rs"]
 mod control_hints;
+#[path = "play_ui.rs"]
+mod play_ui;
+pub(super) use play_ui::update as refresh_play;
 #[path = "drawer.rs"]
 mod drawer;
 #[path = "icons.rs"]
@@ -43,26 +50,38 @@ pub(crate) mod icons;
 #[path = "image_viewer.rs"]
 mod image_viewer;
 #[path = "model_viewer.rs"]
-mod model_viewer;
+pub(in crate::editor) mod model_viewer;
+pub(super) use model_viewer::editing::State as ModelEditingState;
 pub(super) use model_viewer::{ModelViewAction, ModelViewerPlugin};
+#[path = "navigation_gizmo.rs"]
+pub(super) mod navigation_gizmo;
+pub(super) use navigation_gizmo::NavigationGizmoPlugin;
 #[path = "hdri_library.rs"]
 mod hdri_library;
 #[path = "lighting_ui.rs"]
 mod lighting_ui;
 pub(super) use hdri_library::{HdriAction, HdriLibrary, HdriLibraryPlugin};
+#[path = "generation_ui.rs"]
+pub(super) mod generation;
+pub(super) use generation::{GenerationAction, GenerationPlugin};
+#[path = "narrative_ui.rs"]
+pub(super) mod narrative;
 #[path = "numeric_input.rs"]
 mod numeric_input;
 #[path = "orbital.rs"]
 pub(crate) mod orbital;
 #[path = "scene_tabs.rs"]
 mod scene_tabs;
+pub(super) use narrative::{NarrativeAction, NarrativePlugin};
+#[path = "scene_objects_ui.rs"]
+mod scene_objects;
 #[path = "sidebar_resize.rs"]
 mod sidebar_resize;
 #[path = "tool_icons.rs"]
 mod tool_icons;
 pub(super) use asset_loading::AssetLoadingPlugin;
 pub(super) use browser_context::{
-    BrowserContext, BrowserDeletionPlugin, input as browser_context_input,
+    BrowserContext, BrowserDeletionPlugin, BrowserPrimitivePlugin, input as browser_context_input,
     refresh as refresh_browser_context, update as browser_context_actions,
 };
 pub(super) use button_fx::ButtonFxPlugin;
@@ -76,28 +95,44 @@ pub(super) use drawer::{
     update_files as update_browser_files,
 };
 pub(super) use icons::SvgIconsPlugin;
+pub(super) use image_viewer::edit::layers::ui::drag_ui::fx::LayerDragFxPlugin;
+pub(super) use image_viewer::edit::layers::ui::drag_ui::{
+    LayerDrag, input as drag_photo_layers, visuals as refresh_photo_layer_drag,
+};
+pub(super) use image_viewer::edit::layers::ui::{
+    input as photo_layers_input, refresh as refresh_photo_layers, sync_form as refresh_layer_form,
+};
+pub(super) use image_viewer::edit::selection_ui::ImageSelectionPlugin;
 pub(super) use image_viewer::edit::{
-    color_pointer as photo_editor_input, refresh as refresh_photo_editor,
+    color_input as photo_color_input, color_pointer as photo_editor_input,
+    refresh as refresh_photo_editor, refresh_color_picker as refresh_photo_color_picker,
 };
 pub(super) use image_viewer::{
-    ImageAction, ImageViewer, cursor as image_viewer_cursor, edit::EditAction as ImageEditAction,
-    refresh as refresh_image_viewer, update as view_images,
+    ImageAction, ImageCanvasPlugin, ImageViewer, cleanup_cursor as cleanup_image_cursor,
+    cursor as image_viewer_cursor, edit::EditAction as ImageEditAction,
+    refresh as refresh_image_viewer, resize_panel as resize_photo_editor, update as view_images,
 };
 pub(super) use lighting_ui::{
     LightingUi, edit_controls as edit_lighting_controls, edit_name as edit_light_name,
     refresh as refresh_lighting, refresh_controls as refresh_lighting_controls,
 };
+pub(super) use numeric_input::lock_text as lock_numeric_text;
+pub(super) use numeric_input::{
+    Number, Scrub as NumberScrub, scrub_cursor as number_scrub_cursor, scrub_input as scrub_numbers,
+};
 pub(super) use numeric_input::{NumericInput, update as update_numeric_input};
+pub(super) use scene_objects::{ObjectAction as SceneObjectAction, SceneObjectsPlugin};
 pub(super) use sidebar_resize::{
     SidebarLayout, layout as layout_sidebar, resize as resize_sidebar,
 };
 
 pub(super) const TOP: f32 = 94.0;
+pub(super) const IMAGE_TOP: f32 = 52.0;
 pub(super) const SIDE: f32 = 316.0;
 pub(super) const DRAWER: f32 = 350.0;
 pub(super) const FOOT: f32 = 34.0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
     Regular,
     Primary,
@@ -124,14 +159,17 @@ pub(super) struct HorizontalScroller;
 pub(super) struct Interface {
     font: Handle<Font>,
     tabs: Entity,
-    viewport: Entity,
+    toolbar: Entity,
+    tool_bar: Entity,
+    body: Entity,
+    side: Entity,
+    pub(super) viewport: Entity,
     scene_image: Entity,
     scene_badge: Entity,
     empty_scene: Entity,
     outliner: Entity,
     tree_chevron: Entity,
     inspector: Entity,
-    status: Entity,
     dirty: Entity,
     selected: Entity,
     kind: Entity,
@@ -151,6 +189,7 @@ pub(super) struct OutlineState {
     imported: usize,
     models: Vec<u32>,
     hidden: Vec<bool>,
+    objects: Vec<(Selection, String, bool)>,
     lights: Vec<(u32, String, bool, crate::lighting::LightKind)>,
 }
 
@@ -236,6 +275,39 @@ fn group(commands: &mut Commands, parent: Entity) -> Entity {
     )
 }
 
+fn inspector_card(commands: &mut Commands, parent: Entity) -> Entity {
+    let card = surface(
+        commands,
+        parent,
+        Node {
+            width: percent(100),
+            padding: UiRect::all(px(8)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(8)),
+            flex_shrink: 0.,
+            ..column(6.)
+        },
+        WELL.with_alpha(0.55),
+    );
+    commands
+        .entity(card)
+        .insert(BorderColor::all(EDGE.with_alpha(0.65)));
+    card
+}
+
+fn inspector_section(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    title: &str,
+    hint: &str,
+) -> Entity {
+    let card = inspector_card(commands, parent);
+    let heading = text(commands, card, font, title, 13., TEXT);
+    control_hints::attach(commands, heading, hint);
+    card
+}
+
 fn control(
     commands: &mut Commands,
     parent: Entity,
@@ -254,17 +326,17 @@ fn control(
         BorderColor::all(EDGE),
         ChildOf(parent),
     ));
-    if matches!(
-        (look, action),
-        (Look::Asset, Action::Browse(_) | Action::ViewImage(_))
-    ) {
-        // Button emits Activate on every click; folder and image cards use their own event.
+    entity.observe(activate_control::<Activate, false>);
+    if browser_open_action(action) {
+        // File entries opt into double-click activation. Tabs, breadcrumbs and
+        // context-menu commands keep the regular Button activation behavior.
         entity
-            .observe(activate_control::<AssetActivate>)
+            .observe(activate_control::<AssetActivate, true>)
             .observe(asset_pointer_click)
             .observe(asset_keypress);
-    } else {
-        entity.observe(activate_control::<Activate>);
+        if matches!(look, Look::Asset) {
+            entity.insert(AssetOpen);
+        }
     }
     entity.id()
 }
@@ -385,18 +457,18 @@ pub(super) fn setup(
     text(&mut commands, name, &font, "РЕДАКТОР СЦЕН", 9.0, MUTED);
 
     let tabs = scene_tabs::setup(&mut commands, project_bar);
-    button(
-        &mut commands,
-        project_bar,
-        &font,
-        "Играть",
-        Action::Play,
-        Look::Regular,
-    );
     crate::window_chrome::controls(&mut commands, project_bar);
     crate::window_chrome::resize_edges(&mut commands, root);
-    let tool_bar = node(&mut commands, toolbar, row(12.0));
+    let tool_bar = node(
+        &mut commands,
+        toolbar,
+        Node {
+            min_height: px(36),
+            ..row(12.0)
+        },
+    );
     tool_icons::setup(&mut commands, tool_bar);
+    model_viewer::editing::controls::geometry_toolbar(&mut commands, tool_bar);
     let tools = group(&mut commands, tool_bar);
     icons::button(
         &mut commands,
@@ -424,11 +496,11 @@ pub(super) fn setup(
     );
     commands.entity(navigation_hint).insert(Node {
         min_width: px(0),
-        flex_grow: 1.0,
         flex_shrink: 1.0,
         overflow: Overflow::clip(),
         ..default()
     });
+    play_ui::setup(&mut commands, tool_bar, root, &font);
 
     let body = node(
         &mut commands,
@@ -629,8 +701,10 @@ pub(super) fn setup(
 
     let checker = image_viewer::checker_texture(&mut images);
     drawer::setup(&mut commands, root, &font, &stars, &checker);
-    image_viewer::setup(&mut commands, viewport, &font, &checker);
+    image_viewer::setup(&mut commands, viewport, root, &font, &checker);
     browser_context::setup(&mut commands, root, &font);
+    narrative::setup(&mut commands, root, &font, &stars, &mut fonts);
+    generation::setup(&mut commands, root, &font, &checker);
 
     let footer = surface(
         &mut commands,
@@ -650,7 +724,8 @@ pub(super) fn setup(
     );
     commands.entity(footer).insert(ZIndex(20));
     drawer::footer_toggle(&mut commands, footer, &font);
-    let status_cell = node(
+    generation::footer(&mut commands, footer, &font);
+    node(
         &mut commands,
         footer,
         Node {
@@ -660,13 +735,17 @@ pub(super) fn setup(
             ..row(0.0)
         },
     );
-    let status = text(&mut commands, status_cell, &font, "", 12.0, MUTED);
+    generation::service_footer(&mut commands, footer, &font);
     let dirty = text(&mut commands, footer, &font, "●", 11.0, GREEN);
     control_hints::setup(&mut commands, root, &font);
     confirmation::setup(&mut commands, root, &font);
     commands.insert_resource(Interface {
         font,
         tabs,
+        toolbar,
+        tool_bar,
+        body,
+        side,
         viewport,
         scene_image,
         scene_badge: badge,
@@ -674,7 +753,6 @@ pub(super) fn setup(
         outliner,
         tree_chevron,
         inspector,
-        status,
         dirty,
         selected,
         kind,
@@ -696,7 +774,7 @@ fn outline_entry(
     selection: Selection,
     kind: Option<crate::lighting::LightKind>,
     enabled: bool,
-) {
+) -> Entity {
     let entry = button(
         commands,
         parent,
@@ -735,6 +813,7 @@ fn outline_entry(
             node.left = px(8);
             node.top = px(6);
         });
+    entry
 }
 
 fn object_outline_entry(
@@ -771,7 +850,7 @@ fn object_outline_entry(
         Selection::Light(id) => editor.light(id),
         _ => None,
     };
-    outline_entry(
+    let item = outline_entry(
         commands,
         name,
         font,
@@ -780,6 +859,7 @@ fn object_outline_entry(
         light.map(|light| light.kind),
         !hidden && light.is_none_or(|light| light.enabled),
     );
+    commands.entity(item).observe(scene_objects::pointer_menu);
     let eye = control(
         commands,
         container,
@@ -867,6 +947,7 @@ fn number(
     text(commands, cell, font_handle, axis, 11.0, accent);
     commands.spawn((
         field,
+        Number::scene(field),
         TextInput,
         AccessibleLabel(match field {
             Field::Position(_) => format!("Позиция {axis}"),
@@ -877,7 +958,7 @@ fn number(
             Field::Environment(_) => format!("Освещение сцены {axis}"),
         }),
         EditableText::new("0.00"),
-        TextCursorStyle::default(),
+        crate::ui_theme::text_cursor_style(),
         font(font_handle, 12.0),
         TextColor(TEXT),
         TextLayout::no_wrap(),
@@ -898,9 +979,26 @@ fn number(
 }
 
 fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
+    if matches!(action, Action::Play) && editor.play.running() {
+        return true;
+    }
+    if editor.scene_object_popup && !matches!(action, Action::SceneObject(_)) {
+        return false;
+    }
     if editor.pending.is_some() {
         return match action {
-            Action::SaveAndContinue => editor.ready,
+            Action::SaveAndContinue => {
+                editor.ready
+                    || matches!(
+                        editor.pending,
+                        Some(
+                            crate::editor::PendingAction::CloseNarrative(_)
+                                | crate::editor::PendingAction::ExitNarrative(_)
+                                | crate::editor::PendingAction::CloseModelTab(_)
+                                | crate::editor::PendingAction::CloseModelEditor(_)
+                        )
+                    )
+            }
             Action::DiscardAndContinue | Action::CancelPending => true,
             _ => false,
         };
@@ -911,8 +1009,24 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
             Action::HdriLibrary(_) | Action::UseDownloadedHdri(_)
         );
     }
+    if editor.generation.active && !Editor::model_tab_action(action) {
+        return false;
+    }
+    if let Action::Generation(action) = action {
+        return generation::available(editor, action);
+    }
+    if editor.narrative.active.is_some() && !Editor::model_tab_action(action) {
+        return false;
+    }
+    if let Action::Narrative(narrative) = action {
+        return (!editor.browser_popup || matches!(narrative, NarrativeAction::Create(_)))
+            && narrative::available(editor, narrative);
+    }
     if editor.viewing_image.is_some() && !Editor::model_tab_action(action) {
         return false;
+    }
+    if editor.viewing_model.is_some() && model_viewer::editing::toolbar_action(action).is_some() {
+        return !editor.browser_popup;
     }
     if editor.viewing_model.is_some() && !Editor::model_tab_action(action) {
         return false;
@@ -922,11 +1036,20 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
             action,
             Action::BrowserNewFolder
                 | Action::BrowserNewImage
-                | Action::BrowserImageSize(..)
                 | Action::BrowserCreateImage
+                | Action::BrowserNewScene
+                | Action::BrowserCreateScene
+                | Action::BrowserDialogueMenu
+                | Action::BrowserPrimitiveMenu
+                | Action::BrowserCreatePrimitive(_)
+                | Action::BrowserConfirmPrimitive
                 | Action::BrowserCreateFolder
                 | Action::BrowserCancelPopup
                 | Action::BrowserDeleteFile
+                | Action::BrowserOpenEntry
+                | Action::BrowserRenameFile
+                | Action::BrowserConfirmRename
+                | Action::BrowserDuplicateFile
                 | Action::BrowserRestoreFile
         );
     }
@@ -951,9 +1074,19 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         Action::ViewModel(index) => index < editor.project.catalog.len(),
         Action::BrowserCreateFolder
         | Action::BrowserCreateImage
-        | Action::BrowserImageSize(..)
+        | Action::BrowserCreateScene
+        | Action::BrowserConfirmPrimitive
         | Action::BrowserCancelPopup => false,
-        Action::BrowserNewFolder | Action::BrowserNewImage => editor.drawer,
+        Action::BrowserNewFolder
+        | Action::BrowserNewImage
+        | Action::BrowserNewScene
+        | Action::BrowserOpenEntry
+        | Action::BrowserRenameFile
+        | Action::BrowserConfirmRename
+        | Action::BrowserDuplicateFile
+        | Action::BrowserDialogueMenu
+        | Action::BrowserPrimitiveMenu
+        | Action::BrowserCreatePrimitive(_) => editor.drawer,
         Action::SaveAndContinue | Action::DiscardAndContinue | Action::CancelPending => false,
         Action::Open(room) => room < editor.project.scenes.len(),
         Action::CloseTab(room) => editor.open_tabs.contains(&room),
@@ -980,7 +1113,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         Action::BrowseForward => browser.can_go_forward(),
         Action::BrowseUp => browser.current != 0,
         Action::Save => editor.has_scene() && editor.ready,
-        Action::Play => editor.has_scene() && editor.ready && editor.definition().play.is_some(),
+        Action::Play => editor.has_scene() && editor.ready,
         Action::Undo => {
             editor.has_scene() && (!editor.undo.is_empty() || editor.camera_navigation.is_some())
         }
@@ -999,13 +1132,9 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         }
         Action::Focus => editor.has_scene() && editor.ready,
         Action::Reset(_) => editor.has_scene() && editor.ready && editor.selection.is_some(),
-        Action::Delete | Action::Duplicate => {
-            editor.has_scene()
-                && matches!(
-                    editor.selection,
-                    Some(Selection::Model(_) | Selection::Light(_))
-                )
-        }
+        Action::Delete => editor.has_scene() && editor.deletable_targets(),
+        Action::Duplicate => editor.has_scene() && editor.batch_editable(),
+        Action::SceneObject(action) => scene_objects::available(editor, action),
         _ => true,
     }
 }
@@ -1018,6 +1147,9 @@ pub(super) fn input(
     mut focus: ResMut<InputFocus>,
     lighting: Option<Res<LightingUi>>,
 ) {
+    if editor.scene_object_popup {
+        return;
+    }
     if editor.pending.is_some()
         || editor.browser_popup
         || editor.asset_viewer_open()
@@ -1041,16 +1173,71 @@ struct AssetActivate {
     entity: Entity,
 }
 
-fn asset_pointer_click(mut click: On<PointerClick>, mut commands: Commands) {
+#[derive(Component)]
+pub(super) struct AssetOpen;
+
+fn browser_open_action(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Browse(_)
+            | Action::ViewImage(_)
+            | Action::ViewModel(_)
+            | Action::Open(_)
+            | Action::BrowseFile(_)
+            | Action::Narrative(NarrativeAction::File(_))
+    )
+}
+
+fn asset_pointer_click(
+    mut click: On<PointerClick>,
+    controls: Query<(&Control, Option<&drawer::FileCard>), With<AssetOpen>>,
+    editor: Res<Editor>,
+    browser: Res<Browser>,
+    drag: Res<AssetDrag>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut browser_ui: Option<ResMut<drawer::BrowserUi>>,
+    mut focus: ResMut<InputFocus>,
+    mut commands: Commands,
+) {
+    let Ok((control, card)) = controls.get(click.entity) else {
+        return;
+    };
     click.propagate(false);
-    if click.button == PointerButton::Primary && click.count == 2 {
+    if click.button != PointerButton::Primary
+        || drag.suppress_activation_at(window.cursor_position())
+        || !available(&editor, &browser, control.action)
+        || card.is_some_and(|card| card.1 != browser.scan_revision)
+    {
+        return;
+    }
+    if let Some(ui) = browser_ui.as_mut() {
+        let entry = card.map(|card| card.0).or_else(|| match control.action {
+            Action::Browse(folder) => Some(browser::Entry::Folder(folder)),
+            Action::ViewModel(model) => Some(browser::Entry::Model(model)),
+            Action::ViewImage(file) => Some(browser::Entry::Image(file)),
+            Action::BrowseFile(file) | Action::Narrative(NarrativeAction::File(file)) => {
+                Some(browser::Entry::File(file))
+            }
+            _ => None,
+        });
+        ui.select(entry);
+    }
+    focus.set(click.entity, bevy::input_focus::FocusCause::Pressed);
+    if click.count == 2 {
         commands.trigger(AssetActivate {
             entity: click.entity,
         });
     }
 }
 
-fn asset_keypress(mut event: On<FocusedInput<KeyboardInput>>, mut commands: Commands) {
+fn asset_keypress(
+    mut event: On<FocusedInput<KeyboardInput>>,
+    entries: Query<(), With<AssetOpen>>,
+    mut commands: Commands,
+) {
+    if !entries.contains(event.focused_entity) {
+        return;
+    }
     let input = &event.input;
     if !input.repeat
         && input.state == ButtonState::Pressed
@@ -1063,13 +1250,14 @@ fn asset_keypress(mut event: On<FocusedInput<KeyboardInput>>, mut commands: Comm
     }
 }
 
-fn activate_control<E: EntityEvent>(
+fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
     activate: On<E>,
     editor: Res<Editor>,
     browser: Res<Browser>,
     drag: Res<AssetDrag>,
     window: Single<&Window, With<PrimaryWindow>>,
     controls: Query<&Control>,
+    entries: Query<(), With<AssetOpen>>,
     mut effects: Query<&mut button_fx::Effect>,
     mut focus: ResMut<InputFocus>,
     mut messages: MessageWriter<Action>,
@@ -1084,6 +1272,9 @@ fn activate_control<E: EntityEvent>(
         return;
     }
     let entity = activate.event_target();
+    if !EXPLICIT && entries.contains(entity) {
+        return;
+    }
     if !drag.suppress_activation_at(window.cursor_position())
         && let Ok(control) = controls.get(entity)
         && available(&editor, &browser, control.action)
@@ -1110,11 +1301,31 @@ pub(super) fn shortcuts(
     mut actions: MessageWriter<Action>,
     editor: Res<Editor>,
     drag: Option<Res<AssetDrag>>,
+    layer_drag: Option<Res<LayerDrag>>,
     lighting: Option<Res<LightingUi>>,
     browser_context: Option<Res<BrowserContext>>,
     image_viewer: Option<Res<ImageViewer>>,
+    model_edit: Option<Res<model_viewer::editing::State>>,
     sliders: Query<(), With<bevy::ui_widgets::Slider>>,
+    (pointer, scrub): (
+        Option<Res<viewport::PointerState>>,
+        Option<Res<NumberScrub>>,
+    ),
 ) {
+    if editor.scene_object_popup {
+        return;
+    }
+    if layer_drag.as_ref().is_some_and(|drag| drag.capturing()) {
+        return;
+    }
+    if scrub.as_ref().is_some_and(|scrub| scrub.capturing())
+        || pointer.as_ref().is_some_and(|pointer| pointer.selecting())
+        || model_edit
+            .as_ref()
+            .is_some_and(|model| model.box_start.is_some())
+    {
+        return;
+    }
     if keys.any_just_pressed([
         KeyCode::ArrowLeft,
         KeyCode::ArrowRight,
@@ -1138,8 +1349,32 @@ pub(super) fn shortcuts(
         browser_context::shortcuts(&keys, browser_context.as_deref(), &mut actions);
         return;
     }
+    if editor.generation.active && editor.pending.is_none() {
+        if keys.just_pressed(KeyCode::Escape)
+            && drag.as_ref().is_some_and(|drag| drag.cancelled_this_frame)
+        {
+            return;
+        }
+        generation::shortcuts(
+            &keys,
+            focus.get().is_some_and(|e| inputs.contains(e)),
+            &mut actions,
+        );
+        return;
+    }
+    if editor.narrative.active.is_some() && editor.pending.is_none() {
+        narrative::shortcuts(
+            &keys,
+            focus.get().is_some_and(|e| inputs.contains(e)),
+            &mut actions,
+        );
+        return;
+    }
     if editor.viewing_model.is_some() && editor.viewing_image.is_none() && editor.pending.is_none()
     {
+        if mouse.pressed(MouseButton::Right) {
+            return;
+        }
         let command = keys.any_pressed([
             KeyCode::ControlLeft,
             KeyCode::ControlRight,
@@ -1149,11 +1384,16 @@ pub(super) fn shortcuts(
         if focus.get().is_some_and(|entity| inputs.contains(entity)) {
             return;
         }
-        if keys.just_pressed(KeyCode::Escape) || (command && keys.just_pressed(KeyCode::KeyW)) {
-            actions.write(Action::ModelView(ModelViewAction::Close));
+        if model_viewer::editing::shortcuts(
+            &keys,
+            model_edit.as_deref(),
+            editor.viewing_model,
+            &mut actions,
+        ) {
+            return;
         }
-        if keys.just_pressed(KeyCode::KeyF) {
-            actions.write(Action::ModelView(ModelViewAction::Fit));
+        if command && keys.just_pressed(KeyCode::KeyW) {
+            actions.write(Action::ModelView(ModelViewAction::Close));
         }
         if keys.just_pressed(KeyCode::F5) {
             actions.write(Action::ModelView(ModelViewAction::Retry));
@@ -1167,6 +1407,41 @@ pub(super) fn shortcuts(
         return;
     }
     if editor.viewing_image.is_some() && editor.pending.is_none() {
+        if image_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.edit.color_picker.is_some())
+        {
+            if keys.just_pressed(KeyCode::Escape) {
+                actions.write(Action::ImageEdit(ImageEditAction::ColorCancel));
+            }
+            return;
+        }
+        if image_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.edit.layers.form.is_some() || viewer.edit.layers.menu)
+        {
+            return;
+        }
+        if image_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.resizing_panel())
+        {
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape)
+            && image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.resizing_brush())
+        {
+            return;
+        }
+        if keys.just_pressed(KeyCode::Escape)
+            && image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.size_menu)
+        {
+            return;
+        }
         let command = keys.any_pressed([
             KeyCode::ControlLeft,
             KeyCode::ControlRight,
@@ -1204,11 +1479,20 @@ pub(super) fn shortcuts(
             return;
         }
         if keys.just_pressed(KeyCode::Escape) {
-            if image_viewer
+            if let Some(viewer) = image_viewer
                 .as_ref()
-                .is_some_and(|viewer| viewer.edit.paint_menu)
+                .filter(|viewer| viewer.edit.paint_menu)
             {
-                actions.write(Action::ImageEdit(ImageEditAction::PaintMenu));
+                actions.write(Action::ImageEdit(
+                    if viewer
+                        .edit
+                        .active(ImageEditAction::EraserMenu, editor.viewing_image)
+                    {
+                        ImageEditAction::EraserMenu
+                    } else {
+                        ImageEditAction::PaintMenu
+                    },
+                ));
             } else if image_viewer.as_ref().is_some_and(|viewer| viewer.edit.menu) {
                 actions.write(Action::ImageEdit(ImageEditAction::Menu));
             } else if editor.drawer {
@@ -1281,6 +1565,13 @@ pub(super) fn shortcuts(
         actions.write(Action::Save);
         return;
     }
+    if keys.just_pressed(KeyCode::F5)
+        && (editor.play.running() || (editor.has_scene() && editor.ready))
+    {
+        focus.clear();
+        actions.write(Action::Play);
+        return;
+    }
     if focus.get().is_some_and(|entity| numbers.contains(entity)) {
         return;
     }
@@ -1317,6 +1608,14 @@ pub(super) fn shortcuts(
             }
         }
     } else if !editor.pilot && !mouse.pressed(MouseButton::Right) {
+        if keys.just_pressed(KeyCode::F2)
+            && let Some(target) = editor
+                .selection
+                .filter(|&target| editor.object_editable(target))
+        {
+            actions.write(Action::SceneObject(SceneObjectAction::Rename(target)));
+            return;
+        }
         if keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]) {
             for (key, reset) in [
                 (KeyCode::KeyQ, Reset::All),
@@ -1347,6 +1646,7 @@ pub(super) fn shortcuts(
 
 pub(super) fn scroll(
     editor: Res<Editor>,
+    viewer: Option<Res<ImageViewer>>,
     window: Single<&Window, With<PrimaryWindow>>,
     drawer: Res<DrawerMotion>,
     scroll: Res<AccumulatedMouseScroll>,
@@ -1358,6 +1658,8 @@ pub(super) fn scroll(
             &mut ScrollPosition,
             Has<drawer::DrawerScroll>,
             Has<HorizontalScroller>,
+            Has<image_viewer::edit::ColorPickerScroll>,
+            Has<image_viewer::edit::layers::ui::LayerScroll>,
         ),
         With<Scroller>,
     >,
@@ -1381,13 +1683,44 @@ pub(super) fn scroll(
     else {
         return;
     };
-    if cursor.y / window.scale_factor() >= window.height() - FOOT {
+    let color_picker = viewer
+        .as_ref()
+        .is_some_and(|viewer| viewer.edit.color_picker.is_some());
+    if !color_picker && cursor.y / window.scale_factor() >= window.height() - FOOT {
         return;
     }
     let over_drawer = drawer.visible_height > 0.0
         && cursor.y / window.scale_factor() >= window.height() - FOOT - drawer.visible_height;
-    for (computed, transform, mut offset, drawer_scroll, horizontal) in &mut areas {
-        if over_drawer != drawer_scroll {
+    let layer_popup = viewer
+        .as_ref()
+        .is_some_and(|v| v.edit.layers.menu || v.edit.layers.form.is_some());
+    let layer_area = if color_picker {
+        None
+    } else {
+        areas
+            .iter()
+            .filter(|(computed, transform, _, _, _, _, layer)| {
+                *layer
+                    && computed.size().min_element() > 0.0
+                    && !(cursor - transform.affine().translation)
+                        .abs()
+                        .cmpgt(computed.size() * 0.5)
+                        .any()
+            })
+            .map(|(computed, _, _, _, _, _, _)| computed.size().x * computed.size().y)
+            .min_by(f32::total_cmp)
+    };
+    for (computed, transform, mut offset, drawer_scroll, horizontal, picker_scroll, layer_scroll) in
+        &mut areas
+    {
+        if !color_picker
+            && (layer_area
+                .is_some_and(|area| !layer_scroll || computed.size().x * computed.size().y != area)
+                || layer_popup && !layer_scroll)
+        {
+            continue;
+        }
+        if color_picker != picker_scroll || (!color_picker && over_drawer != drawer_scroll) {
             continue;
         }
         let center = transform.affine().translation;
@@ -1425,9 +1758,12 @@ pub(super) fn refresh(
     editor: Res<Editor>,
     interface: Res<Interface>,
     browser: Res<Browser>,
-    image_viewer: Option<Res<ImageViewer>>,
+    (image_viewer, model_edit): (
+        Option<Res<ImageViewer>>,
+        Option<Res<model_viewer::editing::State>>,
+    ),
     (focus, focus_visible): (Res<InputFocus>, Res<bevy::input_focus::InputFocusVisible>),
-    browser_ui: Res<drawer::BrowserUi>,
+    (browser_ui, browser_context): (Res<drawer::BrowserUi>, Res<BrowserContext>),
     numeric: Res<NumericInput>,
     lighting: Res<LightingUi>,
     (mut outline, mut tabs, mut inspector_selection): (
@@ -1444,6 +1780,7 @@ pub(super) fn refresh(
         &Hovered,
         Has<Pressed>,
         Has<InteractionDisabled>,
+        Has<AssetOpen>,
         &ComputedNode,
         &Children,
         Option<&TabIndex>,
@@ -1469,6 +1806,9 @@ pub(super) fn refresh(
         (With<TextInput>, Without<Field>, Without<Control>),
     >,
 ) {
+    let model_edit = model_edit
+        .as_deref()
+        .filter(|_| editor.viewing_model.is_some() && editor.viewing_image.is_none());
     icons::set_glyph(
         &mut commands,
         interface.tree_chevron,
@@ -1503,6 +1843,11 @@ pub(super) fn refresh(
         *inspector_selection = Some(selected_document);
     }
     let models: Vec<_> = editor.edits.models.iter().map(|model| model.id).collect();
+    let objects: Vec<_> = (0..editor.imported.len())
+        .map(Selection::Imported)
+        .chain(models.iter().copied().map(Selection::Model))
+        .map(|target| (target, editor.label(target), editor.object_deleted(target)))
+        .collect();
     let hidden: Vec<_> = (0..editor.imported.len())
         .map(Selection::Imported)
         .chain(models.iter().copied().map(Selection::Model))
@@ -1526,6 +1871,7 @@ pub(super) fn refresh(
         || outline.imported != editor.imported.len()
         || outline.models != models
         || outline.hidden != hidden
+        || outline.objects != objects
         || outline.lights != lights
     {
         *outline = OutlineState {
@@ -1534,6 +1880,7 @@ pub(super) fn refresh(
             imported: editor.imported.len(),
             models,
             hidden,
+            objects,
             lights,
         };
         commands
@@ -1553,7 +1900,7 @@ pub(super) fn refresh(
             text(commands, section, &interface.font, label, 11.0, MUTED);
         };
         if editor.viewing_model.is_some() {
-            heading(&mut commands, "ПРОСМОТР МОДЕЛИ");
+            // The model document supplies its own object list after this refresh.
         } else if editor.has_scene() {
             heading(&mut commands, "ОСВЕЩЕНИЕ");
             outline_entry(
@@ -1590,6 +1937,9 @@ pub(super) fn refresh(
             }
             heading(&mut commands, "ОБЪЕКТЫ СЦЕНЫ");
             for index in 0..editor.imported.len() {
+                if editor.object_deleted(Selection::Imported(index)) {
+                    continue;
+                }
                 object_outline_entry(
                     &mut commands,
                     interface.outliner,
@@ -1625,7 +1975,6 @@ pub(super) fn refresh(
             tint.set_if_neq(TextColor(color));
         }
     };
-    set_label(interface.status, &editor.status, MUTED);
     set_label(
         interface.navigation_hint,
         if editor.viewing_image.is_some() {
@@ -1638,7 +1987,7 @@ pub(super) fn refresh(
                 "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
             }
         } else if editor.viewing_model.is_some() {
-            "Просмотр модели · ЛКМ — вращение · Колесо — приближение"
+            "Модель · ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Tab — режим"
         } else if !editor.has_scene() {
             "Откройте сцену в файловом менеджере"
         } else if editor.pilot {
@@ -1657,7 +2006,17 @@ pub(super) fn refresh(
     );
     set_label(
         interface.dirty,
-        if !editor.has_scene() || editor.viewing_model.is_some() || editor.viewing_image.is_some() {
+        if let Some(doc) = editor.narrative.current() {
+            if doc.dirty() {
+                "● Изменено"
+            } else {
+                "● Сохранено"
+            }
+        } else if editor.generation.active
+            || !editor.has_scene()
+            || editor.viewing_model.is_some()
+            || editor.viewing_image.is_some()
+        {
             ""
         } else if editor.dirty()
             || numeric.has_changes(&editor)
@@ -1667,7 +2026,10 @@ pub(super) fn refresh(
         } else {
             "● Сохранено"
         },
-        if editor.dirty() || numeric.has_changes(&editor) || lighting.name_has_changes(&editor) {
+        if editor.narrative.current().map_or_else(
+            || editor.dirty() || numeric.has_changes(&editor) || lighting.name_has_changes(&editor),
+            |doc| doc.dirty(),
+        ) {
             AMBER
         } else {
             GREEN
@@ -1680,6 +2042,8 @@ pub(super) fn refresh(
         editor.selection.map_or(String::new(), |target| {
             format!("Камера · {} · 16:9", editor.label(target))
         })
+    } else if editor.view_orthographic {
+        "Ортографический вид · Свет сцены".to_owned()
     } else {
         "Перспектива · Свет сцены".to_owned()
     };
@@ -1703,7 +2067,17 @@ pub(super) fn refresh(
         set_label(interface.selected, "Сцена не открыта", MUTED);
         set_label(interface.kind, "Откройте файл сцены внизу", MUTED);
     } else if let Some(target) = editor.selection {
-        set_label(interface.selected, &editor.label(target), TEXT);
+        let selected = editor.selected_targets();
+        let title = if selected.len() > 1 {
+            format!(
+                "Выбрано объектов: {} · {}",
+                selected.len(),
+                editor.label(target)
+            )
+        } else {
+            editor.label(target)
+        };
+        set_label(interface.selected, &title, TEXT);
         let kind = match target {
             Selection::Camera(_) => "Игровой ракурс",
             Selection::Imported(_) if !editor.field_allowed(target, Field::Position(1)) => {
@@ -1714,23 +2088,62 @@ pub(super) fn refresh(
             Selection::Light(_) => "Источник света · настройки ниже",
             Selection::Environment => "Окружение, экспозиция и свет сцены",
         };
-        set_label(interface.kind, kind, MUTED);
+        let kind = if selected.len() > 1 {
+            format!("Поля активного объекта · {}", editor.label(target))
+        } else {
+            kind.into()
+        };
+        set_label(interface.kind, &kind, MUTED);
     } else {
         set_label(interface.selected, "Выберите объект или камеру", MUTED);
         set_label(interface.kind, "В 3D-виде или в дереве сцены", MUTED);
     }
+    let painting = model_edit.is_some_and(|state| {
+        state.mode(editor.viewing_model) == crate::editor::model_document::Mode::Paint
+    });
+    let top = if painting
+        || editor.generation.active
+        || editor.viewing_image.is_some()
+        || editor.narrative.active.is_some()
+    {
+        IMAGE_TOP
+    } else {
+        TOP
+    };
+    if let Ok(mut toolbar) = panes.get_mut(interface.toolbar) {
+        toolbar.height = px(top);
+    }
+    if let Ok(mut body) = panes.get_mut(interface.body) {
+        body.top = px(top);
+    }
     for (entity, shown) in [
         (
+            interface.tool_bar,
+            !painting
+                && !editor.generation.active
+                && editor.viewing_image.is_none()
+                && editor.narrative.active.is_none(),
+        ),
+        (
             interface.scene_image,
-            editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+            !editor.generation.active
+                && editor.has_scene()
+                && editor.viewing_model.is_none()
+                && editor.viewing_image.is_none(),
         ),
         (
             interface.scene_badge,
-            editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+            !editor.generation.active
+                && editor.has_scene()
+                && editor.viewing_model.is_none()
+                && editor.viewing_image.is_none(),
         ),
         (
             interface.empty_scene,
-            !editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none(),
+            !editor.generation.active
+                && !editor.has_scene()
+                && editor.viewing_model.is_none()
+                && editor.viewing_image.is_none(),
         ),
         (
             interface.transforms,
@@ -1760,6 +2173,7 @@ pub(super) fn refresh(
         hovered,
         pressed,
         disabled,
+        asset_open,
         computed,
         children,
         tab_index,
@@ -1769,45 +2183,77 @@ pub(super) fn refresh(
         mut node,
     ) in &mut buttons
     {
-        let active = match control.action {
-            Action::Open(room) | Action::CloseTab(room) => {
-                editor.viewing_model.is_none()
-                    && editor.viewing_image.is_none()
-                    && editor.has_scene()
-                    && editor.room == room
+        let model_action = editor
+            .viewing_model
+            .filter(|_| editor.viewing_image.is_none())
+            .and_then(|_| model_viewer::editing::toolbar_action(control.action));
+        if let Action::Tool(tool) = control.action {
+            commands.entity(entity).try_insert(AccessibleLabel(
+                tool_icons::label(tool, model_action.is_some()).into(),
+            ));
+        }
+        let active = if let Some(action) = model_action {
+            model_edit.is_some_and(|state| state.active(action, editor.viewing_model))
+        } else {
+            match control.action {
+                Action::Generation(action) => generation::active(&editor, action),
+                Action::Open(room) if matches!(control.look, Look::Asset) => {
+                    matches!(browser_ui.selected_entry, Some(browser::Entry::Scene { room: selected, .. }) if selected == room)
+                }
+                Action::Open(room) | Action::CloseTab(room) => {
+                    !editor.generation.active
+                        && editor.viewing_model.is_none()
+                        && editor.narrative.active.is_none()
+                        && editor.viewing_image.is_none()
+                        && editor.has_scene()
+                        && editor.room == room
+                }
+                Action::Select(target) => editor.is_selected(target),
+                Action::Tool(tool) => editor.tool == tool,
+                Action::LocalSpace => editor.local_space,
+                Action::Snap => editor.snap,
+                Action::Drawer => editor.drawer,
+                Action::Browse(index) if asset_open => {
+                    browser_ui.selected_entry == Some(browser::Entry::Folder(index))
+                        || (!matches!(control.look, Look::Asset)
+                            && !matches!(
+                                browser_ui.selected_entry,
+                                Some(browser::Entry::Folder(_))
+                            )
+                            && browser.current == index)
+                }
+                Action::Browse(index) => browser.current == index,
+                Action::BrowseFile(index) => browser_ui.selected == Some(index),
+                Action::Narrative(NarrativeAction::File(index)) => {
+                    browser_ui.selected == Some(index)
+                }
+                Action::ViewImage(index) => browser_ui.selected == Some(index),
+                Action::OpenImageTab(id) | Action::CloseImageTab(id) => {
+                    editor.viewing_image == Some(id)
+                }
+                Action::ImageEdit(action) => image_viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer.edit.active(action, editor.viewing_image)),
+                Action::ImageView(ImageAction::Fit) => {
+                    image_viewer.as_ref().is_some_and(|viewer| viewer.is_fit())
+                }
+                Action::ImageView(ImageAction::ActualSize) => image_viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer.is_actual_size()),
+                Action::ViewModel(index) if matches!(control.look, Look::Tab) => {
+                    editor.viewing_model == Some(index)
+                }
+                Action::ViewModel(index) => browser_ui.selected_model == Some(index),
+                Action::Pilot => editor.pilot,
+                _ => false,
             }
-            Action::Select(target) => editor.selection == Some(target),
-            Action::Tool(tool) => editor.tool == tool,
-            Action::LocalSpace => editor.local_space,
-            Action::Snap => editor.snap,
-            Action::Drawer => editor.drawer,
-            Action::Browse(index) => browser.current == index,
-            Action::BrowseFile(index) => browser_ui.selected == Some(index),
-            Action::ViewImage(index) => browser_ui.selected == Some(index),
-            Action::OpenImageTab(id) | Action::CloseImageTab(id) => {
-                editor.viewing_image == Some(id)
-            }
-            Action::ImageEdit(action) => image_viewer
-                .as_ref()
-                .is_some_and(|viewer| viewer.edit.active(action, editor.viewing_image)),
-            Action::ImageView(ImageAction::Fit) => {
-                image_viewer.as_ref().is_some_and(|viewer| viewer.is_fit())
-            }
-            Action::ImageView(ImageAction::ActualSize) => image_viewer
-                .as_ref()
-                .is_some_and(|viewer| viewer.is_actual_size()),
-            Action::ViewModel(index) if matches!(control.look, Look::Tab) => {
-                editor.viewing_model == Some(index)
-            }
-            Action::ViewModel(index) => browser_ui.selected_model == Some(index),
-            Action::Pilot => editor.pilot,
-            _ => false,
         };
         let visible = match control.action {
             Action::BrowseClear => !browser.search.is_empty(),
             Action::Pilot | Action::Align => camera,
-            Action::Play => editor.has_scene() && editor.definition().play.is_some(),
-            Action::Duplicate | Action::Delete => {
+            Action::Play => play_ui::visible(&editor),
+            Action::Delete => editor.deletable_targets(),
+            Action::Duplicate => {
                 matches!(
                     editor.selection,
                     Some(Selection::Model(_) | Selection::Light(_))
@@ -1824,6 +2270,9 @@ pub(super) fn refresh(
             node.display = display;
         }
         let enabled = available(&editor, &browser, control.action)
+            && model_action.is_none_or(|action| {
+                model_edit.is_some_and(|state| state.available(action, editor.viewing_model))
+            })
             && match control.action {
                 Action::ImageEdit(action) => image_viewer
                     .as_ref()
@@ -1849,19 +2298,35 @@ pub(super) fn refresh(
             // Tabs and the outliner can queue a rebuild earlier in this refresh.
             commands.entity(entity).try_insert(TabIndex(tab));
         }
-        border.set_if_neq(BorderColor::all(
-            if enabled
-                && focus.get() == Some(entity)
-                && !matches!(control.look, Look::Tab | Look::TabClose)
-            {
-                FOCUS
-            } else {
-                Color::NONE
-            },
-        ));
+        let photo_tool =
+            matches!(control.look, Look::Tool) && matches!(control.action, Action::ImageEdit(_));
+        // Menus block activation without making the selected file/object look deselected.
+        let preserve_selection = (asset_open && browser_context.is_menu())
+            || (editor.scene_object_popup && active && matches!(control.look, Look::Outline));
+        let visual_enabled = enabled || preserve_selection;
+        let photo_options = photo_tool
+            && matches!(
+                control.action,
+                Action::ImageEdit(ImageEditAction::PaintMenu | ImageEditAction::EraserMenu)
+                    | Action::ImageEdit(ImageEditAction::Selection(
+                        image_viewer::edit::selection::SelectionAction::Menu
+                    ))
+            );
+        border.set_if_neq(BorderColor::all(if preserve_selection && active {
+            FOCUS
+        } else if enabled
+            && focus.get() == Some(entity)
+            && !matches!(control.look, Look::Tab | Look::TabClose)
+        {
+            FOCUS
+        } else if enabled && active && photo_tool && !photo_options {
+            FOCUS
+        } else {
+            Color::NONE
+        }));
         for child in children.iter() {
             if let Ok((_, mut color)) = labels.get_mut(child) {
-                color.set_if_neq(TextColor(if !enabled {
+                color.set_if_neq(TextColor(if !visual_enabled {
                     DISABLED_TEXT
                 } else if matches!(control.look, Look::Primary) {
                     ON_ACCENT
@@ -1876,7 +2341,7 @@ pub(super) fn refresh(
                 }));
             }
         }
-        let color = if !enabled {
+        let color = if !visual_enabled || photo_options {
             Color::NONE
         } else if matches!(control.look, Look::Tab) {
             Color::NONE
@@ -1888,7 +2353,7 @@ pub(super) fn refresh(
             }
         } else if matches!(control.look, Look::Tool) {
             if active {
-                ACCENT
+                if photo_tool { ACTIVE } else { ACCENT }
             } else if hovered.0 || pressed {
                 tool_icons::HOVER
             } else {
@@ -1906,12 +2371,14 @@ pub(super) fn refresh(
             Color::NONE
         };
         tint.set_if_neq(BackgroundColor(color));
-        let fill = if enabled
+        let fill = if photo_tool {
+            BackgroundGradient::default()
+        } else if enabled
             && (matches!(control.look, Look::Primary)
                 || (active && matches!(control.look, Look::Tool)))
         {
             primary_gradient(hovered.0 || pressed)
-        } else if enabled
+        } else if visual_enabled
             && active
             && !hovered.0
             && !pressed

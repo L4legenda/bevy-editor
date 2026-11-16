@@ -1,7 +1,7 @@
 //! The embedded PhotoCraft document, commands and native persistence.
 use image::{ImageDecoder, ImageFormat};
-use photocraft_color::{ColorMode, PixelFormat, SampleType, blend};
-use photocraft_doc::{Document, Layer, LayerContent};
+use photocraft_color::{ColorMode, PixelFormat, SampleType};
+use photocraft_doc::{Document, Layer, LayerContent, LayerId};
 use photocraft_geom::{Rect, Size};
 #[cfg(test)]
 use photocraft_paint::BrushSettings;
@@ -13,8 +13,30 @@ use std::{
 };
 
 pub(super) const MAX_PIXELS: u64 = 16_777_216;
-const MAX_LAYERS: usize = 64;
+pub(super) const MAX_LAYERS: usize = 4096;
 const HISTORY: usize = 32;
+
+#[path = "photo_layers.rs"]
+mod layers;
+#[path = "photo_libraries.rs"]
+mod libraries;
+#[path = "photo_selection.rs"]
+mod selection;
+pub(super) use libraries::LayerLibraries;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SelectionTool {
+    #[default]
+    Rectangle,
+    Ellipse,
+    Lasso,
+    Polygon,
+    Wand,
+    Quick,
+    Object,
+    Row,
+    Column,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum PhotoTool {
@@ -26,23 +48,45 @@ pub(super) enum PhotoTool {
     Eraser,
     Fill,
     Eyedropper,
+    Select(SelectionTool),
+    Transform,
 }
 
 #[derive(Clone)]
-struct Snapshot {
+pub(super) struct Snapshot {
     document: Document,
     active: usize,
+    selected: Vec<LayerId>,
+    mask_target: bool,
+    filter_target: bool,
     revision: u64,
+}
+
+pub(super) struct LayerMove {
+    before: Snapshot,
+    evicted: Option<Snapshot>,
+    redo: Vec<Snapshot>,
+    applied: bool,
 }
 
 pub(super) struct PhotoDocument {
     pub document: Document,
     pub active: usize,
+    pub selected: Vec<LayerId>,
+    pub mask_target: bool,
+    pub filter_target: bool,
+    pub mask_view: Option<photocraft_engine::commands::mask_view_cmds::LayerMaskView>,
+    pub view_revision: u64,
+    tool_colors: ([f32; 4], [f32; 4]),
+    engine: Option<std::sync::Mutex<Box<photocraft_engine::Session>>>,
+    parents: Vec<layers::Parent>,
     pub revision: u64,
     pub saved_revision: u64,
     next_revision: u64,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    // None invalidates the whole preview; a rectangle limits interactive redraws.
+    damage: Option<Rect>,
 }
 
 impl PhotoDocument {
@@ -116,20 +160,36 @@ impl PhotoDocument {
             photocraft_format::write_noreplace(&native, &bytes).map_err(|e| e.to_string())?;
             doc
         };
-        let active = document.layers.len().saturating_sub(1);
+        let active = document.walk().len().saturating_sub(1);
+        let selected = document
+            .walk()
+            .into_iter()
+            .nth(active)
+            .map(|(_, _, l)| l.id)
+            .into_iter()
+            .collect();
         Ok(Self {
             document,
             active,
+            selected,
+            mask_target: false,
+            filter_target: false,
+            mask_view: None,
+            view_revision: 0,
+            tool_colors: ([0.0, 0.0, 0.0, 1.0], [1.0; 4]),
+            engine: None,
+            parents: Vec::new(),
             revision: 1,
             saved_revision: 1,
             next_revision: 2,
             undo: Vec::new(),
             redo: Vec::new(),
+            damage: None,
         })
     }
 
     pub fn dirty(&self) -> bool {
-        self.revision != self.saved_revision
+        self.revision != self.saved_revision || self.parents.iter().any(|p| p.dirty())
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
@@ -140,28 +200,72 @@ impl PhotoDocument {
     pub fn size(&self) -> Size {
         self.document.size
     }
-    fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             document: self.document.clone(),
             active: self.active,
+            selected: self.selected.clone(),
+            mask_target: self.mask_target,
+            filter_target: self.filter_target,
             revision: self.revision,
         }
     }
     pub fn checkpoint(&mut self) {
-        self.undo.push(self.snapshot());
+        self.checkpoint_from(self.snapshot());
+    }
+    pub fn checkpoint_from(&mut self, snapshot: Snapshot) {
+        self.undo.push(snapshot);
         if self.undo.len() > HISTORY {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
     pub fn changed(&mut self) {
+        self.damage = None;
+        self.revision = self.next_revision;
+        self.next_revision += 1;
+    }
+    pub fn take_damage(&mut self) -> Option<Rect> {
+        std::mem::replace(&mut self.damage, Some(Rect::EMPTY))
+    }
+    fn changed_region(&mut self, damage: Rect) {
+        if self.document.walk().iter().any(|(_, _, l)| {
+            !l.effects.items.is_empty()
+                || l.mask.as_ref().is_some_and(|m| m.feather > 0.0)
+                || l.vector_mask.is_some()
+                || matches!(l.content, LayerContent::Adjustment(_))
+        }) {
+            self.changed();
+            return;
+        }
+        let damage = damage.intersect(&Rect::from_size(self.size()));
+        if damage.is_empty() {
+            return;
+        }
+        if let Some(previous) = &mut self.damage {
+            *previous = previous.union(&damage);
+        }
         self.revision = self.next_revision;
         self.next_revision += 1;
     }
     fn restore(&mut self, snapshot: Snapshot) {
         self.document = snapshot.document;
         self.active = snapshot.active;
+        self.selected = snapshot.selected;
+        self.mask_target = snapshot.mask_target;
+        self.filter_target = snapshot.filter_target;
         self.revision = snapshot.revision;
+        self.damage = None;
+        if self.mask_view.is_some_and(|view| {
+            self.active_id() != Some(view.layer)
+                || self.document.layer(view.layer).is_none_or(|layer| {
+                    photocraft_engine::commands::mask_view_cmds::viewed_mask(layer, view.filter)
+                        .is_none()
+                })
+        }) {
+            self.mask_view = None;
+            self.view_revision += 1;
+        }
     }
     pub fn undo(&mut self) {
         if let Some(snapshot) = self.undo.pop() {
@@ -176,97 +280,71 @@ impl PhotoDocument {
         }
     }
     pub fn add_layer(&mut self) {
-        if self.document.layers.len() >= MAX_LAYERS {
-            return;
-        }
-        self.checkpoint();
-        let position = (self.active + 1).min(self.document.layers.len());
-        self.document.layers.insert(
-            position,
-            Layer::raster(
-                format!("Слой {}", self.document.layers.len() + 1),
-                PixelFormat::RGBA8,
-            ),
-        );
-        self.active = position;
-        self.changed();
+        let _ = self.layer_command("layer.new.layer", serde_json::json!({}));
     }
+    #[cfg(test)]
     pub fn duplicate_layer(&mut self) {
-        if self.document.layers.len() >= MAX_LAYERS {
-            return;
-        }
-        if let Some(layer) = self.document.layers.get(self.active) {
-            let mut copy = layer.duplicate();
-            copy.name = format!("{} — копия", copy.name);
-            self.checkpoint();
-            self.active += 1;
-            self.document.layers.insert(self.active, copy);
-            self.changed();
-        }
+        let _ = self.layer_command("layer.duplicate", serde_json::json!({}));
     }
     pub fn delete_layer(&mut self) {
-        if self.document.layers.len() <= 1 {
-            return;
-        }
-        self.checkpoint();
-        self.document.layers.remove(self.active);
-        self.active = self.active.min(self.document.layers.len() - 1);
-        self.changed();
+        let _ = self.layer_command("layer.delete", serde_json::json!({}));
     }
+    #[cfg(test)]
     pub fn reorder(&mut self, up: bool) {
-        let next = if up {
-            self.active.checked_add(1)
-        } else {
-            self.active.checked_sub(1)
-        };
-        if let Some(next) = next.filter(|&n| n < self.document.layers.len()) {
-            self.checkpoint();
-            self.document.layers.swap(self.active, next);
-            self.active = next;
-            self.changed();
-        }
+        let _ = self.layer_command(
+            if up {
+                "layer.arrange.bringForward"
+            } else {
+                "layer.arrange.sendBackward"
+            },
+            serde_json::json!({}),
+        );
     }
     pub fn visibility(&mut self, index: usize) {
-        if index >= self.document.layers.len() {
-            return;
+        if let Some(layer) = self.layer(index) {
+            let params = serde_json::json!({"layer": layer.id.0, "visible": !layer.visible});
+            let _ = self.layer_command("layer.setProps", params);
         }
-        self.checkpoint();
-        self.document.layers[index].visible ^= true;
-        self.changed();
     }
     #[cfg(test)]
     pub fn opacity(&mut self, value: f32) {
-        if !value.is_finite() {
-            return;
+        if value.is_finite() {
+            let _ = self.layer_command(
+                "layer.setProps",
+                serde_json::json!({"opacity": value.clamp(0.0, 1.0)}),
+            );
         }
-        self.checkpoint();
-        self.document.layers[self.active].opacity = value.clamp(0.0, 1.0);
-        self.changed();
     }
     pub fn rename(&mut self, name: &str) {
         let name = name.trim();
-        if name.is_empty() || self.document.layers[self.active].name == name {
-            return;
+        if !name.is_empty() && self.active_layer().is_some_and(|l| l.name != name) {
+            let _ = self.layer_command(
+                "layer.setProps",
+                serde_json::json!({"name": name.chars().take(100).collect::<String>()}),
+            );
         }
-        self.checkpoint();
-        self.document.layers[self.active].name = name.chars().take(100).collect();
-        self.changed();
     }
     pub fn paintable(&self) -> bool {
-        self.document
-            .layers
-            .get(self.active)
-            .is_some_and(|l| l.visible && !l.locks.all && !l.locks.pixels && l.surface().is_some())
+        let Some(id) = self.active_id() else {
+            return false;
+        };
+        let Some(path) = self.document.path_of(id) else {
+            return false;
+        };
+        let locks = self.document.effective_locks(id);
+        self.document.shown_at(&path)
+            && !locks.all
+            && (self.mask_target || !locks.pixels)
+            && (self.mask_target
+                || self
+                    .active_layer()
+                    .is_some_and(|l| matches!(l.content, LayerContent::Raster(_))))
+            && self.paint_surface().is_some()
     }
     #[cfg(test)]
     pub fn paint(&mut self, original: &Surface, brush: &BrushSettings, points: &[StrokePoint]) {
         let bounds = Rect::from_size(self.size());
-        if let Some(surface) = self
-            .document
-            .layers
-            .get_mut(self.active)
-            .and_then(Layer::surface_mut)
-        {
+        if let Some(surface) = self.paint_surface_mut() {
             *surface = original.clone();
             photocraft_paint::render_stroke_clipped(
                 surface,
@@ -280,14 +358,10 @@ impl PhotoDocument {
             self.changed();
         }
     }
+    #[cfg(test)]
     pub fn move_layer(&mut self, original: &Surface, dx: i32, dy: i32) {
         let bounds = Rect::from_size(self.size());
-        if let Some(surface) = self
-            .document
-            .layers
-            .get_mut(self.active)
-            .and_then(Layer::surface_mut)
-        {
+        if let Some(surface) = self.paint_surface_mut() {
             *surface = original.translated(dx, dy, bounds);
             self.changed();
         }
@@ -296,82 +370,75 @@ impl PhotoDocument {
         &mut self,
         original: &Surface,
         renderer: &mut photocraft_paint::StrokeRenderer,
-        point: Option<StrokePoint>,
+        points: &[StrokePoint],
+        tail: &mut Rect,
         finish: bool,
-    ) {
-        if let Some(point) = point {
-            renderer.push(&[point]);
-        }
+    ) -> Result<(), String> {
+        renderer.push(points);
         if finish {
             renderer.finish();
         }
-        if let Some(surface) = self
-            .document
-            .layers
-            .get_mut(self.active)
-            .and_then(Layer::surface_mut)
-        {
-            renderer.composite(original, surface, None, false, false);
-            self.changed();
+        let lock_transparency = !self.mask_target
+            && self
+                .active_id()
+                .is_some_and(|id| self.document.effective_locks(id).transparency);
+        let selection = self.document.selection.clone();
+        let filter = self.mask_target && self.filter_target;
+        let before = filter.then(|| self.document.clone());
+        let mut changed = None;
+        if let Some(surface) = self.paint_surface_mut() {
+            // PhotoCraft previews the unfinished interpolation tail, then replaces it on
+            // the next batch. A click and the newest pointer position are visible immediately.
+            let (damage, next_tail) = renderer.composite_live(
+                *tail,
+                original,
+                surface,
+                selection.as_ref(),
+                lock_transparency,
+            );
+            *tail = next_tail;
+            changed = Some(damage);
         }
+        if let Some(damage) = changed.filter(|d| !d.is_empty()) {
+            if filter
+                && let Some(id) = self.active_id()
+                && let Err(error) =
+                    photocraft_engine::commands::smart_cmds::refresh_after_filter_mask_edit(
+                        &mut self.document,
+                        id,
+                    )
+            {
+                if let Some(before) = before {
+                    self.document = before;
+                }
+                return Err(error.to_string());
+            }
+            if filter {
+                // Feathering and filters can affect pixels outside the brush's damage rectangle.
+                self.changed();
+            } else {
+                self.changed_region(damage);
+            }
+        }
+        Ok(())
     }
     pub fn fill(&mut self, x: i32, y: i32, color: [f32; 4]) {
-        if !self.paintable() {
-            return;
-        }
-        let size = self.size();
-        if x < 0 || y < 0 || x >= size.width as i32 || y >= size.height as i32 {
-            return;
-        }
-        let Some(surface) = self.document.layers[self.active].surface() else {
-            return;
-        };
-        let old = surface.rgba(x, y);
-        if old
-            .iter()
-            .zip(color)
-            .all(|(a, b)| (*a - b).abs() < 1.0 / 255.0)
+        if !self.paintable()
+            || x < 0
+            || y < 0
+            || x >= self.size().width as i32
+            || y >= self.size().height as i32
         {
             return;
         }
-        self.checkpoint();
-        let Some(surface) = self.document.layers[self.active].surface_mut() else {
-            return;
-        };
-        let mut visited = vec![false; size.area() as usize];
-        let mut stack = vec![(x, y)];
-        while let Some((x, y)) = stack.pop() {
-            let index = y as usize * size.width as usize + x as usize;
-            if visited[index] {
-                continue;
-            }
-            visited[index] = true;
-            if surface
-                .rgba(x, y)
-                .iter()
-                .zip(old)
-                .any(|(a, b)| (*a - b).abs() > 1.0 / 255.0)
-            {
-                continue;
-            }
-            surface.write_pixel(x, y, &color);
-            if x > 0 {
-                stack.push((x - 1, y));
-            }
-            if y > 0 {
-                stack.push((x, y - 1));
-            }
-            if x + 1 < size.width as i32 {
-                stack.push((x + 1, y));
-            }
-            if y + 1 < size.height as i32 {
-                stack.push((x, y + 1));
-            }
-        }
-        self.changed();
+        let _=self.layer_command("paint.bucket",serde_json::json!({"x":x,"y":y,"color":color,"tolerance":0,"antiAlias":false,"target":if self.mask_target && self.filter_target{"filterMask"}else if self.mask_target{"mask"}else{"pixels"}}));
     }
+    #[cfg(test)]
     pub fn composite(&self) -> Rgba8Image {
         composite(&self.document)
+    }
+    pub fn composite_region(&self, rect: Rect) -> Rgba8Image {
+        composite_region(&self.document, rect)
     }
 }
 
@@ -402,58 +469,24 @@ fn validate(doc: &Document) -> Result<(), String> {
         || doc.size.width > 32768
         || doc.size.height > 32768
         || doc.size.area() > MAX_PIXELS
-        || doc.layers.is_empty()
-        || doc.layers.len() > MAX_LAYERS
+        || doc.layer_count() > MAX_LAYERS
     {
-        return Err("Проект превышает ограничения базового редактора: 16 Мп, 64 слоя.".into());
+        return Err("Проект превышает ограничения редактора: 16 Мп, 4096 слоёв.".into());
     }
-    if doc.mode != ColorMode::Rgb
-        || doc.depth != SampleType::U8
-        || doc.layers.iter().any(|l| {
-            !matches!(l.content, LayerContent::Raster(_))
-                || l.mask.is_some()
-                || l.vector_mask.is_some()
-                || !l.effects.items.is_empty()
-                || l.clipped
-                || l.frame.is_some()
-        })
-    {
-        return Err("Этот проект использует возможности полной версии PhotoCraft. Базовый редактор поддерживает растровые RGB-слои без масок и эффектов.".into());
-    }
+
     Ok(())
 }
 
 pub(super) fn composite(doc: &Document) -> Rgba8Image {
-    let mut image = Rgba8Image::new(doc.size.width, doc.size.height);
-    // Gather a row per layer instead of locking a raster tile for every pixel.
-    let width = doc.size.width as usize;
-    let mut accum = vec![[0.0; 4]; width];
-    let mut source = vec![[0.0; 4]; width];
-    for (y, row) in image.pixels.chunks_exact_mut(width * 4).enumerate() {
-        accum.fill([0.0; 4]);
-        for layer in doc.layers.iter().filter(|l| l.visible) {
-            if let Some(surface) = layer.surface() {
-                surface.read_rgba_into(
-                    Rect::new(0, y as i32, width as i32, y as i32 + 1),
-                    &mut source,
-                );
-                for (dst, src) in accum.iter_mut().zip(&source) {
-                    *dst = blend::composite(
-                        layer.blend,
-                        *dst,
-                        *src,
-                        layer.opacity * layer.fill_opacity,
-                    );
-                }
-            }
-        }
-        for (pixel, rgba) in row.chunks_exact_mut(4).zip(&accum) {
-            for (channel, value) in pixel.iter_mut().zip(rgba) {
-                *channel = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-            }
-        }
+    composite_region(doc, Rect::from_size(doc.size))
+}
+
+fn composite_region(doc: &Document, rect: Rect) -> Rgba8Image {
+    let rect = rect.intersect(&Rect::from_size(doc.size));
+    if rect.is_empty() {
+        return Rgba8Image::new(0, 0);
     }
-    image
+    photocraft_compose::render(doc, rect).to_rgba8()
 }
 
 pub(super) fn save(source: &Path, document: &Document) -> Result<(), String> {
@@ -489,8 +522,14 @@ pub(super) fn save(source: &Path, document: &Document) -> Result<(), String> {
             .write_to(&mut encoded, format)
             .map_err(|e| e.to_string())?;
     }
+    let mut native_document = document.clone();
+    native_document.name = source
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     let native = photocraft_format::save_to_bytes(
-        document,
+        &native_document,
         &photocraft_format::SaveOptions {
             full_composite: Some(image),
             ..Default::default()

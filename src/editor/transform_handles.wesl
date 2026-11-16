@@ -106,12 +106,13 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
         alpha = fill + alpha * (1.0 - fill);
     }
     // The white pivot overlays the crossing shafts, with a dark one-pixel rim.
-    if viewport.w != 3.0 {
+    if viewport.w != 3.0 || pivot.z > 0.5 {
         let radius = length(point - pivot.xy);
         let rim = coverage(radius - 4.2);
         let fill = coverage(radius - 3.1);
         color = mix(color, vec3<f32>(0.055), rim);
-        color = mix(color, vec3<f32>(1.0), fill);
+        let center_color = mix(vec3<f32>(1.0), vec3<f32>(1.0, 0.81, 0.38), pivot.w);
+        color = mix(color, center_color, fill);
         alpha = rim + alpha * (1.0 - rim);
     }
     return vec4<f32>(color / max(alpha, 0.0001), alpha);

@@ -480,7 +480,7 @@ fn q_selects_the_universal_tool_and_keeps_flight_controls_and_scene_data_intact(
 }
 
 #[test]
-fn universal_tool_respects_camera_and_point_light_transform_limits() {
+fn selection_tool_has_no_handles_and_transform_tools_respect_object_limits() {
     let mut app = app();
     app.world_mut().resource_mut::<Editor>().ready = true;
     action(&mut app, Action::Tool(Tool::Universal));
@@ -522,7 +522,7 @@ fn universal_tool_respects_camera_and_point_light_transform_limits() {
     assert!(matches!(point, Selection::Light(_)));
     assert_eq!(editor.tool, Tool::Universal);
     for axis in 0..3 {
-        assert!(viewport::allowed(editor, point, Tool::Universal, axis));
+        assert!(!viewport::allowed(editor, point, Tool::Universal, axis));
         assert!(viewport::allowed(editor, point, Tool::Move, axis));
         assert!(!viewport::allowed(editor, point, Tool::Rotate, axis));
         assert!(!viewport::allowed(editor, point, Tool::Scale, axis));

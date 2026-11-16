@@ -9,7 +9,8 @@ use bevy::{
 };
 
 use super::{
-    Action, Control, DISABLED_TEXT, Editor, Look, MUTED, ON_ACCENT, TEXT, control, row, scene_tabs,
+    Action, Control, DISABLED_TEXT, Editor, FOCUS, ImageViewer, Look, MUTED, ModelEditingState,
+    ON_ACCENT, TEXT, control, row, scene_tabs,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -17,6 +18,7 @@ pub(crate) enum Glyph {
     ChevronLeft,
     ChevronRight,
     ChevronDown,
+    SubmenuDown,
     ChevronUp,
     ArrowUp,
     Search,
@@ -27,6 +29,8 @@ pub(crate) enum Glyph {
     Folder,
     FolderOpen,
     File,
+    CharacterFile,
+    DialogueFile,
     Image,
     Trash,
     Layers,
@@ -36,6 +40,7 @@ pub(crate) enum Glyph {
     Move,
     Rotate,
     Scale,
+    Extrude,
     Camera,
     Box,
     Sun,
@@ -50,19 +55,59 @@ pub(crate) enum Glyph {
     Brush,
     Pencil,
     Eraser,
-    Hand,
     Pipette,
     PaintBucket,
     Undo,
     Redo,
+    Selection,
+    SelectionEllipse,
+    Lasso,
+    Polygon,
+    Wand,
+    SelectVertex,
+    SelectEdge,
+    SelectFace,
+    Xray,
+    PrimitivePlane,
+    PrimitiveCircle,
+    PrimitiveUvSphere,
+    PrimitiveIcoSphere,
+    PrimitiveCylinder,
+    PrimitiveCone,
+    PrimitiveTorus,
+    Copy,
+    Lock,
+    Mask,
+    Check,
+    Play,
+    Stop,
 }
 
 impl Glyph {
     fn svg(self) -> &'static str {
         match self {
+            Self::CharacterFile => include_str!("../../assets/icons/asset-character.svg"),
+            Self::DialogueFile => include_str!("../../assets/icons/asset-dialogue.svg"),
+            Self::Play => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M6 3.5a1 1 0 0 1 1.5-.86l14 8.5a1 1 0 0 1 0 1.72l-14 8.5A1 1 0 0 1 6 20.5Z"/></svg>"#
+            }
+            Self::Stop => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>"#
+            }
+            Self::Copy => include_str!("../../assets/icons/lucide/copy.svg"),
+            Self::Lock => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4M12 14v3"/></svg>"#
+            }
+            Self::Mask => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="12" cy="12" r="4"/></svg>"#
+            }
+            Self::Check => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="m7 12 3 3 7-7"/></svg>"#
+            }
             Self::ChevronLeft => include_str!("../../assets/icons/lucide/chevron-left.svg"),
             Self::ChevronRight => include_str!("../../assets/icons/lucide/chevron-right.svg"),
             Self::ChevronDown => include_str!("../../assets/icons/lucide/chevron-down.svg"),
+            Self::SubmenuDown => include_str!("../../assets/icons/submenu-down.svg"),
             Self::ChevronUp => include_str!("../../assets/icons/lucide/chevron-up.svg"),
             Self::ArrowUp => include_str!("../../assets/icons/lucide/arrow-up.svg"),
             Self::Search => include_str!("../../assets/icons/lucide/search.svg"),
@@ -82,6 +127,7 @@ impl Glyph {
             Self::Move => include_str!("../../assets/icons/lucide/move.svg"),
             Self::Rotate => include_str!("../../assets/icons/lucide/rotate-cw.svg"),
             Self::Scale => include_str!("../../assets/icons/lucide/scaling.svg"),
+            Self::Extrude => include_str!("../../assets/icons/extrude.svg"),
             Self::Camera => include_str!("../../assets/icons/lucide/camera.svg"),
             Self::Box => include_str!("../../assets/icons/lucide/box.svg"),
             Self::Sun => include_str!("../../assets/icons/lucide/sun.svg"),
@@ -96,11 +142,36 @@ impl Glyph {
             Self::Brush => include_str!("../../assets/icons/lucide/brush.svg"),
             Self::Pencil => include_str!("../../assets/icons/lucide/pencil.svg"),
             Self::Eraser => include_str!("../../assets/icons/lucide/eraser.svg"),
-            Self::Hand => include_str!("../../assets/icons/lucide/hand.svg"),
             Self::Pipette => include_str!("../../assets/icons/lucide/pipette.svg"),
             Self::PaintBucket => include_str!("../../assets/icons/lucide/paint-bucket.svg"),
             Self::Undo => include_str!("../../assets/icons/lucide/undo-2.svg"),
             Self::Redo => include_str!("../../assets/icons/lucide/redo-2.svg"),
+            Self::Selection => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="1" stroke-dasharray="3 2"/></svg>"#
+            }
+            Self::SelectionEllipse => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><ellipse cx="12" cy="12" rx="9" ry="7" stroke-dasharray="3 2"/></svg>"#
+            }
+            Self::Lasso => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="M7 17C-1 12 4 4 12 4s12 9 5 12-9-1-10 2 4 5 7 2"/><ellipse cx="7" cy="17" rx="2" ry="2"/></svg>"#
+            }
+            Self::Polygon => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2"><path d="m4 17 2-12 14 3-5 12Z" stroke-dasharray="3 2"/><path d="M3 15h4v4H3zM4 3h4v4H4zM18 6h4v4h-4z"/></svg>"#
+            }
+            Self::Wand => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="m4 20 12-12 3 3L7 23Zm8-8 3 3M6 3v4M4 5h4M17 1v4M15 3h4M21 16v4M19 18h4"/></svg>"#
+            }
+            Self::SelectVertex => include_str!("../../assets/icons/select-vertex.svg"),
+            Self::SelectEdge => include_str!("../../assets/icons/select-edge.svg"),
+            Self::SelectFace => include_str!("../../assets/icons/select-face.svg"),
+            Self::Xray => include_str!("../../assets/icons/x-ray.svg"),
+            Self::PrimitivePlane => include_str!("../../assets/icons/primitive-plane.svg"),
+            Self::PrimitiveCircle => include_str!("../../assets/icons/primitive-circle.svg"),
+            Self::PrimitiveUvSphere => include_str!("../../assets/icons/primitive-uv-sphere.svg"),
+            Self::PrimitiveIcoSphere => include_str!("../../assets/icons/primitive-ico-sphere.svg"),
+            Self::PrimitiveCylinder => include_str!("../../assets/icons/primitive-cylinder.svg"),
+            Self::PrimitiveCone => include_str!("../../assets/icons/primitive-cone.svg"),
+            Self::PrimitiveTorus => include_str!("../../assets/icons/primitive-torus.svg"),
         }
     }
 }
@@ -174,6 +245,15 @@ pub(crate) fn set_glyph(commands: &mut Commands, entity: Entity, glyph: Glyph) {
         });
 }
 
+pub(crate) fn set_tint(commands: &mut Commands, entity: Entity, color: Color) {
+    commands
+        .entity(entity)
+        .entry::<SvgIcon>()
+        .and_modify(move |mut icon| {
+            icon.tint = Tint::Fixed(color);
+        });
+}
+
 fn spawn_icon(
     commands: &mut Commands,
     parent: Entity,
@@ -235,7 +315,13 @@ fn resolution(size: Vec2) -> Option<u32> {
         .then(|| (size.max_element().ceil().clamp(8.0, 256.0) as u32).next_power_of_two())
 }
 
-fn tint(icon: &SvgIcon, owner: Option<(&Control, bool, bool)>, editor: &Editor) -> Color {
+fn tint(
+    icon: &SvgIcon,
+    owner: Option<(&Control, bool, bool)>,
+    editor: &Editor,
+    image_viewer: Option<&ImageViewer>,
+    model_edit: Option<&ModelEditingState>,
+) -> Color {
     if owner.is_some_and(|(_, _, disabled)| disabled) {
         return DISABLED_TEXT;
     }
@@ -247,8 +333,26 @@ fn tint(icon: &SvgIcon, owner: Option<(&Control, bool, bool)>, editor: &Editor) 
     };
     match control.look {
         Look::Tool => {
-            if matches!(control.action, Action::Tool(tool) if tool == editor.tool) {
-                ON_ACCENT
+            let active = match control.action {
+                Action::Tool(tool) => {
+                    if editor.viewing_model.is_some() && editor.viewing_image.is_none() {
+                        model_edit.is_some_and(|state| state.tool == tool)
+                    } else {
+                        tool == editor.tool
+                    }
+                }
+                Action::ImageEdit(action) => image_viewer
+                    .is_some_and(|viewer| viewer.edit.active(action, editor.viewing_image)),
+                _ => false,
+            };
+            if active {
+                if matches!(control.action, Action::ImageEdit(_)) {
+                    FOCUS
+                } else {
+                    ON_ACCENT
+                }
+            } else if hovered {
+                TEXT
             } else {
                 MUTED
             }
@@ -270,6 +374,8 @@ fn sync(
     mut library: ResMut<Library>,
     mut images: ResMut<Assets<Image>>,
     editor: Option<Res<Editor>>,
+    image_viewer: Option<Res<ImageViewer>>,
+    model_edit: Option<Res<ModelEditingState>>,
     parents: Query<&ChildOf>,
     controls: Query<(&Control, &super::Hovered, Has<InteractionDisabled>)>,
     disabled: Query<(), With<InteractionDisabled>>,
@@ -294,7 +400,13 @@ fn sync(
         {
             DISABLED_TEXT
         } else if let Some(editor) = editor.as_deref() {
-            tint(icon, owner, editor)
+            tint(
+                icon,
+                owner,
+                editor,
+                image_viewer.as_deref(),
+                model_edit.as_deref(),
+            )
         } else if let Tint::Fixed(color) = icon.tint {
             color
         } else {
@@ -319,11 +431,16 @@ fn rasterize(glyph: Glyph, size: u32) -> Result<Image, String> {
         size as f32 / tree.size().height(),
     );
     resvg::render(&tree, scale, &mut pixmap.as_mut());
-    // Monochrome SVGs become alpha masks for the theme. Transparent white
-    // preserves clean edges when the GPU filters between covered and empty pixels.
+    // File illustrations keep their authored palette. Toolbar glyphs remain
+    // white alpha masks so the existing theme and interaction tints apply.
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for pixel in pixmap.pixels() {
-        rgba.extend_from_slice(&[255, 255, 255, pixel.alpha()]);
+        if matches!(glyph, Glyph::CharacterFile | Glyph::DialogueFile) {
+            let pixel = pixel.demultiply();
+            rgba.extend_from_slice(&[pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]);
+        } else {
+            rgba.extend_from_slice(&[255, 255, 255, pixel.alpha()]);
+        }
     }
     Ok(Image::new(
         Extent3d {
@@ -348,6 +465,7 @@ mod tests {
             Glyph::ChevronLeft,
             Glyph::ChevronRight,
             Glyph::ChevronDown,
+            Glyph::SubmenuDown,
             Glyph::ChevronUp,
             Glyph::ArrowUp,
             Glyph::Search,
@@ -368,6 +486,7 @@ mod tests {
             Glyph::Move,
             Glyph::Rotate,
             Glyph::Scale,
+            Glyph::Extrude,
             Glyph::Camera,
             Glyph::Box,
             Glyph::Sun,
@@ -471,6 +590,49 @@ mod tests {
         app.world_mut().get_mut::<ComputedNode>(icon).unwrap().size = Vec2::splat(32.0);
         app.update();
         assert_eq!(app.world().get::<ImageNode>(icon).unwrap().image, original);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
+
+        // Model tools are independent of the scene tool, just like their button backgrounds.
+        app.init_resource::<ModelEditingState>();
+        app.world_mut().resource_mut::<ModelEditingState>().tool = super::super::Tool::Move;
+        {
+            let mut editor = app.world_mut().resource_mut::<Editor>();
+            editor.tool = super::super::Tool::Universal;
+            editor.viewing_model = Some(0);
+        }
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, ON_ACCENT);
+        app.world_mut().get_mut::<Control>(owner).unwrap().action =
+            Action::Tool(super::super::Tool::Universal);
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, MUTED);
+        app.world_mut().resource_mut::<Editor>().viewing_model = None;
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, ON_ACCENT);
+
+        // Image tools use their own selection state, independently of the 3D tool.
+        use super::super::ImageEditAction;
+        use crate::editor::photo_document::PhotoTool;
+        app.init_resource::<ImageViewer>();
+        app.world_mut().get_mut::<Control>(owner).unwrap().action =
+            Action::ImageEdit(ImageEditAction::DrawingTool);
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, FOCUS);
+        app.world_mut().resource_mut::<ImageViewer>().edit.tool = PhotoTool::Eraser;
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, MUTED);
+        app.world_mut().get_mut::<Control>(owner).unwrap().action =
+            Action::ImageEdit(ImageEditAction::Tool(PhotoTool::Eraser));
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, FOCUS);
+        app.world_mut().get_mut::<Control>(owner).unwrap().action =
+            Action::ImageEdit(ImageEditAction::PaintMenu);
+        app.world_mut()
+            .resource_mut::<ImageViewer>()
+            .edit
+            .paint_menu = true;
+        app.update();
+        assert_eq!(app.world().get::<ImageNode>(icon).unwrap().color, FOCUS);
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
     }
 }

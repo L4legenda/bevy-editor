@@ -2,6 +2,13 @@
 use crate::PlacedModel;
 use bevy::prelude::*;
 
+#[cfg(all(feature = "game", not(target_arch = "wasm32")))]
+mod game;
+#[cfg(all(feature = "game", not(target_arch = "wasm32")))]
+pub use game::{
+    GameCamera, GameLaunch, GameLevel, GameLevelPlugin, GameLevelStatus, GameModel, create_game_app,
+};
+
 #[cfg(feature = "lighting")]
 pub use crate::HdriPlugin;
 #[cfg(feature = "lighting")]

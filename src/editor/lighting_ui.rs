@@ -491,7 +491,7 @@ pub(crate) fn setup(
             NameInput,
             TextInput,
             EditableText::new(""),
-            TextCursorStyle::default(),
+            crate::ui_theme::text_cursor_style(),
             AccessibleLabel("Имя источника света".into()),
             font(font_handle, 13.0),
             TextColor(TEXT),

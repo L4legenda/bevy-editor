@@ -50,6 +50,17 @@ fn fixture_for(action: Option<Action>) -> (App, Entity, Entity, Entity) {
             Look::Regular,
             Node::default(),
         );
+        commands.entity(sidebar).insert(AssetOpen);
+        drawer::setup(
+            &mut commands,
+            parent,
+            &Handle::default(),
+            &starfield::Starfield {
+                chrome: Handle::default(),
+                space: Handle::default(),
+            },
+            &Handle::default(),
+        );
         (card, sidebar)
     };
     app.world_mut().flush();
@@ -93,6 +104,25 @@ fn assert_open(app: &mut App) {
     assert!(matches!(actions.as_slice(), [Action::Browse(_)]));
 }
 
+fn assert_action(actual: Action, expected: Action) {
+    let same = match (actual, expected) {
+        (Action::Browse(a), Action::Browse(b))
+        | (Action::Open(a), Action::Open(b))
+        | (Action::ViewImage(a), Action::ViewImage(b))
+        | (Action::ViewModel(a), Action::ViewModel(b))
+        | (Action::BrowseFile(a), Action::BrowseFile(b))
+        | (
+            Action::Narrative(NarrativeAction::File(a)),
+            Action::Narrative(NarrativeAction::File(b)),
+        ) => a == b,
+        _ => false,
+    };
+    assert!(
+        same,
+        "The entry must dispatch its own open action and index"
+    );
+}
+
 #[test]
 fn folder_cards_require_a_primary_double_click() {
     let (mut app, window, card, _) = fixture();
@@ -107,10 +137,119 @@ fn folder_cards_require_a_primary_double_click() {
 }
 
 #[test]
-fn folder_sidebar_keeps_single_click_navigation() {
+fn folder_sidebar_requires_double_click_navigation() {
     let (mut app, window, _, sidebar) = fixture();
     click(&mut app, window, sidebar, 1, PointerButton::Primary);
+    assert!(take_actions(&mut app).is_empty());
+    assert!(matches!(
+        app.world().resource::<drawer::BrowserUi>().selected_entry,
+        Some(browser::Entry::Folder(_))
+    ));
+    click(&mut app, window, sidebar, 2, PointerButton::Primary);
     assert_open(&mut app);
+}
+
+#[test]
+fn browser_breadcrumbs_and_tabs_keep_single_click_activation() {
+    let (mut app, window, _, _) = fixture();
+    for (action, look) in [
+        (Action::Browse(0), Look::Regular),
+        (Action::Open(0), Look::Tab),
+    ] {
+        let parent = app.world_mut().spawn_empty().id();
+        let button = control(
+            &mut app.world_mut().commands(),
+            parent,
+            action,
+            look,
+            Node::default(),
+        );
+        app.world_mut().flush();
+        click(&mut app, window, button, 1, PointerButton::Primary);
+        let actions = take_actions(&mut app);
+        assert_eq!(actions.len(), 1);
+        assert_action(actions[0], action);
+    }
+}
+
+#[test]
+fn browser_file_types_select_on_single_click_and_open_once_on_double_click() {
+    use browser::Entry;
+    for (action, entry) in [
+        (Action::ViewModel(0), Entry::Model(0)),
+        (Action::Open(0), Entry::Scene { file: 7, room: 0 }),
+        (Action::ViewImage(7), Entry::Image(7)),
+        (Action::BrowseFile(7), Entry::File(7)),
+        (Action::Narrative(NarrativeAction::File(7)), Entry::File(7)),
+    ] {
+        let (mut app, window, card, _) = fixture_for(Some(action));
+        let scan = app.world().resource::<Browser>().scan_revision;
+        app.world_mut()
+            .entity_mut(card)
+            .insert(drawer::FileCard(entry, scan));
+        for _ in 0..2 {
+            click(&mut app, window, card, 1, PointerButton::Primary);
+            assert!(
+                take_actions(&mut app).is_empty(),
+                "Single click must only select the entry"
+            );
+            assert_eq!(
+                app.world().resource::<drawer::BrowserUi>().selected_entry,
+                Some(entry)
+            );
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(card));
+            assert!(app.world().resource::<Editor>().viewing_image.is_none());
+            assert!(app.world().resource::<Editor>().viewing_model.is_none());
+        }
+        click(&mut app, window, card, 2, PointerButton::Secondary);
+        assert!(take_actions(&mut app).is_empty());
+        click(&mut app, window, card, 2, PointerButton::Primary);
+        let actions = take_actions(&mut app);
+        assert_eq!(
+            actions.len(),
+            1,
+            "Double click must open the entry only once"
+        );
+        assert_action(actions[0], action);
+    }
+}
+
+#[test]
+fn browser_file_types_keep_keyboard_activation_and_ignore_blocked_clicks() {
+    for action in [
+        Action::ViewModel(0),
+        Action::Open(0),
+        Action::BrowseFile(7),
+        Action::Narrative(NarrativeAction::File(7)),
+    ] {
+        let (mut app, window, card, _) = fixture_for(Some(action));
+        app.world_mut().resource_mut::<AssetDrag>().dragging = true;
+        click(&mut app, window, card, 2, PointerButton::Primary);
+        assert!(take_actions(&mut app).is_empty());
+        app.world_mut().resource_mut::<AssetDrag>().dragging = false;
+        app.world_mut().resource_mut::<Editor>().browser_popup = true;
+        click(&mut app, window, card, 2, PointerButton::Primary);
+        assert!(take_actions(&mut app).is_empty());
+        app.world_mut().resource_mut::<Editor>().browser_popup = false;
+        for key_code in [KeyCode::Enter, KeyCode::Space] {
+            app.world_mut().trigger(FocusedInput::new(
+                card,
+                KeyboardInput {
+                    key_code,
+                    logical_key: Key::Enter,
+                    state: ButtonState::Pressed,
+                    text: None,
+                    repeat: false,
+                    window,
+                },
+                window,
+            ));
+            app.world_mut().flush();
+            let actions = take_actions(&mut app);
+            assert_eq!(actions.len(), 1);
+            assert_action(actions[0], action);
+        }
+    }
 }
 
 #[test]

@@ -59,7 +59,7 @@ pub(super) fn draw(
         if origin.distance_squared(view.translation) < 0.04 {
             continue;
         }
-        let selected = editor.selection == Some(Selection::Light(light.id));
+        let selected = editor.is_selected(Selection::Light(light.id));
         let radius = viewport::length(camera, view, origin) * if selected { 0.17 } else { 0.12 };
         let color = color(light, selected);
         let ring = |radius: f32| {

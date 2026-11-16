@@ -24,7 +24,7 @@ use bevy::{
     },
     picking::hover::Hovered,
     prelude::*,
-    text::{EditableText, LineBreak, TextCursorStyle, TextReadWriteMode},
+    text::{EditableText, LineBreak, TextReadWriteMode},
     ui::{BackgroundGradient, InteractionDisabled, IsDefaultUiCamera, Pressed, UiGlobalTransform},
     ui_widgets::{Activate, Button, SelectAllOnFocus, TextInput},
     window::PrimaryWindow,
@@ -215,7 +215,7 @@ fn input(
         Node {
             min_width: px(0),
             width: percent(100),
-            height: px(32),
+            height: px(36),
             flex_grow: 1.0,
             ..default()
         },
@@ -225,12 +225,12 @@ fn input(
             field,
             TextInput,
             EditableText::new(value),
-            TextCursorStyle::default(),
+            crate::ui_theme::text_cursor_style(),
             AccessibleLabel(placeholder.into()),
             TabIndex(0),
             TextFont {
                 font: font.clone().into(),
-                font_size: FontSize::Px(13.0),
+                font_size: FontSize::Px(15.0),
                 ..default()
             },
             TextColor(TEXT),
@@ -622,8 +622,7 @@ pub(super) fn refresh(
                 },
             );
             if manager.filter.trim().is_empty() {
-                let orbit = orbital::illustration(&mut commands, empty);
-                commands.entity(orbit).insert(effects::Orbit);
+                orbital::illustration(&mut commands, empty);
             } else {
                 mark(&mut commands, empty, Glyph::Search, 56.0);
             }

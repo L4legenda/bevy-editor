@@ -11,7 +11,7 @@ use bevy::{
 use super::{
     AXES, AXIS_COLORS, Editor, EditorCamera, PointerState, Tool, TransformHandle, allowed,
     axis_color, axis_length, direction, handle_color, length, outer_ring_radius, plane_allowed,
-    plane_corners, quad_contains, rotation_radius, view_rotation_allowed,
+    plane_corners, quad_contains, rotation_radius, view_rotation_allowed, view_translation_allowed,
 };
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -19,23 +19,26 @@ pub(in crate::editor) struct HandleMaterial {
     // Logical target size and visibility. Shader dimensions use logical pixels
     // too, so the heads and pivot retain their size across DPI changes.
     #[uniform(0)]
-    viewport: Vec4,
+    pub viewport: Vec4,
     #[uniform(1)]
-    pivot: Vec4,
+    pub pivot: Vec4,
     #[uniform(2)]
-    tips: [Vec4; 3],
+    pub tips: [Vec4; 3],
     #[uniform(3)]
-    colors: [LinearRgba; 3],
+    pub colors: [LinearRgba; 3],
     // Three visible quadrilateral faces per scale handle, four vertices each.
     #[uniform(4)]
-    faces: [Vec4; 36],
+    pub faces: [Vec4; 36],
     #[uniform(5)]
-    planes: [Vec4; 12],
+    pub planes: [Vec4; 12],
     #[uniform(6)]
-    plane_colors: [LinearRgba; 3],
+    pub plane_colors: [LinearRgba; 3],
     #[uniform(7)]
-    outer_ring: Vec4,
+    pub outer_ring: Vec4,
 }
+
+#[derive(Component)]
+pub(in crate::editor) struct ModelOverlay;
 
 impl Default for HandleMaterial {
     fn default() -> Self {
@@ -79,25 +82,27 @@ pub(in crate::editor) fn spawn_overlay(
     commands: &mut Commands,
     materials: &mut Assets<HandleMaterial>,
     viewport: Entity,
-) {
-    commands.spawn((
-        MaterialNode(materials.add(HandleMaterial::default())),
-        Node {
-            position_type: PositionType::Absolute,
-            width: percent(100),
-            height: percent(100),
-            ..default()
-        },
-        Pickable::IGNORE,
-        ChildOf(viewport),
-    ));
+) -> Entity {
+    commands
+        .spawn((
+            MaterialNode(materials.add(HandleMaterial::default())),
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            Pickable::IGNORE,
+            ChildOf(viewport),
+        ))
+        .id()
 }
 
 fn sync(
     editor: Res<Editor>,
     pointer: Res<PointerState>,
     camera: Query<(&Camera, &Transform, &GlobalTransform), With<EditorCamera>>,
-    overlays: Query<&MaterialNode<HandleMaterial>>,
+    overlays: Query<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>,
     mut materials: ResMut<Assets<HandleMaterial>>,
 ) {
     for overlay in &overlays {
@@ -108,7 +113,11 @@ fn sync(
         material.viewport.z = 0.0;
         material.planes = [Vec4::ZERO; 12];
         material.outer_ring = Vec4::ZERO;
-        if !editor.has_scene() || !editor.ready || editor.pilot {
+        if !editor.has_scene()
+            || !editor.ready
+            || editor.pilot
+            || editor.tool.operations().is_empty()
+        {
             continue;
         }
         let Some(selection) = editor.selection else {
@@ -142,7 +151,18 @@ fn sync(
             Tool::Rotate => 2.0,
         };
         material.viewport = Vec4::new(size.x, size.y, 1.0, mode);
-        material.pivot = start.extend(0.0).extend(0.0);
+        let free_move = view_translation_allowed(&editor, selection);
+        let highlighted = pointer.hover == Some(TransformHandle::ViewTranslation)
+            || pointer
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.handle == TransformHandle::ViewTranslation);
+        material.pivot = Vec4::new(
+            start.x,
+            start.y,
+            if free_move { 1.0 } else { 0.0 },
+            if highlighted { 1.0 } else { 0.0 },
+        );
         let size = length(camera, view, pivot);
         material.tips = [Vec4::ZERO; 3];
         for &tool in editor.tool.operations() {
@@ -187,7 +207,7 @@ fn sync(
                 }
             }
         }
-        if editor.tool == Tool::Universal {
+        if editor.tool == Tool::Move {
             for normal in 0..3 {
                 if !plane_allowed(&editor, selection, normal) {
                     continue;
@@ -243,7 +263,8 @@ mod tests {
 
     fn handle_material(app: &mut App) -> HandleMaterial {
         let world = app.world_mut();
-        let mut query = world.query::<&MaterialNode<HandleMaterial>>();
+        let mut query =
+            world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
         let handle = query.single(world).unwrap().0.clone();
         world
             .resource::<Assets<HandleMaterial>>()
@@ -310,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires GPU adapter; renders and drags each universal transform operation"]
-    fn gpu_transform_handles_universal_mode_edits_each_operation_independently() {
+    #[ignore = "requires GPU adapter; checks selection and the dedicated transform tools"]
+    fn gpu_transform_handles_selection_is_clear_and_tools_edit_independently() {
         let (mut app, window, target) = fixture();
         let selection = Selection::Imported(0);
         {
@@ -324,9 +345,19 @@ mod tests {
         for _ in 0..4 {
             frame(&mut app);
         }
+        assert_eq!(
+            handle_material(&mut app).viewport.z,
+            0.0,
+            "Selection must hide every transform overlay"
+        );
+        app.world_mut()
+            .write_message(crate::editor::Action::Tool(Tool::Move));
+        for _ in 0..3 {
+            frame(&mut app);
+        }
         let initial = app.world().resource::<Editor>().edits.clone();
         let material = handle_material(&mut app);
-        assert_eq!(material.viewport.w, 3.0);
+        assert_eq!(material.viewport.w, 0.0);
         assert!(material.tips.iter().all(|tip| tip.z == 1.0));
         let output = std::env::temp_dir().join(format!(
             "bevy-editor-universal-handles-{}",
@@ -335,7 +366,7 @@ mod tests {
         std::fs::create_dir_all(&output).unwrap();
         println!("Universal gizmo GPU artifacts: {}", output.display());
         let to_canvas = |p: Vec2| (p + Vec2::Y * ui::TOP).round().as_uvec2();
-        assert!(material.outer_ring.x > 0.0 && material.outer_ring.z == 1.0);
+        assert_eq!(material.outer_ring.z, 0.0);
         assert!((0..3).all(|plane| material.planes[plane * 4].z == 1.0));
         let start = material.pivot.truncate().truncate();
         let tip = material.tips[1].truncate().truncate();
@@ -349,7 +380,7 @@ mod tests {
             let sample = to_canvas(tip - (tip - start).normalize() * 8.0);
             assert!(
                 image.get_pixel(sample.x, sample.y).0[axis] > 180,
-                "Move arrow {axis} must render alongside the rotation arcs"
+                "Move arrow {axis} must render in the move tool"
             );
             let face = &material.planes[axis * 4..axis * 4 + 4];
             let sample =
@@ -359,7 +390,14 @@ mod tests {
                 "Translation plane {axis} must have a flat colored face"
             );
         }
+        let center = to_canvas(material.pivot.truncate().truncate());
+        let pixel = image.get_pixel(center.x, center.y).0;
+        assert!(
+            pixel[0] > 245 && pixel[1] > 245 && pixel[2] > 245,
+            "The free-move center must be visible in Move mode: {pixel:?}"
+        );
         for expected in [
+            TransformHandle::ViewTranslation,
             TransformHandle::Axis {
                 tool: Tool::Move,
                 axis: 1,
@@ -371,6 +409,16 @@ mod tests {
             TransformHandle::Plane { normal: 1 },
             TransformHandle::ViewRotation,
         ] {
+            let tool = match expected {
+                TransformHandle::Axis { tool, .. } => tool,
+                TransformHandle::ViewRotation => Tool::Rotate,
+                _ => Tool::Move,
+            };
+            app.world_mut()
+                .write_message(crate::editor::Action::Tool(tool));
+            for _ in 0..3 {
+                frame(&mut app);
+            }
             let material = handle_material(&mut app);
             let before = app
                 .world()
@@ -386,6 +434,9 @@ mod tests {
                 let start = material.tips[1].truncate().truncate();
                 let direction = (start - material.pivot.truncate().truncate()).normalize();
                 (start, start + direction * 25.0)
+            } else if expected == TransformHandle::ViewTranslation {
+                let start = material.pivot.truncate().truncate();
+                (start, start + Vec2::new(28.0, -20.0))
             } else {
                 let world = app.world_mut();
                 let mut query = world
@@ -473,6 +524,16 @@ mod tests {
                 .unwrap()
                 .set_cursor_position(Some(end + Vec2::Y * ui::TOP));
             frame(&mut app);
+            if expected == TransformHandle::ViewTranslation {
+                let material = handle_material(&mut app);
+                assert_eq!(material.pivot.z, 1.0);
+                assert_eq!(material.pivot.w, 1.0);
+                let center = to_canvas(material.pivot.truncate().truncate());
+                capture_when(&mut app, &target, &output.join("free-move.png"), |image| {
+                    let pixel = image.get_pixel(center.x, center.y).0;
+                    pixel[0] > 240 && pixel[1] > 160 && pixel[2] < 210
+                });
+            }
             app.world_mut().write_message(MouseButtonInput {
                 window,
                 button: MouseButton::Left,
@@ -482,15 +543,27 @@ mod tests {
             let editor = app.world().resource::<Editor>();
             let after = editor.pose(selection).unwrap().transform();
             assert_eq!(
-                editor.tool,
-                Tool::Universal,
-                "Dragging must keep the shared mode selected"
+                editor.tool, tool,
+                "Dragging must keep the selected transform tool"
             );
             assert_eq!(
                 after.scale, before.scale,
                 "Shared-mode gestures must not change scale"
             );
             match expected {
+                TransformHandle::ViewTranslation => {
+                    assert!(after.translation.distance(before.translation) > 0.1);
+                    let world = app.world_mut();
+                    let mut query = world.query_filtered::<&Transform, With<EditorCamera>>();
+                    let view = query.single(world).unwrap();
+                    assert!(
+                        (after.translation - before.translation)
+                            .dot(*view.forward())
+                            .abs()
+                            < 1e-4
+                    );
+                    assert_eq!(after.rotation, before.rotation);
+                }
                 TransformHandle::Axis {
                     tool: Tool::Move, ..
                 } => {
@@ -525,6 +598,9 @@ mod tests {
             );
         }
         app.world_mut()
+            .write_message(crate::editor::Action::Tool(Tool::Universal));
+        frame(&mut app);
+        app.world_mut()
             .write_message(crate::editor::Action::Select(Selection::Camera(0)));
         frame(&mut app);
         {
@@ -537,8 +613,21 @@ mod tests {
             frame(&mut app);
         }
         let material = handle_material(&mut app);
-        assert_eq!(material.viewport.z, 1.0, "The camera gizmo must be in view");
-        assert_eq!(material.viewport.w, 3.0);
+        assert_eq!(
+            material.viewport.z, 0.0,
+            "Selecting a camera must not show transform handles"
+        );
+        app.world_mut()
+            .write_message(crate::editor::Action::Tool(Tool::Move));
+        for _ in 0..3 {
+            frame(&mut app);
+        }
+        let material = handle_material(&mut app);
+        assert_eq!(
+            material.viewport.z, 1.0,
+            "The camera move gizmo must be in view"
+        );
+        assert_eq!(material.viewport.w, 0.0);
         assert_eq!(material.tips.len(), 3);
     }
 
@@ -553,7 +642,8 @@ mod tests {
         }
         let material = {
             let world = app.world_mut();
-            let mut query = world.query::<&MaterialNode<HandleMaterial>>();
+            let mut query =
+                world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
             let handle = query.single(world).unwrap().0.clone();
             world
                 .resource::<Assets<HandleMaterial>>()
@@ -660,7 +750,8 @@ mod tests {
         }
         let scale_material = {
             let world = app.world_mut();
-            let mut query = world.query::<&MaterialNode<HandleMaterial>>();
+            let mut query =
+                world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
             let handle = query.single(world).unwrap().0.clone();
             world
                 .resource::<Assets<HandleMaterial>>()

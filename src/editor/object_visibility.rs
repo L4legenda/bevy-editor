@@ -80,11 +80,12 @@ impl Editor {
     }
 
     pub(super) fn object_hidden(&self, target: Selection) -> bool {
-        self.object_key(target).is_some_and(|key| {
-            self.hidden_objects
-                .get(&self.room)
-                .is_some_and(|hidden| hidden.contains(&key))
-        })
+        self.object_deleted(target)
+            || self.object_key(target).is_some_and(|key| {
+                self.hidden_objects
+                    .get(&self.room)
+                    .is_some_and(|hidden| hidden.contains(&key))
+            })
     }
 
     pub(super) fn toggle_visibility(&mut self, target: Selection) {

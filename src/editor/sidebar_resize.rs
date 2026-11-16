@@ -184,11 +184,14 @@ pub(in crate::editor) fn resize(
     )>,
 ) {
     let (window_entity, window, cursor_icon) = *window;
-    let light = matches!(
-        editor.selection,
-        Some(Selection::Light(_) | Selection::Environment)
-    );
+    let light = editor.viewing_model.is_some()
+        || matches!(
+            editor.selection,
+            Some(Selection::Light(_) | Selection::Environment)
+        );
     let allowed = editor.pending.is_none()
+        && !editor.generation.active
+        && editor.narrative.active.is_none()
         && editor.viewing_image.is_none()
         && !editor.hdri_library_open
         && !editor.browser_popup
@@ -196,7 +199,6 @@ pub(in crate::editor) fn resize(
         && !drawer.resizing
         && !lighting.as_ref().is_some_and(|ui| ui.blocks_scene_input())
         && !assets.as_ref().is_some_and(|drag| drag.active());
-    let viewing_model = editor.viewing_model.is_some();
     let layout = &mut editor.sidebar;
     if !mouse.pressed(MouseButton::Left) && !mouse.just_released(MouseButton::Left) {
         layout.suppressed = false;
@@ -333,8 +335,7 @@ pub(in crate::editor) fn resize(
             Color::srgba(0.19, 0.19, 0.22, 0.35)
         };
         color.set_if_neq(BackgroundColor(value));
-        let enabled =
-            allowed && (!(layout.tree_collapsed || viewing_model) || *axis != Axis::Height);
+        let enabled = allowed && (!layout.tree_collapsed || *axis != Axis::Height);
         if enabled {
             commands.entity(entity).try_remove::<InteractionDisabled>();
         } else {
@@ -380,28 +381,25 @@ pub(in crate::editor) fn layout(
     >,
 ) {
     let layout = &editor.sidebar;
-    let light = matches!(
-        editor.selection,
-        Some(Selection::Light(_) | Selection::Environment)
-    );
+    let light = editor.viewing_model.is_some()
+        || matches!(
+            editor.selection,
+            Some(Selection::Light(_) | Selection::Environment)
+        );
     for (mut node, sidebar, inspector, axis) in &mut panes {
         if sidebar {
-            node.display = if editor.viewing_image.is_some() {
+            node.display = if editor.generation.active || editor.viewing_image.is_some() {
                 Display::None
             } else {
                 Display::Flex
             };
             node.width = px(layout.width(window.width()));
         } else if inspector {
-            node.height = px(if editor.viewing_model.is_some() {
-                (window.height() - TOP - FOOT - TREE_HEADER).max(0.0)
-            } else {
-                layout.inspector_height(window.height(), light)
-            });
+            node.height = px(layout.inspector_height(window.height(), light));
             node.min_height = px(0);
             node.max_height = Val::Auto;
         } else if axis != Some(&Axis::Width) {
-            node.display = if layout.tree_collapsed || editor.viewing_model.is_some() {
+            node.display = if layout.tree_collapsed {
                 Display::None
             } else {
                 Display::Flex

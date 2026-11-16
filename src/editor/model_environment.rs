@@ -1,7 +1,6 @@
-//! Studio preview controls reuse the editor's HDRI and camera lighting renderer.
+//! Model workspace lighting starts with the same defaults as a new scene.
 use super::*;
 use bevy::{
-    camera::Exposure,
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     ui_widgets::{
         Slider, SliderRange, SliderStep, SliderThumb, SliderValue, TrackClick, ValueChange,
@@ -26,6 +25,30 @@ pub(in crate::editor) enum Setting {
 }
 
 impl Setting {
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Intensity => {
+                "Сила освещения от окружения. Меняет только просмотр модели, настройки сцены остаются прежними."
+            }
+            Self::Rotation => {
+                "Поворот окружения вокруг модели. Позволяет проверить отражения и освещение с разных направлений."
+            }
+            Self::Exposure => {
+                "Общая яркость предпросмотра. Положительные значения делают изображение светлее, отрицательные — темнее."
+            }
+            Self::Blur => "Размытие видимого фона. На освещение модели не влияет.",
+            Self::BackgroundBrightness => {
+                "Яркость фонового изображения. Освещение модели настраивается отдельно."
+            }
+            Self::KeyIntensity => {
+                "Яркость дополнительного направленного света. Сначала включите свет в этом разделе."
+            }
+            Self::KeyAzimuth => {
+                "Горизонтальное направление дополнительного света относительно окружения, в градусах."
+            }
+            Self::KeyElevation => "Высота дополнительного света над горизонтом, в градусах.",
+        }
+    }
     fn range(self) -> (f32, f32) {
         match self {
             Self::Intensity => (0.0, 4.0),
@@ -42,7 +65,10 @@ impl Setting {
         match self {
             Self::Intensity => settings.lighting.hdri_brightness / LIGHT_SCALE,
             Self::Rotation => settings.lighting.hdri_rotation,
-            Self::Exposure => Exposure::BLENDER.ev100 - settings.lighting.exposure_ev100,
+            Self::Exposure => {
+                crate::SceneLighting::editor_default().exposure_ev100
+                    - settings.lighting.exposure_ev100
+            }
             Self::Blur => settings.blur,
             Self::BackgroundBrightness => settings.background_brightness,
             Self::KeyIntensity => settings.key_intensity,
@@ -60,7 +86,10 @@ impl Setting {
         match self {
             Self::Intensity => settings.lighting.hdri_brightness = value * LIGHT_SCALE,
             Self::Rotation => settings.lighting.hdri_rotation = value,
-            Self::Exposure => settings.lighting.exposure_ev100 = Exposure::BLENDER.ev100 - value,
+            Self::Exposure => {
+                settings.lighting.exposure_ev100 =
+                    crate::SceneLighting::editor_default().exposure_ev100 - value
+            }
             Self::Blur => settings.blur = value,
             Self::BackgroundBrightness => settings.background_brightness = value,
             Self::KeyIntensity => settings.key_intensity = value,
@@ -72,6 +101,7 @@ impl Setting {
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum EnvironmentAction {
+    TogglePanel,
     Set(Setting, f32, bool),
     Preset(crate::EnvironmentPreset),
     ToggleBackground,
@@ -83,6 +113,8 @@ pub(in crate::editor) enum EnvironmentAction {
 #[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Settings {
+    #[serde(default)]
+    version: u32,
     lighting: crate::SceneLighting,
     blur: f32,
     background_brightness: f32,
@@ -95,18 +127,11 @@ pub(super) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            lighting: crate::SceneLighting {
-                hdri: Some(crate::EnvironmentPreset::SmallStudio),
-                hdri_brightness: LIGHT_SCALE,
-                hdri_background: true,
-                ambient_brightness: 0.0,
-                exposure_ev100: Exposure::BLENDER.ev100,
-                tonemapping: crate::ToneMap::AcesFitted,
-                ..default()
-            },
-            blur: 0.6,
-            background_brightness: 0.55,
-            key_enabled: true,
+            version: 2,
+            lighting: crate::SceneLighting::editor_default(),
+            blur: 0.0,
+            background_brightness: 1.0,
+            key_enabled: false,
             key_intensity: 2.2,
             key_azimuth: 40.0,
             key_elevation: 45.0,
@@ -116,7 +141,8 @@ impl Default for Settings {
 
 impl Settings {
     fn valid(&self) -> bool {
-        self.lighting.validate().is_ok()
+        self.version == 2
+            && self.lighting.validate().is_ok()
             && self.lighting.hdri.is_some()
             && self.lighting.hdri_asset.is_none()
             && [
@@ -144,6 +170,19 @@ pub(super) struct KeyLight;
 pub(super) struct Applied(Settings);
 #[derive(Component)]
 pub(super) struct Panel;
+#[derive(Resource)]
+pub(super) struct PanelUi {
+    body: Entity,
+    arrow: Entity,
+    angle: f32,
+    uv_open: bool,
+    model_open: bool,
+}
+impl PanelUi {
+    fn open(&self, uv: bool) -> bool {
+        if uv { self.uv_open } else { self.model_open }
+    }
+}
 #[derive(Component)]
 pub(super) struct ControlValue {
     setting: Setting,
@@ -152,6 +191,7 @@ pub(super) struct ControlValue {
 }
 #[derive(Component)]
 pub(super) enum Caption {
+    Panel,
     Background,
     Key,
     ToneMap,
@@ -170,28 +210,50 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
         .filter(Settings::valid)
         .unwrap_or_default();
-    let panel = node(
-        &mut commands,
-        interface.inspector,
-        Node {
-            display: Display::None,
-            width: percent(100),
-            flex_shrink: 0.0,
-            ..column(6.0)
-        },
-    );
+    let panel = inspector_card(&mut commands, interface.inspector);
+    commands
+        .entity(panel)
+        .entry::<Node>()
+        .and_modify(|mut n| n.display = Display::None);
     commands
         .entity(panel)
         .insert((Panel, AccessibleLabel("Окружение просмотра модели".into())));
     let font = &interface.font;
-    text(
+    let toggle = button(
         &mut commands,
         panel,
         font,
-        "ОКРУЖЕНИЕ · ПРОСМОТР",
-        11.0,
-        MUTED,
+        "Окружение",
+        action(EnvironmentAction::TogglePanel),
+        Look::Regular,
     );
+    commands.entity(toggle).insert(Caption::Panel);
+    let arrow = icons::themed(&mut commands, toggle, icons::Glyph::ChevronRight, 14.);
+    commands.entity(toggle).entry::<Node>().and_modify(|mut n| {
+        n.width = percent(100);
+        n.justify_content = JustifyContent::SpaceBetween;
+    });
+    control_hints::attach(
+        &mut commands,
+        toggle,
+        "Развернуть или свернуть настройки освещения и фона предпросмотра. Они не меняют сцену и материалы модели.",
+    );
+    let body = node(
+        &mut commands,
+        panel,
+        Node {
+            width: percent(100),
+            ..column(6.)
+        },
+    );
+    commands.insert_resource(PanelUi {
+        body,
+        arrow,
+        angle: 0.,
+        uv_open: false,
+        model_open: true,
+    });
+    let panel = body;
     let presets = node(
         &mut commands,
         panel,
@@ -214,6 +276,11 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
             PresetChoice(preset),
             AccessibleLabel(format!("Окружение модели: {}", preset.label())),
         ));
+        control_hints::attach(
+            &mut commands,
+            button,
+            "Применить схему освещения для просмотра модели. Настройки сцены и материалы не меняются.",
+        );
     }
     for (label, field) in [
         ("Яркость окружения", Setting::Intensity),
@@ -231,7 +298,17 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         Look::Regular,
     );
     caption(&mut commands, tone, Caption::ToneMap);
-    text(&mut commands, panel, font, "ФОН", 11.0, MUTED);
+    control_hints::attach(
+        &mut commands,
+        tone,
+        "Переключить обработку яркости и цвета: ACES, AgX или нейтральное отображение PBR. Меняет только предпросмотр.",
+    );
+    let heading = text(&mut commands, panel, font, "Фон", 12.0, MUTED);
+    control_hints::attach(
+        &mut commands,
+        heading,
+        "Отображение окружения за моделью. Фон можно затемнить или размыть независимо от освещения.",
+    );
     let background = button(
         &mut commands,
         panel,
@@ -241,6 +318,11 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         Look::Regular,
     );
     caption(&mut commands, background, Caption::Background);
+    control_hints::attach(
+        &mut commands,
+        background,
+        "Переключить фон между изображением окружения и тёмной заливкой. Освещение модели сохраняется.",
+    );
     scalar(
         &mut commands,
         panel,
@@ -257,7 +339,19 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         Setting::BackgroundBrightness,
         &settings,
     );
-    text(&mut commands, panel, font, "ОСНОВНОЙ СВЕТ", 11.0, MUTED);
+    let heading = text(
+        &mut commands,
+        panel,
+        font,
+        "Дополнительный свет",
+        12.0,
+        MUTED,
+    );
+    control_hints::attach(
+        &mut commands,
+        heading,
+        "Направленный свет для проверки формы и теней. Работает вместе с окружением и не добавляется в сцену.",
+    );
     let key = button(
         &mut commands,
         panel,
@@ -267,6 +361,11 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         Look::Regular,
     );
     caption(&mut commands, key, Caption::Key);
+    control_hints::attach(
+        &mut commands,
+        key,
+        "Включить или выключить дополнительный направленный свет в предпросмотре.",
+    );
     for (label, field) in [
         ("Сила света", Setting::KeyIntensity),
         ("Направление света, °", Setting::KeyAzimuth),
@@ -274,13 +373,18 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
     ] {
         scalar(&mut commands, panel, font, label, field, &settings);
     }
-    button(
+    let reset = button(
         &mut commands,
         panel,
         font,
         "Сбросить просмотр",
         action(EnvironmentAction::Reset),
         Look::Regular,
+    );
+    control_hints::attach(
+        &mut commands,
+        reset,
+        "Вернуть исходные настройки окружения, фона, экспозиции и дополнительного света. UV и геометрия не меняются.",
     );
     commands.insert_resource(settings);
 }
@@ -307,11 +411,13 @@ fn scalar(
         },
     );
     let title = text(commands, header, font, label, 12.0, MUTED);
+    control_hints::attach(commands, title, setting.hint());
     commands.entity(title).insert(Node {
         flex_grow: 1.0,
         ..default()
     });
     let readout = text(commands, header, font, "", 12.0, TEXT);
+    control_hints::attach(commands, readout, setting.hint());
     let (min, max) = setting.range();
     let slider = commands
         .spawn((
@@ -335,6 +441,7 @@ fn scalar(
         ))
         .observe(change_slider)
         .id();
+    control_hints::attach(commands, slider, setting.hint());
     let track = surface(
         commands,
         slider,
@@ -393,6 +500,8 @@ pub(super) fn actions(
     mut events: MessageReader<Action>,
     editor: Res<Editor>,
     mut settings: ResMut<Settings>,
+    mut panel: Option<ResMut<PanelUi>>,
+    editing: Option<Res<editing::State>>,
 ) {
     if editor.viewing_model.is_none()
         || editor.pending.is_some()
@@ -407,8 +516,22 @@ pub(super) fn actions(
         let Action::ModelView(ModelViewAction::Environment(action)) = *event else {
             continue;
         };
+        if matches!(action, EnvironmentAction::TogglePanel) {
+            if let Some(panel) = panel.as_deref_mut() {
+                let uv = editing.as_ref().is_some_and(|s| {
+                    s.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv
+                });
+                if uv {
+                    panel.uv_open = !panel.uv_open;
+                } else {
+                    panel.model_open = !panel.model_open;
+                }
+            }
+            continue;
+        }
         save = true;
         match action {
+            EnvironmentAction::TogglePanel => unreachable!(),
             EnvironmentAction::Set(field, value, final_value) => {
                 field.set(&mut settings, value);
                 save = final_value;
@@ -518,6 +641,8 @@ pub(super) fn synchronize(
 pub(super) fn refresh(
     editor: Res<Editor>,
     settings: Res<Settings>,
+    mut ui: ResMut<PanelUi>,
+    editing: Res<editing::State>,
     mut commands: Commands,
     mut panels: Query<&mut Node, With<Panel>>,
     controls: Query<(Entity, &ControlValue, &ComputedNode)>,
@@ -525,9 +650,32 @@ pub(super) fn refresh(
     mut labels: Query<&mut Text>,
     captions: Query<(&Caption, &Children)>,
     mut presets: Query<(&PresetChoice, &Hovered, &mut BackgroundColor)>,
+    time: Res<Time>,
+    mut transforms: Query<&mut UiTransform>,
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
 ) {
     let shown = editor.viewing_model.is_some();
+    let open =
+        ui.open(editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv);
+    let target = if open {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        0.
+    };
+    ui.angle += (target - ui.angle) * (1. - (-time.delta_secs().min(0.1) * 18.).exp());
+    if (target - ui.angle).abs() < 0.001 {
+        ui.angle = target;
+    } else if shown {
+        redraw.write(bevy::window::RequestRedraw);
+    }
+    if let Ok(mut arrow) = transforms.get_mut(ui.arrow) {
+        arrow.set_if_neq(UiTransform::from_rotation(Rot2::radians(ui.angle)));
+    }
+    if let Ok(mut body) = nodes.get_mut(ui.body) {
+        body.display = if open { Display::Flex } else { Display::None };
+    }
     let enabled = shown
+        && open
         && editor.pending.is_none()
         && editor.viewing_image.is_none()
         && !editor.hdri_library_open;
@@ -557,6 +705,7 @@ pub(super) fn refresh(
     }
     for (caption, children) in &captions {
         let value = match caption {
+            Caption::Panel => "Окружение".into(),
             Caption::Background => {
                 if settings.lighting.hdri_background {
                     "Фон: окружение".into()
@@ -571,10 +720,7 @@ pub(super) fn refresh(
                     "Направленный свет: выкл.".into()
                 }
             }
-            Caption::ToneMap => format!(
-                "Тональное отображение: {}",
-                settings.lighting.tonemapping.label()
-            ),
+            Caption::ToneMap => format!("Цвет: {}", settings.lighting.tonemapping.label()),
         };
         for child in children.iter() {
             if let Ok(mut label) = labels.get_mut(child) {
@@ -648,16 +794,20 @@ mod tests {
     }
 
     #[test]
-    fn studio_settings_round_trip_and_reject_invalid_preferences() {
+    fn scene_settings_round_trip_and_reject_legacy_studio_preferences() {
         let settings = Settings::default();
         assert!(settings.valid());
-        assert_eq!(settings.lighting.tonemapping, crate::ToneMap::AcesFitted);
+        assert_eq!(settings.lighting, crate::SceneLighting::editor_default());
+        assert!(!settings.key_enabled);
         assert_eq!(
             settings.lighting.hdri,
-            Some(crate::EnvironmentPreset::SmallStudio)
+            Some(crate::EnvironmentPreset::Cloudy)
         );
         let json = serde_json::to_vec(&settings).unwrap();
         assert_eq!(serde_json::from_slice::<Settings>(&json).unwrap(), settings);
+        let mut legacy = serde_json::to_value(&settings).unwrap();
+        legacy.as_object_mut().unwrap().remove("version");
+        assert!(!serde_json::from_value::<Settings>(legacy).unwrap().valid());
         for invalid in [f32::NAN, f32::INFINITY, -1.0, 1.1] {
             let mut corrupt = settings.clone();
             corrupt.blur = invalid;

@@ -269,7 +269,7 @@ pub(in crate::editor) fn update(
         job.contact = cursor.and_then(|cursor| {
             let over_preview = !editor.pilot
                 && matches!(editor.selection, Some(Selection::Camera(_)))
-                && ui::camera_preview_rect(&window, &motion, &editor.sidebar).contains(cursor);
+                && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor);
             if !ui::scene_input_rect(&window, &motion, &editor.sidebar).contains(cursor)
                 || over_preview
             {

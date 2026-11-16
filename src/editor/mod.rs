@@ -1,16 +1,31 @@
+mod area_selection;
 mod asset_placement;
 mod browser;
 mod browser_files;
+mod dialogue;
 mod documents;
 mod file_moves;
+mod generation;
+mod generation_backend;
+mod generation_model;
 mod hdri_catalog;
 mod image_previews;
+mod image_texture;
 mod lighting;
 mod lighting_gizmos;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub mod mcp;
+mod model_document;
+mod model_mesh;
+mod model_paint_data;
+mod model_primitives;
+mod model_uv_backend;
+mod model_uv_mesh;
 mod object_visibility;
 mod photo_document;
+mod play;
+mod render_worker;
+mod scene_selection;
 pub(crate) mod selection_outline;
 pub(crate) mod starfield;
 #[cfg(test)]
@@ -22,6 +37,7 @@ pub(crate) use ui::{icons, orbital};
 mod viewport;
 mod viewport_background;
 mod viewport_grid;
+mod wireframe;
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -34,7 +50,7 @@ use bevy::{
     prelude::*,
     transform::helper::TransformHelper,
     ui::IsDefaultUiCamera,
-    window::{PrimaryWindow, WindowCloseRequested, WindowResizeConstraints},
+    window::{PrimaryWindow, WindowCloseRequested},
     world_serialization::WorldInstanceReady,
 };
 
@@ -78,7 +94,7 @@ enum Tool {
 impl Tool {
     fn operations(self) -> &'static [Self] {
         match self {
-            Self::Universal => &[Self::Move, Self::Rotate],
+            Self::Universal => &[],
             Self::Move => &[Self::Move],
             Self::Rotate => &[Self::Rotate],
             Self::Scale => &[Self::Scale],
@@ -105,8 +121,11 @@ enum Reset {
 }
 
 #[derive(Clone, Copy, Message)]
+#[cfg_attr(test, derive(Debug))]
 enum Action {
     Open(Room),
+    Narrative(ui::NarrativeAction),
+    Generation(ui::GenerationAction),
     CloseTab(Room),
     CloseModelTab(usize),
     OpenImageTab(usize),
@@ -114,6 +133,7 @@ enum Action {
     OpenBrowser,
     Select(Selection),
     ToggleVisibility(Selection),
+    SceneObject(ui::SceneObjectAction),
     Lighting(lighting::LightingAction),
     HdriLibrary(ui::HdriAction),
     UseDownloadedHdri(usize),
@@ -135,10 +155,19 @@ enum Action {
     BrowserNewFolder,
     BrowserCreateFolder,
     BrowserNewImage,
-    BrowserImageSize(u32, u32),
     BrowserCreateImage,
+    BrowserNewScene,
+    BrowserCreateScene,
+    BrowserDialogueMenu,
+    BrowserPrimitiveMenu,
+    BrowserCreatePrimitive(model_primitives::Primitive),
+    BrowserConfirmPrimitive,
     BrowserCancelPopup,
     BrowserDeleteFile,
+    BrowserOpenEntry,
+    BrowserRenameFile,
+    BrowserConfirmRename,
+    BrowserDuplicateFile,
     BrowserRestoreFile,
     ViewImage(usize),
     ViewModel(usize),
@@ -168,9 +197,13 @@ enum Action {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingAction {
+    CloseNarrative(usize),
+    ExitNarrative(usize),
     CloseTab(Room),
     CloseImageTab(usize),
     CloseImageEditor(usize),
+    CloseModelTab(usize),
+    CloseModelEditor(usize),
     Close,
 }
 
@@ -191,6 +224,7 @@ struct ImageTab {
 
 #[derive(Clone, Copy)]
 enum ImageReturnTab {
+    Generation,
     Scene(Room),
     Model(usize),
 }
@@ -209,7 +243,9 @@ struct Editor {
     redo: Vec<RoomEdits>,
     camera_navigation: Option<RoomEdits>,
     imported: Vec<Imported>,
+    imported_ancestors: HashMap<String, Vec<String>>,
     selection: Option<Selection>,
+    selection_group: Option<(Room, Vec<Selection>)>,
     tool: Tool,
     local_space: bool,
     snap: bool,
@@ -217,12 +253,16 @@ struct Editor {
     /// Stable document tab ID, independent of the browser's current file indices.
     viewing_image: Option<usize>,
     image_tabs: Vec<ImageTab>,
+    narrative: dialogue::Workspace,
+    generation: generation::Workspace,
     next_image_tab: usize,
     image_return: Option<ImageReturnTab>,
     hdri_library_open: bool,
     viewing_model: Option<usize>,
     model_tabs: Vec<usize>,
+    dirty_models: std::collections::BTreeSet<usize>,
     browser_popup: bool,
+    scene_object_popup: bool,
     sidebar: ui::SidebarLayout,
     pilot: bool,
     focus: bool,
@@ -230,10 +270,12 @@ struct Editor {
     exit_requested: bool,
     exit_queue: Vec<Room>,
     status: String,
+    play: play::Session,
     ready: bool,
     reload: bool,
     view: Transform,
     pivot: Vec3,
+    view_orthographic: bool,
     lighting_defaults: crate::lighting::SceneLighting,
     show_lights: bool,
     hidden_objects: HashMap<Room, std::collections::HashSet<object_visibility::ObjectKey>>,
@@ -262,19 +304,25 @@ impl Editor {
             redo: Vec::new(),
             camera_navigation: None,
             imported: Vec::new(),
+            imported_ancestors: HashMap::new(),
             selection: None,
+            selection_group: None,
             tool: Tool::default(),
             local_space: false,
             snap: false,
             drawer: false,
             viewing_image: None,
             image_tabs: Vec::new(),
+            narrative: default(),
+            generation: default(),
             next_image_tab: 0,
             image_return: None,
             hdri_library_open: false,
             viewing_model: None,
             model_tabs: Vec::new(),
+            dirty_models: default(),
             browser_popup: false,
+            scene_object_popup: false,
             sidebar: ui::SidebarLayout::default(),
             pilot: false,
             focus: false,
@@ -282,10 +330,12 @@ impl Editor {
             exit_requested: false,
             exit_queue: Vec::new(),
             status,
+            play: default(),
             ready: false,
             reload: true,
             view,
             pivot: Vec3::ZERO,
+            view_orthographic: false,
             lighting_defaults: crate::lighting::SceneLighting::editor_default(),
             show_lights: true,
             hidden_objects,
@@ -297,17 +347,24 @@ impl Editor {
     }
 
     fn asset_viewer_open(&self) -> bool {
-        self.viewing_image.is_some() || self.viewing_model.is_some() || self.hdri_library_open
+        self.generation.active
+            || self.narrative.active.is_some()
+            || self.viewing_image.is_some()
+            || self.viewing_model.is_some()
+            || self.hdri_library_open
     }
 
     fn model_tab_action(action: Action) -> bool {
         matches!(
             action,
-            Action::Open(_)
+            Action::Narrative(_)
+                | Action::Generation(_)
+                | Action::Open(_)
                 | Action::CloseTab(_)
                 | Action::ViewModel(_)
                 | Action::CloseModelTab(_)
                 | Action::ModelView(_)
+                | Action::ToggleSceneTree
                 | Action::Drawer
                 | Action::OpenBrowser
                 | Action::Browse(_)
@@ -324,12 +381,21 @@ impl Editor {
                 | Action::ImageView(_)
                 | Action::BrowserNewFolder
                 | Action::BrowserNewImage
-                | Action::BrowserImageSize(..)
                 | Action::BrowserCreateImage
+                | Action::BrowserNewScene
+                | Action::BrowserCreateScene
+                | Action::BrowserDialogueMenu
+                | Action::BrowserPrimitiveMenu
+                | Action::BrowserCreatePrimitive(_)
+                | Action::BrowserConfirmPrimitive
                 | Action::ImageEdit(_)
                 | Action::BrowserCreateFolder
                 | Action::BrowserCancelPopup
                 | Action::BrowserDeleteFile
+                | Action::BrowserOpenEntry
+                | Action::BrowserRenameFile
+                | Action::BrowserConfirmRename
+                | Action::BrowserDuplicateFile
                 | Action::BrowserRestoreFile
         )
     }
@@ -340,6 +406,8 @@ impl Editor {
             if !self.model_tabs.contains(&index) {
                 self.model_tabs.push(index);
             }
+            self.narrative.active = None;
+            self.generation.active = false;
             self.viewing_model = Some(index);
             self.viewing_image = None;
         }
@@ -370,13 +438,18 @@ impl Editor {
             return;
         }
         if self.viewing_image.is_none() {
-            self.image_return = self
-                .viewing_model
-                .map(ImageReturnTab::Model)
-                .or_else(|| self.has_scene().then_some(ImageReturnTab::Scene(self.room)));
+            self.image_return = if self.generation.active {
+                Some(ImageReturnTab::Generation)
+            } else {
+                self.viewing_model
+                    .map(ImageReturnTab::Model)
+                    .or_else(|| self.has_scene().then_some(ImageReturnTab::Scene(self.room)))
+            };
         }
         self.finish_camera_navigation();
         self.viewing_model = None;
+        self.narrative.active = None;
+        self.generation.active = false;
         self.viewing_image = Some(id);
     }
 
@@ -396,6 +469,9 @@ impl Editor {
             return;
         }
         match self.image_return.take() {
+            Some(ImageReturnTab::Generation) if self.generation.opened => {
+                self.generation.active = true;
+            }
             Some(ImageReturnTab::Model(index)) if self.model_tabs.contains(&index) => {
                 self.open_model_tab(index)
             }
@@ -439,6 +515,9 @@ impl Editor {
     }
 
     fn pose(&self, selection: Selection) -> Option<Pose> {
+        if self.object_deleted(selection) {
+            return None;
+        }
         match selection {
             Selection::Imported(index) => self.imported.get(index).map(|node| {
                 self.edits
@@ -458,6 +537,17 @@ impl Editor {
     }
 
     fn label(&self, selection: Selection) -> String {
+        let custom = match selection {
+            Selection::Model(id) => self.edits.model_names.get(&id),
+            Selection::Imported(index) => self
+                .imported
+                .get(index)
+                .and_then(|node| self.edits.node_names.get(&node.name)),
+            _ => None,
+        };
+        if let Some(name) = custom {
+            return name.clone();
+        }
         match selection {
             Selection::Imported(index) => {
                 self.imported.get(index).map_or_else(String::new, |node| {
@@ -656,6 +746,7 @@ impl Editor {
 
     fn select(&mut self, target: Option<Selection>) {
         self.finish_camera_navigation();
+        self.selection_group = None;
         self.selection = target;
         if let Some(Selection::Light(id)) = target
             && (self.tool == Tool::Scale
@@ -807,6 +898,9 @@ impl EditorPlugin {
 
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
+        area_selection::register(app);
+        app.add_plugins(ui::LayerDragFxPlugin);
+        wireframe::register(app);
         if !app.is_plugin_added::<crate::HdriPlugin>() {
             app.add_plugins(crate::HdriPlugin);
         }
@@ -814,6 +908,7 @@ impl Plugin for EditorPlugin {
             TabNavigationPlugin,
             viewport::HandlePlugin,
             starfield::StarfieldPlugin,
+            orbital::OrbitalPlugin,
             viewport_background::BackgroundPlugin,
             viewport_grid::GridPlugin,
             ui::ButtonFxPlugin,
@@ -822,16 +917,28 @@ impl Plugin for EditorPlugin {
             ui::ModelViewerPlugin,
             ui::HdriLibraryPlugin,
             ui::BrowserDeletionPlugin,
+            image_texture::PaintTexturePlugin,
+            ui::ImageCanvasPlugin,
             crate::window_chrome::WindowChromePlugin,
+        ))
+        .add_plugins((
+            ui::NavigationGizmoPlugin,
+            ui::BrowserPrimitivePlugin,
+            ui::NarrativePlugin,
+            ui::GenerationPlugin,
+            ui::SceneObjectsPlugin,
+            ui::ImageSelectionPlugin,
         ))
         .insert_resource(PointLightShadowMap { size: 512 })
         .insert_resource(Editor::new(self.project.clone(), self.edits.clone()))
         .init_resource::<Scene>()
         .init_resource::<viewport::PointerState>()
         .init_resource::<ui::NumericInput>()
+        .init_resource::<ui::NumberScrub>()
         .init_resource::<ui::DrawerMotion>()
         .init_resource::<ui::DrawerSize>()
         .init_resource::<ui::AssetDrag>()
+        .init_resource::<ui::LayerDrag>()
         .init_resource::<asset_placement::PlacementPreview>()
         .init_resource::<image_previews::ImagePreviews>()
         .init_resource::<ui::ImageViewer>()
@@ -850,7 +957,9 @@ impl Plugin for EditorPlugin {
                     ui::browser_context_input,
                     ui::resize_drawer,
                     ui::resize_sidebar,
+                    ui::scrub_numbers,
                     ui::drag_assets,
+                    ui::drag_photo_layers,
                 )
                     .chain(),
                 (ui::input, ui::shortcuts, ui::scroll, ui::search_browser),
@@ -862,14 +971,21 @@ impl Plugin for EditorPlugin {
                     .chain(),
                 (
                     ui::browser_actions,
+                    ui::resize_photo_editor,
                     ui::photo_editor_input,
+                    ui::photo_color_input,
                     ui::view_images,
                     ui::browser_context_actions,
-                    ui::image_viewer_cursor,
                 )
                     .chain(),
                 asset_placement::update,
-                (handle_actions, ui::layout_sidebar).chain(),
+                (
+                    play::poll,
+                    handle_actions,
+                    ui::image_viewer_cursor,
+                    ui::layout_sidebar,
+                )
+                    .chain(),
                 ui::animate_drawer,
                 begin_room,
                 load_room,
@@ -879,7 +995,7 @@ impl Plugin for EditorPlugin {
                 object_visibility::sync,
                 ui::update_camera_preview,
                 lighting::sync,
-                thumbnails::update,
+                (thumbnails::watch_assets, thumbnails::update).chain(),
                 image_previews::update,
                 (
                     viewport::draw,
@@ -888,6 +1004,7 @@ impl Plugin for EditorPlugin {
                     viewport_grid::sync,
                     (
                         ui::refresh,
+                        ui::refresh_play,
                         ui::refresh_lighting,
                         ui::refresh_lighting_controls,
                     )
@@ -898,6 +1015,13 @@ impl Plugin for EditorPlugin {
                         .after(ui::refresh)
                         .after(ui::update_browser_files),
                     ui::refresh_photo_editor.after(ui::refresh_image_viewer),
+                    ui::refresh_photo_color_picker.after(ui::refresh_photo_editor),
+                    ui::refresh_photo_layers.after(ui::refresh_photo_editor),
+                    ui::refresh_layer_form.after(ui::refresh_photo_layers),
+                    ui::refresh_photo_layer_drag
+                        .after(ui::refresh_photo_layers)
+                        .after(ui::image_viewer_cursor),
+                    ui::photo_layers_input.before(ui::refresh_photo_layers),
                     close_editor,
                 ),
                 (
@@ -918,6 +1042,13 @@ impl Plugin for EditorPlugin {
                 .after(bevy::camera::visibility::VisibilitySystems::CalculateBounds),
         );
         app.add_systems(
+            Last,
+            (ui::cleanup_image_cursor, ui::number_scrub_cursor)
+                .chain()
+                .before(bevy::window::CursorSystems::Update),
+        );
+        app.add_systems(Update, ui::lock_numeric_text.after(ui::refresh));
+        app.add_systems(
             PostUpdate,
             asset_placement::measure
                 .after(bevy::transform::TransformSystems::Propagate)
@@ -932,6 +1063,11 @@ impl Plugin for EditorPlugin {
 pub fn create_app(project: EditorProject) -> Result<App, Box<dyn std::error::Error>> {
     let plugin = EditorPlugin::new(project)?;
     let mut app = App::new();
+    let render_worker = render_worker::enabled();
+    if render_worker {
+        app.insert_resource(render_worker::RenderWorker)
+            .insert_resource(render_worker::update_settings());
+    }
     app.add_plugins(crate::AssetRedirectPlugin::new(&plugin.project.asset_root)?);
     app.add_plugins(
         DefaultPlugins
@@ -940,17 +1076,7 @@ pub fn create_app(project: EditorProject) -> Result<App, Box<dyn std::error::Err
                 ..default()
             })
             .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: plugin.project.title.clone(),
-                    decorations: false,
-                    resolution: (1280, 760).into(),
-                    resize_constraints: WindowResizeConstraints {
-                        min_width: 1000.0,
-                        min_height: 620.0,
-                        ..default()
-                    },
-                    ..default()
-                }),
+                primary_window: Some(render_worker::window(&plugin.project.title, render_worker)),
                 close_when_requested: false,
                 ..default()
             }),
@@ -964,8 +1090,11 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut editor: ResMut<Editor>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
+    render_worker: Option<Res<render_worker::RenderWorker>>,
 ) {
-    window.set_maximized(true);
+    if render_worker.is_none() {
+        window.set_maximized(true);
+    }
     commands.insert_resource(browser::Browser::new(&mut editor.project));
     commands.insert_resource(viewport::Surface::new(&mut images));
     commands.insert_resource(thumbnails::Thumbnails::new(
@@ -1109,6 +1238,22 @@ fn record_room(
     })
     .collect();
     editor.imported = imported;
+    editor.imported_ancestors = editor
+        .imported
+        .iter()
+        .map(|node| {
+            let ancestors = parents
+                .iter_ancestors(node.entity)
+                .filter_map(|ancestor| {
+                    names
+                        .get(ancestor)
+                        .ok()
+                        .map(|name| name.as_str().to_owned())
+                })
+                .collect();
+            (node.name.clone(), ancestors)
+        })
+        .collect();
     editor.imported.sort_by(|a, b| a.name.cmp(&b.name));
     if editor
         .imported
@@ -1317,9 +1462,16 @@ fn handle_actions(
     transforms: Query<&GlobalTransform>,
 ) {
     for action in actions.read().copied() {
+        if matches!(action, Action::Play) && editor.play.running() {
+            if let Err(error) = editor.play.stop() {
+                editor.play.error = Some(format!("Не удалось остановить игру · {error}"));
+            }
+            continue;
+        }
         if matches!(
             action,
-            Action::MoveAsset(_, _)
+            Action::Narrative(_)
+                | Action::MoveAsset(_, _)
                 | Action::HdriLibrary(_)
                 | Action::DropAsset(_, _)
                 | Action::Browse(_)
@@ -1332,12 +1484,21 @@ fn handle_actions(
                 | Action::BrowseFile(_)
                 | Action::BrowserNewFolder
                 | Action::BrowserNewImage
-                | Action::BrowserImageSize(..)
                 | Action::BrowserCreateImage
+                | Action::BrowserNewScene
+                | Action::BrowserCreateScene
+                | Action::BrowserDialogueMenu
+                | Action::BrowserPrimitiveMenu
+                | Action::BrowserCreatePrimitive(_)
+                | Action::BrowserConfirmPrimitive
                 | Action::BrowserCreateFolder
                 | Action::BrowserCancelPopup
                 | Action::ViewImage(_)
                 | Action::BrowserDeleteFile
+                | Action::BrowserOpenEntry
+                | Action::BrowserRenameFile
+                | Action::BrowserConfirmRename
+                | Action::BrowserDuplicateFile
                 | Action::BrowserRestoreFile
                 | Action::OpenImageTab(_)
                 | Action::CloseImageTab(_)
@@ -1355,10 +1516,17 @@ fn handle_actions(
             action,
             Action::SaveAndContinue | Action::DiscardAndContinue | Action::CancelPending
         );
-        // Image saves finish asynchronously before their close can continue.
+        // Asset documents finish their asynchronous save before closing.
         if matches!(
             editor.pending,
-            Some(PendingAction::CloseImageTab(_) | PendingAction::CloseImageEditor(_))
+            Some(
+                PendingAction::CloseNarrative(_)
+                    | PendingAction::ExitNarrative(_)
+                    | PendingAction::CloseImageTab(_)
+                    | PendingAction::CloseImageEditor(_)
+                    | PendingAction::CloseModelTab(_)
+                    | PendingAction::CloseModelEditor(_)
+            )
         ) {
             continue;
         }
@@ -1366,9 +1534,12 @@ fn handle_actions(
             continue;
         }
         if pointer.dragging()
-            || (((editor.viewing_image.is_some() && !Editor::model_tab_action(action))
+            || (((editor.generation.active && !Editor::model_tab_action(action))
+                || (editor.narrative.active.is_some() && !Editor::model_tab_action(action))
+                || (editor.viewing_image.is_some() && !Editor::model_tab_action(action))
                 || (editor.hdri_library_open && !matches!(action, Action::UseDownloadedHdri(_)))
                 || editor.browser_popup
+                || editor.scene_object_popup
                 || (editor.viewing_model.is_some() && !Editor::model_tab_action(action)))
                 && !confirmation)
         {
@@ -1377,6 +1548,8 @@ fn handle_actions(
         if matches!(
             action,
             Action::Save
+                | Action::Generation(ui::GenerationAction::Open)
+                | Action::Generation(ui::GenerationAction::Toggle)
                 | Action::Open(_)
                 | Action::CloseTab(_)
                 | Action::Play
@@ -1386,11 +1559,24 @@ fn handle_actions(
         ) && let Some(error) = numeric.as_ref().and_then(|input| input.error_message())
         {
             editor.status = error.into();
+            if matches!(action, Action::Play) {
+                editor.play.error = Some(error.into());
+            }
             continue;
         }
         editor.finish_camera_navigation();
         pointer.stop_navigation();
         match action {
+            Action::Generation(ui::GenerationAction::Open) => editor.open_generation(),
+            Action::Generation(ui::GenerationAction::Toggle) => {
+                if editor.generation.active {
+                    editor.close_generation();
+                } else {
+                    editor.open_generation();
+                }
+            }
+            Action::Generation(ui::GenerationAction::Close) => editor.close_generation(),
+            Action::Generation(_) => {}
             Action::Open(room) => {
                 editor.open_document(room);
             }
@@ -1472,17 +1658,17 @@ fn handle_actions(
                 }
             }
             Action::Save | Action::SaveAndContinue => {}
-            Action::Play if editor.ready => {
-                if editor.dirty() {
-                    editor.status = "Сохраните сцену перед запуском игры".into();
+            Action::Play if editor.has_scene() && editor.ready => {
+                editor.finish_camera_navigation();
+                if editor.definition().play.is_some()
+                    && editor.dirty()
+                    && !save_editor(&mut editor, &scene, &children, &meshes, &transforms)
+                {
+                    editor.play.error = Some(editor.status.clone());
                     continue;
                 }
-                let Some(play) = &editor.definition().play else {
-                    continue;
-                };
-                match play.spawn() {
-                    Ok(_) => editor.status = "Игровое окно запущено".into(),
-                    Err(error) => editor.status = format!("Не удалось запустить игру · {error}"),
+                if let Err(error) = play::start(&mut editor) {
+                    editor.play.error = Some(format!("Не удалось запустить игру · {error}"));
                 }
             }
             action if editor.ready => {
@@ -1499,32 +1685,8 @@ fn handle_actions(
                             bounds: None,
                         });
                     }
-                    Action::Duplicate => {
-                        if let Some(Selection::Model(id)) = editor.selection
-                            && let Some(mut model) = editor.model(id).cloned()
-                        {
-                            model.pose.position[0] += 0.5;
-                            editor.add_model(model);
-                        } else if let Some(Selection::Light(id)) = editor.selection
-                            && let Some(mut light) = editor.light(id).cloned()
-                        {
-                            light.name = format!(
-                                "{} · копия",
-                                light.name.chars().take(115).collect::<String>()
-                            );
-                            light.pose.position[0] += 0.5;
-                            editor.add_light(light);
-                        }
-                    }
-                    Action::Delete => {
-                        if let Some(Selection::Model(id)) = editor.selection {
-                            editor.edits.models.retain(|model| model.id != id);
-                            editor.select(None);
-                        } else if let Some(Selection::Light(id)) = editor.selection {
-                            editor.edits.lights.retain(|light| light.id != id);
-                            editor.select(None);
-                        }
-                    }
+                    Action::Duplicate => editor.duplicate_targets(),
+                    Action::Delete => editor.delete_targets(),
                     Action::Reset(reset) => editor.reset(reset),
                     Action::Align => {
                         if let Some(target @ Selection::Camera(_)) = editor.selection
@@ -1575,8 +1737,13 @@ fn close_editor(
     mut requests: MessageReader<WindowCloseRequested>,
     mut editor: ResMut<Editor>,
     numeric: Option<Res<ui::NumericInput>>,
+    text_editor: Option<Res<ui::narrative::text_editor::State>>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    if text_editor.as_ref().is_some_and(|state| state.is_open()) {
+        requests.read().for_each(drop);
+        return;
+    }
     if std::mem::take(&mut editor.exit_requested) {
         exit.write(AppExit::Success);
         return;
@@ -1598,10 +1765,14 @@ fn close_editor(
 
 fn continue_pending(editor: &mut Editor) {
     match editor.pending.take() {
+        Some(PendingAction::CloseNarrative(id)) => editor.narrative.close(id),
+        Some(PendingAction::ExitNarrative(_)) => editor.continue_exit(),
         Some(PendingAction::CloseTab(room)) => editor.close_document(room),
         Some(PendingAction::Close) => editor.continue_exit(),
         Some(PendingAction::CloseImageTab(id)) => editor.close_image_tab(id),
         Some(PendingAction::CloseImageEditor(_)) => editor.continue_exit(),
+        Some(PendingAction::CloseModelTab(id)) => editor.close_model_tab(id),
+        Some(PendingAction::CloseModelEditor(_)) => editor.continue_exit(),
         None => {}
     }
 }

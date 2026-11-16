@@ -39,7 +39,10 @@ fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
         let project = EditorProject::load(&root).unwrap();
         assert_eq!(project.title, "Мой проект");
         let edits = project.read_scene(0).unwrap();
-        assert!(edits.lights.is_empty(), "HDRI supplies the default scene lighting");
+        assert!(
+            edits.lights.is_empty(),
+            "HDRI supplies the default scene lighting"
+        );
         assert_eq!(edits.models.len(), models);
         let environment = edits.lighting.as_ref().unwrap();
         assert_eq!(environment.hdri, Some(crate::EnvironmentPreset::Cloudy));

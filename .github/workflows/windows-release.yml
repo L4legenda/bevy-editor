@@ -23,7 +23,7 @@ jobs:
         shell: pwsh
     env:
       CARGO_TERM_COLOR: always
-      # Ship one executable without requiring the Visual C++ runtime installer.
+      # Build Rust binaries with the static CRT; the CUDA package ships native GPU DLLs.
       RUSTFLAGS: -C target-feature=+crt-static
 
     steps:
@@ -60,6 +60,10 @@ jobs:
               f"Commit: `{sha}`\n\n"
               "Download `bevy-editor.exe` and launch it to open the project manager. "
               "Rust and Cargo are not required.\n\n"
+              "For native 3D generation, download and extract "
+              "`bevy-editor-with-3d-generation.zip`. It includes the Rust generator "
+              "and CUDA runtime; an NVIDIA GPU/driver is required, Python is not. "
+              "Model weights are downloaded separately inside the editor.\n\n"
               "Open an existing project with `bevy-editor.exe --project PATH`.\n",
               encoding="utf-8",
           )
@@ -80,6 +84,13 @@ jobs:
       - name: Build the editor
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin bevy-editor
 
+      - name: Build the native Candle CUDA generator
+        run: |
+          ./tools/build-hunyuan.ps1 -Release -Destination ./dist
+          Copy-Item -LiteralPath 'target/x86_64-pc-windows-msvc/release/bevy-editor.exe' -Destination './dist/bevy-editor.exe'
+          Copy-Item -LiteralPath 'docs/hunyuan-generation-ui.md' -Destination './dist/3d-generation.md'
+          Compress-Archive -Path './dist/*' -DestinationPath './target/bevy-editor-with-3d-generation.zip'
+
       - name: Check that the executable starts
         run: |
           $process = Start-Process -FilePath 'target/x86_64-pc-windows-msvc/release/bevy-editor.exe' -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
@@ -96,6 +107,7 @@ jobs:
           $releaseArgs = @(
             'release', 'create', $env:RELEASE_TAG,
             'target/x86_64-pc-windows-msvc/release/bevy-editor.exe',
+            'target/bevy-editor-with-3d-generation.zip',
             '--repo', $env:GITHUB_REPOSITORY,
             '--target', $env:GITHUB_SHA,
             '--title', $env:RELEASE_TITLE,

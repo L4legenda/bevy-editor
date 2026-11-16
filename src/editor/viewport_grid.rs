@@ -23,7 +23,7 @@ const RECENTER_STEP: f32 = 64.0;
 pub(super) struct Grid;
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-struct GridMaterial {
+pub(super) struct GridMaterial {
     // Minor spacing, major spacing, distance fade start/end, in metres.
     #[uniform(0)]
     parameters: Vec4,
@@ -77,47 +77,71 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<GridMaterial>>,
 ) {
-    commands.spawn((
-        Name::new("Editor ground grid"),
-        Grid,
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(EXTENT, EXTENT))),
-        MeshMaterial3d(materials.add(GridMaterial {
-            parameters: Vec4::new(0.5, 2.0, 28.0, 72.0),
-        })),
-        Transform::from_xyz(0.0, HEIGHT, 0.0),
-        Visibility::Hidden,
-        RenderLayers::layer(viewport::EDITOR_GIZMO_LAYER),
-        Pickable::IGNORE,
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
+    let grid = spawn(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        viewport::EDITOR_GIZMO_LAYER,
+    );
+    commands.entity(grid).insert(Grid);
+}
+
+pub(super) fn spawn(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<GridMaterial>,
+    layer: usize,
+) -> Entity {
+    commands
+        .spawn((
+            Name::new("Editor ground grid"),
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(EXTENT, EXTENT))),
+            MeshMaterial3d(materials.add(GridMaterial {
+                parameters: Vec4::new(0.5, 2.0, 28.0, 72.0),
+            })),
+            Transform::from_xyz(0.0, HEIGHT, 0.0),
+            Visibility::Hidden,
+            RenderLayers::layer(layer),
+            Pickable::IGNORE,
+            NotShadowCaster,
+            NotShadowReceiver,
+        ))
+        .id()
+}
+
+pub(super) fn recenter(pose: &Transform) -> Vec3 {
+    Vec3::new(
+        (pose.translation.x / RECENTER_STEP).floor() * RECENTER_STEP,
+        HEIGHT,
+        (pose.translation.z / RECENTER_STEP).floor() * RECENTER_STEP,
+    )
 }
 
 /// Run after camera navigation. The mesh follows the view, while the shader's
 /// world coordinates keep all half-metre divisions anchored to the origin.
 pub(super) fn sync(
     editor: Res<Editor>,
-    camera: Query<(&Camera, &Transform), (With<viewport::EditorCamera>, Without<Grid>)>,
+    camera: Query<
+        (&Camera, &Transform, &Projection),
+        (With<viewport::EditorCamera>, Without<Grid>),
+    >,
     mut grids: Query<(&mut Transform, &mut Visibility), With<Grid>>,
 ) {
-    let view = camera.single().ok().filter(|(camera, pose)| {
+    let view = camera.single().ok().filter(|(camera, pose, projection)| {
         editor.ready
             && editor.has_scene()
             && !editor.pilot
             && camera.is_active
             && pose.translation.is_finite()
+            && !matches!(projection, Projection::Orthographic(_))
     });
     for (mut transform, mut visibility) in &mut grids {
-        let Some((_, pose)) = view else {
+        let Some((_, pose, _)) = view else {
             visibility.set_if_neq(Visibility::Hidden);
             continue;
         };
         visibility.set_if_neq(Visibility::Visible);
-        let center = Vec3::new(
-            (pose.translation.x / RECENTER_STEP).floor() * RECENTER_STEP,
-            HEIGHT,
-            (pose.translation.z / RECENTER_STEP).floor() * RECENTER_STEP,
-        );
+        let center = recenter(pose);
         if transform.translation != center {
             transform.translation = center;
         }

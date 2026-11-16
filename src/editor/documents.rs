@@ -10,6 +10,7 @@ pub(super) struct SceneDocument {
     imported_selection: Option<String>,
     view: Transform,
     pivot: Vec3,
+    orthographic: bool,
 }
 
 impl SceneDocument {
@@ -26,6 +27,7 @@ impl SceneDocument {
                 .pose
                 .transform(),
             pivot: Vec3::ZERO,
+            orthographic: false,
         }
     }
 }
@@ -79,6 +81,7 @@ impl Editor {
                 imported_selection,
                 view: self.view,
                 pivot: self.pivot,
+                orthographic: self.view_orthographic,
             },
         );
     }
@@ -89,6 +92,8 @@ impl Editor {
             return false;
         }
         if self.has_scene() && self.room == room {
+            self.generation.active = false;
+            self.narrative.active = None;
             self.viewing_model = None;
             self.viewing_image = None;
             return true;
@@ -114,6 +119,8 @@ impl Editor {
             }
         };
         self.stash_document();
+        self.generation.active = false;
+        self.narrative.active = None;
         self.viewing_model = None;
         self.viewing_image = None;
         if !self.open_tabs.contains(&room) {
@@ -128,6 +135,7 @@ impl Editor {
         self.restore_selection = document.imported_selection;
         self.view = document.view;
         self.pivot = document.pivot;
+        self.view_orthographic = document.orthographic;
         self.imported.clear();
         self.pilot = false;
         self.focus = false;
@@ -140,6 +148,8 @@ impl Editor {
     pub(super) fn close_document(&mut self, room: Room) {
         let active_model = self.viewing_model;
         let active_image = self.viewing_image;
+        let active_narrative = self.narrative.active;
+        let active_generation = self.generation.active;
         let Some(index) = self.open_tabs.iter().position(|&tab| tab == room) else {
             return;
         };
@@ -170,6 +180,8 @@ impl Editor {
         }
         self.viewing_model = active_model;
         self.viewing_image = active_image;
+        self.narrative.active = active_narrative;
+        self.generation.active = active_generation;
     }
 
     pub(super) fn request_exit(&mut self) {
@@ -188,6 +200,25 @@ impl Editor {
     }
 
     pub(super) fn continue_exit(&mut self) {
+        if let Some(id) = self.narrative.tabs.iter().find(|d| d.dirty()).map(|d| d.id) {
+            self.generation.active = false;
+            self.narrative.active = Some(id);
+            self.viewing_model = None;
+            self.viewing_image = None;
+            self.pending = Some(PendingAction::ExitNarrative(id));
+            return;
+        }
+        if let Some(index) = self
+            .model_tabs
+            .iter()
+            .find(|index| self.dirty_models.contains(index))
+            .copied()
+        {
+            self.open_model_tab(index);
+            self.pending = Some(PendingAction::CloseModelEditor(index));
+            self.status = "Есть несохранённые изменения модели".into();
+            return;
+        }
         if let Some(id) = self
             .image_tabs
             .iter()

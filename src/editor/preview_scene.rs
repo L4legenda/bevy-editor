@@ -17,6 +17,9 @@ use crate::{
     runtime,
 };
 
+#[derive(Component)]
+pub(super) struct CatalogModel;
+
 #[derive(Clone, Component, PartialEq)]
 pub(in crate::editor) struct SceneSnapshot {
     pub(super) room: usize,
@@ -217,6 +220,7 @@ pub(super) fn spawn_native(
 pub(super) fn prepare(
     ready: On<WorldInstanceReady>,
     snapshots: Query<&SceneSnapshot>,
+    catalog_models: Query<(), With<CatalogModel>>,
     children: Query<&Children>,
     names: Query<&Name>,
     parents: Query<&ChildOf>,
@@ -236,6 +240,11 @@ pub(super) fn prepare(
             .insert(RenderLayers::layer(super::LAYER));
         if let Ok(mut camera) = cameras.get_mut(entity) {
             camera.is_active = false;
+        }
+        if catalog_models.contains(ready.entity) {
+            commands
+                .entity(entity)
+                .remove::<(PointLight, SpotLight, DirectionalLight, RectLight)>();
         }
     }
 
@@ -264,6 +273,12 @@ pub(super) fn prepare(
             &names,
         )
         .filter_map(|(entity, name)| {
+            if snapshot.edits.deleted_nodes.contains(name) {
+                for removed in std::iter::once(entity).chain(children.iter_descendants(entity)) {
+                    commands.entity(removed).insert(Visibility::Hidden);
+                }
+                return None;
+            }
             commands.entity(entity).insert(Subject);
             snapshot
                 .edits
@@ -564,6 +579,7 @@ mod tests {
                 },
             );
         }
+        editor.edits.deleted_nodes.insert("Removed".into());
         let snapshot = SceneSnapshot::read(&editor, 0).unwrap();
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
@@ -620,6 +636,19 @@ mod tests {
             .world_mut()
             .spawn((Camera::default(), Transform::IDENTITY, ChildOf(root)))
             .id();
+        let removed = app
+            .world_mut()
+            .spawn((
+                Name::new("Removed"),
+                Transform::IDENTITY,
+                Visibility::Inherited,
+                ChildOf(group),
+            ))
+            .id();
+        let removed_child = app
+            .world_mut()
+            .spawn((Visibility::Visible, ChildOf(removed)))
+            .id();
         let light = app
             .world_mut()
             .spawn((DirectionalLight::default(), ChildOf(root)))
@@ -633,6 +662,13 @@ mod tests {
         // preparation must use live local transforms rather than stale globals.
         trigger_ready(&mut app, root);
         assert!(app.world().get::<Prepared>(root).is_some());
+        for entity in [removed, removed_child] {
+            assert_eq!(
+                app.world().get::<Visibility>(entity),
+                Some(&Visibility::Hidden)
+            );
+            assert!(app.world().get::<Subject>(entity).is_none());
+        }
         assert_pose(world_pose(&mut app, parent), parent_pose);
         assert_pose(world_pose(&mut app, child), child_pose);
         assert_eq!(

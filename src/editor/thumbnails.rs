@@ -6,6 +6,7 @@ use std::{
 
 use bevy::{
     anti_alias::taa::TemporalAntiAliasing,
+    asset::AssetEvent,
     camera::{
         ClearColorConfig, Exposure, Hdr, RenderTarget, primitives::Aabb, visibility::RenderLayers,
     },
@@ -39,6 +40,9 @@ mod lifecycle_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "thumbnail_performance.rs"]
 mod performance;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "thumbnail_render_tests.rs"]
+mod render_tests;
 #[path = "preview_scene.rs"]
 mod scene;
 
@@ -87,7 +91,9 @@ pub(super) struct Thumbnails {
     warmed_up: bool,
     view: Option<PreviewView>,
     light: Option<Entity>,
-    floor: Option<(Handle<Mesh>, Handle<StandardMaterial>)>,
+    model_environment: Option<crate::SceneLighting>,
+    changed_assets: HashSet<String>,
+    asset_versions: HashMap<String, (u64, std::time::SystemTime)>,
     job: Option<Job>,
 }
 
@@ -144,7 +150,9 @@ impl Thumbnails {
             warmed_up: false,
             view: None,
             light: None,
-            floor: None,
+            model_environment: None,
+            changed_assets: HashSet::new(),
+            asset_versions: HashMap::new(),
             job: None,
         };
         previews.extend(images, models);
@@ -156,6 +164,65 @@ impl Thumbnails {
 
     pub(super) fn extend(&mut self, images: &mut Assets<Image>, count: usize) {
         self.images.resize_with(count, || target_texture(images));
+    }
+
+    pub(super) fn invalidate_asset(&mut self, path: &str) {
+        self.changed_assets.insert(path.replace('\\', "/"));
+    }
+
+    fn remember_asset(&mut self, editor: &Editor, path: &str) {
+        if let Some(version) = asset_version(editor, path) {
+            self.asset_versions
+                .entry(asset_key(editor, path))
+                .or_insert(version);
+        }
+    }
+
+    fn asset_modified(&mut self, editor: &Editor, path: &str) -> bool {
+        let Some(version) = asset_version(editor, path) else {
+            return true;
+        };
+        // Loading a GLTF root again also replaces its live Scene0 subasset.
+        // That emits Modified even when the file itself has not changed.
+        self.asset_versions
+            .insert(asset_key(editor, path), version)
+            .is_none_or(|previous| previous != version)
+    }
+
+    fn refresh_models(
+        &mut self,
+        editor: &Editor,
+        environment: &crate::SceneLighting,
+        commands: &mut Commands,
+    ) {
+        let lighting_changed = self.model_environment.as_ref() != Some(environment);
+        self.model_environment = Some(environment.clone());
+        let changed = std::mem::take(&mut self.changed_assets);
+        if !lighting_changed && changed.is_empty() {
+            return;
+        }
+        let key = |path: &str| asset_key(editor, path);
+        let changed: HashSet<_> = changed.iter().map(|path| key(path)).collect();
+        let invalid = |target: Target| match target {
+            Target::Model(index) => {
+                lighting_changed
+                    || editor
+                        .project
+                        .catalog
+                        .get(index)
+                        .is_some_and(|model| changed.contains(&key(&model.asset)))
+            }
+            // A GLB can occur in multiple scene documents, including closed ones.
+            Target::Scene(_) => !changed.is_empty(),
+        };
+        if self.job.as_ref().is_some_and(|job| invalid(job.target)) {
+            self.cancel(commands);
+        }
+        self.completed.retain(|&target| !invalid(target));
+        self.failed.retain(|&target| !invalid(target));
+        if !changed.is_empty() {
+            self.changed.fill(Instant::now());
+        }
     }
 
     pub(super) fn state(&self, entry: Entry) -> PreviewState {
@@ -327,6 +394,43 @@ fn next_missing(
         .find(|target| !completed.contains(target) && ready(*target))
 }
 
+fn asset_key(editor: &Editor, path: &str) -> String {
+    crate::asset_paths::original_asset_path(&editor.root, path)
+        .unwrap_or_else(|_| path.replace('\\', "/"))
+}
+
+fn asset_version(editor: &Editor, path: &str) -> Option<(u64, std::time::SystemTime)> {
+    let path = crate::asset_paths::resolve_asset_path(&editor.root, path).ok()?;
+    let metadata = std::fs::metadata(editor.root.join(path)).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+/// A saved/reloaded GLB invalidates both its catalog card and dependent scenes.
+pub(super) fn watch_assets(
+    mut gltfs: MessageReader<AssetEvent<Gltf>>,
+    mut worlds: MessageReader<AssetEvent<WorldAsset>>,
+    server: Res<AssetServer>,
+    editor: Res<Editor>,
+    mut previews: ResMut<Thumbnails>,
+) {
+    for event in gltfs.read() {
+        if let AssetEvent::Modified { id } = event
+            && let Some(path) = server.get_path(*id)
+            && previews.asset_modified(&editor, &path.path().to_string_lossy())
+        {
+            previews.invalidate_asset(&path.path().to_string_lossy());
+        }
+    }
+    for event in worlds.read() {
+        if let AssetEvent::Modified { id } = event
+            && let Some(path) = server.get_path(*id)
+            && previews.asset_modified(&editor, &path.path().to_string_lossy())
+        {
+            previews.invalidate_asset(&path.path().to_string_lossy());
+        }
+    }
+}
+
 pub(super) fn update(
     mut commands: Commands,
     editor: Res<Editor>,
@@ -338,10 +442,18 @@ pub(super) fn update(
     subjects: Query<(), With<scene::Subject>>,
     children: Query<&Children>,
     meshes: Query<(&Aabb, &GlobalTransform)>,
-    mut studio_meshes: ResMut<Assets<Mesh>>,
-    mut studio_materials: ResMut<Assets<StandardMaterial>>,
+    mut backdrop_assets: (
+        ResMut<Assets<Mesh>>,
+        ResMut<Assets<super::viewport_background::BackgroundMaterial>>,
+    ),
     mut images: ResMut<Assets<Image>>,
 ) {
+    let model_environment = if editor.has_scene() {
+        editor.environment().clone()
+    } else {
+        crate::SceneLighting::editor_default()
+    };
+    previews.refresh_models(&editor, &model_environment, &mut commands);
     let scene_count = editor.project.scenes.len();
     previews
         .scene_images
@@ -395,8 +507,7 @@ pub(super) fn update(
     }
     let entries = Arc::clone(&previews.visible);
     let visible = if editor.drawer { entries.as_ref() } else { &[] };
-    // Catalog previews always use the studio profile, even when the initial
-    // scene has its own lighting hook. Warm that shared path before browsing.
+    // Warm the same calibrated environment used by the active scene.
     let start_warmup = !previews.warmed_up && previews.warmup.is_none() && editor.has_scene();
     if start_warmup {
         previews.warmup = Some(if editor.project.catalog.is_empty() {
@@ -429,6 +540,17 @@ pub(super) fn update(
                 Target::Model(index) => &editor.project.catalog[index].asset,
                 Target::Scene(room) => &editor.project.scenes[room].asset,
             };
+            previews.remember_asset(&editor, path);
+            if let Target::Scene(room) = target {
+                let dependencies: Vec<_> = previews.snapshots[room]
+                    .iter()
+                    .flat_map(|snapshot| &snapshot.edits.models)
+                    .map(|model| model.asset.clone())
+                    .collect();
+                for path in dependencies {
+                    previews.remember_asset(&editor, &path);
+                }
+            }
             let asset = if path.is_empty() {
                 Handle::default()
             } else {
@@ -516,6 +638,9 @@ pub(super) fn update(
                 return;
             };
             let mut instance = commands.spawn((WorldAssetRoot(world.clone()), ChildOf(job.root)));
+            if matches!(job.target, Target::Model(_)) {
+                instance.insert(scene::CatalogModel);
+            }
             if let Target::Scene(room) = job.target
                 && let Some(snapshot) = &previews.snapshots[room]
             {
@@ -586,13 +711,17 @@ pub(super) fn update(
             };
             let host_lighting = matches!(job.target, Target::Scene(_))
                 && (editor.project.scene_setup.is_some() || editor.project.camera_setup.is_some());
-            let environment = snapshot.and_then(|snapshot| {
-                snapshot
-                    .edits
-                    .lighting
-                    .clone()
-                    .or_else(|| (!host_lighting).then(crate::SceneLighting::editor_default))
-            });
+            let environment = if matches!(job.target, Target::Model(_)) {
+                Some(model_environment.clone())
+            } else {
+                snapshot.and_then(|snapshot| {
+                    snapshot
+                        .edits
+                        .lighting
+                        .clone()
+                        .or_else(|| (!host_lighting).then(crate::SceneLighting::editor_default))
+                })
+            };
             let custom_lights = snapshot.is_some_and(|snapshot| !snapshot.edits.lights.is_empty());
             let contacts = snapshot.is_some_and(|snapshot| {
                 snapshot.edits.lights.iter().any(|light| {
@@ -653,41 +782,21 @@ pub(super) fn update(
                         .id(),
                 );
             }
-            if let Target::Model(_) = job.target
-                && let Some(bounds) = bounds
+            if matches!(job.target, Target::Model(_))
+                && (!model_environment.has_hdri() || !model_environment.hdri_background)
             {
-                let center = Vec3::from(bounds.center);
-                let half = Vec3::from(bounds.half_size);
-                let span = half.length().max(0.01) * 24.0;
-                let (mesh, material) = previews
-                    .floor
-                    .get_or_insert_with(|| {
-                        (
-                            studio_meshes.add(Plane3d::default().mesh().size(1.0, 1.0)),
-                            studio_materials.add(StandardMaterial {
-                                base_color: Color::srgb(0.24, 0.27, 0.32),
-                                perceptual_roughness: 0.95,
-                                ..default()
-                            }),
-                        )
-                    })
-                    .clone();
-                commands.spawn((
-                    Name::new("Thumbnail studio floor"),
-                    Mesh3d(mesh),
-                    MeshMaterial3d(material),
-                    Transform::from_xyz(
-                        center.x,
-                        center.y - half.y - half.length() * 0.002,
-                        center.z,
-                    )
-                    .with_scale(Vec3::splat(span)),
-                    RenderLayers::layer(LAYER),
-                    ChildOf(job.root),
-                ));
+                let backdrop = super::viewport_background::spawn(
+                    &mut commands,
+                    &mut backdrop_assets.0,
+                    &mut backdrop_assets.1,
+                    LAYER,
+                );
+                commands
+                    .entity(backdrop)
+                    .insert((Visibility::Visible, view, ChildOf(job.root)));
             }
             commands.entity(job.root).insert(Visibility::Inherited);
-            let reusable = previews.view.filter(|view| view.studio && studio_fill);
+            let reusable = previews.view.filter(|view| view.studio && !host_lighting);
             let mut camera = if let Some(view) = reusable {
                 commands.entity(view.entity)
             } else {
@@ -743,7 +852,7 @@ pub(super) fn update(
             );
             previews.view = job.camera.map(|entity| PreviewView {
                 entity,
-                studio: studio_fill,
+                studio: !host_lighting,
             });
             job.started = Instant::now();
         }

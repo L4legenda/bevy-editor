@@ -15,6 +15,7 @@ pub(crate) struct DragPayload {
 pub(crate) enum DropTarget {
     Folder(usize),
     Scene(Vec2),
+    GenerationSource,
 }
 
 #[derive(Clone, Copy)]
@@ -168,7 +169,7 @@ fn scene_target_contains(
     }
     if !editor.pilot
         && matches!(editor.selection, Some(Selection::Camera(_)))
-        && camera_preview_rect(window, motion, &editor.sidebar).contains(cursor)
+        && camera_preview_rect(window, &editor.sidebar).contains(cursor)
     {
         return false;
     }
@@ -205,8 +206,15 @@ pub(crate) fn pointer(
         &UiGlobalTransform,
         Option<&CalculatedClip>,
     )>,
+    sources: Query<(
+        &generation::SourceDrop,
+        &ComputedNode,
+        &UiGlobalTransform,
+        Option<&CalculatedClip>,
+    )>,
     mut actions: MessageWriter<Action>,
     lighting: Option<Res<LightingUi>>,
+    viewer: Option<Res<ImageViewer>>,
 ) {
     drag.cancelled_this_frame = false;
     if mouse.just_pressed(MouseButton::Left)
@@ -215,6 +223,9 @@ pub(crate) fn pointer(
         drag.suppress_click = false;
     }
     if !window.focused
+        || viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.edit.color_picker.is_some())
         || lighting
             .as_ref()
             .is_some_and(|lighting| lighting.blocks_scene_input())
@@ -281,11 +292,22 @@ pub(crate) fn pointer(
                 (a.size().x * a.size().y).total_cmp(&(b.size().x * b.size().y))
             })
             .map(|(folder, _, _, _)| folder.0);
-        drag.target = folder.map(DropTarget::Folder).or_else(|| {
-            (can_place(payload.entry, &browser, &editor)
-                && scene_target_contains(&editor, &window, &motion, cursor))
-            .then_some(DropTarget::Scene(cursor))
-        });
+        drag.target = folder
+            .map(DropTarget::Folder)
+            .or_else(|| {
+                (editor.generation.active
+                    && !motion.covers(cursor, &window)
+                    && generation::source_file(&browser, payload.entry).is_some()
+                    && sources.iter().any(|(source, node, transform, clip)| {
+                        source.enabled && hit(node, transform, clip, physical)
+                    }))
+                .then_some(DropTarget::GenerationSource)
+            })
+            .or_else(|| {
+                (can_place(payload.entry, &browser, &editor)
+                    && scene_target_contains(&editor, &window, &motion, cursor))
+                .then_some(DropTarget::Scene(cursor))
+            });
     }
     if mouse.just_released(MouseButton::Left) || !mouse.pressed(MouseButton::Left) {
         if let Some((payload, target)) = drag.finish() {
@@ -295,6 +317,14 @@ pub(crate) fn pointer(
                 }
                 DropTarget::Scene(position) => {
                     actions.write(Action::DropAsset(payload.entry, position));
+                }
+                DropTarget::GenerationSource => {
+                    if let Some(file) = generation::source_file(&browser, payload.entry) {
+                        actions.write(Action::Generation(GenerationAction::Choose(
+                            file,
+                            payload.scan_revision,
+                        )));
+                    }
                 }
             }
         }
@@ -378,6 +408,9 @@ pub(crate) fn visuals(
             .into(),
             BLUE,
         ),
+        Some(DropTarget::GenerationSource) => {
+            ("Использовать в 3D генерации · Esc — отмена".into(), GREEN)
+        }
         None => ("Здесь нельзя разместить".into(), MUTED),
     };
     let cursor = window.cursor_position().unwrap_or(Vec2::ZERO);
@@ -529,7 +562,7 @@ mod tests {
             &editor,
             &window,
             &motion,
-            camera_preview_rect(&window, &motion, &editor.sidebar).center()
+            camera_preview_rect(&window, &editor.sidebar).center()
         ));
         editor.pilot = true;
         let render = viewport_rect(&window, &editor.sidebar);

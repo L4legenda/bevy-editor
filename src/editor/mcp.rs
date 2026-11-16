@@ -13,6 +13,7 @@ use std::{
 
 use base64::Engine;
 use bevy::{
+    camera::RenderTarget,
     camera::primitives::Aabb,
     input_focus::InputFocus,
     prelude::*,
@@ -136,6 +137,7 @@ fn process(
     drag: Option<Res<ui::AssetDrag>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     surface: Option<Res<viewport::Surface>>,
+    viewport_targets: Query<&RenderTarget, With<viewport::EditorCamera>>,
     children: Query<&Children>,
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
@@ -189,9 +191,24 @@ fn process(
                     .send(Err("This editor has no rendered viewport".into()));
                 continue;
             };
+            let Ok(target) = viewport_targets.single() else {
+                let _ = job
+                    .reply
+                    .send(Err("This editor has no rendered viewport".into()));
+                continue;
+            };
+            if !matches!(target, RenderTarget::Image(image) if image.handle == surface.0) {
+                let _ = job
+                    .reply
+                    .send(Err("Wait for the viewport render target to be ready".into()));
+                continue;
+            }
             let reply = Mutex::new(Some(job.reply));
             commands
-                .spawn(Screenshot::image(surface.0.clone()))
+                // Image target identity includes its DPI scale factor. Rebuilding
+                // it from the handle alone captures an unused, black attachment
+                // when the viewport camera renders at a non-default window scale.
+                .spawn(Screenshot(target.clone()))
                 .observe(move |captured: On<ScreenshotCaptured>| {
                     let Some(reply) = reply.lock().ok().and_then(|mut reply| reply.take()) else {
                         return;
@@ -283,7 +300,9 @@ fn resolve(editor: &Editor, id: &str) -> Result<Selection, String> {
     } else {
         (suffix == "environment").then_some(Selection::Environment)
     };
-    selection.ok_or_else(|| format!("Unknown object ID: {id}"))
+    selection
+        .filter(|&target| !editor.object_deleted(target))
+        .ok_or_else(|| format!("Unknown object ID: {id}"))
 }
 
 fn transform_json(pose: crate::Pose) -> Value {
@@ -431,6 +450,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             "active": editor.has_scene() && editor.room == index, "dirty": editor.document_dirty(index)
         })).collect::<Vec<_>>() })),
         Command::Objects(args) => page((0..editor.imported.len()).map(Selection::Imported)
+            .filter(|&target| !editor.object_deleted(target))
             .chain(editor.edits.models.iter().map(|model| Selection::Model(model.id)))
             .chain((0..editor.definition().cameras.len()).map(Selection::Camera))
             .chain(editor.edits.lights.iter().map(|light| Selection::Light(light.id)))
@@ -507,7 +527,10 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if !matches!(target, Selection::Model(_) | Selection::Light(_)) { return Err("Only added models and lights can be removed; hide imported objects instead".into()); }
             let before = editor.edits.clone();
             match target {
-                Selection::Model(id) => editor.edits.models.retain(|model| model.id != id),
+                Selection::Model(id) => {
+                    editor.edits.models.retain(|model| model.id != id);
+                    editor.edits.model_names.remove(&id);
+                }
                 Selection::Light(id) => editor.edits.lights.retain(|light| light.id != id),
                 _ => unreachable!(),
             }

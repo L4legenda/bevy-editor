@@ -20,7 +20,7 @@ use super::{Editor, viewport};
 pub(super) struct Background;
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-struct BackgroundMaterial {
+pub(super) struct BackgroundMaterial {
     #[uniform(0)]
     top: LinearRgba,
     #[uniform(1)]
@@ -85,8 +85,22 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<BackgroundMaterial>>,
 ) {
-    // Explicit positions avoid depending on the mesh allocator's vertex offset.
-    // The custom vertex stage emits these directly in clip space at far depth.
+    let background = spawn(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        viewport::EDITOR_GIZMO_LAYER,
+    );
+    commands.entity(background).insert(Background);
+}
+
+pub(super) fn spawn(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<BackgroundMaterial>,
+    layer: usize,
+) -> Entity {
+    // A clip-space triangle, decoded by the vertex shader if Bevy packs positions.
     let mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -95,45 +109,59 @@ fn setup(
         Mesh::ATTRIBUTE_POSITION,
         vec![[-1.0, 1.0, -1.0], [-1.0, -3.0, 1.0], [3.0, 1.0, -1.0]],
     );
-    commands.spawn((
-        Name::new("Editor gradient backdrop"),
-        Background,
-        Mesh3d(meshes.add(mesh)),
-        MeshMaterial3d(materials.add(BackgroundMaterial {
-            top: Color::srgb(0.030, 0.039, 0.061).to_linear(),
-            bottom: Color::srgb(0.070, 0.080, 0.106).to_linear(),
-            violet: Color::srgb(0.145, 0.122, 0.190).to_linear(),
-            gold: Color::srgb(0.160, 0.117, 0.075).to_linear(),
-        })),
-        Transform::IDENTITY,
-        Visibility::Hidden,
-        RenderLayers::layer(viewport::EDITOR_GIZMO_LAYER),
-        NoFrustumCulling,
-        Pickable::IGNORE,
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
+    commands
+        .spawn((
+            Name::new("Editor gradient backdrop"),
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials.add(BackgroundMaterial {
+                top: Color::srgb(0.030, 0.039, 0.061).to_linear(),
+                bottom: Color::srgb(0.070, 0.080, 0.106).to_linear(),
+                violet: Color::srgb(0.145, 0.122, 0.190).to_linear(),
+                gold: Color::srgb(0.160, 0.117, 0.075).to_linear(),
+            })),
+            Transform::IDENTITY,
+            Visibility::Hidden,
+            RenderLayers::layer(layer),
+            NoFrustumCulling,
+            Pickable::IGNORE,
+            NotShadowCaster,
+            NotShadowReceiver,
+        ))
+        .id()
 }
 
 pub(super) fn sync(
     editor: Res<Editor>,
-    camera: Query<
-        (&Camera, &Transform, Option<&Skybox>),
+    mut camera: Query<
+        (
+            &Camera,
+            &Transform,
+            Option<&Skybox>,
+            &Projection,
+            Option<&mut crate::hdri::OrthographicBackdrop>,
+        ),
         (With<viewport::EditorCamera>, Without<Background>),
     >,
     images: Res<Assets<Image>>,
     mut backgrounds: Query<(&mut Visibility, &mut Transform), With<Background>>,
 ) {
-    let view = camera.single().ok();
+    let mut view = camera.single_mut().ok();
+    if let Some((_, _, _, _, Some(mode))) = &mut view {
+        mode.0 = !editor.pilot;
+    }
     let panorama_loaded = view
-        .and_then(|(_, _, skybox)| skybox)
+        .as_ref()
+        .filter(|(_, _, _, projection, _)| !matches!(projection, Projection::Orthographic(_)))
+        .and_then(|(_, _, skybox, _, _)| *skybox)
         .and_then(|skybox| skybox.image.as_ref())
         .is_some_and(|image| images.contains(image));
     let visible = editor.has_scene()
         && editor.ready
         && !editor.pilot
         && !panorama_loaded
-        && view.is_some_and(|(camera, _, _)| camera.is_active);
+        && view
+            .as_ref()
+            .is_some_and(|(camera, _, _, _, _)| camera.is_active);
     for (mut visibility, mut transform) in &mut backgrounds {
         visibility.set_if_neq(if visible {
             Visibility::Visible
@@ -142,7 +170,7 @@ pub(super) fn sync(
         });
         // Keep the dummy bounds around the camera for optional GPU occlusion
         // culling. The vertex shader itself ignores the world transform.
-        if let Some((_, pose, _)) = view
+        if let Some((_, pose, _, _, _)) = &view
             && transform.translation != pose.translation
         {
             transform.translation = pose.translation;

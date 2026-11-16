@@ -143,18 +143,46 @@ pub(in crate::editor) fn update(
         focus.set(dialog.cancel, FocusCause::Auto);
     }
     let destination = match pending {
-        PendingAction::CloseTab(_) | PendingAction::CloseImageTab(_) => "закрытием вкладки",
-        PendingAction::Close | PendingAction::CloseImageEditor(_) => "закрытием редактора",
+        PendingAction::CloseNarrative(_)
+        | PendingAction::CloseTab(_)
+        | PendingAction::CloseImageTab(_)
+        | PendingAction::CloseModelTab(_) => "закрытием вкладки",
+        PendingAction::ExitNarrative(_)
+        | PendingAction::Close
+        | PendingAction::CloseImageEditor(_)
+        | PendingAction::CloseModelEditor(_) => "закрытием редактора",
     };
-    let message = if let PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id) =
+    let message = if let PendingAction::CloseNarrative(id) | PendingAction::ExitNarrative(id) =
         pending
     {
+        format!(
+            "В документе «{}» есть несохранённые изменения. Сохранить перед {}?",
+            editor
+                .narrative
+                .get(id)
+                .map(|d| d.path.display().to_string())
+                .unwrap_or_default(),
+            destination
+        )
+    } else if let PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id) = pending {
         format!(
             "В изображении «{}» есть несохранённые изменения. Сохранить слои .pcraft и обновить исходное изображение перед {}?",
             editor
                 .image_tab(id)
                 .map(|tab| tab.path.display().to_string())
                 .unwrap_or_default(),
+            destination
+        )
+    } else if let PendingAction::CloseModelTab(index) | PendingAction::CloseModelEditor(index) =
+        pending
+    {
+        format!(
+            "В модели «{}» есть несохранённые изменения. Сохранить GLB перед {}?",
+            editor
+                .project
+                .catalog
+                .get(index)
+                .map_or("Модель", |m| m.label.as_str()),
             destination
         )
     } else {

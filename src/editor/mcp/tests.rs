@@ -395,6 +395,131 @@ fn enqueue(bridge: &Bridge, command: Command, deadline: Instant) -> oneshot::Rec
 }
 
 #[test]
+fn capture_uses_the_camera_target_including_its_dpi_scale() {
+    use bevy::camera::ImageRenderTarget;
+
+    for scale_factor in [1.0, 1.25, 2.0] {
+        let (mut app, bridge) = app(editor());
+        let handle = Handle::<Image>::default();
+        let target = RenderTarget::Image(ImageRenderTarget {
+            handle: handle.clone(),
+            scale_factor,
+        });
+        app.insert_resource(viewport::Surface(handle));
+        app.world_mut()
+            .spawn((viewport::EditorCamera, target.clone()));
+        let _reply = enqueue(&bridge, Command::Capture, Instant::now() + REQUEST_TIMEOUT);
+        app.update();
+        let world = app.world_mut();
+        let screenshot = world.query::<&Screenshot>().single(world).unwrap();
+        assert_eq!(
+            screenshot.0.normalize(None),
+            target.normalize(None),
+            "Capture lost the camera's DPI scale"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires GPU; captures the real editor viewport through MCP at 200% DPI"]
+fn gpu_mcp_capture_renders_the_viewport_at_high_dpi() {
+    use crate::editor::{
+        selection_outline::render_tests::frame, tests::lighting_ui_render::fixture,
+    };
+
+    let (mut app, window, _) = fixture();
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .resolution
+        .set_scale_factor_override(Some(2.0));
+    let (sender, receiver) = mpsc::sync_channel(64);
+    let bridge = Bridge {
+        sender,
+        wake: Arc::new(|| {}),
+    };
+    app.insert_resource(Inbox(Mutex::new(receiver)))
+        .add_systems(
+            Update,
+            process
+                .after(super::super::handle_actions)
+                .before(super::super::begin_room),
+        );
+    for _ in 0..24 {
+        frame(&mut app);
+    }
+    {
+        let world = app.world_mut();
+        let target = world
+            .query_filtered::<&RenderTarget, With<viewport::EditorCamera>>()
+            .single(world)
+            .unwrap();
+        assert!(matches!(target, RenderTarget::Image(image) if image.scale_factor == 2.0));
+    }
+
+    let output = std::env::var_os("BEVY_EDITOR_TEST_OUTPUT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("bevy-editor-mcp-capture"));
+    std::fs::create_dir_all(&output).unwrap();
+    let mut captures = Vec::new();
+    for (index, position) in [[6.0, 4.0, 7.0], [-5.0, 3.0, 2.0]].into_iter().enumerate() {
+        let mut view = enqueue(
+            &bridge,
+            Command::View(ViewArgs {
+                position,
+                target: [0.0; 3],
+            }),
+            Instant::now() + REQUEST_TIMEOUT,
+        );
+        for _ in 0..5 {
+            frame(&mut app);
+        }
+        assert!(view.try_recv().unwrap().is_ok());
+        let mut pending = enqueue(&bridge, Command::Capture, Instant::now() + REQUEST_TIMEOUT);
+        let payload = (0..240)
+            .find_map(|_| {
+                frame(&mut app);
+                pending.try_recv().ok()
+            })
+            .expect("MCP capture did not complete")
+            .expect("MCP capture failed");
+        let Payload::Image { png, width, height } = payload else {
+            panic!("Capture must return an image");
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(png)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+        assert_eq!(image.dimensions(), (width, height));
+        assert!(width <= 1600 && height <= 1000);
+        let visible = image
+            .pixels()
+            .filter(|p| p.0.iter().any(|v| *v > 24))
+            .count();
+        assert!(
+            visible > (width * height / 20) as usize,
+            "MCP returned a black capture"
+        );
+        std::fs::write(output.join(format!("mcp-viewport-dpi2-{index}.png")), bytes).unwrap();
+        captures.push(image);
+    }
+    assert_eq!(captures[0].dimensions(), captures[1].dimensions());
+    let changed = captures[0]
+        .pixels()
+        .zip(captures[1].pixels())
+        .filter(|(a, b)| {
+            a.0.iter()
+                .zip(b.0)
+                .any(|(a, b)| (*a as i16 - b as i16).abs() > 20)
+        })
+        .count();
+    assert!(
+        changed > (captures[0].width() * captures[0].height() / 50) as usize,
+        "Capture must follow the changed live camera view"
+    );
+}
+
+#[test]
 fn expired_cancelled_and_busy_requests_never_mutate_the_editor() {
     let editor = editor();
     let command = Command::AddModel(AddModelArgs {

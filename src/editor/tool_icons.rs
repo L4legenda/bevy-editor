@@ -6,6 +6,19 @@ use super::{Action, EDGE, Look, Tool, control, icons, row, surface};
 pub(super) const IDLE: Color = Color::srgb(0.102, 0.105, 0.133);
 pub(super) const HOVER: Color = Color::srgb(0.183, 0.168, 0.218);
 
+pub(super) fn label(tool: Tool, model: bool) -> &'static str {
+    match (tool, model) {
+        (Tool::Universal, true) => "Выделение (Q)",
+        (Tool::Move, true) => "Двигать (G)",
+        (Tool::Rotate, true) => "Поворот (R)",
+        (Tool::Scale, true) => "Масштаб (S)",
+        (Tool::Universal, false) => "Выделение (Q)",
+        (Tool::Move, false) => "Двигать (W)",
+        (Tool::Rotate, false) => "Поворот (E)",
+        (Tool::Scale, false) => "Масштаб (R)",
+    }
+}
+
 pub(super) fn setup(commands: &mut Commands, parent: Entity) {
     let group = surface(
         commands,
@@ -19,15 +32,11 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) {
         },
         IDLE,
     );
-    for (index, (tool, glyph, label)) in [
-        (
-            Tool::Universal,
-            icons::Glyph::Cursor,
-            "Выбор и преобразование (Q)",
-        ),
-        (Tool::Move, icons::Glyph::Move, "Двигать (W)"),
-        (Tool::Rotate, icons::Glyph::Rotate, "Поворот (E)"),
-        (Tool::Scale, icons::Glyph::Scale, "Масштаб (R)"),
+    for (index, (tool, glyph)) in [
+        (Tool::Universal, icons::Glyph::Cursor),
+        (Tool::Move, icons::Glyph::Move),
+        (Tool::Rotate, icons::Glyph::Rotate),
+        (Tool::Scale, icons::Glyph::Scale),
     ]
     .into_iter()
     .enumerate()
@@ -62,7 +71,7 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) {
         );
         commands
             .entity(button)
-            .insert(AccessibleLabel(label.into()));
+            .insert(AccessibleLabel(label(tool, false).into()));
         icons::themed(commands, button, glyph, 18.0);
     }
 }

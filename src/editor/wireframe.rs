@@ -1,0 +1,75 @@
+//! Depth-tested line overlay without optional polygon-mode GPU features.
+use bevy::{
+    asset::{AssetPath, embedded_asset, embedded_path},
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{MaterialPipeline, MaterialPipelineKey},
+    prelude::*,
+    reflect::TypePath,
+    render::render_resource::{
+        AsBindGroup, CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    },
+    shader::ShaderRef,
+};
+
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+pub(super) struct WireMaterial {
+    #[uniform(0)]
+    tint: Vec4,
+}
+
+impl Default for WireMaterial {
+    fn default() -> Self {
+        Self {
+            tint: Vec4::new(0.035, 0.027, 0.016, 1.0),
+        }
+    }
+}
+
+impl WireMaterial {
+    pub(super) fn colored(tint: Vec4) -> Self {
+        Self { tint }
+    }
+}
+
+impl Material for WireMaterial {
+    fn vertex_shader() -> ShaderRef {
+        Self::fragment_shader()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Path(
+            AssetPath::from_path_buf(embedded_path!("wireframe.wesl")).with_source("embedded"),
+        )
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        // Queue after the opaque surface so its depth test can hide rear edges.
+        AlphaMode::Blend
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn specialize(
+        _: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _: &MeshVertexBufferLayoutRef,
+        _: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+        if let Some(depth) = &mut descriptor.depth_stencil {
+            depth.depth_write_enabled = Some(false);
+            depth.depth_compare = Some(CompareFunction::GreaterEqual);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn register(app: &mut App) {
+    embedded_asset!(app, "wireframe.wesl");
+    app.add_plugins(MaterialPlugin::<WireMaterial>::default());
+}

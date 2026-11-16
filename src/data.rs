@@ -2,7 +2,7 @@
 use bevy::{math::Affine3A, prelude::*};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs, io,
     path::{Component as PathComponent, Path},
 };
@@ -153,6 +153,14 @@ pub struct LevelEdits<K: Ord = String> {
     pub cameras: BTreeMap<K, CameraPlacement>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<PlacedModel>,
+    /// Per-instance labels; shared model assets keep their original names.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_names: BTreeMap<u32, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_names: BTreeMap<String, String>,
+    /// Removed source placements retain stable GLB names for undo and reloading.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub deleted_nodes: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lights: Vec<crate::lighting::SceneLight>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +174,9 @@ impl<K: Ord> Default for LevelEdits<K> {
             nodes: BTreeMap::new(),
             cameras: BTreeMap::new(),
             models: Vec::new(),
+            model_names: BTreeMap::new(),
+            node_names: BTreeMap::new(),
+            deleted_nodes: BTreeSet::new(),
             lights: Vec::new(),
             lighting: None,
         }
@@ -220,6 +231,27 @@ impl<K: Ord> LevelEdits<K> {
 
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        if self
+            .model_names
+            .values()
+            .chain(self.node_names.values())
+            .any(|name| {
+                name.trim().is_empty()
+                    || name.chars().count() > 128
+                    || name.chars().any(char::is_control)
+            })
+            || self
+                .node_names
+                .keys()
+                .chain(self.deleted_nodes.iter())
+                .any(String::is_empty)
+            || self
+                .model_names
+                .keys()
+                .any(|id| !self.models.iter().any(|model| model.id == *id))
+        {
+            return Err(invalid("Invalid scene object name".into()));
+        }
         if let Some(scene) = &self.scene {
             if !self.nodes.is_empty() {
                 return Err(invalid(

@@ -9,12 +9,23 @@ use bevy::{
     image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor},
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
-    window::{CursorIcon, SystemCursorIcon},
+    window::CursorIcon,
 };
 use std::{collections::HashMap, path::PathBuf};
 
+#[path = "image_canvas.rs"]
+mod canvas_material;
 #[path = "image_edit.rs"]
 pub(in crate::editor) mod edit;
+pub(in crate::editor) use canvas_material::{CanvasMaterial, ImageCanvasPlugin};
+#[path = "image_paint_input.rs"]
+mod paint_input;
+#[path = "image_panel_resize.rs"]
+mod panel_resize;
+pub(in crate::editor) use panel_resize::resize as resize_panel;
+#[path = "image_cursor.rs"]
+mod tool_cursor;
+pub(in crate::editor) use tool_cursor::{cleanup as cleanup_cursor, cursor};
 
 const MAX_TEXTURE: u32 = 4096;
 const ZOOM_STEP: f32 = 1.25;
@@ -75,6 +86,7 @@ struct SavedView {
 #[derive(Resource, Default)]
 pub(in crate::editor) struct ImageViewer {
     pub edit: edit::State,
+    panel: panel_resize::Panel,
     tab: Option<usize>,
     path: Option<PathBuf>,
     needs_load: bool,
@@ -93,9 +105,18 @@ pub(in crate::editor) struct ImageViewer {
     scale_factor: Option<f32>,
     cursor_owned: bool,
     previous_cursor: Option<CursorIcon>,
+    last_cursor: Option<CursorIcon>,
+    brush_cursor: Option<tool_cursor::Tip>,
+    brush_cursor_position: Option<Vec2>,
+    native_brush_cursor: bool,
+    pipette_preview: Option<tool_cursor::PipetteSample>,
 }
 
 impl ImageViewer {
+    pub(super) fn resizing_panel(&self) -> bool {
+        self.panel.capturing()
+    }
+
     pub(super) fn is_fit(&self) -> bool {
         self.zoom == Zoom::Fit
     }
@@ -106,6 +127,14 @@ impl ImageViewer {
 
     fn source_size(&self, dimensions: UVec2) -> Vec2 {
         dimensions.as_vec2() / self.scale_factor.unwrap_or(1.0)
+    }
+
+    fn image_rect(&self, dimensions: UVec2, viewport: Rect) -> Rect {
+        let original = self.source_size(dimensions);
+        let size = original * self.zoom.scale(original, viewport.size());
+        let density = self.scale_factor.unwrap_or(1.0);
+        let offset = (((viewport.size() - size) * 0.5 + self.pan) * density).round() / density;
+        Rect::from_corners(viewport.min + offset, viewport.min + offset + size)
     }
 
     fn reset(
@@ -132,13 +161,6 @@ impl ImageViewer {
         self.last_click = None;
     }
 
-    fn clamp_pan(&mut self, viewport: Vec2) {
-        let original = self.source_size(self.dimensions.unwrap_or(UVec2::ONE));
-        let extent =
-            ((original * self.zoom.scale(original, viewport) - viewport) * 0.5).max(Vec2::ZERO);
-        self.pan = self.pan.clamp(-extent, extent);
-    }
-
     fn zoom_at(&mut self, factor: f32, anchor: Vec2, viewport: Vec2) {
         let Some(original) = self.dimensions else {
             return;
@@ -147,12 +169,14 @@ impl ImageViewer {
         let scale = (previous * factor).clamp(0.001, 32.0);
         self.pan = anchor + (self.pan - anchor) * (scale / previous);
         self.zoom = Zoom::Scale(scale);
-        self.clamp_pan(viewport);
     }
 }
 
 #[derive(Component)]
 pub(in crate::editor) struct ImageCanvas;
+
+#[derive(Component)]
+pub(in crate::editor) struct CanvasControl;
 
 #[derive(Resource)]
 pub(in crate::editor) struct ViewerUi {
@@ -160,8 +184,6 @@ pub(in crate::editor) struct ViewerUi {
     picture: Entity,
     checker: Entity,
     canvas: Entity,
-    counter: Entity,
-    zoom: Entity,
     background: Entity,
     metadata: Entity,
     help: Entity,
@@ -224,6 +246,7 @@ pub(super) fn checker(commands: &mut Commands, parent: Entity, image: &Handle<Im
 pub(super) fn setup(
     commands: &mut Commands,
     viewport: Entity,
+    root: Entity,
     font: &Handle<Font>,
     checker_image: &Handle<Image>,
 ) {
@@ -269,76 +292,13 @@ pub(super) fn setup(
         },
         CHROME,
     );
-    let navigation = group(commands, toolbar);
-    icons::button(
-        commands,
-        navigation,
-        icons::Glyph::ChevronLeft,
-        "Предыдущее изображение · ←",
-        Action::ImageView(ImageAction::Previous),
-        Look::Regular,
-    );
-    let counter = text(commands, navigation, font, "", 12.0, MUTED);
-    commands.entity(counter).insert(Node {
-        min_width: px(48),
-        justify_content: JustifyContent::Center,
-        ..default()
-    });
-    icons::button(
-        commands,
-        navigation,
-        icons::Glyph::ChevronRight,
-        "Следующее изображение · →",
-        Action::ImageView(ImageAction::Next),
-        Look::Regular,
-    );
-    button(
-        commands,
-        toolbar,
-        font,
-        "Вписать",
-        Action::ImageView(ImageAction::Fit),
-        Look::Regular,
-    );
-    button(
-        commands,
-        toolbar,
-        font,
-        "1:1",
-        Action::ImageView(ImageAction::ActualSize),
-        Look::Regular,
-    );
-    let zoom_controls = group(commands, toolbar);
-    let minus = button(
-        commands,
-        zoom_controls,
-        font,
-        "−",
-        Action::ImageView(ImageAction::ZoomOut),
-        Look::Regular,
-    );
-    commands
-        .entity(minus)
-        .insert(AccessibleLabel("Уменьшить · −".into()));
-    let zoom = text(commands, zoom_controls, font, "100%", 12.0, TEXT);
-    commands.entity(zoom).insert(Node {
-        min_width: px(52),
-        ..default()
-    });
-    icons::button(
-        commands,
-        zoom_controls,
-        icons::Glyph::Plus,
-        "Увеличить · +",
-        Action::ImageView(ImageAction::ZoomIn),
-        Look::Regular,
-    );
-    node(
+    let editing_controls = node(
         commands,
         toolbar,
         Node {
             flex_grow: 1.0,
-            ..default()
+            min_width: px(0),
+            ..row(12.0)
         },
     );
     let background_button = button(
@@ -385,10 +345,10 @@ pub(super) fn setup(
         AccessibleLabel("Изображение: колесо — масштаб, перетаскивание — панорама".into()),
     ));
     let checker = checker(commands, canvas, checker_image);
-    edit::setup(commands, toolbar, body, canvas, font);
+    edit::setup(commands, editing_controls, body, canvas, root, font);
     let picture = commands
         .spawn((
-            ImageNode::default(),
+            MaterialNode(canvas_material::HANDLE),
             Node {
                 display: Display::None,
                 position_type: PositionType::Absolute,
@@ -471,8 +431,6 @@ pub(super) fn setup(
         picture,
         checker,
         canvas,
-        counter,
-        zoom,
         background,
         metadata,
         help: help_text,
@@ -557,7 +515,6 @@ pub(in crate::editor) fn neighbor(
 fn canvas_rect(
     canvas: &Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
     window: &Window,
-    drawer_height: f32,
 ) -> Rect {
     canvas
         .single()
@@ -566,10 +523,10 @@ fn canvas_rect(
         .map_or_else(
             || {
                 Rect::from_corners(
-                    Vec2::new(0.0, TOP + 44.0),
+                    Vec2::new(0.0, IMAGE_TOP + 44.0),
                     Vec2::new(
                         window.width(),
-                        (window.height() - FOOT - 38.0 - drawer_height).max(TOP + 45.0),
+                        (window.height() - FOOT - 38.0).max(IMAGE_TOP + 45.0),
                     ),
                 )
             },
@@ -581,31 +538,67 @@ fn canvas_rect(
         )
 }
 
+fn over_controls(
+    controls: &Query<(&ComputedNode, &UiGlobalTransform), With<CanvasControl>>,
+    point: Vec2,
+) -> bool {
+    controls.iter().any(|(node, transform)| {
+        !node.is_empty() && node.contains_point(*transform, point / node.inverse_scale_factor())
+    })
+}
+
 pub(in crate::editor) fn update(
     mut messages: MessageReader<Action>,
     mut editor: ResMut<Editor>,
     mut browser: ResMut<Browser>,
     mut viewer: ResMut<ImageViewer>,
     previews: Res<ImagePreviews>,
-    mut images: ResMut<Assets<Image>>,
-    window: Single<&Window, With<PrimaryWindow>>,
+    (mut images, mut uploads): (
+        ResMut<Assets<Image>>,
+        Option<ResMut<crate::editor::image_texture::TextureUploads>>,
+    ),
+    window: Single<(Entity, &mut Window), With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
     scroll: Res<AccumulatedMouseScroll>,
     time: Res<Time>,
-    canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
+    (canvas, controls): (
+        Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
+        Query<(&ComputedNode, &UiGlobalTransform), With<CanvasControl>>,
+    ),
     mut focus: ResMut<InputFocus>,
     mut browser_ui: Option<ResMut<drawer::BrowserUi>>,
     drawer: Option<Res<DrawerMotion>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    (keys, mut strokes, mut events): (
+        Res<ButtonInput<KeyCode>>,
+        Local<paint_input::Samples>,
+        MessageReader<bevy::window::WindowEvent>,
+    ),
+    inputs: Query<(), With<TextInput>>,
 ) {
-    let rect = canvas_rect(
-        &canvas,
-        &window,
-        drawer.as_ref().map_or(0.0, |drawer| drawer.visible_height),
+    let (window_entity, mut window) = window.into_inner();
+    let mut samples = strokes.collect(
+        events.read(),
+        window_entity,
+        window.cursor_position(),
+        &mouse,
     );
+    let pressed_controls = samples.iter().any(|sample| {
+        matches!(sample, paint_input::Sample::Down(point) if over_controls(&controls, *point))
+    });
+    // Floating controls share the canvas rectangle, but must never start a
+    // stroke. Keep motion/release samples for gestures already captured there.
+    samples.retain(|sample| {
+        !matches!(sample, paint_input::Sample::Down(point) if over_controls(&controls, *point))
+    });
+    let hovering_controls = window
+        .cursor_position()
+        .is_some_and(|point| over_controls(&controls, point));
+    let rect = canvas_rect(&canvas, &window);
+    let input_rect = drawer
+        .as_ref()
+        .map_or(rect, |drawer| drawer.input_rect(rect, window.height()));
     let viewport = rect.size().max(Vec2::ONE);
     viewer.scale_factor = Some(window.scale_factor());
-    viewer.edit.compact = window.height() < 740.0;
     if let Some(tab) = viewer.tab {
         let view = SavedView {
             zoom: viewer.zoom,
@@ -628,8 +621,7 @@ pub(in crate::editor) fn update(
             {
                 editor.open_image_tab(browser.files[file].path.clone());
                 if let Some(interface) = browser_ui.as_mut() {
-                    interface.selected = Some(file);
-                    interface.selected_model = None;
+                    interface.select(Some(browser::Entry::Image(file)));
                 }
                 focus.clear();
             }
@@ -734,7 +726,10 @@ pub(in crate::editor) fn update(
             }
         }
     }
-    let Some((tab, path)) = active else { return };
+    let Some((tab, path)) = active else {
+        viewer.edit.size_adjust = default();
+        return;
+    };
     if viewer.needs_load && viewer.pending.is_none() && !viewer.edit.has_document(tab) {
         viewer.needs_load = false;
         let absolute = editor.root.join(&path);
@@ -747,7 +742,19 @@ pub(in crate::editor) fn update(
             }),
         });
     }
-    edit::sync(&mut viewer, &editor, &mut images);
+    edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
+    let adjusting_size = (viewer.edit.resizing_brush()
+        || (!hovering_controls && !pressed_controls && !viewer.edit.mode_menu_dismissed))
+        && edit::resize_brush(
+            &mut viewer,
+            &editor,
+            rect,
+            input_rect,
+            &mut window,
+            &mouse,
+            &keys,
+            focus.get().is_some_and(|entity| inputs.contains(entity)),
+        );
     if editor.pending.is_some()
         || editor.browser_popup
         || editor.hdri_library_open
@@ -761,18 +768,35 @@ pub(in crate::editor) fn update(
         viewer.last_click = None;
         return;
     }
+    if adjusting_size {
+        edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
+        return;
+    }
     let edit_pointer = edit::pointer(
         &mut viewer,
         &mut editor,
         rect,
-        window.cursor_position(),
+        input_rect,
         &mouse,
         &keys,
         &mut focus,
+        &samples,
     );
+    // Present this batch, including its live interpolation tail, in the frame that received it.
+    edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
+    if viewer.panel.blocks_canvas() || viewer.edit.color_picker.is_some() || viewer.edit.size_menu {
+        viewer.gesture = None;
+        viewer.last_click = None;
+        return;
+    }
     if let Some(cursor) = window.cursor_position() {
-        if rect.contains(cursor)
+        if !input_rect.contains(cursor) {
+            viewer.gesture = None;
+            viewer.last_click = None;
+        }
+        if input_rect.contains(cursor)
             && scroll.delta.y != 0.0
+            && !hovering_controls
             && !viewer.edit.menu
             && !viewer.edit.paint_menu
         {
@@ -788,7 +812,11 @@ pub(in crate::editor) fn update(
             );
         }
         if !edit_pointer
-            && rect.contains(cursor)
+            && input_rect.contains(cursor)
+            && !hovering_controls
+            && !pressed_controls
+            && !viewer.edit.mode_menu_dismissed
+            && !viewer.edit.menu
             && mouse.any_just_pressed([MouseButton::Left, MouseButton::Middle])
         {
             focus.clear();
@@ -825,66 +853,6 @@ pub(in crate::editor) fn update(
     if !mouse.any_pressed([MouseButton::Left, MouseButton::Middle]) {
         viewer.gesture = None;
     }
-    viewer.clamp_pan(viewport);
-}
-
-pub(in crate::editor) fn cursor(
-    mut commands: Commands,
-    editor: Res<Editor>,
-    mut viewer: ResMut<ImageViewer>,
-    window: Single<(Entity, &Window, Option<&CursorIcon>), With<PrimaryWindow>>,
-    canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
-    drawer: Option<Res<DrawerMotion>>,
-) {
-    let (entity, window, current) = *window;
-    let rect = canvas_rect(
-        &canvas,
-        window,
-        drawer.as_ref().map_or(0.0, |drawer| drawer.visible_height),
-    );
-    let can_pan = viewer.dimensions.is_some_and(|size| {
-        let original = viewer.source_size(size);
-        (original * viewer.zoom.scale(original, rect.size()) - rect.size()).max_element() > 1.0
-    });
-    let desired = (editor.viewing_image.is_some()
-        && editor.pending.is_none()
-        && !editor.browser_popup
-        && !editor.hdri_library_open
-        && window.focused
-        && (can_pan || viewer.edit.editing(editor.viewing_image))
-        && viewer.error.is_none()
-        && window
-            .cursor_position()
-            .is_some_and(|point| rect.contains(point)))
-    .then(|| {
-        CursorIcon::from(
-            if viewer.edit.editing(editor.viewing_image)
-                && viewer.edit.tool != crate::editor::photo_document::PhotoTool::Hand
-            {
-                SystemCursorIcon::Crosshair
-            } else if viewer.gesture.is_some() {
-                SystemCursorIcon::Grabbing
-            } else {
-                SystemCursorIcon::Grab
-            },
-        )
-    });
-    if let Some(desired) = desired {
-        if !viewer.cursor_owned {
-            viewer.previous_cursor = current.cloned();
-            viewer.cursor_owned = true;
-        }
-        if current != Some(&desired) {
-            commands.entity(entity).insert(desired);
-        }
-    } else if viewer.cursor_owned {
-        viewer.cursor_owned = false;
-        if let Some(previous) = viewer.previous_cursor.take() {
-            commands.entity(entity).insert(previous);
-        } else {
-            commands.entity(entity).remove::<CursorIcon>();
-        }
-    }
 }
 
 pub(in crate::editor) fn refresh(
@@ -893,34 +861,40 @@ pub(in crate::editor) fn refresh(
     viewer: Res<ImageViewer>,
     previews: Res<ImagePreviews>,
     interface: Res<ViewerUi>,
-    drawer: Res<DrawerMotion>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut nodes: Query<&mut Node>,
     mut labels: Query<&mut Text>,
-    mut pictures: Query<&mut ImageNode>,
+    mut materials: ResMut<Assets<CanvasMaterial>>,
     mut colors: Query<&mut BackgroundColor>,
     children: Query<&Children>,
 ) {
     let shown = editor.viewing_image.is_some();
+    if let Ok(mut node) = nodes.get_mut(interface.background) {
+        node.display = if viewer.edit.editing(editor.viewing_image) && window.width() < 1000.0 {
+            Display::None
+        } else {
+            Display::Flex
+        };
+    }
     if let Ok(mut node) = nodes.get_mut(interface.overlay) {
         let display = if shown { Display::Flex } else { Display::None };
         if node.display != display {
             node.display = display;
         }
-        if node.bottom != px(drawer.visible_height) {
-            node.bottom = px(drawer.visible_height);
-        }
+        node.bottom = px(0);
     }
     let Some(tab) = editor.viewing_image.and_then(|id| editor.image_tab(id)) else {
-        if let Ok(mut picture) = pictures.get_mut(interface.picture) {
-            picture.image = Handle::default();
+        if let Some(mut material) = materials.get_mut(&canvas_material::HANDLE)
+            && material.image.is_some()
+        {
+            material.image = None;
         }
         return;
     };
     let file = browser.files.iter().position(|file| file.path == tab.path);
     let source = file.and_then(|file| browser.files.get(file));
-    let rect = canvas_rect(&canvas, &window, drawer.visible_height);
+    let rect = canvas_rect(&canvas, &window);
     let preview = file.and_then(|file| previews.get(file));
     let dimensions = viewer
         .dimensions
@@ -930,17 +904,31 @@ pub(in crate::editor) fn refresh(
         .as_ref()
         .or_else(|| preview.and_then(|preview| preview.image.as_ref()));
     let ready = handle.is_some() && viewer.error.is_none();
-    if let Ok(mut image) = pictures.get_mut(interface.picture) {
-        image.image = handle.cloned().unwrap_or_default();
+    if let Some(mut material) = materials.get_mut(&canvas_material::HANDLE) {
+        let image = handle.cloned();
+        let parameters = dimensions.map_or(Vec4::ZERO, |size| {
+            Vec4::new(
+                size.x as f32,
+                size.y as f32,
+                if viewer.image.is_some() && viewer.decoded_size == Some(size) {
+                    1.0
+                } else {
+                    0.0
+                },
+                viewer.zoom.scale(viewer.source_size(size), rect.size()),
+            )
+        });
+        if material.image != image || material.parameters != parameters {
+            material.image = image;
+            material.parameters = parameters;
+        }
     }
     if let Ok(mut picture) = nodes.get_mut(interface.picture) {
         picture.display = if ready { Display::Flex } else { Display::None };
         if let Some(dimensions) = dimensions {
-            let original = viewer.source_size(dimensions);
-            let size = original * viewer.zoom.scale(original, rect.size());
-            let offset = (((rect.size() - size) * 0.5 + viewer.pan) * window.scale_factor())
-                .round()
-                / window.scale_factor();
+            let image = viewer.image_rect(dimensions, rect);
+            let size = image.size();
+            let offset = image.min - rect.min;
             picture.width = px(size.x);
             picture.height = px(size.y);
             picture.left = px(offset.x);
@@ -961,12 +949,6 @@ pub(in crate::editor) fn refresh(
             WELL
         }));
     }
-    let files = gallery(&editor, &browser);
-    let position = files
-        .iter()
-        .position(|&file| browser.files[file].path == tab.path)
-        .map(|position| (position + 1).to_string())
-        .unwrap_or_else(|| "—".into());
     let size = dimensions.map_or(String::new(), |size| {
         format!(" · {} × {} px", size.x, size.y)
     });
@@ -992,9 +974,6 @@ pub(in crate::editor) fn refresh(
             ""
         }
     );
-    let percent = dimensions.map_or(100.0, |size| {
-        viewer.zoom.scale(viewer.source_size(size), rect.size()) * 100.0
-    });
     for (entity, value) in [
         (
             interface.help,
@@ -1002,15 +981,6 @@ pub(in crate::editor) fn refresh(
                 "Пробел — панорама · Ctrl+Z — отменить · Ctrl+S — сохранить".into()
             } else {
                 "← → — листать · Колесо — масштаб · Ctrl+W — закрыть вкладку".into()
-            },
-        ),
-        (interface.counter, format!("{position} / {}", files.len())),
-        (
-            interface.zoom,
-            if percent < 10.0 {
-                format!("{percent:.1}%")
-            } else {
-                format!("{percent:.0}%")
             },
         ),
         (interface.metadata, metadata),

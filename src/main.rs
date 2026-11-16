@@ -15,6 +15,10 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if std::env::var_os("BEVY_EDITOR_PLAY_SNAPSHOT").is_some() {
+                eprintln!("Bevy: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
             #[cfg(target_os = "windows")]
             windows_launcher::report_error(&error.to_string(), console);
             #[cfg(not(target_os = "windows"))]
@@ -26,6 +30,17 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [flag, snapshot] = args.as_slice()
+        && flag == "--play-snapshot"
+    {
+        let launch = bevy_editor::runtime::GameLaunch::read(snapshot)?;
+        let mut app = bevy_editor::runtime::create_game_app(launch.asset_root, launch.level)?;
+        return if app.run().is_error() {
+            Err("Bevy game exited with an error".into())
+        } else {
+            Ok(())
+        };
+    }
     let path = match args.as_slice() {
         [] => None,
         [flag] if flag == "--manager" => None,
@@ -35,6 +50,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Without arguments, opens the project manager.\n\
                 --example         Open the bundled example\n\
                 --project PATH    Open a project directly\n\
+                --play-snapshot PATH  Run an editor level snapshot in Bevy\n\
                 --manager         Open the project manager"
             );
             return Ok(());
@@ -55,7 +71,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.add_plugins(bevy_editor::mcp::McpPlugin);
             app
         };
-        if let Err(error) = remember_project(&path) {
+        if !std::env::var_os("BEVY_EDITOR_RENDER_WORKER").is_some_and(|value| value == "1")
+            && let Err(error) = remember_project(&path)
+        {
             eprintln!("Could not save recent project: {error}");
         }
         app

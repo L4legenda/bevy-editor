@@ -209,6 +209,7 @@ fn returning_to_a_tab_rebinds_imported_selection_by_name_and_restores_the_free_v
             assert_eq!(editor.imported[1].name, "Target");
             editor.view = view;
             editor.pivot = pivot;
+            editor.view_orthographic = true;
         }
         let editor = app.world().resource::<Editor>();
         let old_entity = editor.imported[1].entity;
@@ -217,6 +218,7 @@ fn returning_to_a_tab_rebinds_imported_selection_by_name_and_restores_the_free_v
 
         action(&mut app, Action::Open(1));
         record_placements(&mut app, &["Other"]);
+        assert!(!app.world().resource::<Editor>().view_orthographic);
         {
             let mut editor = app.world_mut().resource_mut::<Editor>();
             editor.view = Transform::from_xyz(-15.0, 2.0, 11.0);
@@ -235,6 +237,7 @@ fn returning_to_a_tab_rebinds_imported_selection_by_name_and_restores_the_free_v
         assert!(editor.ready);
         assert_eq!(editor.view, view);
         assert_eq!(editor.pivot, pivot);
+        assert!(editor.view_orthographic);
         assert_eq!(editor.edits, edits);
         assert_eq!(editor.undo, history);
         if target_removed {

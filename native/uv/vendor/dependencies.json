@@ -1,0 +1,14 @@
+{
+  "headers_sha256": "6016cf4206c0d343763f43dfe2628685211a651c8bb3a8ee2aec4dc52ebf0d1b",
+  "partuv_source": "https://github.com/IgorAherne/PartUV",
+  "partuv_commit": "13176a925a2768ab2ed83901f33a89c6976a72f5",
+  "xatlas_source": "https://github.com/jpcy/xatlas",
+  "xatlas_commit": "f700c7790aaa030e794b52ba7791a05c085faf0c",
+  "eigen": "3.4.0",
+  "libigl": "2.5.0",
+  "cgal": "6.0.1",
+  "boost": "1.87.0",
+  "json": "3.11.3",
+  "algorithm": "Geometric Ward + PartUV ABF, 5 iterations, CPU only",
+  "reference": "PartUV 0.1.6 Python runtime, compared on the same 23755-triangle character"
+}

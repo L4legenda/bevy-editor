@@ -260,7 +260,7 @@ pub struct PlayCommand {
 }
 
 impl PlayCommand {
-    pub(crate) fn spawn(&self) -> io::Result<std::process::Child> {
+    pub(crate) fn command(&self) -> io::Result<Command> {
         let program = match &self.program {
             Some(program) => program.clone(),
             None => std::env::current_exe()?,
@@ -270,6 +270,6 @@ impl PlayCommand {
         if let Some(directory) = &self.working_directory {
             command.current_dir(directory);
         }
-        command.spawn()
+        Ok(command)
     }
 }

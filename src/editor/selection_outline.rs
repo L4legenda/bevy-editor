@@ -28,7 +28,7 @@ pub(super) fn setup(mut configs: ResMut<GizmoConfigStore>) {
 
 /// Bounds live in the selected root's space so rotating a model rotates its
 /// brackets too. Transform all child bounds before merging, preserving shear.
-fn bounds(
+pub(super) fn bounds(
     root: Entity,
     layers: &RenderLayers,
     children: &Query<&Children>,
@@ -69,7 +69,11 @@ fn bounds(
     (min.is_finite() && max.is_finite()).then_some((min, max, world))
 }
 
-fn corner_segments(min: Vec3, max: Vec3, world: Affine3A) -> impl Iterator<Item = (Vec3, Vec3)> {
+pub(super) fn corner_segments(
+    min: Vec3,
+    max: Vec3,
+    world: Affine3A,
+) -> impl Iterator<Item = (Vec3, Vec3)> {
     (0..8).flat_map(move |corner| {
         let start = Vec3::new(
             if corner & 1 == 0 { min.x } else { max.x },
@@ -107,56 +111,60 @@ pub(super) fn draw(
     if !editor.has_scene() || !editor.ready || editor.pilot {
         return;
     }
-    let root = match editor.selection {
-        Some(Selection::Imported(index)) => editor.imported.get(index).map(|node| node.entity),
-        Some(Selection::Model(id)) => scene.models.get(&id).map(|(entity, _)| *entity),
-        _ => None,
-    };
-    let Some(root) = root else { return };
+    let roots = editor
+        .selected_targets()
+        .into_iter()
+        .filter_map(|target| match target {
+            Selection::Imported(index) => editor.imported.get(index).map(|node| node.entity),
+            Selection::Model(id) => scene.models.get(&id).map(|(entity, _)| *entity),
+            _ => None,
+        });
     let Ok((camera, view, layers)) = camera.single() else {
         return;
     };
     if !camera.is_active {
         return;
     }
-    let Some((mut min, mut max, world)) = bounds(
-        root,
-        layers.unwrap_or(&RenderLayers::default()),
-        &children,
-        &transforms,
-        &meshes,
-    ) else {
-        return;
-    };
-    // Leave a small screen-sized gap between the geometry and the brackets,
-    // including thin/flat models. Derive it from the actual camera projection.
-    let center = world.transform_point3((min + max) * 0.5);
-    let Ok(screen) = camera.world_to_viewport(view, center) else {
-        return;
-    };
-    let padding = camera
-        .viewport_to_world(view, screen)
-        .ok()
-        .zip(camera.viewport_to_world(view, screen + Vec2::X * 3.0).ok())
-        .map(|(a, b)| {
-            let normal = *view.forward();
-            let depth = (center - a.origin).dot(normal);
-            let point = |ray: bevy::shape::Ray3d| {
-                ray.origin + *ray.direction * (depth / ray.direction.dot(normal).max(1e-5))
-            };
-            point(a).distance(point(b))
-        })
-        .unwrap_or(0.0);
-    let axis_lengths = Vec3::new(
-        world.matrix3.x_axis.length(),
-        world.matrix3.y_axis.length(),
-        world.matrix3.z_axis.length(),
-    );
-    let gap = Vec3::splat(padding) / axis_lengths;
-    min -= gap;
-    max += gap;
-    for (start, end) in corner_segments(min, max, world) {
-        gizmos.line(start, end, COLOR);
+    for root in roots {
+        let Some((mut min, mut max, world)) = bounds(
+            root,
+            layers.unwrap_or(&RenderLayers::default()),
+            &children,
+            &transforms,
+            &meshes,
+        ) else {
+            continue;
+        };
+        // Leave a small screen-sized gap between the geometry and the brackets,
+        // including thin/flat models. Derive it from the actual camera projection.
+        let center = world.transform_point3((min + max) * 0.5);
+        let Ok(screen) = camera.world_to_viewport(view, center) else {
+            continue;
+        };
+        let padding = camera
+            .viewport_to_world(view, screen)
+            .ok()
+            .zip(camera.viewport_to_world(view, screen + Vec2::X * 3.0).ok())
+            .map(|(a, b)| {
+                let normal = *view.forward();
+                let depth = (center - a.origin).dot(normal);
+                let point = |ray: bevy::shape::Ray3d| {
+                    ray.origin + *ray.direction * (depth / ray.direction.dot(normal).max(1e-5))
+                };
+                point(a).distance(point(b))
+            })
+            .unwrap_or(0.0);
+        let axis_lengths = Vec3::new(
+            world.matrix3.x_axis.length(),
+            world.matrix3.y_axis.length(),
+            world.matrix3.z_axis.length(),
+        );
+        let gap = Vec3::splat(padding) / axis_lengths;
+        min -= gap;
+        max += gap;
+        for (start, end) in corner_segments(min, max, world) {
+            gizmos.line(start, end, COLOR);
+        }
     }
 }
 

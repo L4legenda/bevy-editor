@@ -1,0 +1,32 @@
+[package]
+name = "bevy-hunyuan"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = ["cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+anyhow = "1"
+candle-core = "=0.9.2"
+candle-nn = "=0.9.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+fast-surface-nets = "0.2"
+ndshape = "0.3"
+
+[profile.dev]
+opt-level = 2
+debug = 0
+
+[profile.release]
+opt-level = 3
+debug = 0

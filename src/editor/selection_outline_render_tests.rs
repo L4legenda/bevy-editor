@@ -131,10 +131,28 @@ pub(crate) fn capture_when(
         .size;
     let mut request = true;
     let mut last = None;
+    // Image render-target identity includes DPI. A default-scale screenshot would
+    // redirect a different attachment and capture black instead of a Retina UI.
+    let screenshot_target = {
+        let world = app.world_mut();
+        world
+            .query::<&RenderTarget>()
+            .iter(world)
+            .find_map(|render_target| {
+                if let RenderTarget::Image(image) = render_target
+                    && image.handle == *target
+                {
+                    Some(render_target.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| RenderTarget::Image(target.clone().into()))
+    };
     for _ in 0..MAX_CAPTURE_FRAMES {
         if request {
             app.world_mut()
-                .spawn(Screenshot::image(target.clone()))
+                .spawn(Screenshot(screenshot_target.clone()))
                 .observe(
                     |capture: On<ScreenshotCaptured>, mut output: ResMut<CapturedImage>| {
                         output.0 = Some(capture.image.clone());

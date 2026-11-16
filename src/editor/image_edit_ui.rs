@@ -1,9 +1,6 @@
 //! Bevy-native controls using the editor's existing colors, buttons and icons.
 use super::*;
-use bevy::{
-    color::{Hsva, Srgba},
-    ui_widgets::{Slider, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange},
-};
+use bevy::ui_widgets::{Slider, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange};
 
 #[derive(Clone, Copy, Component)]
 enum Binding {
@@ -11,7 +8,6 @@ enum Binding {
     Hardness,
     BrushOpacity,
     LayerOpacity,
-    Hue,
 }
 #[derive(Component)]
 pub(in crate::editor) struct PhotoSlider {
@@ -19,32 +15,34 @@ pub(in crate::editor) struct PhotoSlider {
     thumb: Entity,
     readout: Entity,
 }
-#[derive(Component)]
-pub(in crate::editor) struct ColorPlane;
 
 #[derive(Resource)]
 pub(in crate::editor) struct EditUi {
-    center: Entity,
+    mode_button: Entity,
     mode: Entity,
     menu: Entity,
     tools: Entity,
     paint_button: Entity,
+    eraser_button: Entity,
     brush_icon: Entity,
     pencil_icon: Entity,
     paint_menu: Entity,
     panel: Entity,
-    plane: Handle<Image>,
-    plane_node: Entity,
-    color_details: Entity,
-    marker: Entity,
-    chip: Entity,
-    hex: Entity,
+    eraser_modes: Entity,
     name: Entity,
-    layers: Entity,
     status: Entity,
-    ring: Entity,
-    hue: Option<f32>,
-    layer_signature: String,
+    size_group: Entity,
+    size_button: Entity,
+    size_value: Entity,
+    size_menu: Entity,
+    size_title: Entity,
+    size_shown: bool,
+    size_input: Entity,
+    size_original: Option<f32>,
+    size_last_text: Option<String>,
+    size_invalid: bool,
+    size_confirm: bool,
+    cursor: super::super::tool_cursor::Overlay,
 }
 
 fn slider(
@@ -66,6 +64,17 @@ fn slider(
     );
     text(commands, header, font_handle, title, 11.0, MUTED);
     let readout = text(commands, header, font_handle, "", 11.0, TEXT);
+    slider_track(commands, parent, binding, range, readout, title);
+}
+
+fn slider_track(
+    commands: &mut Commands,
+    parent: Entity,
+    binding: Binding,
+    range: (f32, f32),
+    readout: Entity,
+    title: &str,
+) -> Entity {
     let slider = commands
         .spawn((
             Slider {
@@ -101,17 +110,21 @@ fn slider(
         },
         WELL,
     );
+    if matches!(binding, Binding::LayerOpacity) {
+        layers::ux::help(
+            commands,
+            slider,
+            "Непрозрачность всего слоя вместе с эффектами. 100% — полностью виден, 0% — невидим. Двигайте ползунок, чтобы просвечивали нижние слои.",
+        );
+    }
     commands.entity(track).insert(Pickable::IGNORE);
-    if matches!(binding, Binding::Hue) {
+    if matches!(
+        binding,
+        Binding::Size | Binding::Hardness | Binding::BrushOpacity | Binding::LayerOpacity
+    ) {
         commands
             .entity(track)
-            .insert(BackgroundGradient::from(LinearGradient {
-                angle: LinearGradient::TO_RIGHT,
-                stops: (0..=6)
-                    .map(|i| ColorStop::auto(Color::from(Hsva::hsv(i as f32 * 60.0, 1.0, 1.0))))
-                    .collect(),
-                color_space: bevy::ui::InterpolationColorSpace::Srgba,
-            }));
+            .insert((BackgroundColor(EDGE), BackgroundGradient::default()));
     }
     let thumb = surface(
         commands,
@@ -135,6 +148,14 @@ fn slider(
         thumb,
         readout,
     });
+    slider
+}
+
+fn size_label(size: f32) -> String {
+    format!("{size:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 fn slider_change(
@@ -148,13 +169,12 @@ fn slider_change(
             Binding::Hardness => EditAction::Hardness(event.value),
             Binding::BrushOpacity => EditAction::BrushOpacity(event.value),
             Binding::LayerOpacity => EditAction::Opacity(event.value, event.is_final),
-            Binding::Hue => EditAction::Hue(event.value),
         };
         actions.write(Action::ImageEdit(action));
     }
 }
 
-fn input(
+pub(super) fn input(
     commands: &mut Commands,
     parent: Entity,
     font_handle: &Handle<Font>,
@@ -164,7 +184,7 @@ fn input(
         .spawn((
             TextInput,
             EditableText::new(""),
-            TextCursorStyle::default(),
+            crate::ui_theme::text_cursor_style(),
             AccessibleLabel(label.into()),
             font(font_handle, 12.0),
             TextColor(TEXT),
@@ -187,64 +207,227 @@ fn input(
         .id()
 }
 
+pub(super) fn tool_node() -> Node {
+    Node {
+        width: px(36),
+        height: px(36),
+        flex_shrink: 0.0,
+        justify_content: JustifyContent::Center,
+        border: UiRect::all(px(1)),
+        border_radius: BorderRadius::all(px(7)),
+        ..row(0.0)
+    }
+}
+
+pub(super) fn tool_button(
+    commands: &mut Commands,
+    parent: Entity,
+    glyph: icons::Glyph,
+    label: &str,
+    tool: PhotoTool,
+) {
+    let button = control(
+        commands,
+        parent,
+        Action::ImageEdit(EditAction::Tool(tool)),
+        Look::Tool,
+        tool_node(),
+    );
+    commands
+        .entity(button)
+        .insert(AccessibleLabel(label.into()));
+    icons::themed(commands, button, glyph, 18.0);
+}
+
+fn tool_menu_hint(commands: &mut Commands, parent: Entity) {
+    let hint = icons::spawn(commands, parent, icons::Glyph::SubmenuDown, 12.0, MUTED);
+    commands.entity(hint).insert((
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(1),
+            bottom: px(1),
+            width: px(12),
+            height: px(12),
+            ..default()
+        },
+        Pickable::IGNORE,
+    ));
+}
+
 pub(in crate::editor) fn setup(
     commands: &mut Commands,
     toolbar: Entity,
     body: Entity,
     canvas: Entity,
+    root: Entity,
     font_handle: &Handle<Font>,
 ) {
-    let center = node(
+    let size_group = node(
         commands,
         toolbar,
         Node {
-            position_type: PositionType::Absolute,
-            left: percent(50),
-            top: px(4),
-            height: px(36),
-            ..row(0.0)
+            display: Display::None,
+            height: px(28),
+            flex_shrink: 0.0,
+            ..default()
         },
     );
-    commands.entity(center).insert((
-        UiTransform::from_translation(Val2::percent(-50, 0)),
-        ZIndex(4),
-    ));
-    let mode_button = control(
+    let size_button = control(
         commands,
-        center,
-        Action::ImageEdit(EditAction::Menu),
+        size_group,
+        Action::ImageEdit(EditAction::SizeMenu),
         Look::Regular,
         Node {
             height: percent(100),
-            padding: UiRect::horizontal(px(12)),
+            padding: UiRect::horizontal(px(6)),
             border: UiRect::all(px(1)),
             border_radius: BorderRadius::all(px(6)),
-            ..row(10.0)
+            ..row(4.0)
         },
     );
-    let mode = text(commands, mode_button, font_handle, "Просмотр", 12.0, TEXT);
-    icons::themed(commands, mode_button, icons::Glyph::ChevronDown, 14.0);
+    commands
+        .entity(size_button)
+        .insert(AccessibleLabel("Настройки кисти".into()));
+    icons::themed(commands, size_button, icons::Glyph::Brush, 14.0);
+    let size_value = text(commands, size_button, font_handle, "24 px", 12.0, TEXT);
+    commands.entity(size_value).insert(Node {
+        flex_shrink: 0.0,
+        ..default()
+    });
+    icons::themed(commands, size_button, icons::Glyph::ChevronDown, 12.0);
+    let size_menu = surface(
+        commands,
+        size_group,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            top: px(36),
+            left: px(0),
+            width: px(264),
+            padding: UiRect::all(px(12)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(8)),
+            ..column(10.0)
+        },
+        PANEL,
+    );
+    commands.entity(size_menu).insert((
+        GlobalZIndex(50),
+        TabGroup::modal(),
+        AccessibleLabel("Параметры кисти".into()),
+    ));
+    let size_header = node(
+        commands,
+        size_menu,
+        Node {
+            width: percent(100),
+            ..row(6.0)
+        },
+    );
+    let size_title = text(
+        commands,
+        size_header,
+        font_handle,
+        "Размер кисти",
+        12.0,
+        TEXT,
+    );
+    commands.entity(size_title).insert(Node {
+        flex_grow: 1.0,
+        ..default()
+    });
+    let size_input = input(
+        commands,
+        size_header,
+        font_handle,
+        "Размер кисти · px · Shift + движение мыши",
+    );
+    commands
+        .entity(size_input)
+        .insert((
+            bevy::ui_widgets::SelectAllOnFocus,
+            crate::editor::ui::Number::decimal(1.0, 256.0, 0.25, 2),
+        ))
+        .entry::<Node>()
+        .and_modify(|mut n| {
+            n.width = px(64);
+            n.height = px(28);
+        });
+    text(commands, size_header, font_handle, "px", 11.0, MUTED);
+    slider_track(
+        commands,
+        size_menu,
+        Binding::Size,
+        (1.0, 256.0),
+        size_input,
+        "Размер кисти",
+    );
+    for (title, binding, range) in [
+        ("Жёсткость", Binding::Hardness, (0.0, 1.0)),
+        ("Непрозрачность кисти", Binding::BrushOpacity, (0.01, 1.0)),
+    ] {
+        let setting = node(
+            commands,
+            size_menu,
+            Node {
+                width: percent(100),
+                ..column(4.0)
+            },
+        );
+        slider(commands, setting, font_handle, title, binding, range);
+    }
+    let selector = surface(
+        commands,
+        toolbar,
+        Node {
+            height: px(32),
+            flex_shrink: 0.0,
+            border_radius: BorderRadius::all(px(6)),
+            ..default()
+        },
+        PANEL,
+    );
+    commands.entity(toolbar).insert_children(0, &[selector]);
+    commands.entity(selector).insert(ZIndex(30));
+    let mode_button = control(
+        commands,
+        selector,
+        Action::ImageEdit(EditAction::Menu),
+        Look::Regular,
+        Node {
+            height: px(32),
+            padding: UiRect::horizontal(px(9)),
+            flex_shrink: 0.0,
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(6)),
+            overflow: Overflow::clip(),
+            ..row(4.0)
+        },
+    );
+    commands
+        .entity(mode_button)
+        .insert((CanvasControl, AccessibleLabel("Режим изображения".into())));
+    let mode = text(commands, mode_button, font_handle, "Просмотр", 13.0, TEXT);
+    icons::themed(commands, mode_button, icons::Glyph::ChevronDown, 12.0);
     let menu = surface(
         commands,
-        center,
+        selector,
         Node {
             display: Display::None,
             position_type: PositionType::Absolute,
             top: px(40),
-            left: percent(50),
-            width: px(210),
-            padding: UiRect::all(px(5)),
+            left: px(0),
+            width: px(185),
+            padding: UiRect::all(px(6)),
             border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(8)),
-            ..column(3.0)
+            border_radius: BorderRadius::all(px(7)),
+            ..column(4.0)
         },
         PANEL,
     );
-    commands.entity(menu).insert((
-        GlobalZIndex(50),
-        BorderColor::all(EDGE),
-        UiTransform::from_translation(Val2::percent(-50, 0)),
-    ));
+    commands
+        .entity(menu)
+        .insert((GlobalZIndex(50), BorderColor::all(EDGE)));
     for (label, action) in [
         ("Просмотр", EditAction::View),
         ("Редактирование", EditAction::Edit),
@@ -257,6 +440,7 @@ pub(in crate::editor) fn setup(
             Action::ImageEdit(action),
             Look::Regular,
         );
+        commands.entity(item).insert(CanvasControl);
         commands.entity(item).entry::<Node>().and_modify(|mut n| {
             n.width = percent(100);
             n.justify_content = JustifyContent::Start;
@@ -278,48 +462,100 @@ pub(in crate::editor) fn setup(
         CHROME,
     );
     commands.entity(body).insert_children(0, &[tools]);
-    icons::button(
+    super::selection_ui::setup(commands, tools, toolbar, canvas, root, font_handle);
+    let paint_group = node(
         commands,
         tools,
-        icons::Glyph::Move,
-        "Перемещение слоя · V",
-        Action::ImageEdit(EditAction::Tool(PhotoTool::Move)),
-        Look::Tool,
+        Node {
+            width: px(36),
+            height: px(36),
+            flex_shrink: 0.0,
+            ..default()
+        },
     );
     let paint_button = control(
         commands,
-        tools,
+        paint_group,
         Action::ImageEdit(EditAction::DrawingTool),
         Look::Tool,
-        Node {
-            width: px(30),
-            height: px(29),
-            flex_shrink: 0.0,
-            justify_content: JustifyContent::Center,
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(6)),
-            ..row(0.0)
-        },
+        tool_node(),
     );
     commands.entity(paint_button).insert(AccessibleLabel(
         "Кисть · B · ПКМ — выбрать кисть или карандаш".into(),
     ));
-    let brush_icon = icons::themed(commands, paint_button, icons::Glyph::Brush, 16.0);
-    let pencil_icon = icons::themed(commands, paint_button, icons::Glyph::Pencil, 16.0);
-    for (glyph, label, tool) in [
-        (icons::Glyph::Eraser, "Ластик · E", PhotoTool::Eraser),
-        (icons::Glyph::PaintBucket, "Заливка · G", PhotoTool::Fill),
-        (icons::Glyph::Pipette, "Пипетка · I", PhotoTool::Eyedropper),
-        (icons::Glyph::Hand, "Рука · H / Пробел", PhotoTool::Hand),
+    let brush_icon = icons::themed(commands, paint_button, icons::Glyph::Brush, 18.0);
+    let pencil_icon = icons::themed(commands, paint_button, icons::Glyph::Pencil, 18.0);
+    tool_menu_hint(commands, paint_button);
+    let eraser_group = node(
+        commands,
+        tools,
+        Node {
+            width: px(36),
+            height: px(36),
+            flex_shrink: 0.0,
+            ..default()
+        },
+    );
+    let eraser_button = control(
+        commands,
+        eraser_group,
+        Action::ImageEdit(EditAction::Tool(PhotoTool::Eraser)),
+        Look::Tool,
+        tool_node(),
+    );
+    icons::themed(commands, eraser_button, icons::Glyph::Eraser, 18.0);
+    tool_menu_hint(commands, eraser_button);
+    let eraser_modes = surface(
+        commands,
+        eraser_group,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            left: px(42),
+            top: px(0),
+            width: px(230),
+            padding: UiRect::all(px(5)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(7)),
+            ..column(3.0)
+        },
+        PANEL,
+    );
+    commands.entity(eraser_modes).insert((
+        GlobalZIndex(60),
+        BorderColor::all(EDGE),
+        AccessibleLabel("Тип ластика".into()),
+    ));
+    for (label, mode) in [
+        ("Обычный ластик", EraserMode::Brush),
+        ("Пиксельный ластик", EraserMode::Pixel),
     ] {
-        icons::button(
+        let item = control(
             commands,
-            tools,
-            glyph,
-            label,
-            Action::ImageEdit(EditAction::Tool(tool)),
-            Look::Tool,
+            eraser_modes,
+            Action::ImageEdit(EditAction::EraserMode(mode)),
+            Look::Regular,
+            Node {
+                width: percent(100),
+                height: px(31),
+                padding: UiRect::horizontal(px(8)),
+                border_radius: BorderRadius::all(px(4)),
+                ..row(8.0)
+            },
         );
+        commands.entity(item).insert(AccessibleLabel(label.into()));
+        icons::themed(commands, item, icons::Glyph::Eraser, 16.0);
+        text(commands, item, font_handle, label, 12.0, TEXT);
+    }
+    for (glyph, label, tool) in [
+        (icons::Glyph::PaintBucket, "Заливка · G", PhotoTool::Fill),
+        (
+            icons::Glyph::Pipette,
+            "Пипетка · I / Alt",
+            PhotoTool::Eyedropper,
+        ),
+    ] {
+        tool_button(commands, tools, glyph, label, tool);
     }
     let paint_menu = surface(
         commands,
@@ -328,7 +564,7 @@ pub(in crate::editor) fn setup(
             display: Display::None,
             position_type: PositionType::Absolute,
             left: px(49),
-            top: px(40),
+            top: px(7),
             width: px(230),
             padding: UiRect::all(px(5)),
             border: UiRect::all(px(1)),
@@ -396,22 +632,37 @@ pub(in crate::editor) fn setup(
             Look::Regular,
         );
     }
-    let panel = surface(
+    super::picker_ui::setup(commands, root, tools, font_handle);
+    let panel_root = node(
         commands,
         body,
         Node {
             display: Display::None,
             width: px(248),
-            min_width: px(248),
+            min_width: px(0),
+            min_height: px(0),
+            flex_shrink: 0.0,
+            overflow: Overflow::clip(),
+            ..default()
+        },
+    );
+    let panel = surface(
+        commands,
+        panel_root,
+        Node {
+            width: percent(100),
+            height: percent(100),
+            min_width: px(0),
             min_height: px(0),
             padding: UiRect::all(px(12)),
             border: UiRect::left(px(1)),
-            overflow: Overflow::scroll_y(),
+            overflow: Overflow::clip(),
             ..column(4.0)
         },
         CHROME,
     );
     commands.entity(panel).insert(Scroller);
+    super::super::panel_resize::setup(commands, panel_root);
     let save = button(
         commands,
         panel,
@@ -426,158 +677,6 @@ pub(in crate::editor) fn setup(
         .and_modify(|mut n| n.width = percent(100));
     let status = text(commands, panel, font_handle, "", 11.0, MUTED);
     commands.entity(status).insert(TextLayout::default());
-    // The texture is initialized by refresh once Assets<Image> is available.
-    let plane_image = Handle::<Image>::default();
-    let color_details = node(
-        commands,
-        panel,
-        Node {
-            width: percent(100),
-            flex_shrink: 0.0,
-            ..column(4.0)
-        },
-    );
-    let plane_node = commands
-        .spawn((
-            ImageNode::new(plane_image.clone()),
-            ColorPlane,
-            AccessibleLabel("Выбор насыщенности и яркости".into()),
-            Node {
-                width: percent(100),
-                height: px(86),
-                min_height: px(86),
-                border_radius: BorderRadius::all(px(5)),
-                overflow: Overflow::clip(),
-                ..default()
-            },
-            ChildOf(color_details),
-        ))
-        .id();
-    let marker = surface(
-        commands,
-        plane_node,
-        Node {
-            position_type: PositionType::Absolute,
-            width: px(9),
-            height: px(9),
-            border: UiRect::all(px(2)),
-            border_radius: BorderRadius::MAX,
-            ..default()
-        },
-        Color::NONE,
-    );
-    commands.entity(marker).insert((
-        BorderColor::all(Color::WHITE),
-        Pickable::IGNORE,
-        UiTransform::from_translation(Val2::percent(-50, -50)),
-    ));
-    slider(
-        commands,
-        color_details,
-        font_handle,
-        "Оттенок",
-        Binding::Hue,
-        (0.0, 360.0),
-    );
-    let colorrow = node(
-        commands,
-        panel,
-        Node {
-            width: percent(100),
-            ..row(6.0)
-        },
-    );
-    commands.entity(panel).insert_children(2, &[colorrow]);
-    let chip = control(
-        commands,
-        colorrow,
-        Action::ImageEdit(EditAction::ColorPanel),
-        Look::Regular,
-        Node {
-            width: px(28),
-            height: px(28),
-            min_width: px(28),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(5)),
-            ..default()
-        },
-    );
-    commands.entity(chip).insert((AccessibleLabel(
-        "Цвет · Раскрыть или свернуть выбор цвета".into(),
-    ),));
-    let hex = input(
-        commands,
-        colorrow,
-        font_handle,
-        "Цвет HEX · Enter — применить",
-    );
-    let palette = node(
-        commands,
-        panel,
-        Node {
-            width: percent(100),
-            ..row(4.0)
-        },
-    );
-    for rgb in [
-        [0.05, 0.05, 0.06],
-        [1.0, 1.0, 1.0],
-        [0.95, 0.24, 0.26],
-        [1.0, 0.65, 0.20],
-        [0.28, 0.75, 0.62],
-        [0.25, 0.55, 1.0],
-        [0.65, 0.4, 0.95],
-    ] {
-        let swatch = control(
-            commands,
-            palette,
-            Action::ImageEdit(EditAction::Color([rgb[0], rgb[1], rgb[2], 1.0])),
-            Look::Regular,
-            Node {
-                width: px(24),
-                height: px(22),
-                border: UiRect::all(px(1)),
-                border_radius: BorderRadius::all(px(4)),
-                ..default()
-            },
-        );
-        let color = surface(
-            commands,
-            swatch,
-            Node {
-                width: percent(100),
-                height: percent(100),
-                border_radius: BorderRadius::all(px(3)),
-                ..default()
-            },
-            Color::srgb(rgb[0], rgb[1], rgb[2]),
-        );
-        commands.entity(color).insert(Pickable::IGNORE);
-    }
-    slider(
-        commands,
-        panel,
-        font_handle,
-        "Размер кисти",
-        Binding::Size,
-        (1.0, 256.0),
-    );
-    slider(
-        commands,
-        panel,
-        font_handle,
-        "Жёсткость",
-        Binding::Hardness,
-        (0.0, 1.0),
-    );
-    slider(
-        commands,
-        panel,
-        font_handle,
-        "Непрозрачность кисти",
-        Binding::BrushOpacity,
-        (0.01, 1.0),
-    );
     let layer_header = node(
         commands,
         panel,
@@ -587,23 +686,15 @@ pub(in crate::editor) fn setup(
             ..row(6.0)
         },
     );
-    text(commands, layer_header, font_handle, "Слои", 13.0, TEXT);
+    let layer_title = text(commands, layer_header, font_handle, "Слои", 13.0, TEXT);
     let actions = node(commands, layer_header, row(2.0));
-    for (glyph, label, action) in [
-        (icons::Glyph::Plus, "Новый слой", EditAction::AddLayer),
-        (
-            icons::Glyph::Restore,
-            "Дублировать слой",
-            EditAction::DuplicateLayer,
-        ),
-        (icons::Glyph::ChevronUp, "Слой выше", EditAction::LayerUp),
-        (
-            icons::Glyph::ChevronDown,
-            "Слой ниже",
-            EditAction::LayerDown,
-        ),
-        (icons::Glyph::Close, "Удалить слой", EditAction::DeleteLayer),
-    ] {
+    for (glyph, label, action) in [(
+        icons::Glyph::Search,
+        "Поиск и фильтры слоёв",
+        EditAction::Layers(layers::LayerAction::PanelSection(
+            layers::PanelSection::Search,
+        )),
+    )] {
         let item = icons::button(
             commands,
             actions,
@@ -617,15 +708,40 @@ pub(in crate::editor) fn setup(
             n.height = px(25);
         });
     }
+    let layer_menu = button(
+        commands,
+        actions,
+        font_handle,
+        "•••",
+        Action::ImageEdit(EditAction::Layers(layers::LayerAction::Menu)),
+        Look::Regular,
+    );
+    commands
+        .entity(layer_menu)
+        .insert(AccessibleLabel("Операции со слоями".into()))
+        .entry::<Node>()
+        .and_modify(|mut n| {
+            n.width = px(25);
+            n.height = px(25);
+            n.padding = UiRect::ZERO;
+        });
     let name = input(
         commands,
         panel,
         font_handle,
         "Название слоя · Enter — применить",
     );
-    slider(
+    let layer_opacity = node(
         commands,
         panel,
+        Node {
+            width: percent(100),
+            ..column(3.0)
+        },
+    );
+    slider(
+        commands,
+        layer_opacity,
         font_handle,
         "Непрозрачность слоя",
         Binding::LayerOpacity,
@@ -636,93 +752,87 @@ pub(in crate::editor) fn setup(
         panel,
         Node {
             width: percent(100),
-            min_height: px(60),
-            flex_shrink: 0.0,
+            min_height: px(0),
+            flex_grow: 1.0,
             ..column(3.0)
         },
     );
-    let ring = surface(
+    layers::ui::setup(
         commands,
-        canvas,
-        Node {
-            display: Display::None,
-            position_type: PositionType::Absolute,
-            width: px(24),
-            height: px(24),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::MAX,
-            ..default()
-        },
-        Color::NONE,
+        layers,
+        root,
+        font_handle,
+        layer_title,
+        name,
+        layer_opacity,
     );
-    commands.entity(ring).insert((
-        BorderColor::all(Color::WHITE),
-        Pickable::IGNORE,
-        ZIndex(8),
-        UiTransform::from_translation(Val2::percent(-50, -50)),
-    ));
+    let cursor = super::super::tool_cursor::Overlay::setup(commands, canvas, font_handle);
     commands.insert_resource(EditUi {
-        center,
+        mode_button,
         mode,
         menu,
         tools,
         paint_button,
+        eraser_button,
         brush_icon,
         pencil_icon,
         paint_menu,
-        panel,
-        plane: plane_image,
-        plane_node,
-        color_details,
-        marker,
-        chip,
-        hex,
+        panel: panel_root,
+        eraser_modes,
         name,
-        layers,
         status,
-        ring,
-        hue: None,
-        layer_signature: String::new(),
+        size_group,
+        size_button,
+        size_value,
+        size_menu,
+        size_title,
+        size_shown: false,
+        size_input,
+        size_original: None,
+        size_last_text: None,
+        size_invalid: false,
+        size_confirm: false,
+        cursor,
     });
-}
-
-fn paint_plane(data: &mut [u8], hue: f32) {
-    for (i, pixel) in data.chunks_exact_mut(4).enumerate() {
-        let rgb = Srgba::from(Hsva::hsv(
-            hue,
-            (i % 192) as f32 / 191.0,
-            1.0 - (i / 192) as f32 / 95.0,
-        ));
-        pixel.copy_from_slice(&[
-            (rgb.red * 255.0) as u8,
-            (rgb.green * 255.0) as u8,
-            (rgb.blue * 255.0) as u8,
-            255,
-        ]);
-    }
 }
 
 pub(in crate::editor) fn color_pointer(
     mut viewer: ResMut<ImageViewer>,
     editor: Res<Editor>,
-    ui: Res<EditUi>,
+    mut ui: ResMut<EditUi>,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&Window, With<PrimaryWindow>>,
-    planes: Query<(&ComputedNode, &UiGlobalTransform), With<ColorPlane>>,
+    drawer: Option<Res<DrawerMotion>>,
     nodes: Query<(&ComputedNode, &UiGlobalTransform)>,
     inputs: Query<&EditableText>,
+    canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
+    scroll: Res<AccumulatedMouseScroll>,
     mut focus: ResMut<InputFocus>,
     mut actions: MessageWriter<Action>,
+    scrub: Option<Res<crate::editor::ui::NumberScrub>>,
 ) {
     viewer.edit.paint_menu_dismissed = false;
-    if editor.pending.is_some() || editor.browser_popup {
+    viewer.edit.mode_menu_dismissed = false;
+    viewer.edit.size_menu_dismissed = false;
+    if editor.pending.is_some()
+        || editor.browser_popup
+        || viewer.panel.blocks_canvas()
+        || viewer.edit.color_picker.is_some()
+        || viewer.edit.layers.menu
+        || viewer.edit.layers.form.is_some()
+        || window.cursor_position().is_some_and(|point| {
+            drawer
+                .as_ref()
+                .is_some_and(|drawer| drawer.covers(point, &window))
+        })
+    {
         return;
     }
     if viewer.edit.menu
         && (mouse.just_pressed(MouseButton::Left)
             && window.cursor_position().is_some_and(|p| {
-                ![ui.center, ui.menu].into_iter().any(|e| {
+                ![ui.mode_button, ui.menu].into_iter().any(|e| {
                     nodes
                         .get(e)
                         .is_ok_and(|(n, t)| n.contains_point(*t, p / n.inverse_scale_factor()))
@@ -730,10 +840,107 @@ pub(in crate::editor) fn color_pointer(
             }))
     {
         viewer.edit.menu = false;
+        viewer.edit.mode_menu_dismissed = true;
     }
     if !viewer.edit.editing(editor.viewing_image) {
         viewer.edit.paint_menu = false;
         return;
+    }
+    let hit_size = |entity| {
+        window.cursor_position().is_some_and(|cursor| {
+            nodes.get(entity).is_ok_and(|(n, t)| {
+                !n.is_empty() && n.contains_point(*t, cursor / n.inverse_scale_factor())
+            })
+        })
+    };
+    if viewer.edit.size_menu {
+        let dismiss = mouse.any_just_pressed([MouseButton::Left, MouseButton::Right])
+            && !hit_size(ui.size_button)
+            && !hit_size(ui.size_menu);
+        let rect = super::super::canvas_rect(&canvas, &window);
+        let input_rect = drawer
+            .as_ref()
+            .map_or(rect, |d| d.input_rect(rect, window.height()));
+        let shift = keys.any_just_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+            && !scrub.as_ref().is_some_and(|scrub| scrub.capturing())
+            && window
+                .cursor_position()
+                .is_some_and(|p| input_rect.contains(p));
+        if dismiss || shift {
+            viewer.edit.size_menu = false;
+            viewer.edit.size_menu_dismissed = dismiss;
+            ui.size_original = None;
+            focus.clear();
+        }
+    }
+    if viewer.edit.sizeable()
+        && !viewer.edit.busy()
+        && hit_size(ui.size_button)
+        && scroll.delta.y != 0.0
+    {
+        let delta = if scroll.unit == MouseScrollUnit::Line {
+            scroll.delta.y
+        } else {
+            scroll.delta.y / 24.0
+        };
+        let step = if delta.abs() < 1.0 {
+            delta.signum()
+        } else {
+            delta.round()
+        };
+        actions.write(Action::ImageEdit(EditAction::Size(
+            (viewer.edit.size.round() + step).clamp(1.0, 256.0),
+        )));
+        viewer.edit.size_menu = false;
+        ui.size_original = None;
+        focus.clear();
+    }
+    if focus.get() == Some(ui.size_input) {
+        let confirm = ui.size_confirm;
+        ui.size_confirm = false;
+        if ui.size_original.is_none() {
+            ui.size_original = Some(viewer.edit.size);
+            ui.size_last_text = None;
+        }
+        if let Ok(input) = inputs.get(ui.size_input) {
+            let value = input.value().to_string();
+            if ui.size_last_text.as_ref() != Some(&value) {
+                let size = value
+                    .trim()
+                    .replace(',', ".")
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|size| size.is_finite() && (1.0..=256.0).contains(size));
+                ui.size_invalid = size.is_none();
+                if let Some(size) = size {
+                    actions.write(Action::ImageEdit(EditAction::Size(size)));
+                }
+                ui.size_last_text = Some(value);
+            }
+        }
+        // Native text edits are applied in PostUpdate. Read the last typed character
+        // on the next frame before blurring, even when typing and Enter arrive together.
+        if keys.just_pressed(KeyCode::Enter) {
+            ui.size_confirm = true;
+        }
+        if confirm && !ui.size_invalid {
+            focus.clear();
+            ui.size_original = None;
+            viewer.edit.size_menu = false;
+        }
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        viewer.edit.size_menu = false;
+        if let Some(original) = ui.size_original.take() {
+            actions.write(Action::ImageEdit(EditAction::Size(original)));
+            focus.clear();
+        }
+    }
+    if focus.get() != Some(ui.size_input) {
+        ui.size_original = None;
+        ui.size_last_text = None;
+        ui.size_invalid = false;
+        ui.size_confirm = false;
     }
     if let Some(cursor) = window.cursor_position() {
         let hit = |entity| {
@@ -746,52 +953,27 @@ pub(in crate::editor) fn color_pointer(
             actions.write(Action::ImageEdit(EditAction::PaintMenu));
             viewer.edit.paint_menu_dismissed = true;
             focus.clear();
+        } else if mouse.just_pressed(MouseButton::Right)
+            && hit(ui.eraser_button)
+            && !viewer.edit.busy()
+        {
+            actions.write(Action::ImageEdit(EditAction::EraserMenu));
+            viewer.edit.paint_menu_dismissed = true;
+            focus.clear();
         } else if viewer.edit.paint_menu
             && mouse.any_just_pressed([MouseButton::Left, MouseButton::Right])
-            && !hit(ui.paint_menu)
+            && !hit(if viewer.edit.tool_menu == ToolMenu::Eraser {
+                ui.eraser_modes
+            } else {
+                ui.paint_menu
+            })
         {
             viewer.edit.paint_menu = false;
             viewer.edit.paint_menu_dismissed = true;
         }
     }
-    if let Ok((node, transform)) = planes.single()
-        && mouse.pressed(MouseButton::Left)
-        && let Some(cursor) = window.cursor_position()
-        && node.contains_point(*transform, cursor / node.inverse_scale_factor())
-    {
-        let min =
-            (transform.affine().translation - node.size() * 0.5) * node.inverse_scale_factor();
-        let point = ((cursor - min) / (node.size() * node.inverse_scale_factor()))
-            .clamp(Vec2::ZERO, Vec2::ONE);
-        actions.write(Action::ImageEdit(EditAction::SaturationValue(
-            point.x,
-            1.0 - point.y,
-        )));
-    }
     if keys.just_pressed(KeyCode::Enter) {
-        if focus.get() == Some(ui.hex)
-            && let Ok(input) = inputs.get(ui.hex)
-        {
-            let value = input
-                .value()
-                .to_string()
-                .trim()
-                .trim_start_matches('#')
-                .to_owned();
-            if value.len() == 6
-                && let Ok(rgb) = u32::from_str_radix(&value, 16)
-            {
-                actions.write(Action::ImageEdit(EditAction::Color([
-                    ((rgb >> 16) & 255) as f32 / 255.0,
-                    ((rgb >> 8) & 255) as f32 / 255.0,
-                    (rgb & 255) as f32 / 255.0,
-                    1.0,
-                ])));
-                focus.clear();
-            } else {
-                viewer.edit.error = Some("Цвет: введите 6 цифр HEX, например #E8AD5C".into());
-            }
-        } else if focus.get() == Some(ui.name)
+        if focus.get() == Some(ui.name)
             && let Ok(input) = inputs.get(ui.name)
             && let Some(id) = editor.viewing_image
             && let Some(session) = viewer.edit.sessions.get_mut(&id)
@@ -806,25 +988,97 @@ pub(in crate::editor) fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
     viewer: Res<ImageViewer>,
-    interface: Res<Interface>,
-    mut ui: ResMut<EditUi>,
     window: Single<&Window, With<PrimaryWindow>>,
-    focus: Res<InputFocus>,
-    mut images: ResMut<Assets<Image>>,
+    mut ui: ResMut<EditUi>,
+    mut focus: ResMut<InputFocus>,
     mut nodes: Query<&mut Node>,
     mut labels: Query<&mut Text>,
-    mut colors: Query<&mut BackgroundColor>,
-    mut pictures: Query<&mut ImageNode>,
     sliders: Query<(Entity, &PhotoSlider, &SliderValue, &SliderRange)>,
     mut inputs: Query<&mut EditableText>,
+    mut borders: Query<&mut BorderColor>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
+    parents: Query<&ChildOf>,
+    mut colors: Query<&mut BackgroundColor>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
+    if let Ok(mut group) = nodes.get_mut(ui.size_group) {
+        group.display = if editing && viewer.edit.sizeable() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    let size_shown = editing && viewer.edit.sizeable() && viewer.edit.size_menu;
+    if let Ok(mut menu) = nodes.get_mut(ui.size_menu) {
+        menu.display = if size_shown {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if size_shown && !ui.size_shown {
+        if let Ok(mut input) = inputs.get_mut(ui.size_input) {
+            input.editor_mut().set_text(&size_label(viewer.edit.size));
+        }
+        focus.set(ui.size_input, bevy::input_focus::FocusCause::Auto);
+    } else if !size_shown && ui.size_shown {
+        if focus.get().is_some_and(|e| {
+            parents
+                .iter_ancestors(e)
+                .any(|parent| parent == ui.size_menu)
+        }) {
+            focus.clear();
+        }
+        ui.size_original = None;
+        ui.size_last_text = None;
+        ui.size_invalid = false;
+        ui.size_confirm = false;
+    }
+    ui.size_shown = size_shown;
+    if let Ok(mut label) = labels.get_mut(ui.size_value) {
+        label.set_if_neq(Text(format!(
+            "{} px",
+            size_label((viewer.edit.size * 10.0).round() / 10.0)
+        )));
+    }
+    if let Ok(mut title) = labels.get_mut(ui.size_title) {
+        title.set_if_neq(Text(
+            match viewer.edit.tool {
+                PhotoTool::Eraser => "Размер ластика",
+                PhotoTool::Pencil => "Размер карандаша",
+                _ => "Размер кисти",
+            }
+            .into(),
+        ));
+    }
+    if focus.get() != Some(ui.size_input)
+        && let Ok(mut input) = inputs.get_mut(ui.size_input)
+    {
+        let value = size_label(viewer.edit.size);
+        if input.value().to_string() != value {
+            input.editor_mut().set_text(&value);
+        }
+    }
+    if let Ok(mut border) = borders.get_mut(ui.size_input) {
+        border.set_if_neq(BorderColor::all(if ui.size_invalid {
+            ERROR
+        } else if focus.get() == Some(ui.size_input) {
+            FOCUS
+        } else {
+            EDGE
+        }));
+    }
+    if let Ok(mut panel) = nodes.get_mut(ui.panel) {
+        panel.width = px(viewer.panel.width(window.width()));
+    }
     for (entity, visible) in [
         (ui.tools, editing),
         (
             ui.paint_menu,
-            editing && viewer.edit.paint_menu && editor.pending.is_none(),
+            editing
+                && viewer.edit.paint_menu
+                && viewer.edit.tool_menu == ToolMenu::Paint
+                && editor.pending.is_none(),
         ),
         (ui.brush_icon, viewer.edit.drawing_tool != PhotoTool::Pencil),
         (
@@ -833,8 +1087,11 @@ pub(in crate::editor) fn refresh(
         ),
         (ui.panel, editing),
         (
-            ui.color_details,
-            editing && viewer.edit.color_expanded.unwrap_or(!viewer.edit.compact),
+            ui.eraser_modes,
+            editing
+                && viewer.edit.paint_menu
+                && viewer.edit.tool_menu == ToolMenu::Eraser
+                && editor.pending.is_none(),
         ),
         (ui.menu, viewer.edit.menu && editor.viewing_image.is_some()),
     ] {
@@ -851,6 +1108,14 @@ pub(in crate::editor) fn refresh(
             "Карандаш · B · ПКМ — выбрать кисть или карандаш"
         } else {
             "Кисть · B · ПКМ — выбрать кисть или карандаш"
+        }
+        .into(),
+    ));
+    commands.entity(ui.eraser_button).insert(AccessibleLabel(
+        if viewer.edit.eraser_mode == EraserMode::Pixel {
+            "Пиксельный ластик · E · ПКМ — выбрать тип ластика"
+        } else {
+            "Обычный ластик · E · ПКМ — выбрать тип ластика"
         }
         .into(),
     ));
@@ -876,60 +1141,23 @@ pub(in crate::editor) fn refresh(
             }
         })));
     }
-    let rgba = viewer.edit.color();
-    let hsv = viewer
-        .edit
-        .hsv
-        .unwrap_or_else(|| Hsva::from(Srgba::new(rgba[0], rgba[1], rgba[2], 1.0)));
-    if let Ok(mut color) = colors.get_mut(ui.chip) {
-        color.0 = Color::srgba(rgba[0], rgba[1], rgba[2], 1.0);
-    }
-    if ui.hue != Some(hsv.hue) {
-        let mut data = vec![255; 192 * 96 * 4];
-        paint_plane(&mut data, hsv.hue);
-        let image = image_previews::texture_image(DecodedImage {
-            rgba: data,
-            size: UVec2::new(192, 96),
-            original: UVec2::new(192, 96),
-        });
-        if ui.hue.is_some()
-            && let Some(mut existing) = images.get_mut(&ui.plane)
-        {
-            *existing = image;
-        } else {
-            ui.plane = images.add(image);
-        }
-        ui.hue = Some(hsv.hue);
-        if let Ok(mut picture) = pictures.get_mut(ui.plane_node) {
-            picture.image = ui.plane.clone();
-        }
-    }
-    if let Ok(mut marker) = nodes.get_mut(ui.marker) {
-        marker.left = percent(hsv.saturation * 100.0);
-        marker.top = percent((1.0 - hsv.value) * 100.0);
-    }
-    if focus.get() != Some(ui.hex)
-        && let Ok(mut input) = inputs.get_mut(ui.hex)
+    if let Some(doc) = doc
+        && let Some(active) = doc.active_layer()
     {
-        input.editor_mut().set_text(&format!(
-            "#{:02X}{:02X}{:02X}",
-            (rgba[0] * 255.0).round() as u8,
-            (rgba[1] * 255.0).round() as u8,
-            (rgba[2] * 255.0).round() as u8
-        ));
-    }
-    if let Some(doc) = doc {
-        let active = &doc.document.layers[doc.active];
         if focus.get() != Some(ui.name)
             && let Ok(mut input) = inputs.get_mut(ui.name)
+            && input.value().to_string() != active.name
         {
             input.editor_mut().set_text(&active.name);
         }
         for (entity, slider, value, range) in &sliders {
             let (number, label) = match slider.binding {
-                Binding::Size => (viewer.edit.size, format!("{:.0} px", viewer.edit.size)),
+                Binding::Size => (
+                    viewer.edit.size,
+                    format!("{} px", size_label(viewer.edit.size)),
+                ),
                 Binding::Hardness => {
-                    let hardness = if viewer.edit.tool == PhotoTool::Pencil {
+                    let hardness = if viewer.edit.pixel_tool() {
                         1.0
                     } else {
                         viewer.edit.hardness
@@ -943,13 +1171,12 @@ pub(in crate::editor) fn refresh(
                 Binding::LayerOpacity => {
                     (active.opacity, format!("{:.0}%", active.opacity * 100.0))
                 }
-                Binding::Hue => (hsv.hue, format!("{:.0}°", hsv.hue)),
             };
             if value.0 != number {
                 commands.entity(entity).try_insert(SliderValue(number));
             }
             if matches!(slider.binding, Binding::Hardness) {
-                if viewer.edit.tool == PhotoTool::Pencil {
+                if viewer.edit.pixel_tool() {
                     commands.entity(entity).try_insert(InteractionDisabled);
                 } else {
                     commands.entity(entity).try_remove::<InteractionDisabled>();
@@ -962,99 +1189,27 @@ pub(in crate::editor) fn refresh(
                 thumb.left = percent(((number - range.start()) / range.span()) * 94.0);
             }
         }
-        let signature = format!(
-            "{}:{:?}",
-            doc.active,
-            doc.document
-                .layers
-                .iter()
-                .map(|l| (&l.name, l.visible))
-                .collect::<Vec<_>>()
-        );
-        if ui.layer_signature != signature {
-            commands.entity(ui.layers).despawn_related::<Children>();
-            for (index, layer) in doc.document.layers.iter().enumerate().rev() {
-                let row_node = surface(
-                    &mut commands,
-                    ui.layers,
-                    Node {
-                        width: percent(100),
-                        height: px(32),
-                        min_height: px(32),
-                        border_radius: BorderRadius::all(px(5)),
-                        ..row(3.0)
-                    },
-                    if index == doc.active { ACTIVE } else { WELL },
-                );
-                icons::button(
-                    &mut commands,
-                    row_node,
-                    if layer.visible {
-                        icons::Glyph::Eye
-                    } else {
-                        icons::Glyph::EyeOff
-                    },
-                    "Видимость слоя",
-                    Action::ImageEdit(EditAction::Visible(index)),
-                    Look::Regular,
-                );
-                let select = button(
-                    &mut commands,
-                    row_node,
-                    &interface.font,
-                    &layer.name,
-                    Action::ImageEdit(EditAction::SelectLayer(index)),
-                    Look::Regular,
-                );
-                commands.entity(select).entry::<Node>().and_modify(|mut n| {
-                    n.flex_grow = 1.0;
-                    n.min_width = px(0);
-                    n.overflow = Overflow::clip();
-                    n.justify_content = JustifyContent::Start;
-                });
-            }
-            ui.layer_signature = signature;
-        }
     }
-    let ring_shown = editing
-        && matches!(
-            viewer.edit.tool,
-            PhotoTool::Brush | PhotoTool::Pencil | PhotoTool::Eraser
-        )
-        && !viewer.edit.menu
-        && !viewer.edit.paint_menu
-        && editor.pending.is_none()
-        && canvas.single().is_ok_and(|(n, t)| {
-            window
-                .cursor_position()
-                .is_some_and(|p| n.contains_point(*t, p / n.inverse_scale_factor()))
-        });
-    if let Ok(mut ring) = nodes.get_mut(ui.ring) {
-        ring.border_radius = if viewer.edit.tool == PhotoTool::Pencil {
-            BorderRadius::ZERO
-        } else {
-            BorderRadius::MAX
-        };
-        ring.display = if ring_shown {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        if ring_shown
-            && let Ok((node, transform)) = canvas.single()
-            && let Some(cursor) = window.cursor_position()
-            && let Some(dimensions) = viewer.dimensions
-        {
-            let viewport = node.size() * node.inverse_scale_factor();
-            let source = viewer.source_size(dimensions);
-            let size =
-                viewer.edit.size * viewer.zoom.scale(source, viewport) / window.scale_factor();
-            ring.width = px(size.max(3.0));
-            ring.height = px(size.max(3.0));
-            let min =
-                (transform.affine().translation - node.size() * 0.5) * node.inverse_scale_factor();
-            ring.left = px(cursor.x - min.x);
-            ring.top = px(cursor.y - min.y);
-        }
-    }
+
+    let position = canvas.single().ok().and_then(|(node, transform)| {
+        let min =
+            (transform.affine().translation - node.size() * 0.5) * node.inverse_scale_factor();
+        viewer.brush_cursor_position.map(|point| point - min)
+    });
+    ui.cursor.refresh(
+        &mut nodes,
+        &mut labels,
+        viewer.brush_cursor.filter(|_| !viewer.native_brush_cursor),
+        position,
+        viewer.edit.resizing_brush().then_some(viewer.edit.size),
+    );
+    let pipette = canvas.single().ok().and_then(|(node, transform)| {
+        let min =
+            (transform.affine().translation - node.size() * 0.5) * node.inverse_scale_factor();
+        viewer.pipette_preview.map(|mut sample| {
+            sample.position -= min;
+            sample
+        })
+    });
+    ui.cursor.refresh_pipette(&mut nodes, &mut colors, pipette);
 }

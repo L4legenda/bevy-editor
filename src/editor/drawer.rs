@@ -8,7 +8,9 @@ pub(crate) use resize::{DrawerSize, resize as resize_drawer};
 
 #[path = "asset_drag.rs"]
 mod drag;
-pub(crate) use drag::{AssetDrag, DropFolder, pointer as drag_assets, visuals as drag_visuals};
+pub(crate) use drag::{
+    AssetDrag, DropFolder, DropTarget, pointer as drag_assets, visuals as drag_visuals,
+};
 
 const DURATION: f32 = 0.24;
 const CARD: f32 = 180.0;
@@ -26,6 +28,23 @@ pub(crate) struct DrawerMotion {
 }
 
 impl DrawerMotion {
+    pub(crate) fn input_rect(&self, mut rect: Rect, window_height: f32) -> Rect {
+        rect.max.y = rect
+            .max
+            .y
+            .min(window_height - FOOT - self.visible_height)
+            .max(rect.min.y);
+        rect
+    }
+
+    pub(crate) fn covers(&self, point: Vec2, window: &Window) -> bool {
+        self.visible_height > 0.0
+            && point.x >= 0.0
+            && point.x < window.width()
+            && point.y >= window.height() - FOOT - self.visible_height
+            && point.y < window.height() - FOOT
+    }
+
     fn advance(&mut self, open: bool, delta: f32, height: f32) {
         let direction = if open { 1.0 } else { -1.0 };
         self.progress = (self.progress + direction * delta / DURATION).clamp(0.0, 1.0);
@@ -66,6 +85,21 @@ pub(crate) struct BrowserUi {
     checker: Handle<Image>,
     pub(super) selected: Option<usize>,
     pub(super) selected_model: Option<usize>,
+    pub(super) selected_entry: Option<Entry>,
+}
+
+impl BrowserUi {
+    pub(super) fn select(&mut self, entry: Option<Entry>) {
+        self.selected_entry = entry;
+        self.selected = match entry {
+            Some(Entry::Scene { file, .. } | Entry::Image(file) | Entry::File(file)) => Some(file),
+            _ => None,
+        };
+        self.selected_model = match entry {
+            Some(Entry::Model(index)) => Some(index),
+            _ => None,
+        };
+    }
 }
 
 fn folder_icon(commands: &mut Commands, parent: Entity, size: f32, expanded: bool) {
@@ -322,7 +356,7 @@ pub(super) fn setup(
         AssetSearch,
         TextInput,
         EditableText::new(""),
-        TextCursorStyle::default(),
+        crate::ui_theme::text_cursor_style(),
         AccessibleLabel("Поиск файлов и папок в текущей папке".into()),
         font(font_handle, 12.0),
         TextColor(TEXT),
@@ -422,6 +456,7 @@ pub(super) fn setup(
         checker: checker.clone(),
         selected: None,
         selected_model: None,
+        selected_entry: None,
     });
 }
 
@@ -489,40 +524,33 @@ pub(crate) fn actions(
                     })
                     .unwrap_or(0);
                 browser.navigate(folder);
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::Browse(0) => {
                 browser.home();
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::Browse(folder) => {
                 browser.navigate(folder);
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::BrowseBack => {
                 browser.go_back();
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::BrowseForward => {
                 browser.go_forward();
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::BrowseUp => {
                 browser.up();
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
             }
             Action::BrowseClear => {
                 browser.set_search(String::new());
             }
             Action::BrowseRefresh => {
-                interface.selected = None;
-                interface.selected_model = None;
+                interface.select(None);
                 browser.refresh(&mut editor.project);
                 previews.extend(&mut images, editor.project.catalog.len());
             }
@@ -530,12 +558,16 @@ pub(crate) fn actions(
                 browser.toggle_folder(folder);
             }
             Action::BrowseFile(file) | Action::ViewImage(file) if file < browser.files.len() => {
-                interface.selected = Some(file);
-                interface.selected_model = None;
+                interface.select(Some(
+                    if browser.files[file].kind == browser::FileKind::Image {
+                        Entry::Image(file)
+                    } else {
+                        Entry::File(file)
+                    },
+                ));
             }
             Action::ViewModel(model) if model < editor.project.catalog.len() => {
-                interface.selected = None;
-                interface.selected_model = Some(model);
+                interface.select(Some(Entry::Model(model)));
             }
             Action::MoveAsset(entry, folder) => {
                 if let Some(error) = numeric.as_ref().and_then(|input| input.error_message()) {
@@ -559,8 +591,7 @@ pub(crate) fn actions(
                                 format!("Файл перемещён, ошибка обновления ссылок · {error}");
                             continue;
                         }
-                        interface.selected = None;
-                        interface.selected_model = None;
+                        interface.select(None);
                         previews.extend(&mut images, editor.project.catalog.len());
                         if scene_asset.is_some_and(|asset| asset != editor.definition().asset) {
                             editor.restore_selection = match editor.selection {
@@ -693,6 +724,7 @@ fn tree_folder(
         },
     );
     commands.entity(item).insert((
+        AssetOpen,
         DropFolder(index, browser.scan_revision),
         AccessibleLabel(format!("Открыть папку {}", folder.label)),
     ));
@@ -794,6 +826,16 @@ fn file_icon(
     font_handle: &Handle<Font>,
     extension: &str,
 ) -> Entity {
+    let artwork = if extension.eq_ignore_ascii_case("dcharacter") {
+        Some(icons::Glyph::CharacterFile)
+    } else if extension.eq_ignore_ascii_case("dialog") {
+        Some(icons::Glyph::DialogueFile)
+    } else {
+        None
+    };
+    if let Some(glyph) = artwork {
+        return icons::spawn(commands, parent, glyph, PREVIEW_HEIGHT * 0.9, Color::WHITE);
+    }
     let icon = node(
         commands,
         parent,
@@ -853,11 +895,14 @@ pub(crate) fn refresh(
     previews: Res<Thumbnails>,
     interface: Res<BrowserUi>,
     mut revision: Local<Option<u64>>,
-    mut tree_revision: Local<Option<u64>>,
+    mut tree_revision: Local<Option<(u64, u64)>>,
     mut labels: Query<&mut Text>,
 ) {
-    if *tree_revision != Some(browser.tree_revision) {
-        *tree_revision = Some(browser.tree_revision);
+    // Tree entries carry scan generations for activation and drag/drop, even
+    // when a file-only change leaves the folder hierarchy unchanged.
+    let tree_stamp = (browser.tree_revision, browser.scan_revision);
+    if *tree_revision != Some(tree_stamp) {
+        *tree_revision = Some(tree_stamp);
         commands.entity(interface.tree).despawn_children();
         tree_folder(&mut commands, &interface, &browser, 0, 0);
     }
@@ -999,7 +1044,11 @@ pub(crate) fn refresh(
             Entry::Image(index) | Entry::File(index) => {
                 let file = &browser.files[index];
                 let is_image = matches!(entry, Entry::Image(_));
-                let action = if is_image {
+                let narrative = file.extension.eq_ignore_ascii_case("dialog")
+                    || file.extension.eq_ignore_ascii_case("dcharacter");
+                let action = if narrative {
+                    Action::Narrative(NarrativeAction::File(index))
+                } else if is_image {
                     Action::ViewImage(index)
                 } else {
                     Action::BrowseFile(index)
@@ -1072,7 +1121,11 @@ pub(crate) fn refresh(
                     file_icon(&mut commands, well, &interface.font, &file.extension);
                     format!(
                         "{} · {}",
-                        if file.extension.is_empty() {
+                        if file.extension.eq_ignore_ascii_case("dialog") {
+                            "Диалог".into()
+                        } else if file.extension.eq_ignore_ascii_case("dcharacter") {
+                            "Персонаж".into()
+                        } else if file.extension.is_empty() {
                             "Файл".into()
                         } else {
                             file.extension.to_uppercase()

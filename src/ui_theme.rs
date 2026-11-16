@@ -17,6 +17,17 @@ pub(crate) const GREEN: Color = Color::srgb(0.476, 0.803, 0.674);
 pub(crate) const AMBER: Color = Color::srgb(1.0, 0.775, 0.433);
 pub(crate) const ERROR: Color = Color::srgb(1.0, 0.40, 0.40);
 pub(crate) const DISABLED_TEXT: Color = Color::srgb(0.48, 0.50, 0.55);
+
+/// Keep selected input text readable on the editor's dark surfaces.
+pub(crate) fn text_cursor_style() -> bevy::text::TextCursorStyle {
+    bevy::text::TextCursorStyle {
+        color: FOCUS,
+        selection_color: Color::srgb(0.29, 0.22, 0.14),
+        unfocused_selection_color: Color::srgb(0.16, 0.17, 0.21),
+        selected_text_color: Some(TEXT),
+        selection_radius: 0.1,
+    }
+}
 pub(crate) const AXIS: [Color; 3] = [
     Color::srgb(1.0, 0.54, 0.54),
     Color::srgb(0.53, 0.88, 0.64),

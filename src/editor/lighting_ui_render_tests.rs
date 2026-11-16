@@ -140,6 +140,102 @@ fn warm(app: &mut App, frames: usize) {
 }
 
 #[test]
+#[ignore = "requires GPU adapter; verifies drawer overlay keeps camera preview and pilot hints fixed"]
+fn gpu_file_manager_overlays_camera_preview_and_pilot_hints() {
+    let (mut app, _, target) = fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut()
+        .write_message(Action::Select(Selection::Camera(0)));
+    warm(&mut app, 25);
+    let scene_image = {
+        let world = app.world_mut();
+        let image = world
+            .resource::<crate::editor::viewport::Surface>()
+            .0
+            .clone();
+        world
+            .query::<(Entity, &ImageNode)>()
+            .iter(world)
+            .find(|(_, node)| node.image == image)
+            .unwrap()
+            .0
+    };
+    let preview_image = {
+        let world = app.world_mut();
+        let camera_target = world
+            .query_filtered::<&RenderTarget, With<ui::PreviewCamera>>()
+            .single(world)
+            .unwrap();
+        let RenderTarget::Image(image) = camera_target else {
+            panic!("Missing camera preview")
+        };
+        let image = image.handle.clone();
+        world
+            .query::<(Entity, &ImageNode)>()
+            .iter(world)
+            .find(|(_, node)| node.image == image)
+            .unwrap()
+            .0
+    };
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/file-manager-overlay-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    for pilot in [false, true] {
+        if pilot {
+            app.world_mut().write_message(Action::Pilot);
+            warm(&mut app, 5);
+        }
+        let entity = if pilot {
+            let world = app.world_mut();
+            world
+                .query::<(Entity, &Text)>()
+                .iter(world)
+                .find(|(_, text)| text.0 == "ПКМ + WASD · движение   Q/E · вверх/вниз")
+                .unwrap()
+                .0
+        } else {
+            preview_image
+        };
+        let geometry = |app: &App| {
+            [scene_image, entity].map(|entity| {
+                let node = app.world().get::<ComputedNode>(entity).unwrap();
+                let transform = app.world().get::<UiGlobalTransform>(entity).unwrap();
+                assert!(!node.is_empty());
+                Rect::from_center_size(transform.affine().translation, node.size())
+            })
+        };
+        let fixed = geometry(&app);
+        let view = app.world().resource::<Editor>().view;
+        app.world_mut().write_message(Action::Drawer);
+        for _ in 0..25 {
+            frame(&mut app);
+            assert_eq!(geometry(&app), fixed);
+        }
+        app.world_mut()
+            .resource_mut::<ui::DrawerSize>()
+            .preferred_height = Some(500.0);
+        warm(&mut app, 4);
+        assert_eq!(geometry(&app), fixed);
+        assert_eq!(app.world().resource::<Editor>().view, view);
+        capture_when(
+            &mut app,
+            &target,
+            &output.join(if pilot {
+                "pilot.png"
+            } else {
+                "camera-preview.png"
+            }),
+            |_| true,
+        );
+        app.world_mut().write_message(Action::Drawer);
+        for _ in 0..25 {
+            frame(&mut app);
+            assert_eq!(geometry(&app), fixed);
+        }
+    }
+    println!("File manager overlay screenshots: {}", output.display());
+}
+
+#[test]
 #[ignore = "requires GPU adapter; opens, edits, saves and previews native .scene documents"]
 fn gpu_native_scene_documents_open_edit_save_and_preview() {
     let directory =
@@ -627,13 +723,21 @@ fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
         &output.join("00-default-cloudy.png"),
         |image| {
             ui_pixels(image)
-                && image.enumerate_pixels().filter(|(x, y, pixel)| {
-                    let [red, green, blue, _] = pixel.0;
-                    *x < 960 && *y > 150 && *y < 850
-                        && red > 230 && green > 130 && blue < 180
-                        && red.saturating_sub(green) > 15
-                        && green.saturating_sub(blue) > 20
-                }).count() > 2000
+                && image
+                    .enumerate_pixels()
+                    .filter(|(x, y, pixel)| {
+                        let [red, green, blue, _] = pixel.0;
+                        *x < 960
+                            && *y > 150
+                            && *y < 850
+                            && red > 230
+                            && green > 130
+                            && blue < 180
+                            && red.saturating_sub(green) > 15
+                            && green.saturating_sub(blue) > 20
+                    })
+                    .count()
+                    > 2000
         },
     );
     app.world_mut()
@@ -671,7 +775,11 @@ fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
     );
     assert!(app.world().resource::<Editor>().environment().hdri_rotation > 80.0);
     assert_eq!(app.world().resource::<Editor>().undo.len(), history + 1);
-    let original_brightness = app.world().resource::<Editor>().environment().hdri_brightness;
+    let original_brightness = app
+        .world()
+        .resource::<Editor>()
+        .environment()
+        .hdri_brightness;
     drag_control(
         &mut app,
         window,

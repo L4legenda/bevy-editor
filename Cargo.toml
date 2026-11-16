@@ -21,12 +21,26 @@ lighting = [
     "bevy/zstd_rust",
     "bevy/ktx2",
 ]
+game = [
+    "lighting",
+    "bevy/3d_bevy_render",
+    "bevy/bevy_winit",
+    "bevy/default_app",
+    "bevy/jpeg",
+    "bevy/keyboard",
+    "bevy/mouse",
+    "bevy/multi_threaded",
+    "bevy/x11",
+]
 editor = [
+    "game",
+    "dep:parley",
     "lighting",
     "dep:image",
     "dep:resvg",
     "dep:winit",
     "dep:reqwest",
+    "dep:sha2",
     "dep:zip",
     "dep:photocraft-geom",
     "dep:photocraft-color",
@@ -34,12 +48,16 @@ editor = [
     "dep:photocraft-doc",
     "dep:photocraft-paint",
     "dep:photocraft-format",
+    "dep:photocraft-engine",
+    "dep:photocraft-compose",
     "bevy/3d_bevy_render",
     "bevy/bevy_winit",
     "bevy/default_app",
+    "bevy/custom_cursor",
     "bevy/jpeg",
     "bevy/keyboard",
     "bevy/mouse",
+    "bevy/system_clipboard",
     "bevy/multi_threaded",
     "bevy/ui",
     "bevy/x11",
@@ -57,17 +75,21 @@ path = "src/bin/bevy-editor-mcp.rs"
 required-features = ["mcp"]
 
 [dependencies]
+parley = { version = "0.11.1", optional = true, default-features = false }
 photocraft-geom = { path = "vendor/photocraft/crates/geom", optional = true }
 photocraft-color = { path = "vendor/photocraft/crates/color", optional = true }
 photocraft-raster = { path = "vendor/photocraft/crates/raster", optional = true }
 photocraft-doc = { path = "vendor/photocraft/crates/doc", optional = true }
 photocraft-paint = { path = "vendor/photocraft/crates/paint", optional = true }
 photocraft-format = { path = "vendor/photocraft/crates/format", optional = true }
+photocraft-engine = { path = "vendor/photocraft/crates/engine", optional = true }
+photocraft-compose = { path = "vendor/photocraft/crates/compose", optional = true }
 bevy = { version = "0.20.1", default-features = false, features = ["bevy_world_serialization"] }
 image = { version = "0.25.10", optional = true, default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tga", "webp", "hdr", "exr"] }
 half = { version = "2.7", optional = true }
 # HTTPS catalog/download workers and ambientCG's compressed environment packages.
 reqwest = { version = "0.13.5", optional = true, default-features = false, features = ["blocking", "json", "rustls"] }
+sha2 = { version = "0.10.9", optional = true }
 zip = { version = "9.5", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 resvg = { version = "0.49.0", optional = true, default-features = false }
 winit = { version = "0.30.13", optional = true, default-features = false, features = ["rwh_06"] }
@@ -81,6 +103,14 @@ base64 = { version = "0.22", optional = true }
 
 [build-dependencies]
 embed-resource = "3.0.12"
+
+# PhotoCraft's CPU smart-object import uses the same reviewed PDF decoder as upstream.
+[patch.crates-io]
+parley = { path = "vendor/parley" }
+hayro = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+hayro-syntax = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+hayro-interpret = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+hayro-jbig2 = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
 
 [profile.dev]
 opt-level = 1

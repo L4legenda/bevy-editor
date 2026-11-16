@@ -124,6 +124,7 @@ fn animate(
     focus: Res<InputFocus>,
     focus_visible: Res<InputFocusVisible>,
     drag: Option<Res<AssetDrag>>,
+    layer_drag: Option<Res<super::LayerDrag>>,
     mut materials: ResMut<Assets<ButtonMaterial>>,
     surfaces: Query<(
         &Hovered,
@@ -140,7 +141,8 @@ fn animate(
     )>,
 ) {
     let delta = time.delta_secs().min(0.05);
-    let dragging = drag.as_ref().is_some_and(|drag| drag.active());
+    let dragging = drag.as_ref().is_some_and(|drag| drag.active())
+        || layer_drag.as_ref().is_some_and(|drag| drag.active);
     let smooth = |value: f32, target: f32, rate: f32| {
         let next = value.lerp(target, 1.0 - (-delta * rate).exp());
         if (next - target).abs() < 0.001 {

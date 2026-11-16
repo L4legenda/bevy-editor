@@ -253,6 +253,7 @@ fn install(app: &mut App, manager: Manager) {
         .add_plugins((
             crate::editor::icons::SvgIconsPlugin,
             crate::editor::starfield::StarfieldPlugin,
+            crate::editor::orbital::OrbitalPlugin,
             effects::EffectsPlugin,
             crate::window_chrome::WindowChromePlugin,
         ))

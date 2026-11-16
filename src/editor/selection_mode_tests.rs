@@ -6,7 +6,7 @@ fn cursor_mode_is_the_default_and_tree_picking_is_exclusive_to_it() {
     app.world_mut().resource_mut::<Editor>().ready = true;
     assert_eq!(Tool::default(), Tool::Universal);
     assert_eq!(app.world().resource::<Editor>().tool, Tool::Universal);
-    assert_eq!(Tool::Universal.operations(), &[Tool::Move, Tool::Rotate]);
+    assert!(Tool::Universal.operations().is_empty());
     action(&mut app, Action::Select(Selection::Camera(0)));
     for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
         // Set mode directly: cameras intentionally don't support the Scale tool.

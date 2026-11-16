@@ -46,7 +46,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn meta_path(path: &Path) -> PathBuf {
+pub(super) fn meta_path(path: &Path) -> PathBuf {
     let mut extension = path.extension().unwrap_or_default().to_os_string();
     if !extension.is_empty() {
         extension.push(".");
@@ -64,6 +64,14 @@ fn destination_available(path: &Path) -> io::Result<()> {
             "В папке назначения уже есть файл или папка с таким именем",
         )),
     }
+}
+
+fn move_destination_available(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if destination.exists() && source.canonicalize()? == destination.canonicalize()? {
+        return Ok(());
+    }
+    destination_available(destination)
 }
 
 fn remap(path: &Path, from: &Path, to: &Path) -> PathBuf {
@@ -100,7 +108,7 @@ fn validate_edit_paths(edits: &RoomEdits, from: &Path, to: &Path) -> io::Result<
     Ok(())
 }
 
-fn checked_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
+pub(super) fn checked_path(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     if !relative
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
@@ -135,7 +143,7 @@ fn portable_move_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn entry_path(editor: &Editor, browser: &Browser, entry: Entry) -> io::Result<PathBuf> {
+pub(super) fn entry_path(editor: &Editor, browser: &Browser, entry: Entry) -> io::Result<PathBuf> {
     let path = match entry {
         Entry::Folder(folder) => browser
             .folders
@@ -319,32 +327,44 @@ fn prepare(
     target: usize,
 ) -> io::Result<Option<MovePlan>> {
     let from = entry_path(editor, browser, entry)?;
-    if from.as_os_str().is_empty() {
-        return Err(invalid("Корневую папку ассетов нельзя переместить"));
-    }
     let target = &browser
         .folders
         .get(target)
         .ok_or_else(|| invalid("Папка назначения больше не существует"))?
         .path;
+    let filename = from
+        .file_name()
+        .ok_or_else(|| invalid("У файла нет имени"))?;
+    prepare_to(editor, browser, entry, target.join(filename))
+}
+
+fn prepare_to(
+    editor: &Editor,
+    browser: &Browser,
+    entry: Entry,
+    to: PathBuf,
+) -> io::Result<Option<MovePlan>> {
+    let from = entry_path(editor, browser, entry)?;
+    if from.as_os_str().is_empty() {
+        return Err(invalid("Корневую папку ассетов нельзя переместить"));
+    }
+    let target = to
+        .parent()
+        .ok_or_else(|| invalid("У файла нет родительской папки"))?;
     let source = checked_path(&editor.root, &from)?;
     let destination = checked_path(&editor.root, target)?;
     if !destination.is_dir() {
         return Err(invalid("Назначение должно быть папкой"));
     }
-    if from.parent() == Some(target.as_path()) {
+    if from == to {
         return Ok(None);
     }
     if source.is_dir() && target.starts_with(&from) {
         return Err(invalid("Папку нельзя переместить внутрь самой себя"));
     }
-    let filename = from
-        .file_name()
-        .ok_or_else(|| invalid("У файла нет имени"))?;
-    let to = target.join(filename);
     portable_move_path(&from)?;
     portable_move_path(&to)?;
-    destination_available(&editor.root.join(&to))?;
+    move_destination_available(&source, &editor.root.join(&to))?;
     let redirect_path = PathBuf::from(REDIRECT_FILE);
     let original_redirects = read_optional(&editor.root.join(&redirect_path))?;
     if original_redirects.is_some() {
@@ -361,7 +381,7 @@ fn prepare(
                     return Err(invalid("Сопутствующий .pcraft должен быть обычным файлом"));
                 }
                 let target = to.with_extension("pcraft");
-                destination_available(&editor.root.join(&target))?;
+                move_destination_available(&editor.root.join(&native), &editor.root.join(&target))?;
                 companions.push((native, target));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -380,7 +400,10 @@ fn prepare(
                 }
                 let moved_meta = meta_path(&to);
                 if original_meta != moved_meta {
-                    destination_available(&editor.root.join(&moved_meta))?;
+                    move_destination_available(
+                        &editor.root.join(&original_meta),
+                        &editor.root.join(&moved_meta),
+                    )?;
                     companions.push((original_meta, moved_meta));
                 }
             }
@@ -438,7 +461,13 @@ fn prepare(
             ));
         }
     }
-    let mut rewrites = Vec::new();
+    let mut rewrites = narrative_rewrites(&editor.root, &from, &to)?;
+    if matches!(entry, Entry::Image(_)) && from.file_name() != to.file_name() {
+        let native = from.with_extension("pcraft");
+        if companions.iter().any(|(path, _)| *path == native) {
+            rewrites.push(image_name_rewrite(&editor.root, &native, &to)?);
+        }
+    }
     for (index, scene) in updated.scenes.iter_mut().enumerate() {
         remap_string(&mut scene.asset, &from, &to);
         remap_string(&mut scene.file, &from, &to);
@@ -496,7 +525,11 @@ fn prepare(
 
 /// Reserve the destination before moving, so a pre-existing or concurrently
 /// created file is never silently overwritten. Source and target share a root.
-fn move_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(super) fn move_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    if destination.exists() && fs::canonicalize(source)? == fs::canonicalize(destination)? {
+        return fs::rename(source, destination);
+    }
     if fs::symlink_metadata(source)?.is_dir() {
         // Windows rejects existing directory destinations. Unix can replace
         // empty directories, so reserve one first on those platforms.
@@ -522,6 +555,160 @@ fn move_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replace only the source-name manifest field. Tile/blob payloads, previews and
+/// unknown bundle entries retain their exact uncompressed bytes.
+fn image_name_rewrite(root: &Path, native: &Path, image: &Path) -> io::Result<Rewrite> {
+    const LIMIT: usize = 512 << 20;
+    let path = checked_path(root, native)?;
+    let metadata = fs::metadata(&path)?;
+    if metadata.len() > LIMIT as u64 {
+        return Err(invalid(
+            "Файл .pcraft слишком велик для переименования (до 512 МБ)",
+        ));
+    }
+    let original = fs::read(&path)?;
+    let updated = image_bundle_for_name(&original, image)?;
+    Ok(Rewrite {
+        before: native.to_owned(),
+        after: image.with_extension("pcraft"),
+        original: Some(original),
+        updated,
+        permissions: Some(metadata.permissions()),
+    })
+}
+
+pub(super) fn image_bundle_for_name(original: &[u8], image: &Path) -> io::Result<Vec<u8>> {
+    const LIMIT: usize = 512 << 20;
+    let archive = photocraft_format::zip::ZipReader::new(original).map_err(io::Error::other)?;
+    let manifest = archive
+        .read_by_name("manifest.json", 32 << 20)
+        .map_err(io::Error::other)?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&manifest).map_err(io::Error::other)?;
+    let name = manifest
+        .get_mut("document")
+        .and_then(|document| document.get_mut("name"))
+        .filter(|name| name.is_string())
+        .ok_or_else(|| invalid("В .pcraft отсутствует имя исходного изображения"))?;
+    *name = image
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    let manifest = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
+    let mut writer = photocraft_format::zip::ZipWriter::new();
+    let mut remaining = LIMIT;
+    for entry in &archive.entries {
+        let data = if entry.name == "manifest.json" {
+            manifest.clone()
+        } else {
+            archive.read(entry, remaining).map_err(io::Error::other)?
+        };
+        remaining = remaining
+            .checked_sub(data.len())
+            .ok_or_else(|| invalid("Данные .pcraft превышают 512 МБ"))?;
+        writer.add(&entry.name, &data).map_err(io::Error::other)?;
+    }
+    writer.finish().map_err(io::Error::other)
+}
+
+fn narrative_rewrites(root: &Path, from: &Path, to: &Path) -> io::Result<Vec<Rewrite>> {
+    let mut rewrites = Vec::new();
+    if from
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("dcharacter"))
+    {
+        let old = from.to_string_lossy().replace('\\', "/");
+        let new = to.to_string_lossy().replace('\\', "/");
+        for path in all_files(&root)?.into_iter().filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dialog"))
+        }) {
+            let absolute = checked_path(&root, &path)?;
+            let original = fs::read(&absolute)?;
+            let Ok(mut data) = serde_json::from_slice::<serde_json::Value>(&original) else {
+                continue;
+            };
+            let mut changed = false;
+            if let Some(nodes) = data.get_mut("nodes").and_then(|v| v.as_array_mut()) {
+                for node in nodes {
+                    if node
+                        .get("speaker")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|speaker| super::dialogue::same_asset_path(speaker, &old))
+                    {
+                        node["speaker"] = new.clone().into();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let permissions = fs::metadata(&absolute)?.permissions();
+                if permissions.readonly() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("Диалог {} защищён от записи", path.display()),
+                    ));
+                }
+                rewrites.push(Rewrite {
+                    before: path.clone(),
+                    after: path,
+                    original: Some(original),
+                    updated: serde_json::to_vec_pretty(&data).map_err(io::Error::other)?,
+                    permissions: Some(permissions),
+                });
+            }
+        }
+    }
+    Ok(rewrites)
+}
+
+/// Use the existing staged move transaction to rename narrative resources and
+/// rewrite saved speaker links, keeping unrelated unsaved edits in memory.
+pub(super) fn rename_narrative(root: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    let root = root.canonicalize()?;
+    let source = checked_path(&root, from)?;
+    checked_path(&root, to.parent().unwrap_or(Path::new("")))?;
+    if !source.is_file() {
+        return Err(invalid("Документ должен быть обычным файлом"));
+    }
+    let mut rewrites = narrative_rewrites(&root, from, to)?;
+    let mut redirects = Redirects::read(&root)?;
+    let original_meta = redirects.resolve(meta_path(from))?;
+    let mut companions = Vec::new();
+    if root.join(&original_meta).exists() {
+        checked_path(&root, &original_meta)?;
+        if !root.join(&original_meta).is_file() {
+            return Err(invalid("Сопутствующий .meta должен быть обычным файлом"));
+        }
+        let target = meta_path(to);
+        companions.push((original_meta.clone(), target.clone()));
+        redirects.record_move(&original_meta, &target)?;
+    }
+    redirects.record_move(from, to)?;
+    let redirect_path = PathBuf::from(REDIRECT_FILE);
+    let original_redirects = read_optional(&root.join(&redirect_path))?;
+    rewrites.push(Rewrite {
+        before: redirect_path.clone(),
+        after: redirect_path,
+        original: original_redirects,
+        updated: redirects.encode()?,
+        permissions: fs::metadata(root.join(REDIRECT_FILE))
+            .ok()
+            .map(|m| m.permissions()),
+    });
+    commit(
+        &root,
+        &MovePlan {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            companions,
+            rewrites,
+        },
+    )
 }
 
 fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -662,8 +849,51 @@ pub(super) fn move_entry(
     let Some(plan) = prepare(editor, browser, entry, target_folder)? else {
         return Ok(false);
     };
+    apply_plan(editor, browser, plan)?;
+    Ok(true)
+}
+
+/// Rename only the filename, preserving its format and all document references.
+pub(super) fn rename_entry(
+    editor: &mut Editor,
+    browser: &mut Browser,
+    entry: Entry,
+    filename: &str,
+) -> io::Result<bool> {
+    super::browser_files::validate_name(filename).map_err(invalid)?;
+    if matches!(entry, Entry::Folder(_)) {
+        return Err(invalid("Выберите файл для переименования"));
+    }
+    let from = entry_path(editor, browser, entry)?;
+    if !checked_path(&editor.root, &from)?.is_file() {
+        return Err(invalid("Для переименования выберите обычный файл"));
+    }
+    let to = from.with_file_name(filename);
+    if from.extension().map(|s| s.to_ascii_lowercase())
+        != to.extension().map(|s| s.to_ascii_lowercase())
+    {
+        return Err(invalid("При переименовании сохраните расширение файла"));
+    }
+    let Some(plan) = prepare_to(editor, browser, entry, to)? else {
+        return Ok(false);
+    };
+    apply_plan(editor, browser, plan)?;
+    Ok(true)
+}
+
+fn apply_plan(editor: &mut Editor, browser: &mut Browser, plan: MovePlan) -> io::Result<()> {
     commit(&editor.root, &plan)?;
     for model in &mut editor.project.catalog {
+        if Path::new(&model.asset) == plan.from
+            && Some(model.label.as_str()) == plan.from.file_stem().and_then(|s| s.to_str())
+        {
+            model.label = plan
+                .to
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+        }
         remap_string(&mut model.asset, &plan.from, &plan.to);
     }
     for scene in &mut editor.project.scenes {
@@ -689,11 +919,21 @@ pub(super) fn move_entry(
             remap_edits(edits, &plan.from, &plan.to);
         }
     }
+    for tab in &mut editor.narrative.tabs {
+        tab.path = remap(&tab.path, &plan.from, &plan.to);
+        for content in std::iter::once(&mut tab.content)
+            .chain(std::iter::once(&mut tab.saved))
+            .chain(&mut tab.undo)
+            .chain(&mut tab.redo)
+        {
+            content.remap_character(&plan.from, &plan.to);
+        }
+    }
     for tab in &mut editor.image_tabs {
         tab.path = remap(&tab.path, &plan.from, &plan.to);
     }
     browser.refresh_after_move(&mut editor.project, &plan.from, &plan.to);
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -843,6 +1083,208 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn renaming_model_keeps_open_identity_history_metadata_and_saved_scene_links() {
+        let files = Fixture::new();
+        files.glb("models/chair.glb", None);
+        files.file("models/chair.glb.meta", b"import settings");
+        let (mut editor, mut browser) = files.editor();
+        let index = model(&editor, "models/chair.glb");
+        editor.model_tabs.push(index);
+        editor.viewing_model = Some(index);
+        editor.saved = placements("models/chair.glb");
+        editor.saved.write(&files.0, "levels/room.json").unwrap();
+        editor.edits = editor.saved.clone();
+        editor.edits.models[0].pose.position[0] = 7.0;
+        editor.undo.push(editor.saved.clone());
+        editor.redo.push(editor.edits.clone());
+        let original = fs::read(files.0.join("models/chair.glb")).unwrap();
+        assert!(
+            rename_entry(&mut editor, &mut browser, Entry::Model(index), "Кресло.glb").unwrap()
+        );
+        assert_eq!(editor.project.catalog[index].asset, "models/Кресло.glb");
+        assert_eq!(editor.project.catalog[index].label, "Кресло");
+        assert_eq!(editor.viewing_model, Some(index));
+        assert_eq!(editor.model_tabs, vec![index]);
+        assert_eq!(editor.edits.models[0].pose.position[0], 7.0);
+        assert!(editor.dirty());
+        for edits in [
+            &editor.edits,
+            &editor.saved,
+            &editor.undo[0],
+            &editor.redo[0],
+        ] {
+            assert_eq!(edits.models[0].asset, "models/Кресло.glb");
+        }
+        assert_eq!(
+            editor.project.read_scene(0).unwrap().models[0].asset,
+            "models/Кресло.glb"
+        );
+        assert_eq!(
+            fs::read(files.0.join("models/Кресло.glb")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read(files.0.join("models/Кресло.glb.meta")).unwrap(),
+            b"import settings"
+        );
+        assert!(!files.0.join("models/chair.glb").exists());
+        assert_eq!(
+            Redirects::read(&files.0)
+                .unwrap()
+                .resolve(Path::new("models/chair.glb"))
+                .unwrap(),
+            Path::new("models/Кресло.glb")
+        );
+        assert!(
+            !rename_entry(&mut editor, &mut browser, Entry::Model(index), "Кресло.glb").unwrap()
+        );
+    }
+
+    #[test]
+    fn renaming_never_overwrites_files_sidecars_or_changes_format() {
+        let files = Fixture::new();
+        files.glb("models/chair.glb", None);
+        files.glb("models/existing.glb", None);
+        files.file("models/reserved.glb.meta", b"other settings");
+        let (mut editor, mut browser) = files.editor();
+        let index = model(&editor, "models/chair.glb");
+        let original = fs::read(files.0.join("models/chair.glb")).unwrap();
+        files.file("models/chair.glb.meta", b"keep settings");
+        for name in [
+            "existing.glb",
+            "reserved.glb",
+            "../outside.glb",
+            "NUL.glb",
+            "different.txt",
+            "bad#asset.glb",
+            "",
+        ] {
+            assert!(
+                rename_entry(&mut editor, &mut browser, Entry::Model(index), name).is_err(),
+                "{name}"
+            );
+            assert_eq!(
+                fs::read(files.0.join("models/chair.glb")).unwrap(),
+                original
+            );
+            assert_eq!(editor.project.catalog[index].asset, "models/chair.glb");
+            assert_eq!(browser.scan_revision, 0);
+        }
+        assert_eq!(
+            fs::read(files.0.join("models/reserved.glb.meta")).unwrap(),
+            b"other settings"
+        );
+        assert!(!files.0.join(REDIRECT_FILE).exists());
+    }
+
+    #[test]
+    fn renaming_image_retains_open_tab_and_native_layers() {
+        let files = Fixture::new();
+        fs::create_dir(files.0.join("images")).unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([31, 78, 152, 255]))
+            .save(files.0.join("images/photo.png"))
+            .unwrap();
+        let document =
+            super::super::photo_document::PhotoDocument::load(&files.0.join("images/photo.png"))
+                .unwrap();
+        let original_native = fs::read(files.0.join("images/photo.pcraft")).unwrap();
+        let (mut editor, mut browser) = files.editor();
+        editor.open_image_tab(PathBuf::from("images/photo.png"));
+        let tab = editor.viewing_image;
+        let image = browser
+            .files
+            .iter()
+            .position(|file| file.path == Path::new("images/photo.png"))
+            .unwrap();
+        rename_entry(
+            &mut editor,
+            &mut browser,
+            Entry::Image(image),
+            "Рисунок.png",
+        )
+        .unwrap();
+        assert_eq!(editor.viewing_image, tab);
+        assert_eq!(
+            editor.image_tab(tab.unwrap()).unwrap().path,
+            Path::new("images/Рисунок.png")
+        );
+        let renamed_native = fs::read(files.0.join("images/Рисунок.pcraft")).unwrap();
+        let original_archive = photocraft_format::zip::ZipReader::new(&original_native).unwrap();
+        let renamed_archive = photocraft_format::zip::ZipReader::new(&renamed_native).unwrap();
+        for entry in original_archive
+            .entries
+            .iter()
+            .filter(|entry| entry.name != "manifest.json")
+        {
+            assert_eq!(
+                original_archive.read(entry, 1 << 20).unwrap(),
+                renamed_archive.read_by_name(&entry.name, 1 << 20).unwrap()
+            );
+        }
+        let loaded =
+            super::super::photo_document::PhotoDocument::load(&files.0.join("images/Рисунок.png"))
+                .unwrap();
+        assert_eq!(loaded.document.name, "Рисунок.png");
+        assert_eq!(loaded.document.id, document.document.id);
+        super::super::photo_document::save(&files.0.join("images/Рисунок.png"), &document.document)
+            .unwrap();
+        assert_eq!(
+            super::super::photo_document::PhotoDocument::load(&files.0.join("images/Рисунок.png"))
+                .unwrap()
+                .document
+                .name,
+            "Рисунок.png"
+        );
+        assert!(!files.0.join("images/photo.pcraft").exists());
+    }
+
+    #[test]
+    fn renaming_character_updates_saved_dialogue_speakers() {
+        let files = Fixture::new();
+        files.file("hero.dcharacter", b"character");
+        files.file(
+            "story.dialog",
+            br#"{"nodes":[{"speaker":"hero.dcharacter","text":"keep"}]}"#,
+        );
+        let (mut editor, mut browser) = files.editor();
+        let character = browser
+            .files
+            .iter()
+            .position(|file| file.path == Path::new("hero.dcharacter"))
+            .unwrap();
+        rename_entry(
+            &mut editor,
+            &mut browser,
+            Entry::File(character),
+            "Captain.dcharacter",
+        )
+        .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(files.0.join("story.dialog")).unwrap()).unwrap();
+        assert_eq!(saved["nodes"][0]["speaker"], "Captain.dcharacter");
+        assert_eq!(saved["nodes"][0]["text"], "keep");
+        assert!(files.0.join("Captain.dcharacter").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn renaming_can_change_only_the_filename_case() {
+        let files = Fixture::new();
+        files.glb("models/chair.glb", None);
+        files.file("models/chair.glb.meta", b"settings");
+        let (mut editor, mut browser) = files.editor();
+        let index = model(&editor, "models/chair.glb");
+        rename_entry(&mut editor, &mut browser, Entry::Model(index), "Chair.glb").unwrap();
+        assert_eq!(editor.project.catalog[index].asset, "models/Chair.glb");
+        let names: Vec<_> = fs::read_dir(files.0.join("models"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.iter().any(|name| name == "Chair.glb"));
+        assert!(names.iter().any(|name| name == "Chair.glb.meta"));
     }
 
     #[test]

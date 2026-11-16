@@ -17,8 +17,13 @@ use crate::{data::LevelEdits as RoomEdits, project::LensKind};
 use super::{Editor, Field, Scene, Selection, Shot, Tool, ui};
 
 #[path = "transform_handles.rs"]
-mod transform_handles;
+pub(super) mod transform_handles;
 pub(super) use transform_handles::{HandleMaterial, HandlePlugin, spawn_overlay};
+#[path = "scene_area.rs"]
+mod area;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "scene_area_tests.rs"]
+mod area_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "rotation_gizmo_tests.rs"]
@@ -28,15 +33,19 @@ mod rotation_tests;
 #[path = "transform_space_gizmo_tests.rs"]
 mod space_tests;
 
-const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
-const AXIS_COLORS: [Color; 3] = [
+#[cfg(test)]
+#[path = "translation_gizmo_tests.rs"]
+mod translation_tests;
+
+pub(super) const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
+pub(super) const AXIS_COLORS: [Color; 3] = [
     Color::srgb(1.0, 0.28, 0.29),
     Color::srgb(0.33, 0.89, 0.49),
     Color::srgb(0.32, 0.62, 1.0),
 ];
 const HIGHLIGHT: Color = Color::srgb(1.0, 0.81, 0.38);
 const CAMERA_COLOR: Color = Color::srgba(0.49, 0.72, 1.0, 0.72);
-const EDITOR_FOV: f32 = 58.0_f32.to_radians();
+pub(super) const EDITOR_FOV: f32 = 58.0_f32.to_radians();
 const FOCUS_DURATION: f32 = 0.5;
 pub(super) const CAMERA_ASPECT: f32 = 16.0 / 9.0;
 pub(super) const EDITOR_GIZMO_LAYER: usize = 3;
@@ -119,24 +128,40 @@ pub(super) struct PointerState {
     pivot: Vec3,
     drag: Option<Drag>,
     hover: Option<TransformHandle>,
+    area: Option<area::SceneArea>,
+    group_start: Vec<(Selection, Transform)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TransformHandle {
+pub(super) enum TransformHandle {
     Axis { tool: Tool, axis: usize },
     Plane { normal: usize },
+    ViewTranslation,
     ViewRotation,
 }
 
 impl PointerState {
     pub(super) fn dragging(&self) -> bool {
-        self.drag.is_some()
+        self.drag.is_some() || self.area.is_some()
+    }
+    pub(super) fn selecting(&self) -> bool {
+        self.area.is_some()
+    }
+    pub(super) fn cancel_selection(&mut self) {
+        self.area = None;
+    }
+    pub(super) fn selection_rect(&self) -> Option<Rect> {
+        self.area
+            .as_ref()
+            .filter(|a| super::area_selection::dragged(a.start, a.end))
+            .map(|a| Rect::from_corners(a.start, a.end))
     }
 
     pub(super) fn stop_navigation(&mut self) {
         self.nav = None;
         self.focus_flight = None;
         self.pilot = None;
+        self.area = None;
     }
 }
 
@@ -175,6 +200,7 @@ pub(super) fn spawn_camera(
 ) {
     let mut camera = commands.spawn((
         EditorCamera,
+        crate::hdri::OrthographicBackdrop(!editor.pilot),
         bevy::camera::ShadowLodOrigin,
         Camera3d::default(),
         RenderLayers::from_layers(&[0, EDITOR_GIZMO_LAYER]),
@@ -227,8 +253,12 @@ pub(super) fn navigate(
     focus: Res<InputFocus>,
     text_inputs: Query<(), With<TextInput>>,
     asset_drag: Option<Res<ui::AssetDrag>>,
-    lighting: Option<Res<ui::LightingUi>>,
+    overlays: (
+        Option<Res<ui::LightingUi>>,
+        Option<ResMut<ui::navigation_gizmo::State>>,
+    ),
 ) {
+    let (lighting, mut orientation) = overlays;
     let Ok((mut camera, mut target, mut pose, mut lens)) = camera.single_mut() else {
         return;
     };
@@ -283,6 +313,7 @@ pub(super) fn navigate(
     let enabled = window.focused
         && !editor.asset_viewer_open()
         && !editor.browser_popup
+        && !editor.scene_object_popup
         && editor.ready
         && editor.pending.is_none()
         && !typing
@@ -296,11 +327,36 @@ pub(super) fn navigate(
             .is_some_and(|lighting| lighting.blocks_scene_input());
     let preview_visible =
         editor.ready && !editor.pilot && matches!(editor.selection, Some(Selection::Camera(_)));
+    let gizmo_blocked = !editor.asset_viewer_open()
+        && orientation.as_deref_mut().is_some_and(|gizmo| {
+            let mut frame = ui::navigation_gizmo::Frame {
+                workspace: ui::navigation_gizmo::Workspace::Scene(editor.room),
+                view: editor.view,
+                pivot: editor.pivot,
+                rect,
+                orthographic: editor.view_orthographic,
+            };
+            let blocked = gizmo.drive(
+                &mut frame,
+                &window,
+                &mouse,
+                &keys,
+                enabled && shot.is_none() && !state.dragging(),
+            );
+            if blocked {
+                state.stop_navigation();
+                editor.focus = false;
+                editor.view = frame.view;
+                editor.view_orthographic = frame.orthographic;
+            }
+            blocked
+        });
     let inside = enabled
+        && !gizmo_blocked
         && window.cursor_position().is_some_and(|cursor| {
             ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
                 && !(preview_visible
-                    && ui::camera_preview_rect(&window, &drawer, &editor.sidebar).contains(cursor))
+                    && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor))
         });
     let orbit_key = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
     let held = match state.nav {
@@ -356,6 +412,9 @@ pub(super) fn navigate(
     match state.nav {
         Some(Navigation::Fly) if mouse.pressed(MouseButton::Right) => {
             if delta != Vec2::ZERO {
+                if shot.is_none() {
+                    editor.view_orthographic = false;
+                }
                 let (yaw, pitch, _) = view.rotation.to_euler(EulerRot::YXZ);
                 view.rotation = Quat::from_euler(
                     EulerRot::YXZ,
@@ -370,6 +429,9 @@ pub(super) fn navigate(
             let movement = *view.right() * input(KeyCode::KeyD, KeyCode::KeyA)
                 + *view.forward() * input(KeyCode::KeyW, KeyCode::KeyS)
                 + Vec3::Y * input(KeyCode::KeyE, KeyCode::KeyQ);
+            if shot.is_none() && movement != Vec3::ZERO {
+                editor.view_orthographic = false;
+            }
             let speed = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
                 11.0
             } else {
@@ -385,6 +447,9 @@ pub(super) fn navigate(
         }
         Some(Navigation::Orbit) if mouse.pressed(MouseButton::Left) => {
             if delta != Vec2::ZERO {
+                if shot.is_none() {
+                    editor.view_orthographic = false;
+                }
                 let direction = (view.translation - pivot).normalize_or_zero();
                 let yaw = direction.x.atan2(direction.z) - delta.x * 0.006;
                 let pitch = (direction.y.asin() + delta.y * 0.006).clamp(-1.5, 1.5);
@@ -438,7 +503,7 @@ pub(super) fn navigate(
         editor.view = view;
         editor.pivot = pivot;
         *pose = view;
-        *lens = projection(LensKind::Perspective, EDITOR_FOV.to_degrees());
+        *lens = free_projection(editor.view_orthographic, distance);
     }
 }
 
@@ -477,7 +542,34 @@ pub(super) fn projection(kind: LensKind, lens: f32) -> Projection {
     }
 }
 
+/// Match the perspective framing at the orbit pivot when changing projection.
+pub(super) fn free_projection(orthographic: bool, distance: f32) -> Projection {
+    if orthographic {
+        let height = 2.0 * distance.max(0.000001) * (EDITOR_FOV * 0.5).tan();
+        Projection::Orthographic(OrthographicProjection {
+            scaling_mode: ScalingMode::FixedVertical {
+                viewport_height: height,
+            },
+            near: -200.0,
+            far: 200.0,
+            ..OrthographicProjection::default_3d()
+        })
+    } else {
+        projection(LensKind::Perspective, EDITOR_FOV.to_degrees())
+    }
+}
+
 pub(super) fn length(camera: &Camera, view: &Transform, pivot: Vec3) -> f32 {
+    let global = GlobalTransform::from(*view);
+    if let Some(pixels) = camera
+        .world_to_viewport(&global, pivot)
+        .ok()
+        .zip(camera.world_to_viewport(&global, pivot + *view.up()).ok())
+        .map(|(a, b)| a.distance(b))
+        .filter(|pixels| *pixels > 0.000001)
+    {
+        return (87.5 / pixels).clamp(0.06, 8.0);
+    }
     let height = camera
         .logical_viewport_size()
         .map_or(500.0, |size| size.y)
@@ -498,10 +590,17 @@ pub(super) fn allowed(editor: &Editor, selection: Selection, tool: Tool, axis: u
         Tool::Rotate => Field::Rotation(axis),
         Tool::Scale => Field::Scale(axis),
     };
-    editor.field_allowed(selection, field)
+    if editor.selection == Some(selection) {
+        editor
+            .selected_targets()
+            .into_iter()
+            .all(|target| editor.field_allowed(target, field))
+    } else {
+        editor.field_allowed(selection, field)
+    }
 }
 
-fn axis_length(mode: Tool, tool: Tool, length: f32) -> f32 {
+pub(super) fn axis_length(mode: Tool, tool: Tool, length: f32) -> f32 {
     if mode == Tool::Universal && tool == Tool::Move {
         length * 1.45
     } else {
@@ -540,7 +639,7 @@ fn ring_points(pivot: Vec3, axis: usize, radius: f32) -> impl Iterator<Item = Ve
 }
 
 const ROTATION_RADIUS_PIXELS: f32 = 88.0;
-const ROTATION_COLORS: [Color; 3] = [
+pub(super) const ROTATION_COLORS: [Color; 3] = [
     Color::srgb(1.0, 0.12, 0.30),
     Color::srgb(0.55, 0.85, 0.02),
     Color::srgb(0.03, 0.54, 1.0),
@@ -578,7 +677,7 @@ fn display_ring_points(
 
 /// The rotation reference shows the front hemisphere of each axis circle.
 /// The grey view-aligned outer ring provides the complete circular silhouette.
-fn universal_ring_segments(
+pub(super) fn universal_ring_segments(
     pivot: Vec3,
     axis: usize,
     radius: f32,
@@ -609,7 +708,7 @@ fn universal_ring_segments(
     })
 }
 
-fn plane_corners(pivot: Vec3, normal: usize, size: f32, frame: Quat) -> [Vec3; 4] {
+pub(super) fn plane_corners(pivot: Vec3, normal: usize, size: f32, frame: Quat) -> [Vec3; 4] {
     let u = frame * AXES[(normal + 1) % 3];
     let v = frame * AXES[(normal + 2) % 3];
     let center = pivot + (u + v) * size * 0.28;
@@ -620,6 +719,11 @@ fn plane_allowed(editor: &Editor, selection: Selection, normal: usize) -> bool {
     [1, 2]
         .into_iter()
         .all(|offset| allowed(editor, selection, Tool::Move, (normal + offset) % 3))
+}
+
+fn view_translation_allowed(editor: &Editor, selection: Selection) -> bool {
+    editor.tool.operations().contains(&Tool::Move)
+        && (0..3).all(|axis| allowed(editor, selection, Tool::Move, axis))
 }
 
 fn view_rotation_allowed(editor: &Editor, selection: Selection) -> bool {
@@ -644,7 +748,7 @@ fn plane_point(ray: Ray3d, center: Vec3, normal: Vec3) -> Option<Vec3> {
     point.is_finite().then_some(point)
 }
 
-fn quad_contains(point: Vec2, corners: [Vec2; 4]) -> bool {
+pub(super) fn quad_contains(point: Vec2, corners: [Vec2; 4]) -> bool {
     let mut lower = f32::INFINITY;
     let mut upper = f32::NEG_INFINITY;
     let mut area = 0.0;
@@ -674,13 +778,20 @@ fn handle_at(
     cursor: Vec2,
     rotation_radius: f32,
 ) -> Option<TransformHandle> {
+    if editor.tool.operations().is_empty() {
+        return None;
+    }
     let global = GlobalTransform::from(*view);
     let project = |point| camera.world_to_viewport(&global, point).ok();
     let pivot = pose.translation;
     let frame = editor.gizmo_rotation(pose);
     let length = length(camera, view, pivot);
     let start = project(pivot)?;
-    if editor.tool == Tool::Universal {
+    // The shared center takes priority over nearby axis shafts and planes.
+    if view_translation_allowed(editor, selection) && cursor.distance(start) < 9.0 {
+        return Some(TransformHandle::ViewTranslation);
+    }
+    if editor.tool == Tool::Move {
         for normal in (0..3).rev() {
             if !plane_allowed(editor, selection, normal) {
                 continue;
@@ -770,13 +881,36 @@ pub(super) fn manipulate(
     drawer: Res<ui::DrawerMotion>,
     asset_drag: Option<Res<ui::AssetDrag>>,
     lighting: Option<Res<ui::LightingUi>>,
+    orientation: Option<Res<ui::navigation_gizmo::State>>,
+    bounds: (
+        Query<&Children>,
+        Query<&GlobalTransform>,
+        Query<
+            (
+                &bevy::camera::primitives::Aabb,
+                &GlobalTransform,
+                &InheritedVisibility,
+                Option<&RenderLayers>,
+            ),
+            With<Mesh3d>,
+        >,
+    ),
 ) {
     let Ok((camera, view)) = camera.single() else {
         return;
     };
+    if pointer.area.is_none()
+        && orientation
+            .as_ref()
+            .is_some_and(|gizmo| gizmo.blocks_input())
+    {
+        pointer.hover = None;
+        return;
+    }
     if editor.pending.is_some()
         || editor.asset_viewer_open()
         || editor.browser_popup
+        || editor.scene_object_popup
         || asset_drag.as_ref().is_some_and(|drag| drag.active())
         || lighting
             .as_ref()
@@ -795,8 +929,10 @@ pub(super) fn manipulate(
     if let Some(drag) = pointer.drag.take() {
         if keys.just_pressed(KeyCode::Escape) || !window.focused {
             editor.edits = drag.before;
+            pointer.group_start.clear();
         } else if !mouse.pressed(MouseButton::Left) {
             editor.finish_edit(drag.before);
+            pointer.group_start.clear();
         } else {
             if let Some(cursor) = cursor {
                 let offset = cursor - drag.cursor;
@@ -810,9 +946,15 @@ pub(super) fn manipulate(
                     }
                 };
                 let mut pose = drag.start;
+                let mut scale_factor = 1.0;
                 match drag.tool {
                     Tool::Universal => unreachable!("dragging resolves to one transform operation"),
-                    Tool::Move if matches!(drag.handle, TransformHandle::Plane { .. }) => {
+                    Tool::Move
+                        if matches!(
+                            drag.handle,
+                            TransformHandle::Plane { .. } | TransformHandle::ViewTranslation
+                        ) =>
+                    {
                         if let Some(point) =
                             drag.plane_start
                                 .zip(camera.viewport_to_world(&global, cursor).ok().and_then(
@@ -823,7 +965,8 @@ pub(super) fn manipulate(
                             let local = drag.frame.inverse() * point;
                             let mut shift = Vec3::ZERO;
                             for axis in 0..3 {
-                                if axis != drag.axis {
+                                if !matches!(drag.handle, TransformHandle::Plane { normal } if normal == axis)
+                                {
                                     shift[axis] = snap(local[axis], 0.25);
                                 }
                             }
@@ -839,7 +982,8 @@ pub(super) fn manipulate(
                         };
                         let scale = snap(original * (1.0 + delta / drag.scale_length), 0.1)
                             .clamp(0.01, 100.0);
-                        pose = scaled_pose(pose, drag.frame, drag.axis, scale / original);
+                        scale_factor = scale / original;
+                        pose = scaled_pose(pose, drag.frame, drag.axis, scale_factor);
                     }
                     Tool::Rotate => {
                         let angle = drag
@@ -864,7 +1008,42 @@ pub(super) fn manipulate(
                     && pose.translation.abs().max_element() <= 1000.0
                     && crate::Pose::from(pose).valid()
                 {
-                    editor.set_pose(drag.selection, pose);
+                    if pointer.group_start.len() <= 1 {
+                        editor.set_pose(drag.selection, pose);
+                    } else {
+                        let mut updates = Vec::new();
+                        for &(target, start) in &pointer.group_start {
+                            let mut next = start;
+                            match drag.tool {
+                                Tool::Move => {
+                                    next.translation += pose.translation - drag.start.translation
+                                }
+                                Tool::Rotate => {
+                                    let rotation = pose.rotation * drag.start.rotation.inverse();
+                                    next.translation = drag.start.translation
+                                        + rotation * (start.translation - drag.start.translation);
+                                    next.rotation = rotation * start.rotation;
+                                }
+                                Tool::Scale => {
+                                    next = scaled_pose(start, drag.frame, drag.axis, scale_factor);
+                                    let mut offset = drag.frame.inverse()
+                                        * (start.translation - drag.start.translation);
+                                    offset[drag.axis] *= scale_factor;
+                                    next.translation = drag.start.translation + drag.frame * offset;
+                                }
+                                Tool::Universal => {}
+                            }
+                            updates.push((target, next));
+                        }
+                        if updates.iter().all(|(_, pose)| {
+                            crate::Pose::from(*pose).valid()
+                                && pose.translation.abs().max_element() <= 1000.0
+                        }) {
+                            for (target, pose) in updates {
+                                editor.set_pose(target, pose);
+                            }
+                        }
+                    }
                 }
             }
             pointer.drag = Some(drag);
@@ -873,13 +1052,50 @@ pub(super) fn manipulate(
     }
 
     pointer.hover = None;
+    if let Some(mut area) = pointer.area.take() {
+        if !editor.ready
+            || !window.focused
+            || editor.tool != Tool::Universal
+            || editor.room != area.room
+            || keys.just_pressed(KeyCode::Escape)
+            || mouse.just_pressed(MouseButton::Right)
+            || mouse.just_pressed(MouseButton::Middle)
+        {
+            return;
+        }
+        if let Some(cursor) = window.cursor_position() {
+            let rect = ui::scene_input_rect(&window, &drawer, &editor.sidebar);
+            area.end = cursor.clamp(rect.min, rect.max);
+            if mouse.just_released(MouseButton::Left) || !mouse.pressed(MouseButton::Left) {
+                let mode = super::area_selection::Mode::keys(&keys);
+                if super::area_selection::dragged(area.start, area.end) {
+                    let hits = area::targets(
+                        &editor,
+                        &scene,
+                        camera,
+                        &global,
+                        Rect::from_corners(area.start, area.end),
+                        &bounds.0,
+                        &bounds.1,
+                        &bounds.2,
+                    );
+                    editor.select_targets(hits, mode);
+                } else {
+                    editor.pick_target(area.hit, mode);
+                }
+            } else {
+                pointer.area = Some(area);
+            }
+        }
+        return;
+    }
     if !editor.ready || editor.pilot || pointer.nav.is_some() || !window.focused {
         return;
     }
     if !window.cursor_position().is_some_and(|cursor| {
         ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
             && !(matches!(editor.selection, Some(Selection::Camera(_)))
-                && ui::camera_preview_rect(&window, &drawer, &editor.sidebar).contains(cursor))
+                && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor))
     }) {
         return;
     }
@@ -911,6 +1127,11 @@ pub(super) fn manipulate(
         if let Some(handle) = pointer.hover
             && mouse.just_pressed(MouseButton::Left)
         {
+            pointer.group_start = editor
+                .selected_targets()
+                .into_iter()
+                .filter_map(|target| editor.pose(target).map(|p| (target, p.transform())))
+                .collect();
             let (tool, axis, direction) = match handle {
                 TransformHandle::Axis { tool, axis } => {
                     (tool, axis, direction(&editor, pose, axis))
@@ -918,6 +1139,7 @@ pub(super) fn manipulate(
                 TransformHandle::Plane { normal } => {
                     (Tool::Move, normal, direction(&editor, pose, normal))
                 }
+                TransformHandle::ViewTranslation => (Tool::Move, 0, *view.back()),
                 TransformHandle::ViewRotation => (Tool::Rotate, 0, *view.back()),
             };
             let length = axis_length(editor.tool, tool, length(camera, view, pose.translation));
@@ -946,9 +1168,12 @@ pub(super) fn manipulate(
                     length
                 },
                 ring_start: rotation_direction(camera, view, cursor, pose.translation, direction),
-                plane_start: matches!(handle, TransformHandle::Plane { .. })
-                    .then(|| plane_point(ray, pose.translation, direction))
-                    .flatten(),
+                plane_start: matches!(
+                    handle,
+                    TransformHandle::Plane { .. } | TransformHandle::ViewTranslation
+                )
+                .then(|| plane_point(ray, pose.translation, direction))
+                .flatten(),
             });
             return;
         }
@@ -960,6 +1185,9 @@ pub(super) fn manipulate(
     // Transform tools keep the current selection, including clicks on empty
     // space. Only the cursor mode performs scene picking or deselection.
     if editor.tool != Tool::Universal {
+        return;
+    }
+    if keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]) {
         return;
     }
 
@@ -998,7 +1226,13 @@ pub(super) fn manipulate(
                 .first()
                 .and_then(|(entity, _)| find(*entity))
         });
-    editor.select(target);
+    let point = cursor + Vec2::Y * ui::TOP;
+    pointer.area = Some(area::SceneArea {
+        start: point,
+        end: point,
+        hit: target,
+        room: editor.room,
+    });
 }
 
 pub(super) fn shots(editor: &Editor) -> std::ops::Range<usize> {
@@ -1028,7 +1262,7 @@ pub(super) fn draw(
         if pose.translation.distance_squared(view.translation) <= 0.04 {
             continue;
         }
-        let selected = editor.selection == Some(Selection::Camera(shot));
+        let selected = editor.is_selected(Selection::Camera(shot));
         let size = length(camera, view, pose.translation) * if selected { 0.43 } else { 0.14 };
         let forward = *pose.forward() * size;
         let right = *pose.right() * size * 0.70;

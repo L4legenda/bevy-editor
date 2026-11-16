@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use super::{SETTLE, Target, Thumbnails};
 use crate::editor::{
     Editor,
-    browser::{Browser, Entry},
+    browser::Browser,
     selection_outline::render_tests::{capture_when, frame},
     tests::lighting_ui_render::fixture,
 };
@@ -77,34 +77,28 @@ fn completed(app: &App, scenes: &HashSet<Target>) -> usize {
 #[ignore = "requires GPU adapter; reports real editor scene-folder latency"]
 fn gpu_scene_folder_preview_latency() {
     let (mut app, _, canvas) = fixture();
-    let (folder, scenes) = {
-        let editor = app.world().resource::<Editor>();
+    let folder = {
         let browser = app.world().resource::<Browser>();
-        let folder = browser
+        browser
             .folders
             .iter()
             .position(|folder| folder.path == Path::new("scenes"))
-            .expect("The bundled example must have a scenes folder");
-        let scenes = browser
+            .expect("The bundled example must have a scenes folder")
+    };
+    // Inspect the folder without rendering it. Source GLBs are model cards;
+    // only scene documents produce Target::Scene entries in the browser.
+    assert!(app.world_mut().resource_mut::<Browser>().navigate(folder));
+    let scenes = {
+        let editor = app.world().resource::<Editor>();
+        app.world()
+            .resource::<Browser>()
             .entries(&editor.project.catalog)
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Scene { room, .. } => Some(Target::Scene(*room)),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        (folder, scenes)
+            .into_iter()
+            .filter_map(Target::from_entry)
+            .collect::<HashSet<_>>()
     };
-    // The root lists folders rather than their children; gather the scene IDs
-    // from the project before changing browser state for the measured visit.
-    let scenes = if scenes.is_empty() {
-        (0..app.world().resource::<Editor>().project.scenes.len())
-            .map(Target::Scene)
-            .collect()
-    } else {
-        scenes
-    };
-    assert_eq!(scenes.len(), 2, "Expected the two bundled example scenes");
+    assert!(app.world_mut().resource_mut::<Browser>().navigate(0));
+    assert_eq!(scenes.len(), 2, "Expected two previewable scene sources");
 
     let mut baseline = Vec::new();
     for _ in 0..32 {
@@ -173,7 +167,7 @@ fn gpu_scene_folder_preview_latency() {
     assert_eq!(
         app.world().resource::<Thumbnails>().view.unwrap().entity,
         studio_view,
-        "Plain scene thumbnails must reuse the prepared studio camera"
+        "Folder thumbnails must reuse the prepared camera"
     );
     assert!(!app.world().get::<Camera>(studio_view).unwrap().is_active);
 

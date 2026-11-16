@@ -10,6 +10,36 @@ use photocraft_raster::Surface;
 #[path = "image_edit_ui.rs"]
 mod interface;
 pub(in crate::editor) use interface::{color_pointer, refresh, setup};
+#[path = "image_color.rs"]
+pub(in crate::editor) mod color;
+#[path = "image_color_picker.rs"]
+pub(in crate::editor) mod picker_ui;
+pub(in crate::editor) use color::{ColorComponent, ColorTarget};
+pub(in crate::editor) use picker_ui::ColorPickerScroll;
+pub(in crate::editor) use picker_ui::{input as color_input, refresh as refresh_color_picker};
+#[path = "image_brush_size.rs"]
+mod brush_size;
+pub(super) use brush_size::pointer as resize_brush;
+#[path = "image_layers.rs"]
+pub(in crate::editor) mod layers;
+#[path = "image_selection.rs"]
+pub(in crate::editor) mod selection;
+#[path = "image_selection_ui.rs"]
+pub(in crate::editor) mod selection_ui;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum EraserMode {
+    #[default]
+    Brush,
+    Pixel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum ToolMenu {
+    #[default]
+    Paint,
+    Eraser,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum EditAction {
@@ -17,32 +47,42 @@ pub(in crate::editor) enum EditAction {
     View,
     Edit,
     Tool(PhotoTool),
+    EraserMode(EraserMode),
     DrawingTool,
     PaintMenu,
+    EraserMenu,
     Save,
     Undo,
     Redo,
+    CancelGesture,
     AddLayer,
-    DuplicateLayer,
     DeleteLayer,
-    LayerUp,
-    LayerDown,
     SelectLayer(usize),
     Visible(usize),
     Opacity(f32, bool),
+    Layers(layers::LayerAction),
     Size(f32),
+    SizeMenu,
     Hardness(f32),
     BrushOpacity(f32),
-    Hue(f32),
-    SaturationValue(f32, f32),
+    #[cfg(test)]
     Color([f32; 4]),
-    ColorPanel,
+    ColorPicker(ColorTarget),
+    ColorConfirm,
+    ColorCancel,
+    ColorComponent(ColorComponent, f32),
+    ColorDraft([f32; 4]),
+    ColorSv(f32, f32),
+    SwapColors,
+    ResetColors,
+    AddSwatch,
+    Selection(selection::SelectionAction),
 }
 
 struct Session {
     pub doc: PhotoDocument,
     pub editing: bool,
-    rendered: Option<u64>,
+    rendered: Option<(u64, u64)>,
 }
 struct Opening {
     id: usize,
@@ -55,30 +95,45 @@ struct Saving {
     task: Task<Result<(), String>>,
 }
 enum Gesture {
+    PickColor {
+        last: Option<IVec2>,
+    },
     Paint {
         original: Surface,
+        checkpoint: Option<photo_document::Snapshot>,
         renderer: photocraft_paint::StrokeRenderer,
         last: Option<Vec2>,
+        tail: photocraft_geom::Rect,
     },
     Move {
-        original: Surface,
+        original: photo_document::LayerMove,
         origin: Vec2,
     },
 }
 
 #[derive(Default)]
 pub(in crate::editor) struct State {
+    pub selection: selection::SelectionState,
+    pub layers: layers::LayerState,
     sessions: HashMap<usize, Session>,
     opening: Option<Opening>,
     saving: Option<Saving>,
     gesture: Option<(usize, Gesture)>,
     opacity_drag: Option<usize>,
+    pub size_adjust: brush_size::Adjustment,
     pub menu: bool,
     pub paint_menu: bool,
+    pub tool_menu: ToolMenu,
     pub paint_menu_dismissed: bool,
+    pub mode_menu_dismissed: bool,
+    pub size_menu: bool,
+    pub size_menu_dismissed: bool,
     pub drawing_tool: PhotoTool,
     brush_size: f32,
     pencil_size: f32,
+    eraser_size: f32,
+    pixel_eraser_size: f32,
+    pub eraser_mode: EraserMode,
     pub tool: PhotoTool,
     pub size: f32,
     pub hardness: f32,
@@ -86,11 +141,44 @@ pub(in crate::editor) struct State {
     pub hsv: Option<bevy::color::Hsva>,
     pub color: Option<[f32; 4]>,
     pub error: Option<String>,
-    pub color_expanded: Option<bool>,
-    pub compact: bool,
+    pub background: Option<[f32; 4]>,
+    pub color_picker: Option<color::Picker>,
+    pub swatches: Vec<[f32; 4]>,
 }
 
 impl State {
+    pub(in crate::editor) fn file_busy(&self, id: usize) -> bool {
+        self.opening.as_ref().is_some_and(|work| work.id == id)
+            || self.saving.as_ref().is_some_and(|work| work.id == id)
+    }
+    pub fn sizeable(&self) -> bool {
+        matches!(
+            self.tool,
+            PhotoTool::Brush | PhotoTool::Pencil | PhotoTool::Eraser
+        )
+    }
+    pub fn resizing_brush(&self) -> bool {
+        self.size_adjust.active()
+    }
+    pub fn eyedropper(&self, keys: &ButtonInput<KeyCode>, id: Option<usize>) -> bool {
+        // A press keeps its tool until release, even if Alt changes mid-stroke.
+        if let Some((gesture_id, gesture)) = &self.gesture
+            && Some(*gesture_id) == id
+        {
+            return matches!(gesture, Gesture::PickColor { .. });
+        }
+        self.tool == PhotoTool::Eyedropper
+            || ((self.sizeable() || self.tool == PhotoTool::Fill)
+                && keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]))
+    }
+    fn set_size(&mut self, size: f32) {
+        if size.is_finite() {
+            self.size = size.clamp(1.0, 256.0);
+            if self.pixel_tool() {
+                self.size = self.size.round();
+            }
+        }
+    }
     pub fn editing(&self, id: Option<usize>) -> bool {
         id.and_then(|id| self.sessions.get(&id))
             .is_some_and(|s| s.editing)
@@ -100,13 +188,49 @@ impl State {
     }
     pub fn active(&self, action: EditAction, id: Option<usize>) -> bool {
         match action {
+            EditAction::Selection(action) => self.selection.active(action, self.tool),
             EditAction::View => !self.editing(id),
             EditAction::Edit => self.editing(id),
             EditAction::Tool(tool) => self.tool == tool,
-            EditAction::DrawingTool => matches!(self.tool, PhotoTool::Brush | PhotoTool::Pencil),
-            EditAction::SelectLayer(index) => {
-                self.document(id).is_some_and(|doc| doc.active == index)
+            EditAction::EraserMode(mode) => {
+                self.tool == PhotoTool::Eraser && self.eraser_mode == mode
             }
+            EditAction::DrawingTool => matches!(self.tool, PhotoTool::Brush | PhotoTool::Pencil),
+            EditAction::PaintMenu => self.paint_menu && self.tool_menu == ToolMenu::Paint,
+            EditAction::EraserMenu => self.paint_menu && self.tool_menu == ToolMenu::Eraser,
+            EditAction::SizeMenu => self.size_menu,
+            EditAction::ColorPicker(target) => self
+                .color_picker
+                .as_ref()
+                .is_some_and(|p| p.target == target),
+            EditAction::SelectLayer(index) => self
+                .document(id)
+                .is_some_and(|doc| doc.active == index && !doc.mask_target),
+            EditAction::Layers(layers::LayerAction::Mask(index)) => self
+                .document(id)
+                .is_some_and(|doc| doc.active == index && doc.mask_target && !doc.filter_target),
+            EditAction::Layers(layers::LayerAction::FilterMask(index)) => self
+                .document(id)
+                .is_some_and(|doc| doc.active == index && doc.mask_target && doc.filter_target),
+            EditAction::Layers(layers::LayerAction::PanelSection(section)) => {
+                self.layers.section_open(section)
+                    || matches!(section, layers::PanelSection::Search) && self.layers.has_filter()
+            }
+            EditAction::Layers(layers::LayerAction::FieldChoice(index,choice)) => self.layers.form.as_ref()
+                .and_then(|f|f.fields.get(index)).is_some_and(|f| matches!(&f.kind,layers::FieldKind::Choice(values) if values.get(choice).is_some_and(|v|v.as_str().map(str::to_owned).unwrap_or_else(||v.to_string())==f.text))),
+            EditAction::Layers(layers::LayerAction::Preview) => self.layers.preview_enabled,
+            EditAction::Layers(layers::LayerAction::BlendMore) => self.layers.blend_more,
+            EditAction::Layers(layers::LayerAction::SetBlend(blend)) => self.document(id).and_then(PhotoDocument::active_layer).is_some_and(|l|l.blend==blend),
+            EditAction::Layers(layers::LayerAction::Lock(key)) => self
+                .document(id)
+                .and_then(PhotoDocument::active_layer)
+                .is_some_and(|layer| match key {
+                    "all" => layer.locks.all,
+                    "transparency" => layer.locks.transparency,
+                    "pixels" => layer.locks.pixels,
+                    "position" => layer.locks.position,
+                    _ => false,
+                }),
             _ => false,
         }
     }
@@ -117,17 +241,53 @@ impl State {
         if self.busy() {
             return false;
         }
+        if let Some(picker) = &self.color_picker {
+            return match action {
+                EditAction::ColorConfirm => picker.error.is_none(),
+                EditAction::ColorCancel
+                | EditAction::ColorComponent(..)
+                | EditAction::ColorDraft(_)
+                | EditAction::ColorSv(..) => true,
+                EditAction::AddSwatch => {
+                    self.swatches.len() < 24
+                        && !self.swatches.iter().any(|c| color::hex(*c) == picker.hex())
+                }
+                _ => false,
+            };
+        }
         let doc = self.document(id);
         match action {
+            EditAction::Selection(selection::SelectionAction::Apply) => {
+                self.selection.transform.is_some()
+            }
+            EditAction::Selection(selection::SelectionAction::Cancel) => {
+                self.selection.transform.is_some() || self.selection.draft.is_some()
+            }
+            EditAction::Selection(selection::SelectionAction::Command(command))
+                if matches!(command, "select.deselect" | "select.inverse" | "edit.clear") =>
+            {
+                self.editing(id) && doc.is_some_and(|d| d.document.selection.is_some())
+            }
+            EditAction::Selection(_) => self.editing(id),
             EditAction::Menu | EditAction::View | EditAction::Edit => true,
             EditAction::Save => doc.is_some_and(PhotoDocument::dirty),
             EditAction::Undo => doc.is_some_and(PhotoDocument::can_undo),
             EditAction::Redo => doc.is_some_and(PhotoDocument::can_redo),
-            EditAction::DeleteLayer => doc.is_some_and(|d| d.document.layers.len() > 1),
-            EditAction::LayerUp => doc.is_some_and(|d| d.active + 1 < d.document.layers.len()),
-            EditAction::LayerDown => doc.is_some_and(|d| d.active > 0),
-            EditAction::AddLayer | EditAction::DuplicateLayer => {
-                doc.is_some_and(|d| d.document.layers.len() < 64)
+            EditAction::DeleteLayer => doc.is_some_and(|d| d.active_layer().is_some()),
+            EditAction::AddLayer => {
+                doc.is_some_and(|d| d.document.layer_count() < photo_document::MAX_LAYERS)
+            }
+            EditAction::EraserMode(_) => self.editing(id),
+            EditAction::SizeMenu => self.editing(id) && self.sizeable(),
+            EditAction::Layers(layers::LayerAction::PanelSection(section)) => {
+                self.editing(id)
+                    && (matches!(
+                        section,
+                        layers::PanelSection::Search | layers::PanelSection::Layers
+                    ) || doc.is_some_and(|doc| doc.active_layer().is_some()))
+            }
+            EditAction::Layers(action) => {
+                self.editing(id) && doc.is_some_and(|doc| layers::ux::enabled(action, doc))
             }
             _ => self.editing(id),
         }
@@ -138,29 +298,71 @@ impl State {
     pub fn color(&self) -> [f32; 4] {
         self.color.unwrap_or([0.0, 0.0, 0.0, 1.0])
     }
-    fn select_tool(&mut self, tool: PhotoTool) {
-        if self.tool == PhotoTool::Pencil {
-            self.pencil_size = self.size;
+    pub fn background(&self) -> [f32; 4] {
+        self.background.unwrap_or([1.0; 4])
+    }
+    pub fn pixel_tool(&self) -> bool {
+        self.tool == PhotoTool::Pencil
+            || (self.tool == PhotoTool::Eraser && self.eraser_mode == EraserMode::Pixel)
+    }
+    pub fn pixel_square(&self) -> bool {
+        self.pixel_tool() && self.size.round().max(1.0) <= 3.0
+    }
+    pub fn snap_point(&self, point: Vec2) -> Vec2 {
+        if self.pixel_tool() {
+            let (x, y) = photocraft_paint::grid_center(point.x as f64, point.y as f64, self.size);
+            Vec2::new(x, y)
         } else {
-            self.brush_size = self.size;
+            point
         }
-        self.size = if tool == PhotoTool::Pencil {
-            self.pencil_size.max(1.0).round()
-        } else {
-            self.brush_size.max(1.0)
+    }
+    fn remember_size(&mut self) {
+        match self.tool {
+            PhotoTool::Pencil => self.pencil_size = self.size,
+            PhotoTool::Eraser if self.eraser_mode == EraserMode::Pixel => {
+                self.pixel_eraser_size = self.size
+            }
+            PhotoTool::Eraser => self.eraser_size = self.size,
+            PhotoTool::Brush => self.brush_size = self.size,
+            _ => {}
+        }
+    }
+    fn restore_size(&mut self) {
+        self.size = match self.tool {
+            PhotoTool::Pencil => self.pencil_size.max(1.0).round(),
+            PhotoTool::Eraser if self.eraser_mode == EraserMode::Pixel => {
+                self.pixel_eraser_size.max(1.0).round()
+            }
+            PhotoTool::Eraser => self.eraser_size.max(1.0),
+            _ => self.brush_size.max(1.0),
         };
+    }
+    fn select_eraser_mode(&mut self, mode: EraserMode) {
+        if self.eraser_mode == mode {
+            return;
+        }
+        self.remember_size();
+        self.eraser_mode = mode;
+        self.restore_size();
+        self.gesture = None;
+    }
+    fn select_tool(&mut self, tool: PhotoTool) {
+        if self.tool != tool {
+            self.selection.transform = None;
+            self.selection.draft = None;
+            self.selection.menu = 0;
+        }
+        self.remember_size();
         self.tool = tool;
+        self.restore_size();
         if matches!(tool, PhotoTool::Brush | PhotoTool::Pencil) {
             self.drawing_tool = tool;
         }
         self.paint_menu = false;
         self.gesture = None;
-        for session in self.sessions.values_mut() {
-            session.rendered = None;
-        }
     }
     fn brush(&self) -> BrushSettings {
-        let pencil = self.tool == PhotoTool::Pencil;
+        let pencil = self.pixel_tool();
         BrushSettings {
             size: if pencil {
                 self.size.round().max(1.0)
@@ -170,6 +372,7 @@ impl State {
             hardness: if pencil { 1.0 } else { self.hardness },
             opacity: self.opacity,
             color: self.color(),
+            background: self.background(),
             erase: self.tool == PhotoTool::Eraser,
             aliased: pencil,
             ..Default::default()
@@ -182,12 +385,25 @@ impl State {
         )));
     }
     fn save(&mut self, id: usize, editor: &mut Editor) {
+        layers::finish_preview(self, true);
+        self.layers.form = None;
+        self.selection.transform = None;
+        self.selection.draft = None;
+        if self.tool == PhotoTool::Transform {
+            self.select_tool(PhotoTool::Move);
+        }
         if self.saving.is_some() {
             return;
         }
-        let Some(session) = self.sessions.get(&id) else {
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        while session.doc.editing_smart() {
+            if let Err(error) = session.doc.finish_smart() {
+                self.error = Some(error);
+                return;
+            }
+        }
         let Some(tab) = editor.image_tab(id) else {
             return;
         };
@@ -220,12 +436,31 @@ pub(super) fn update(
     browser: &mut Browser,
 ) {
     let state = &mut viewer.edit;
+    if state
+        .selection
+        .transform
+        .as_ref()
+        .is_some_and(|t| Some(t.id) != editor.viewing_image)
+    {
+        state.selection.transform = None;
+    }
+    if state
+        .selection
+        .draft
+        .as_ref()
+        .is_some_and(|d| Some(d.id) != editor.viewing_image)
+    {
+        state.selection.draft = None;
+    }
     if state.size == 0.0 {
         state.size = 24.0;
         state.brush_size = 24.0;
         state.pencil_size = 1.0;
+        state.eraser_size = 24.0;
+        state.pixel_eraser_size = 1.0;
         state.hardness = 1.0;
         state.opacity = 1.0;
+        state.swatches = color::PRESETS.to_vec();
     }
     if let Some((id, path, result)) = state.opening.as_mut().and_then(|job| {
         block_on(poll_once(&mut job.task)).map(|result| (job.id, job.path.clone(), result))
@@ -293,15 +528,35 @@ pub(super) fn update(
         }
     }
     for &action in actions {
+        if !matches!(action, Action::ImageEdit(EditAction::Opacity(..))) {
+            state.opacity_drag = None;
+        }
+        if !matches!(
+            action,
+            Action::ImageEdit(
+                EditAction::SizeMenu
+                    | EditAction::Size(_)
+                    | EditAction::Hardness(_)
+                    | EditAction::BrushOpacity(_)
+            )
+        ) {
+            state.size_menu = false;
+        }
         if matches!(
             action,
-            Action::Open(_)
+            Action::Generation(super::GenerationAction::Open)
+                | Action::Open(_)
                 | Action::OpenImageTab(_)
                 | Action::ViewImage(_)
                 | Action::ViewModel(_)
                 | Action::CloseImageTab(_)
         ) {
+            layers::finish_preview(state, false);
             state.menu = false;
+            state.color_picker = None;
+            state.layers.form = None;
+            state.layers.menu = false;
+            state.layers.blend_menu = false;
         }
         if let Some(PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id)) =
             editor.pending
@@ -340,6 +595,15 @@ pub(super) fn update(
             continue;
         };
         match action {
+            EditAction::Undo if state.layers.preview.is_some() => {
+                layers::finish_preview(state, false);
+                state.layers.form = None;
+                state.layers.ui_revision += 1;
+            }
+            EditAction::Selection(action) => selection::dispatch(state, id, action),
+            EditAction::Undo if state.selection.transform.is_some() => {
+                selection::dispatch(state, id, selection::SelectionAction::Cancel)
+            }
             EditAction::Menu => {
                 state.menu ^= true;
                 state.paint_menu = false;
@@ -347,6 +611,17 @@ pub(super) fn update(
                 viewer.last_click = None;
             }
             EditAction::View => {
+                layers::finish_preview(state, false);
+                state.selection.transform = None;
+                state.selection.draft = None;
+                state.selection.menu = 0;
+                if state.tool == PhotoTool::Transform {
+                    state.select_tool(PhotoTool::Move);
+                }
+                state.color_picker = None;
+                state.layers.form = None;
+                state.layers.menu = false;
+                state.layers.blend_menu = false;
                 if let Some(session) = state.sessions.get_mut(&id) {
                     session.editing = false;
                 }
@@ -375,55 +650,153 @@ pub(super) fn update(
                 }
             }
             EditAction::Save => state.save(id, editor),
+            EditAction::CancelGesture => {
+                if let Some((gesture_id, Gesture::Move { mut original, .. })) = state.gesture.take()
+                    && let Some(session) = state.sessions.get_mut(&gesture_id)
+                {
+                    session.doc.cancel_move(&mut original);
+                }
+            }
+            EditAction::Layers(action) => {
+                state.selection.transform = None;
+                state.selection.draft = None;
+                if state.tool == PhotoTool::Transform {
+                    state.select_tool(PhotoTool::Move);
+                }
+                layers::dispatch(state, id, action);
+                viewer.gesture = None;
+            }
             EditAction::Tool(tool) => {
                 state.select_tool(tool);
             }
+            EditAction::EraserMode(mode) => {
+                if state.tool != PhotoTool::Eraser {
+                    state.select_tool(PhotoTool::Eraser);
+                }
+                state.select_eraser_mode(mode);
+                state.paint_menu = false;
+            }
             EditAction::DrawingTool => state.select_tool(state.drawing_tool),
-            EditAction::PaintMenu => {
-                state.paint_menu ^= true;
+            EditAction::PaintMenu | EditAction::EraserMenu => {
+                let menu = if matches!(action, EditAction::EraserMenu) {
+                    ToolMenu::Eraser
+                } else {
+                    ToolMenu::Paint
+                };
+                state.paint_menu = !state.paint_menu || state.tool_menu != menu;
+                state.tool_menu = menu;
                 state.menu = false;
                 state.gesture = None;
                 viewer.gesture = None;
                 viewer.last_click = None;
             }
             EditAction::Size(value) => {
-                state.size = value.clamp(1.0, 256.0);
-                if state.tool == PhotoTool::Pencil {
-                    state.size = state.size.round();
-                }
+                state.set_size(value);
+            }
+            EditAction::SizeMenu => {
+                state.size_menu ^= true;
+                state.menu = false;
+                state.paint_menu = false;
+                state.gesture = None;
+                viewer.gesture = None;
+                viewer.last_click = None;
             }
             EditAction::Hardness(value) => state.hardness = value.clamp(0.0, 1.0),
             EditAction::BrushOpacity(value) => state.opacity = value.clamp(0.01, 1.0),
-            EditAction::Hue(value) => {
-                let mut hsv = state.hsv.unwrap_or_else(|| {
-                    bevy::color::Hsva::from(bevy::color::Srgba::new(
-                        state.color()[0],
-                        state.color()[1],
-                        state.color()[2],
-                        1.0,
-                    ))
-                });
-                hsv.hue = value;
-                let rgb = bevy::color::Srgba::from(hsv);
-                state.set_color([rgb.red, rgb.green, rgb.blue, 1.0]);
+            #[cfg(test)]
+            EditAction::Color(color) => {
+                if let Some(picker) = &mut state.color_picker {
+                    picker.set_color(color);
+                } else {
+                    state.set_color(color);
+                }
             }
-            EditAction::SaturationValue(s, v) => {
-                let mut hsv = state.hsv.unwrap_or_else(|| {
-                    bevy::color::Hsva::from(bevy::color::Srgba::new(
-                        state.color()[0],
-                        state.color()[1],
-                        state.color()[2],
-                        1.0,
-                    ))
-                });
-                hsv.saturation = s;
-                hsv.value = v;
-                let rgb = bevy::color::Srgba::from(hsv);
-                state.set_color([rgb.red, rgb.green, rgb.blue, 1.0]);
+            EditAction::ColorPicker(target) => {
+                state.color_picker = Some(color::Picker::new(
+                    target,
+                    match target {
+                        ColorTarget::Foreground => state.color(),
+                        ColorTarget::Background => state.background(),
+                        ColorTarget::LayerField(index) => state
+                            .layers
+                            .form
+                            .as_ref()
+                            .and_then(|f| f.fields.get(index))
+                            .and_then(|f| layers::parse_color(&f.text))
+                            .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                    },
+                ));
+                state.menu = false;
+                state.paint_menu = false;
+                state.gesture = None;
+                viewer.gesture = None;
+                viewer.last_click = None;
             }
-            EditAction::Color(color) => state.set_color(color),
-            EditAction::ColorPanel => {
-                state.color_expanded = Some(!state.color_expanded.unwrap_or(!state.compact))
+            EditAction::ColorConfirm => {
+                if state
+                    .color_picker
+                    .as_ref()
+                    .is_some_and(|p| p.error.is_none())
+                    && let Some(picker) = state.color_picker.take()
+                {
+                    match picker.target {
+                        ColorTarget::Foreground => {
+                            state.set_color(picker.draft);
+                            state.hsv = Some(picker.hsv);
+                        }
+                        ColorTarget::Background => state.background = Some(picker.draft),
+                        ColorTarget::LayerField(index) => {
+                            if let Some(field) = state
+                                .layers
+                                .form
+                                .as_mut()
+                                .and_then(|f| f.fields.get_mut(index))
+                            {
+                                let mut chosen = picker.draft;
+                                chosen[3] = layers::parse_color(&field.text).map_or(1.0, |c| c[3]);
+                                field.text = layers::color_hex(chosen);
+                                field.enabled = true;
+                                state.layers.ui_revision = state.layers.ui_revision.wrapping_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+            EditAction::ColorCancel => state.color_picker = None,
+            EditAction::ColorComponent(channel, value) => {
+                if let Some(picker) = &mut state.color_picker {
+                    picker.set_component(channel, value);
+                }
+            }
+            EditAction::ColorDraft(value) => {
+                if let Some(picker) = &mut state.color_picker {
+                    picker.set_color(value);
+                }
+            }
+            EditAction::ColorSv(s, v) => {
+                if let Some(picker) = &mut state.color_picker {
+                    picker.sv(s, v);
+                }
+            }
+            EditAction::SwapColors => {
+                let fg = state.color();
+                state.set_color(state.background());
+                state.background = Some(fg);
+            }
+            EditAction::ResetColors => {
+                state.set_color([0.0, 0.0, 0.0, 1.0]);
+                state.background = Some([1.0; 4]);
+            }
+            EditAction::AddSwatch => {
+                if let Some(picker) = &state.color_picker
+                    && state.swatches.len() < 24
+                    && !state
+                        .swatches
+                        .iter()
+                        .any(|c| color::hex(*c) == picker.hex())
+                {
+                    state.swatches.push(picker.draft);
+                }
             }
             _ if state.saving.is_none() => {
                 let Some(session) = state.sessions.get_mut(&id).filter(|s| s.editing) else {
@@ -434,26 +807,25 @@ pub(super) fn update(
                     EditAction::Undo => session.doc.undo(),
                     EditAction::Redo => session.doc.redo(),
                     EditAction::AddLayer => session.doc.add_layer(),
-                    EditAction::DuplicateLayer => session.doc.duplicate_layer(),
                     EditAction::DeleteLayer => session.doc.delete_layer(),
-                    EditAction::LayerUp => session.doc.reorder(true),
-                    EditAction::LayerDown => session.doc.reorder(false),
                     EditAction::Visible(index) => session.doc.visibility(index),
                     EditAction::Opacity(value, final_value) => {
                         if state.opacity_drag != Some(id) {
                             session.doc.checkpoint();
                             state.opacity_drag = Some(id);
                         }
-                        session.doc.document.layers[session.doc.active].opacity =
-                            value.clamp(0.0, 1.0);
+                        let selected = session.doc.selected.clone();
+                        for layer in selected {
+                            if let Some(layer) = session.doc.document.layer_mut(layer) {
+                                layer.opacity = value.clamp(0.0, 1.0);
+                            }
+                        }
                         session.doc.changed();
                         if final_value {
                             state.opacity_drag = None;
                         }
                     }
-                    EditAction::SelectLayer(index) if index < session.doc.document.layers.len() => {
-                        session.doc.active = index
-                    }
+                    EditAction::SelectLayer(index) => session.doc.select(index, false, false),
                     _ => {}
                 }
             }
@@ -463,21 +835,61 @@ pub(super) fn update(
     state
         .sessions
         .retain(|id, _| editor.image_tab(*id).is_some());
+    if let Some(id) = editor.viewing_image {
+        layers::preview(state, id);
+    }
     for tab in &mut editor.image_tabs {
         tab.dirty = state.sessions.get(&tab.id).is_some_and(|s| s.doc.dirty());
     }
 }
 
-pub(super) fn sync(viewer: &mut ImageViewer, editor: &Editor, images: &mut Assets<Image>) {
+pub(super) fn sync(
+    viewer: &mut ImageViewer,
+    editor: &Editor,
+    images: &mut Assets<Image>,
+    mut uploads: Option<&mut crate::editor::image_texture::TextureUploads>,
+) {
     let state = &mut viewer.edit;
     if let Some(id) = editor.viewing_image
         && let Some(session) = state.sessions.get_mut(&id)
     {
-        if session.rendered != Some(session.doc.revision)
+        if session.rendered != Some((session.doc.revision, session.doc.view_revision))
             || viewer.tab != Some(id)
             || viewer.image.is_none()
         {
-            let composite = session.doc.composite();
+            let source_size = session.doc.size();
+            let size = UVec2::new(source_size.width, source_size.height);
+            let initialized = session.rendered.is_some() && viewer.tab == Some(id);
+            let damage = session.doc.take_damage();
+            if initialized
+                && size.max_element() <= MAX_TEXTURE
+                && let (Some(rect), Some(handle), Some(uploads)) =
+                    (damage, viewer.image.as_ref(), uploads.as_deref_mut())
+                && let Some(image) = images.get_mut_untracked(handle)
+                && image.width() == size.x
+                && image.height() == size.y
+                && let Some(data) = image.data.as_mut()
+                && data.len() == (size.x * size.y * 4) as usize
+            {
+                if !rect.is_empty() {
+                    let region = session.doc.preview_region(rect);
+                    let stride = size.x as usize * 4;
+                    let row_len = region.width as usize * 4;
+                    for (y, row) in region.pixels.chunks_exact(row_len).enumerate() {
+                        let start = (rect.y0 as usize + y) * stride + rect.x0 as usize * 4;
+                        data[start..start + row_len].copy_from_slice(row);
+                    }
+                    uploads.patch(
+                        handle.id(),
+                        UVec2::new(rect.x0 as u32, rect.y0 as u32),
+                        UVec2::new(region.width, region.height),
+                        region.pixels,
+                    );
+                }
+                session.rendered = Some((session.doc.revision, session.doc.view_revision));
+                return;
+            }
+            let composite = session.doc.preview();
             let size = UVec2::new(composite.width, composite.height);
             let decoded = if size.max_element() > MAX_TEXTURE {
                 let rgba = image::RgbaImage::from_raw(size.x, size.y, composite.pixels)
@@ -498,9 +910,8 @@ pub(super) fn sync(viewer: &mut ImageViewer, editor: &Editor, images: &mut Asset
             };
             let decoded_size = decoded.size;
             let mut texture = image_previews::texture_image(decoded);
-            if state.tool == PhotoTool::Pencil {
-                texture.sampler = ImageSampler::nearest();
-            }
+            // The canvas shader selects sharp pixels by zoom, independently of the active tool.
+            texture.sampler = ImageSampler::linear();
             if let Some(mut image) = viewer
                 .image
                 .as_ref()
@@ -510,10 +921,13 @@ pub(super) fn sync(viewer: &mut ImageViewer, editor: &Editor, images: &mut Asset
             } else {
                 viewer.image = Some(images.add(texture));
             }
+            if let (Some(uploads), Some(handle)) = (uploads, viewer.image.as_ref()) {
+                uploads.reset(handle.id());
+            }
             viewer.dimensions = Some(size);
             viewer.decoded_size = Some(decoded_size);
             viewer.error = None;
-            session.rendered = Some(session.doc.revision);
+            session.rendered = Some((session.doc.revision, session.doc.view_revision));
         }
     }
 }
@@ -522,11 +936,29 @@ pub(super) fn pointer(
     viewer: &mut ImageViewer,
     editor: &mut Editor,
     rect: Rect,
-    cursor: Option<Vec2>,
+    input_rect: Rect,
     mouse: &ButtonInput<MouseButton>,
     keys: &ButtonInput<KeyCode>,
     focus: &mut InputFocus,
+    samples: &[super::paint_input::Sample],
 ) -> bool {
+    if viewer.edit.selection.menu != 0 || viewer.edit.selection.dismissed {
+        viewer.edit.gesture = None;
+        return true;
+    }
+    if selection::pointer(
+        viewer, editor, rect, input_rect, mouse, keys, focus, samples,
+    ) {
+        return true;
+    }
+    if viewer.panel.blocks_canvas()
+        || viewer.edit.color_picker.is_some()
+        || viewer.edit.layers.menu
+        || viewer.edit.layers.form.is_some()
+    {
+        viewer.edit.gesture = None;
+        return true;
+    }
     let Some(id) = editor.viewing_image else {
         return false;
     };
@@ -536,8 +968,11 @@ pub(super) fn pointer(
     }
     if viewer.edit.busy()
         || viewer.edit.menu
+        || viewer.edit.mode_menu_dismissed
         || viewer.edit.paint_menu
         || viewer.edit.paint_menu_dismissed
+        || viewer.edit.size_menu
+        || viewer.edit.size_menu_dismissed
     {
         viewer.edit.gesture = None;
         return true;
@@ -548,115 +983,207 @@ pub(super) fn pointer(
     {
         return false;
     }
-    let Some(cursor) = cursor else { return true };
     let Some(dimensions) = viewer.dimensions else {
         return true;
     };
-    let original_size = viewer.source_size(dimensions);
-    let size = original_size * viewer.zoom.scale(original_size, rect.size());
-    let image_min = rect.center() - size * 0.5 + viewer.pan;
-    let point = (cursor - image_min) / size * dimensions.as_vec2();
-    if mouse.just_pressed(MouseButton::Left)
-        && rect.contains(cursor)
-        && point.cmpge(Vec2::ZERO).all()
-        && point.cmplt(dimensions.as_vec2()).all()
-    {
-        focus.clear();
-        let state = &mut viewer.edit;
-        let color = state.color();
-        let brush = state.brush();
-        let Some(session) = state.sessions.get_mut(&id) else {
-            return true;
+    // Input and the visible pixel grid use the same pixel-aligned document origin.
+    let image = viewer.image_rect(dimensions, rect);
+    let size = image.size();
+    let image_min = image.min;
+    let state = &mut viewer.edit;
+    let mut points = Vec::new();
+    let mut position = None;
+    for &sample in samples {
+        use super::paint_input::Sample;
+        let (cursor, down, up) = match sample {
+            Sample::Down(point) => (point, true, false),
+            Sample::Move(point) => (point, false, false),
+            Sample::Up(point) => (point, false, true),
         };
-        if state.tool == PhotoTool::Eyedropper {
-            let composite = session.doc.composite();
-            let index = (point.y as usize * composite.width as usize + point.x as usize) * 4;
-            if let Some(pixel) = composite.pixels.get(index..index + 4) {
-                state.set_color([
-                    pixel[0] as f32 / 255.0,
-                    pixel[1] as f32 / 255.0,
-                    pixel[2] as f32 / 255.0,
-                    1.0,
-                ]);
-            }
-        } else if session.doc.paintable() {
-            if state.tool == PhotoTool::Fill {
-                session.doc.fill(point.x as i32, point.y as i32, color);
-            } else if let Some(original) = session.doc.document.layers[session.doc.active]
-                .surface()
-                .cloned()
+        // Only a workspace press can start painting. Once captured, keep the
+        // complete trajectory over panels and outside the window until release.
+        let captured = matches!(
+            state.gesture,
+            Some((gesture_id, Gesture::Paint { .. } | Gesture::PickColor { .. })) if gesture_id == id
+        );
+        if !input_rect.contains(cursor) && (down || !captured) {
+            flush(state, id, &points, position, true);
+            state.gesture = None;
+            points.clear();
+            position = None;
+            continue;
+        }
+        let point = (cursor - image_min) / size * dimensions.as_vec2();
+        if !point.is_finite() {
+            continue;
+        }
+        if down {
+            flush(state, id, &points, position, true);
+            points.clear();
+            state.gesture = None;
+            let picking = state.eyedropper(keys, Some(id));
+            // Painting owns a press anywhere in the workspace, including the
+            // pasteboard. Point tools still need an actual document pixel.
+            if (picking || !state.sizeable())
+                && (!point.cmpge(Vec2::ZERO).all() || !point.cmplt(dimensions.as_vec2()).all())
             {
-                session.doc.checkpoint();
+                continue;
+            }
+            focus.clear();
+            let color = state.color();
+            let mut brush = state.brush();
+            let Some(session) = state.sessions.get_mut(&id) else {
+                continue;
+            };
+            if session.doc.mask_target && brush.erase {
+                brush.erase = false;
+                brush.color = [0.0, 0.0, 0.0, 1.0];
+            }
+            if picking {
+                state.gesture = Some((id, Gesture::PickColor { last: None }));
+            } else if state.tool == PhotoTool::Move && session.doc.movable() {
                 state.gesture = Some((
                     id,
-                    if state.tool == PhotoTool::Move {
-                        Gesture::Move {
-                            original,
-                            origin: point,
-                        }
-                    } else {
-                        let renderer = photocraft_paint::StrokeRenderer::new(
-                            &brush,
-                            Some(original.format()),
-                            1.0,
-                        )
-                        .with_clip(photocraft_geom::Rect::from_size(session.doc.size()));
-                        Gesture::Paint {
-                            original,
-                            renderer,
-                            last: None,
-                        }
+                    Gesture::Move {
+                        original: session.doc.begin_move(),
+                        origin: point,
                     },
                 ));
+            } else if !session.doc.paintable() {
+                editor.status = "Выберите видимый незаблокированный слой".into();
+            } else if state.tool == PhotoTool::Fill {
+                session.doc.fill(point.x as i32, point.y as i32, color);
+            } else if let Some(original) = session.doc.paint_surface().cloned() {
+                let gesture = {
+                    let renderer =
+                        photocraft_paint::StrokeRenderer::new(&brush, Some(original.format()), 1.0)
+                            .with_clip(photocraft_geom::Rect::from_size(session.doc.size()));
+                    Gesture::Paint {
+                        original,
+                        checkpoint: Some(session.doc.snapshot()),
+                        renderer,
+                        last: None,
+                        tail: photocraft_geom::Rect::EMPTY,
+                    }
+                };
+                state.gesture = Some((id, gesture));
             }
-        } else {
-            editor.status = "Выберите видимый незаблокированный слой".into();
+        }
+        sample_color(state, id, point, dimensions);
+        let point = state.snap_point(point);
+        position = Some(point);
+        if let Some((gesture_id, Gesture::Paint { last, .. })) = &mut state.gesture
+            && *gesture_id == id
+            && last.is_none_or(|last| last.distance_squared(point) > 0.01)
+        {
+            points.push(StrokePoint::new(point.x as f64, point.y as f64, 1.0));
+            *last = Some(point);
+        }
+        if up {
+            flush(state, id, &points, position, true);
+            state.gesture = None;
+            points.clear();
+            position = None;
         }
     }
-    if let Some((gesture_id, gesture)) = &mut viewer.edit.gesture
+    let finished = !mouse.pressed(MouseButton::Left);
+    flush(state, id, &points, position, finished);
+    if finished {
+        state.gesture = None;
+    }
+    if let Some(tab) = editor.image_tabs.iter_mut().find(|tab| tab.id == id) {
+        tab.dirty = state
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.doc.dirty());
+    }
+    true
+}
+
+fn sample_color(state: &mut State, id: usize, point: Vec2, dimensions: UVec2) {
+    if !point.cmpge(Vec2::ZERO).all() || !point.cmplt(dimensions.as_vec2()).all() {
+        return;
+    }
+    let pixel = point.floor().as_ivec2();
+    if let Some((gesture_id, Gesture::PickColor { last })) = &mut state.gesture
         && *gesture_id == id
-        && (mouse.pressed(MouseButton::Left) || mouse.just_released(MouseButton::Left))
-        && let Some(session) = viewer.edit.sessions.get_mut(&id)
+        && *last != Some(pixel)
+        && let Some(session) = state.sessions.get(&id)
+    {
+        *last = Some(pixel);
+        let composite = session.doc.composite_region(photocraft_geom::Rect::new(
+            pixel.x,
+            pixel.y,
+            pixel.x + 1,
+            pixel.y + 1,
+        ));
+        if let Some(pixel) = composite.pixels.get(..4) {
+            state.set_color([
+                pixel[0] as f32 / 255.0,
+                pixel[1] as f32 / 255.0,
+                pixel[2] as f32 / 255.0,
+                1.0,
+            ]);
+        }
+    }
+}
+
+fn flush(
+    state: &mut State,
+    id: usize,
+    points: &[StrokePoint],
+    position: Option<Vec2>,
+    finish: bool,
+) {
+    let mut failure = None;
+    if let Some((gesture_id, gesture)) = &mut state.gesture
+        && *gesture_id == id
+        && let Some(session) = state.sessions.get_mut(&id)
     {
         match gesture {
             Gesture::Paint {
                 original,
+                checkpoint,
                 renderer,
-                last,
-            } => {
-                let point = point.clamp(
-                    Vec2::splat(-256.0),
-                    dimensions.as_vec2() + Vec2::splat(256.0),
-                );
-                let changed = last.is_none_or(|last| last.distance_squared(point) > 0.01);
-                let finished = mouse.just_released(MouseButton::Left);
-                if changed || finished {
-                    session.doc.paint_live(
-                        original,
-                        renderer,
-                        changed.then(|| StrokePoint::new(point.x as f64, point.y as f64, 1.0)),
-                        finished,
-                    );
-                    *last = Some(point);
+                tail,
+                ..
+            } if !points.is_empty() || finish => {
+                let revision = session.doc.revision;
+                if let Err(error) = session
+                    .doc
+                    .paint_live(original, renderer, points, tail, finish)
+                {
+                    failure = Some(error);
+                }
+                // Capture the original document at Down, but only create an undo
+                // entry once this gesture actually reaches the visible image.
+                if session.doc.revision != revision
+                    && let Some(before) = checkpoint.take()
+                {
+                    session.doc.checkpoint_from(before);
                 }
             }
             Gesture::Move { original, origin } => {
-                let delta = (point - *origin)
-                    .round()
-                    .clamp(Vec2::splat(-32768.0), Vec2::splat(32768.0));
-                session
-                    .doc
-                    .move_layer(original, delta.x as i32, delta.y as i32);
+                if let Some(position) = position {
+                    let delta = (position - *origin)
+                        .round()
+                        .clamp(Vec2::splat(-32768.0), Vec2::splat(32768.0));
+                    if let Err(error) =
+                        session
+                            .doc
+                            .translate_live(original, delta.x as i32, delta.y as i32)
+                    {
+                        failure = Some(error);
+                    }
+                }
             }
-        }
-        if let Some(tab) = editor.image_tabs.iter_mut().find(|t| t.id == id) {
-            tab.dirty = session.doc.dirty();
+            _ => {}
         }
     }
-    if !mouse.pressed(MouseButton::Left) {
-        viewer.edit.gesture = None;
+    if let Some(error) = failure {
+        state.error = Some(error);
+        state.gesture = None;
     }
-    true
 }
 
 pub(in crate::editor) fn shortcuts(
@@ -668,6 +1195,23 @@ pub(in crate::editor) fn shortcuts(
     if !viewer.edit.editing(viewer.tab) {
         return false;
     }
+    if selection::shortcuts(keys, viewer, actions) {
+        return true;
+    }
+    if keys.just_pressed(KeyCode::Escape)
+        && matches!(viewer.edit.gesture, Some((_, Gesture::Move { .. })))
+    {
+        actions.write(Action::ImageEdit(EditAction::CancelGesture));
+        return true;
+    }
+    if viewer.edit.layers.menu || viewer.edit.layers.form.is_some() {
+        if keys.just_pressed(KeyCode::Escape) {
+            actions.write(Action::ImageEdit(EditAction::Layers(
+                layers::LayerAction::Cancel,
+            )));
+        }
+        return true;
+    }
     let command = keys.any_pressed([
         KeyCode::ControlLeft,
         KeyCode::ControlRight,
@@ -675,6 +1219,35 @@ pub(in crate::editor) fn shortcuts(
         KeyCode::SuperRight,
     ]);
     if command {
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+        let layer_command = if keys.just_pressed(KeyCode::KeyG) {
+            Some(if shift {
+                "layer.ungroupLayers"
+            } else if alt {
+                "layer.createClippingMask"
+            } else {
+                "layer.groupLayers"
+            })
+        } else if keys.just_pressed(KeyCode::KeyJ) {
+            Some("layer.duplicate")
+        } else if keys.just_pressed(KeyCode::KeyE) {
+            Some(if shift {
+                "layer.mergeVisible"
+            } else {
+                "layer.mergeLayers"
+            })
+        } else if shift && keys.just_pressed(KeyCode::KeyN) {
+            Some("layer.new.layer")
+        } else {
+            None
+        };
+        if let Some(command) = layer_command {
+            actions.write(Action::ImageEdit(EditAction::Layers(
+                layers::LayerAction::Command(command),
+            )));
+            return true;
+        }
         if keys.just_pressed(KeyCode::KeyZ) {
             actions.write(Action::ImageEdit(
                 if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
@@ -690,6 +1263,16 @@ pub(in crate::editor) fn shortcuts(
             return true;
         }
     } else {
+        if keys.just_pressed(KeyCode::Delete) {
+            actions.write(Action::ImageEdit(EditAction::DeleteLayer));
+            return true;
+        }
+        if keys.just_pressed(KeyCode::F2) {
+            actions.write(Action::ImageEdit(EditAction::Layers(
+                layers::LayerAction::Command("layer.renameLayer"),
+            )));
+            return true;
+        }
         if keys.just_pressed(KeyCode::KeyB) {
             let action = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {
                 EditAction::Tool(if viewer.edit.drawing_tool == PhotoTool::Pencil {
@@ -712,6 +1295,15 @@ pub(in crate::editor) fn shortcuts(
         ] {
             if keys.just_pressed(key) {
                 actions.write(Action::ImageEdit(EditAction::Tool(tool)));
+                return true;
+            }
+        }
+        for (key, action) in [
+            (KeyCode::KeyX, EditAction::SwapColors),
+            (KeyCode::KeyD, EditAction::ResetColors),
+        ] {
+            if keys.just_pressed(key) {
+                actions.write(Action::ImageEdit(action));
                 return true;
             }
         }
@@ -800,5 +1392,119 @@ mod tests {
         state.select_tool(state.drawing_tool);
         assert_eq!(state.tool, PhotoTool::Pencil);
         assert_eq!(state.size, 3.0);
+    }
+
+    #[test]
+    fn pixel_eraser_removes_whole_cells_without_soft_edges() {
+        let mut state = State {
+            tool: PhotoTool::Eraser,
+            eraser_mode: EraserMode::Pixel,
+            size: 1.0,
+            hardness: 0.1,
+            opacity: 1.0,
+            ..Default::default()
+        };
+        let opaque = || {
+            let mut surface = Surface::new(PixelFormat::RGBA8);
+            surface.fill_rect(photocraft_geom::Rect::new(0, 0, 20, 16), &[1.0; 4]);
+            surface
+        };
+        for size in [1.0, 2.0, 3.0, 7.0] {
+            state.size = size;
+            let brush = state.brush();
+            assert!(brush.aliased && brush.erase);
+            assert_eq!(brush.hardness, 1.0);
+            assert_eq!(brush.flow, 1.0);
+            let points = [Vec2::new(2.1, 6.2), Vec2::new(14.7, 6.8)]
+                .map(|point| state.snap_point(point))
+                .map(|p| StrokePoint::new(p.x as f64, p.y as f64, 1.0));
+            let mut pixels = opaque();
+            photocraft_paint::render_stroke(&mut pixels, &brush, &points, None, false, 1.0);
+            for y in 0..16 {
+                for x in 0..20 {
+                    let alpha = pixels.rgba(x, y)[3];
+                    assert!(
+                        alpha == 0.0 || alpha == 1.0,
+                        "Pixel eraser size {size} smoothed {x},{y}: {alpha}"
+                    );
+                    if size == 1.0 {
+                        assert_eq!(
+                            alpha,
+                            if y == 6 && (2..=14).contains(&x) {
+                                0.0
+                            } else {
+                                1.0
+                            },
+                            "One-pixel eraser touched the wrong cell {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+        state.eraser_mode = EraserMode::Brush;
+        state.size = 7.0;
+        let mut soft = opaque();
+        photocraft_paint::render_stroke(
+            &mut soft,
+            &state.brush(),
+            &[StrokePoint::new(7.3, 7.7, 1.0)],
+            None,
+            false,
+            1.0,
+        );
+        assert!(
+            (0..16).any(|y| (0..20).any(|x| {
+                let alpha = soft.rgba(x, y)[3];
+                alpha > 0.0 && alpha < 1.0
+            })),
+            "Normal eraser must keep its soft edge"
+        );
+        state.eraser_mode = EraserMode::Pixel;
+        state.opacity = 0.5;
+        assert_eq!(
+            state.brush().opacity,
+            0.5,
+            "Respect explicitly chosen opacity, as PhotoCraft does"
+        );
+        assert_eq!(
+            state.hardness, 0.1,
+            "Pixel mode must not overwrite the soft eraser settings"
+        );
+    }
+
+    #[test]
+    fn eraser_modes_remember_sizes_and_snap_even_and_odd_tips() {
+        let mut state = State {
+            size: 24.0,
+            pencil_size: 1.0,
+            eraser_size: 12.0,
+            pixel_eraser_size: 1.0,
+            ..Default::default()
+        };
+        state.select_tool(PhotoTool::Eraser);
+        assert_eq!(state.size, 12.0);
+        state.select_eraser_mode(EraserMode::Pixel);
+        assert_eq!(state.size, 1.0);
+        assert!(state.pixel_square());
+        assert_eq!(state.snap_point(Vec2::new(2.1, 6.8)), Vec2::new(2.5, 6.5));
+        state.size = 2.0;
+        assert_eq!(state.snap_point(Vec2::new(2.1, 6.8)), Vec2::new(2.0, 7.0));
+        state.size = 7.0;
+        assert!(!state.pixel_square());
+        state.select_eraser_mode(EraserMode::Brush);
+        assert_eq!(state.size, 12.0);
+        state.size = 16.0;
+        state.select_eraser_mode(EraserMode::Pixel);
+        assert_eq!(state.size, 7.0);
+        state.select_tool(PhotoTool::Brush);
+        assert_eq!(state.size, 24.0);
+        state.select_tool(PhotoTool::Pencil);
+        assert_eq!(state.size, 1.0);
+        state.select_tool(PhotoTool::Eraser);
+        assert_eq!(state.eraser_mode, EraserMode::Pixel);
+        assert_eq!(state.size, 7.0);
+        state.select_eraser_mode(EraserMode::Brush);
+        assert_eq!(state.size, 16.0);
+        assert_eq!(state.snap_point(Vec2::new(2.1, 6.8)), Vec2::new(2.1, 6.8));
     }
 }

@@ -16,6 +16,335 @@ use bevy::{
     window::CursorMoved,
 };
 
+#[test]
+#[ignore = "requires GPU; renames via the real file menu and F2, rejects collisions, cancels, and retains dirty image layers"]
+fn gpu_browser_renames_files_without_losing_open_image_edits() {
+    let fixture = Fixture::new();
+    std::fs::copy(
+        fixture.source("picture.png"),
+        fixture.assets().join("picture.png"),
+    )
+    .unwrap();
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([10, 20, 30, 255]))
+        .save(fixture.assets().join("occupied.png"))
+        .unwrap();
+    let original = std::fs::read(fixture.assets().join("picture.png")).unwrap();
+    let occupied = std::fs::read(fixture.assets().join("occupied.png")).unwrap();
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.assets();
+            editor.project.asset_root = fixture.assets();
+            editor.drawer = false;
+            browser.refresh(&mut editor.project);
+        });
+    warm(&mut app, 30);
+    let file = app
+        .world()
+        .resource::<Browser>()
+        .files
+        .iter()
+        .position(|file| file.path == PathBuf::from("picture.png"))
+        .unwrap();
+    app.world_mut().write_message(Action::ViewImage(file));
+    warm(&mut app, 30);
+    let tab = app.world().resource::<Editor>().viewing_image.unwrap();
+    app.world_mut().write_message(Action::ImageEdit(
+        super::super::image_viewer::edit::EditAction::Edit,
+    ));
+    for _ in 0..120 {
+        frame(&mut app);
+        if app
+            .world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .is_some(),
+        "Image edit must load: status={}, error={:?}",
+        app.world().resource::<Editor>().status,
+        app.world().resource::<ImageViewer>().edit.error
+    );
+    app.world_mut().write_message(Action::ImageEdit(
+        super::super::image_viewer::edit::EditAction::Layers(
+            super::super::image_viewer::edit::layers::LayerAction::Group,
+        ),
+    ));
+    warm(&mut app, 6);
+    app.world_mut().resource_mut::<Editor>().drawer = true;
+    warm(&mut app, 24);
+    let file = app
+        .world()
+        .resource::<Browser>()
+        .files
+        .iter()
+        .position(|file| file.path == PathBuf::from("picture.png"))
+        .unwrap();
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .dirty()
+    );
+    let card = {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &drawer::FileCard)>()
+            .iter(world)
+            .find(|(_, card)| card.0 == browser::Entry::Image(file))
+            .unwrap()
+            .0
+    };
+    let point = rect(&mut app, card).center();
+    click(&mut app, window, point, MouseButton::Right);
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/browser-rename-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    capture_when(&mut app, &target, &output.join("01-file-menu.png"), |_| {
+        true
+    });
+    let rename = app.world().resource::<ContextUi>().rename;
+    let point = rect(&mut app, rename).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Rename);
+    let name = app.world().resource::<ContextUi>().name;
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(name)
+            .unwrap()
+            .value()
+            .to_string(),
+        "picture"
+    );
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(name));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("02-rename-dialog.png"),
+        |_| true,
+    );
+    for invalid in ["../bad", "", "occupied"] {
+        app.world_mut()
+            .get_mut::<EditableText>(name)
+            .unwrap()
+            .editor_mut()
+            .set_text(invalid);
+        key(&mut app, window, KeyCode::Enter, Key::Enter);
+        assert!(app.world().resource::<BrowserContext>().phase == Phase::Rename);
+        assert!(!app.world().resource::<BrowserContext>().error.is_empty());
+        assert_eq!(
+            std::fs::read(fixture.assets().join("picture.png")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(fixture.assets().join("occupied.png")).unwrap(),
+            occupied
+        );
+    }
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("03-name-collision.png"),
+        |_| true,
+    );
+    app.world_mut()
+        .get_mut::<EditableText>(name)
+        .unwrap()
+        .editor_mut()
+        .set_text("Обложка");
+    warm(&mut app, 2);
+    let submit = app.world().resource::<ContextUi>().submit;
+    let point = rect(&mut app, submit).center();
+    click(&mut app, window, point, MouseButton::Left);
+    warm(&mut app, 8);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Closed);
+    assert!(!fixture.assets().join("picture.png").exists());
+    assert_eq!(
+        std::fs::read(fixture.assets().join("Обложка.png")).unwrap(),
+        original
+    );
+    assert_eq!(app.world().resource::<Editor>().viewing_image, Some(tab));
+    assert_eq!(
+        app.world()
+            .resource::<Editor>()
+            .image_tab(tab)
+            .unwrap()
+            .path,
+        PathBuf::from("Обложка.png")
+    );
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .dirty()
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("04-renamed-file.png"),
+        |_| true,
+    );
+    key(&mut app, window, KeyCode::F2, Key::F2);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Rename);
+    app.world_mut()
+        .get_mut::<EditableText>(name)
+        .unwrap()
+        .editor_mut()
+        .set_text("Отмена");
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Closed);
+    assert!(!fixture.assets().join("Отмена.png").exists());
+    key(&mut app, window, KeyCode::F2, Key::F2);
+    app.world_mut()
+        .get_mut::<EditableText>(name)
+        .unwrap()
+        .editor_mut()
+        .set_text("Портрет.PNG");
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Closed);
+    assert!(fixture.assets().join("Портрет.png").exists());
+    assert!(!fixture.assets().join("Портрет.PNG.png").exists());
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .dirty()
+    );
+    eprintln!("Rename screenshots: {}", output.display());
+}
+
+#[test]
+#[ignore = "requires GPU; duplicates an open GLB through the real file menu, selects copies and keeps the original tab and scene edits"]
+fn gpu_browser_duplicates_saved_models_from_the_file_menu() {
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    let fixture = Fixture::new();
+    let mut project = crate::EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    copy_tree(&project.asset_root, &fixture.assets());
+    project.asset_root = fixture.assets();
+    let original_path = PathBuf::from(&project.catalog[0].asset);
+    let original_bytes = std::fs::read(fixture.assets().join(&original_path)).unwrap();
+    let (mut app, window, target) = lighting_ui_render::fixture_project(project);
+    app.world_mut().write_message(Action::ViewModel(0));
+    warm(&mut app, 20);
+    let before = app.world().resource::<Editor>().edits.clone();
+    let initial_count = app.world().resource::<Editor>().project.catalog.len();
+    app.world_mut().resource_mut::<Editor>().drawer = true;
+    let folder = app
+        .world()
+        .resource::<Browser>()
+        .folders
+        .iter()
+        .position(|folder| folder.path == original_path.parent().unwrap())
+        .unwrap();
+    app.world_mut().resource_mut::<Browser>().navigate(folder);
+    warm(&mut app, 30);
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/browser-duplicate-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    for number in 1..=2 {
+        let card = {
+            let world = app.world_mut();
+            world
+                .query::<(Entity, &drawer::FileCard)>()
+                .iter(world)
+                .find(|(_, card)| card.0 == browser::Entry::Model(0))
+                .unwrap()
+                .0
+        };
+        let point = rect(&mut app, card).center();
+        click(&mut app, window, point, MouseButton::Right);
+        assert!(app.world().resource::<BrowserContext>().file_menu());
+        let duplicate = app.world().resource::<ContextUi>().duplicate;
+        if number == 1 {
+            capture_when(
+                &mut app,
+                &target,
+                &output.join("01-duplicate-menu.png"),
+                |_| true,
+            );
+        }
+        let point = rect(&mut app, duplicate).center();
+        click(&mut app, window, point, MouseButton::Left);
+        for _ in 0..240 {
+            frame(&mut app);
+            if app.world().resource::<Editor>().project.catalog.len() == initial_count + number {
+                break;
+            }
+        }
+        warm(&mut app, 8);
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(
+            editor.project.catalog.len(),
+            initial_count + number,
+            "{}",
+            editor.status
+        );
+        assert_eq!(editor.viewing_model, Some(0));
+        assert_eq!(editor.edits, before);
+        assert_eq!(
+            std::fs::read(fixture.assets().join(&original_path)).unwrap(),
+            original_bytes
+        );
+        let suffix = if number == 1 {
+            " — копия".to_owned()
+        } else {
+            format!(" — копия ({number})")
+        };
+        let copy = original_path.with_file_name(format!(
+            "{}{suffix}.glb",
+            original_path.file_stem().unwrap().to_string_lossy()
+        ));
+        let copied = editor
+            .project
+            .catalog
+            .iter()
+            .position(|model| std::path::Path::new(&model.asset) == copy)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(fixture.assets().join(&copy)).unwrap(),
+            original_bytes
+        );
+        assert_eq!(
+            app.world().resource::<drawer::BrowserUi>().selected_entry,
+            Some(browser::Entry::Model(copied))
+        );
+    }
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("02-created-copies.png"),
+        |_| true,
+    );
+    eprintln!("Duplicate screenshots: {}", output.display());
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -166,6 +495,95 @@ fn folder_card(app: &mut App, path: &str) -> Vec2 {
         })
         .unwrap()
 }
+
+fn folder_tree_item(app: &mut App, path: &str) -> (Entity, Vec2) {
+    let index = app
+        .world()
+        .resource::<Browser>()
+        .folders
+        .iter()
+        .position(|folder| folder.path == PathBuf::from(path))
+        .unwrap();
+    let world = app.world_mut();
+    let mut controls = world
+        .query_filtered::<(Entity, &Control, &ComputedNode, &UiGlobalTransform), With<AssetOpen>>();
+    controls
+        .iter(world)
+        .find_map(|(entity, control, node, transform)| {
+            (matches!(control.look, Look::Regular)
+                && matches!(control.action, Action::Browse(folder) if folder == index)
+                && !node.is_empty())
+            .then_some((entity, transform.affine().translation))
+        })
+        .expect("The real folder tree item must be visible")
+}
+
+#[test]
+#[ignore = "requires GPU; double-clicks real tree entries before/after a file-only rename and filesystem refresh"]
+fn gpu_browser_folder_tree_keeps_navigation_after_file_rename_and_refresh() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.assets().join("notes.dialog"), b"{}").unwrap();
+    let (mut app, window, _) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.assets();
+            editor.project.asset_root = fixture.assets();
+            editor.drawer = true;
+            browser.refresh(&mut editor.project);
+        });
+    warm(&mut app, 20);
+
+    let assert_open = |app: &App, path: &str| {
+        let browser = app.world().resource::<Browser>();
+        assert_eq!(browser.folders[browser.current].path, PathBuf::from(path));
+    };
+    let (entity, point) = folder_tree_item(&mut app, "textures");
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "");
+    assert_eq!(folder_tree_item(&mut app, "textures").0, entity);
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "textures");
+
+    // Renaming a narrative file advances the scan generation without changing
+    // the hierarchy. Tree entries must not keep the old FileCard/DropFolder IDs.
+    std::fs::rename(
+        fixture.assets().join("notes.dialog"),
+        fixture.assets().join("renamed.dialog"),
+    )
+    .unwrap();
+    {
+        let mut browser = app.world_mut().resource_mut::<Browser>();
+        let tree_revision = browser.tree_revision;
+        assert!(browser.rename_narrative(
+            &fixture.assets(),
+            std::path::Path::new("notes.dialog"),
+            std::path::Path::new("renamed.dialog"),
+        ));
+        assert_eq!(browser.tree_revision, tree_revision);
+    }
+    warm(&mut app, 5);
+    let (entity, point) = folder_tree_item(&mut app, "reference");
+    let scan = app.world().resource::<Browser>().scan_revision;
+    assert_eq!(app.world().get::<drawer::FileCard>(entity).unwrap().1, scan);
+    assert_eq!(
+        app.world().get::<drawer::DropFolder>(entity).unwrap().1,
+        scan
+    );
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "textures");
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "reference");
+
+    app.world_mut().write_message(Action::BrowseRefresh);
+    warm(&mut app, 5);
+    let (_, point) = folder_tree_item(&mut app, "textures");
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "reference");
+    click(&mut app, window, point, MouseButton::Left);
+    assert_open(&app, "textures");
+}
+
 fn enter_name(app: &mut App, window: Entity, name: &str) {
     let input = app.world().resource::<ContextUi>().name;
     app.world_mut()
@@ -189,8 +607,266 @@ fn finish_import(app: &mut App) {
 }
 
 #[test]
+#[ignore = "requires GPU; right-clicks real file cards and empty space, checks selection and executes the file menu"]
+fn gpu_browser_context_menu_selects_files_and_separates_creation_actions() {
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = true;
+    {
+        let mut browser = app.world_mut().resource_mut::<Browser>();
+        let folder = browser
+            .folders
+            .iter()
+            .position(|folder| folder.path == PathBuf::from("models"))
+            .unwrap();
+        browser.navigate(folder);
+    }
+    warm(&mut app, 35);
+    let card = |app: &mut App, model| {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &drawer::FileCard)>()
+            .iter(world)
+            .find_map(|(entity, card)| (card.0 == browser::Entry::Model(model)).then_some(entity))
+            .unwrap()
+    };
+    let first = card(&mut app, 0);
+    let second = card(&mut app, 1);
+    let first_point = rect(&mut app, first).center();
+    let second_point = rect(&mut app, second).min + Vec2::splat(20.0);
+    let remove = {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &Control)>()
+            .iter(world)
+            .find_map(|(entity, control)| {
+                matches!(control.action, Action::BrowserDeleteFile).then_some(entity)
+            })
+            .unwrap()
+    };
+    let assert_menu = |app: &App, selected: Option<browser::Entry>| {
+        let context = app.world().resource::<BrowserContext>();
+        let ui = app.world().resource::<ContextUi>();
+        assert!(context.phase == Phase::Menu);
+        assert_eq!(
+            app.world().resource::<drawer::BrowserUi>().selected_entry,
+            selected
+        );
+        for entity in ui.creation {
+            assert_eq!(
+                app.world().get::<Node>(entity).unwrap().display,
+                if selected.is_some() {
+                    Display::None
+                } else {
+                    Display::Flex
+                }
+            );
+        }
+        for entity in [ui.open, remove] {
+            assert_eq!(
+                app.world().get::<Node>(entity).unwrap().display,
+                if selected.is_some() {
+                    Display::Flex
+                } else {
+                    Display::None
+                }
+            );
+        }
+        if let Some(entry) = context.menu_entry {
+            assert!(
+                app.world()
+                    .get::<InteractionDisabled>(entry.entity)
+                    .is_some()
+            );
+            assert_eq!(
+                *app.world().get::<BorderColor>(entry.entity).unwrap(),
+                BorderColor::all(FOCUS)
+            );
+            assert_eq!(
+                app.world().get::<BackgroundColor>(entry.entity).unwrap().0,
+                ACTIVE
+            );
+        }
+    };
+
+    // No preliminary left click: the file under RMB becomes selected immediately.
+    click(&mut app, window, second_point, MouseButton::Right);
+    assert_menu(&app, Some(browser::Entry::Model(1)));
+    let output =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/browser-context-actions-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    capture_when(&mut app, &target, &output.join("01-file-menu.png"), |_| {
+        true
+    });
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(second));
+    assert_eq!(
+        app.world().resource::<drawer::BrowserUi>().selected_entry,
+        Some(browser::Entry::Model(1))
+    );
+
+    // Opening a selected card's menu and retargeting another card keep selection visible.
+    click(&mut app, window, first_point, MouseButton::Left);
+    click(&mut app, window, first_point, MouseButton::Right);
+    assert_menu(&app, Some(browser::Entry::Model(0)));
+    click(&mut app, window, second_point, MouseButton::Right);
+    assert_menu(&app, Some(browser::Entry::Model(1)));
+
+    let grid = app.world().resource::<drawer::BrowserUi>().grid;
+    let empty = rect(&mut app, grid).max - Vec2::splat(24.0);
+    click(&mut app, window, empty, MouseButton::Right);
+    assert_menu(&app, None);
+    capture_when(&mut app, &target, &output.join("02-empty-menu.png"), |_| {
+        true
+    });
+
+    click(&mut app, window, second_point, MouseButton::Right);
+    assert_menu(&app, Some(browser::Entry::Model(1)));
+    let open = app.world().resource::<ContextUi>().open;
+    let open_point = rect(&mut app, open).center();
+    // A right click inside the popup must not select a card underneath it.
+    click(&mut app, window, open_point, MouseButton::Right);
+    assert_menu(&app, Some(browser::Entry::Model(1)));
+    click(&mut app, window, open_point, MouseButton::Left);
+    warm(&mut app, 12);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Closed);
+    assert_eq!(app.world().resource::<Editor>().viewing_model, Some(1));
+}
+
+#[test]
+#[ignore = "requires GPU; creates a scene via the actual context menu, validates/cancels names and opens its card"]
+fn gpu_browser_creates_scene_from_context_menu_and_opens_it_on_double_click() {
+    let fixture = Fixture::new();
+    std::fs::create_dir(fixture.assets().join("scenes")).unwrap();
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.assets();
+            editor.project.asset_root = fixture.assets();
+            editor.drawer = true;
+            browser.refresh(&mut editor.project);
+            let folder = browser
+                .folders
+                .iter()
+                .position(|folder| folder.path == PathBuf::from("scenes"))
+                .unwrap();
+            browser.navigate(folder);
+        });
+    warm(&mut app, 25);
+    app.world_mut()
+        .write_message(Action::Select(Selection::Camera(0)));
+    app.world_mut()
+        .write_message(Action::Number(Field::Lens, 65.0));
+    warm(&mut app, 3);
+    let (previous_room, previous_edits) = {
+        let editor = app.world().resource::<Editor>();
+        (editor.room, editor.edits.clone())
+    };
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/browser-scene-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    let grid = app.world().resource::<drawer::BrowserUi>().grid;
+    let empty = rect(&mut app, grid).max - Vec2::splat(24.0);
+    click(&mut app, window, empty, MouseButton::Right);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Menu);
+    capture_when(&mut app, &target, &output.join("01-menu.png"), |_| true);
+    let new_scene = {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &Control)>()
+            .iter(world)
+            .find(|(_, control)| matches!(control.action, Action::BrowserNewScene))
+            .unwrap()
+            .0
+    };
+    let point = rect(&mut app, new_scene).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Scene);
+    let name = app.world().resource::<ContextUi>().name;
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(name));
+    app.world_mut()
+        .get_mut::<EditableText>(name)
+        .unwrap()
+        .editor_mut()
+        .set_text("Отменено");
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    assert!(!fixture.assets().join("scenes/Отменено.scene").exists());
+
+    click(&mut app, window, empty, MouseButton::Right);
+    let point = rect(&mut app, new_scene).center();
+    click(&mut app, window, point, MouseButton::Left);
+    enter_name(&mut app, window, "../outside");
+    assert!(app.world().resource::<BrowserContext>().phase == Phase::Scene);
+    assert!(!app.world().resource::<BrowserContext>().error.is_empty());
+    app.world_mut()
+        .get_mut::<EditableText>(name)
+        .unwrap()
+        .editor_mut()
+        .set_text("Новая локация.SCENE");
+    warm(&mut app, 3);
+    capture_when(&mut app, &target, &output.join("02-dialog.png"), |_| true);
+    let submit = app.world().resource::<ContextUi>().submit;
+    let point = rect(&mut app, submit).center();
+    click(&mut app, window, point, MouseButton::Left);
+    finish_import(&mut app);
+    let path = PathBuf::from("scenes/Новая локация.scene");
+    let document =
+        crate::LevelEdits::<String>::read(&fixture.assets(), path.to_str().unwrap()).unwrap();
+    assert_eq!(document.scene.as_ref().unwrap().label, "Новая локация");
+    assert!(document.models.is_empty());
+    let room = app
+        .world()
+        .resource::<Editor>()
+        .project
+        .scenes
+        .iter()
+        .position(|scene| PathBuf::from(&scene.file) == path)
+        .unwrap();
+    let file = app
+        .world()
+        .resource::<Browser>()
+        .files
+        .iter()
+        .position(|file| file.path == path)
+        .unwrap();
+    assert_eq!(
+        app.world().resource::<drawer::BrowserUi>().selected_entry,
+        Some(browser::Entry::Scene { file, room })
+    );
+    assert_eq!(app.world().resource::<Editor>().room, previous_room);
+    assert_eq!(app.world().resource::<Editor>().edits, previous_edits);
+    let card = {
+        let world = app.world_mut();
+        world
+            .query::<(Entity, &Control, &ChildOf)>()
+            .iter(world)
+            .find(|(_, control, parent)| {
+                matches!(control.action, Action::Open(id) if id == room) && parent.parent() == grid
+            })
+            .unwrap()
+            .0
+    };
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(card));
+    let point = rect(&mut app, card).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert_eq!(app.world().resource::<Editor>().room, previous_room);
+    click(&mut app, window, point, MouseButton::Left);
+    warm(&mut app, 12);
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.room, room);
+    assert!(editor.ready && editor.definition().is_native());
+    assert!(editor.edits.models.is_empty());
+    assert!(editor.document_dirty(previous_room));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("03-empty-scene.png"),
+        |_| true,
+    );
+}
+
+#[test]
 #[ignore = "requires GPU adapter; creates a white PNG through the real context menu and size dialog"]
-fn gpu_browser_creates_white_images_with_presets_custom_sizes_and_cancel() {
+fn gpu_browser_creates_white_images_with_custom_sizes_and_cancel() {
     let fixture = Fixture::new();
     let (mut app, window, target) = lighting_ui_render::fixture();
     app.world_mut()
@@ -233,24 +909,20 @@ fn gpu_browser_creates_white_images_with_presets_custom_sizes_and_cancel() {
         let ui = app.world().resource::<ContextUi>();
         (ui.name, ui.size.width, ui.size.height, ui.dialog, ui.submit)
     };
-    let preset = {
-        let world = app.world_mut();
-        world
-            .query::<(Entity, &Control)>()
-            .iter(world)
-            .find(|(_, control)| matches!(control.action, Action::BrowserImageSize(1920, 1080)))
-            .unwrap()
-            .0
-    };
-    let point = rect(&mut app, preset).center();
-    click(&mut app, window, point, MouseButton::Left);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(name));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("02-default-dialog.png"),
+        |_| true,
+    );
     assert_eq!(
         app.world()
             .get::<EditableText>(width)
             .unwrap()
             .value()
             .to_string(),
-        "1920"
+        "1024"
     );
     assert_eq!(
         app.world()
@@ -258,7 +930,7 @@ fn gpu_browser_creates_white_images_with_presets_custom_sizes_and_cancel() {
             .unwrap()
             .value()
             .to_string(),
-        "1080"
+        "1024"
     );
     app.world_mut()
         .get_mut::<EditableText>(name)

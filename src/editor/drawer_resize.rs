@@ -46,6 +46,7 @@ pub(crate) struct ResizeGrip;
 pub(crate) fn resize(
     mut commands: Commands,
     editor: Res<Editor>,
+    viewer: Option<Res<ImageViewer>>,
     window: Single<(Entity, &Window, Option<&CursorIcon>), With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut size: ResMut<DrawerSize>,
@@ -56,7 +57,11 @@ pub(crate) fn resize(
     let (window_entity, window, cursor_icon) = *window;
     let cursor = window.cursor_position();
     let top = window.height() - FOOT - motion.visible_height;
+    let color_picker = viewer
+        .as_ref()
+        .is_some_and(|viewer| viewer.edit.color_picker.is_some());
     let settled = editor.pending.is_none()
+        && !color_picker
         && !editor.hdri_library_open
         && !editor.browser_popup
         && editor.drawer
@@ -65,6 +70,7 @@ pub(crate) fn resize(
         && !editor.sidebar.resizing();
 
     if editor.pending.is_some()
+        || color_picker
         || editor.hdri_library_open
         || editor.browser_popup
         || !editor.drawer

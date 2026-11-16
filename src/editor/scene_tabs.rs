@@ -93,6 +93,8 @@ fn close_icon(commands: &mut Commands, parent: Entity) -> Entity {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DocumentTab {
+    Generation,
+    Narrative(usize),
     Scene(Room),
     Model(usize),
     Image(usize),
@@ -101,6 +103,18 @@ enum DocumentTab {
 impl DocumentTab {
     fn caption(self, editor: &Editor) -> String {
         match self {
+            Self::Generation => "3D генерация".into(),
+            Self::Narrative(id) => editor
+                .narrative
+                .get(id)
+                .map(|d| {
+                    d.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default(),
             Self::Scene(room) => editor.project.scenes[room].label.clone(),
             Self::Model(index) => editor.project.catalog[index].label.clone(),
             Self::Image(id) => editor
@@ -118,8 +132,12 @@ impl DocumentTab {
 
     fn active(self, editor: &Editor) -> bool {
         match self {
+            Self::Generation => editor.generation.active,
+            Self::Narrative(id) => editor.narrative.active == Some(id),
             Self::Scene(room) => {
-                editor.viewing_model.is_none()
+                !editor.generation.active
+                    && editor.narrative.active.is_none()
+                    && editor.viewing_model.is_none()
                     && editor.viewing_image.is_none()
                     && editor.has_scene()
                     && editor.room == room
@@ -131,6 +149,8 @@ impl DocumentTab {
 
     fn open(self) -> Action {
         match self {
+            Self::Generation => Action::Generation(GenerationAction::Open),
+            Self::Narrative(id) => Action::Narrative(NarrativeAction::Open(id)),
             Self::Scene(room) => Action::Open(room),
             Self::Model(index) => Action::ViewModel(index),
             Self::Image(id) => Action::OpenImageTab(id),
@@ -139,6 +159,8 @@ impl DocumentTab {
 
     fn close(self) -> Action {
         match self {
+            Self::Generation => Action::Generation(GenerationAction::Close),
+            Self::Narrative(id) => Action::Narrative(NarrativeAction::Close(id)),
             Self::Scene(room) => Action::CloseTab(room),
             Self::Model(index) => Action::CloseModelTab(index),
             Self::Image(id) => Action::CloseImageTab(id),
@@ -147,6 +169,8 @@ impl DocumentTab {
 
     fn kind(self) -> &'static str {
         match self {
+            Self::Generation => "вкладку генерации",
+            Self::Narrative(_) => "документ",
             Self::Scene(_) => "сцену",
             Self::Model(_) => "модель",
             Self::Image(_) => "изображение",
@@ -159,6 +183,8 @@ impl DocumentTab {
             self.caption(editor),
             if active {
                 match self {
+                    Self::Generation => " · активная вкладка",
+                    Self::Narrative(_) => " · активный документ",
                     Self::Scene(_) => " · активная сцена",
                     Self::Model(_) => " · активная модель",
                     Self::Image(_) => " · активное изображение",
@@ -301,12 +327,22 @@ pub(super) fn refresh(
                 .iter()
                 .map(|tab| DocumentTab::Image(tab.id)),
         )
+        .chain(
+            editor
+                .narrative
+                .tabs
+                .iter()
+                .map(|d| DocumentTab::Narrative(d.id)),
+        )
+        .chain(editor.generation.opened.then_some(DocumentTab::Generation))
         .collect();
     let document_dirty = |document| match document {
+        DocumentTab::Generation => false,
+        DocumentTab::Narrative(id) => editor.narrative.get(id).is_some_and(|d| d.dirty()),
         DocumentTab::Scene(room) => {
             editor.document_dirty(room) || (room == editor.room && numeric.has_changes(editor))
         }
-        DocumentTab::Model(_) => false,
+        DocumentTab::Model(index) => editor.dirty_models.contains(&index),
         DocumentTab::Image(id) => editor.image_tab(id).is_some_and(|tab| tab.dirty),
     };
     if tabs.documents.as_ref() != Some(&documents) {
@@ -363,12 +399,18 @@ pub(super) fn refresh(
                 },
             );
             match document {
+                DocumentTab::Generation => {
+                    icons::spawn(commands, open, icons::Glyph::Box, 18.0, FOCUS);
+                }
+                DocumentTab::Narrative(_) => {
+                    icons::spawn(commands, open, icons::Glyph::Layers, 18.0, BLUE);
+                }
                 DocumentTab::Scene(_) => scene_icon(commands, open),
                 DocumentTab::Model(_) => {
                     icons::spawn(commands, open, icons::Glyph::Box, 18.0, FOCUS);
                 }
                 DocumentTab::Image(_) => {
-                    icons::spawn(commands, open, icons::Glyph::Eye, 18.0, GREEN);
+                    icons::spawn(commands, open, icons::Glyph::Image, 18.0, GREEN);
                 }
             }
             let active = document.active(editor);

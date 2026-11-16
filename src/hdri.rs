@@ -78,6 +78,11 @@ pub(crate) struct EnvironmentBackdrop {
     pub blur: f32,
 }
 
+/// Editor workspaces use a flat drafting background in orthographic views.
+/// Pilot/game cameras keep their own background policy.
+#[derive(Component)]
+pub(crate) struct OrthographicBackdrop(pub bool);
+
 #[derive(Resource, Default)]
 struct EnvironmentImages {
     builtin: HashMap<EnvironmentPreset, (Handle<Image>, Handle<Image>)>,
@@ -117,6 +122,8 @@ fn synchronize(
         Option<&EnvironmentMapLight>,
         Option<&Skybox>,
         Option<&EnvironmentBackdrop>,
+        Option<&Projection>,
+        Option<&OrthographicBackdrop>,
     )>,
     server: Res<AssetServer>,
     panoramas: Res<Assets<PanoramaMaps>>,
@@ -126,7 +133,7 @@ fn synchronize(
 ) {
     let active: HashSet<_> = cameras
         .iter()
-        .filter_map(|(_, settings, _, _, _)| match &settings.source {
+        .filter_map(|(_, settings, _, _, _, _, _)| match &settings.source {
             EnvironmentSource::Downloaded(path) => Some(path.as_str()),
             _ => None,
         })
@@ -138,7 +145,14 @@ fn synchronize(
     cache
         .backdrops
         .retain(|entity, _| cameras.contains(*entity));
-    for (entity, settings, current, current_sky, backdrop) in &cameras {
+    for (entity, settings, current, current_sky, backdrop, projection, drafting) in &cameras {
+        let show_panorama = settings.background
+            && !(drafting.is_some_and(|mode| mode.0)
+                && matches!(projection, Some(Projection::Orthographic(_))));
+        // Also remove a previous skybox while a replacement HDRI is loading.
+        if !show_panorama && current_sky.is_some() {
+            commands.entity(entity).remove::<Skybox>();
+        }
         let (diffuse, specular, skybox) = match &settings.source {
             EnvironmentSource::Builtin(preset) => {
                 let (diffuse, specular) = cache.builtin.entry(*preset).or_insert_with(|| {
@@ -180,7 +194,7 @@ fn synchronize(
             }
         };
         let skybox = if let Some(backdrop) =
-            backdrop.filter(|backdrop| settings.background && backdrop.blur > 0.0)
+            backdrop.filter(|backdrop| show_panorama && backdrop.blur > 0.0)
         {
             if let Some(image) = images.get(&specular) {
                 let level = (backdrop.blur.clamp(0.0, 1.0)
@@ -228,7 +242,7 @@ fn synchronize(
                 ..default()
             });
         }
-        if settings.background {
+        if show_panorama {
             if current_sky.is_none_or(|old| {
                 old.image.as_ref() != Some(&skybox)
                     || old.brightness != sky_brightness
@@ -240,8 +254,6 @@ fn synchronize(
                     rotation,
                 });
             }
-        } else {
-            camera.remove::<Skybox>();
         }
     }
 }
@@ -254,6 +266,75 @@ mod tests {
         image::{CompressedImageFormats, ImagePlugin, ImageType},
         render::render_resource::{TextureFormat, TextureViewDimension},
     };
+
+    #[test]
+    fn orthographic_editor_backdrops_preserve_lighting_and_restore_panorama() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            ImagePlugin::default(),
+            HdriPlugin,
+        ));
+        app.finish();
+        app.cleanup();
+        let camera = app
+            .world_mut()
+            .spawn((
+                CameraEnvironment {
+                    source: EnvironmentSource::Builtin(EnvironmentPreset::SmallStudio),
+                    brightness: 1200.0,
+                    rotation: 35.0,
+                    background: true,
+                },
+                Projection::Perspective(default()),
+                OrthographicBackdrop(true),
+            ))
+            .id();
+        app.update();
+        let map_state = |app: &App| {
+            let light = app.world().get::<EnvironmentMapLight>(camera).unwrap();
+            (
+                light.diffuse_map.id(),
+                light.specular_map.id(),
+                light.intensity,
+                light.rotation,
+            )
+        };
+        let lighting = map_state(&app);
+        assert!(app.world().get::<Skybox>(camera).is_some());
+        *app.world_mut().get_mut::<Projection>(camera).unwrap() =
+            Projection::Orthographic(OrthographicProjection::default_3d());
+        app.update();
+        assert!(app.world().get::<Skybox>(camera).is_none());
+        assert_eq!(map_state(&app), lighting);
+        assert!(
+            app.world()
+                .get::<CameraEnvironment>(camera)
+                .unwrap()
+                .background
+        );
+
+        // Piloting an orthographic game camera keeps its presentation policy.
+        app.world_mut()
+            .get_mut::<OrthographicBackdrop>(camera)
+            .unwrap()
+            .0 = false;
+        app.update();
+        assert!(app.world().get::<Skybox>(camera).is_some());
+        app.world_mut()
+            .get_mut::<OrthographicBackdrop>(camera)
+            .unwrap()
+            .0 = true;
+        app.update();
+        assert!(app.world().get::<Skybox>(camera).is_none());
+
+        *app.world_mut().get_mut::<Projection>(camera).unwrap() =
+            Projection::Perspective(default());
+        app.update();
+        assert!(app.world().get::<Skybox>(camera).is_some());
+        assert_eq!(map_state(&app), lighting);
+    }
 
     #[test]
     fn preview_backdrop_uses_a_blurred_view_without_changing_lighting_maps() {

@@ -153,10 +153,6 @@ impl Reveal {
 #[derive(Component, Default)]
 pub(super) struct Backdrop(f32);
 
-#[derive(Component)]
-#[require(UiTransform)]
-pub(super) struct Orbit;
-
 /// Move the artwork while keeping the button's hit target stationary.
 #[derive(Component)]
 #[require(UiTransform)]
@@ -376,7 +372,6 @@ fn reveal(
     time: Res<Time>,
     mut reveals: Query<(&mut Reveal, &mut UiTransform), Without<Motion>>,
     mut backdrops: Query<(&mut Backdrop, &mut BackgroundColor)>,
-    mut orbits: Query<&mut UiTransform, (With<Orbit>, Without<Reveal>, Without<Motion>)>,
 ) {
     let delta = time.delta_secs().min(0.05);
     for (mut reveal, mut transform) in &mut reveals {
@@ -396,14 +391,6 @@ fn reveal(
             0.0,
             0.65 * ease_out(backdrop.0 / 0.18),
         )));
-    }
-    for mut transform in &mut orbits {
-        let phase = time.elapsed_secs() * 0.55;
-        transform.set_if_neq(UiTransform {
-            translation: Val2::px(0.0, phase.sin() * 3.0),
-            rotation: Rot2::degrees((phase * 0.6).sin() * 1.4),
-            ..default()
-        });
     }
 }
 

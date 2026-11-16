@@ -350,6 +350,36 @@ impl Browser {
         self.refresh(project);
     }
 
+    /// Renaming a narrative file does not change folders or file indices.
+    pub fn rename_narrative(&mut self, root: &Path, from: &Path, to: &Path) -> bool {
+        let Some(file) = self.files.iter_mut().find(|file| file.path == from) else {
+            return false;
+        };
+        file.path = to.to_owned();
+        file.filename = to
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        file.extension = to
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        for file in &mut self.files {
+            if file.extension.eq_ignore_ascii_case("dialog")
+                || file.extension.eq_ignore_ascii_case("dcharacter")
+            {
+                if let Ok(metadata) = fs::metadata(root.join(&file.path)) {
+                    file.bytes = metadata.len();
+                }
+            }
+        }
+        self.revision += 1;
+        self.scan_revision += 1;
+        true
+    }
+
     fn record_error(&mut self, directory: &Path, error: &std::io::Error) {
         self.error.get_or_insert_with(|| {
             format!("Не удалось прочитать {}: {error}", directory.display())

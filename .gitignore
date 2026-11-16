@@ -1,5 +1,6 @@
 # Rust build output (including auxiliary crates).
 target/
+/.bevy-editor-build.lock
 *.exe
 *.dll
 *.pdb
@@ -7,6 +8,14 @@ target/
 *.rmeta
 *.ilk
 *.o
+*.obj
+*.lib
+*.exp
+*.iobj
+*.ipdb
+*.a
+*.so
+*.dylib
 *.rs.bk
 
 # Generated release and coverage output.
@@ -41,6 +50,8 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+CMakeFiles/
+CMakeCache.txt
 
 # Machine-specific IDE settings and local environment variables.
 .idea/

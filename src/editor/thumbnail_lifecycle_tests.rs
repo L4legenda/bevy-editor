@@ -89,6 +89,51 @@ fn stopping_a_scene_specific_preview_removes_its_camera_and_instance_hierarchy()
     assert!(world.get_entity(instance).is_err());
 }
 
+#[test]
+fn reloaded_models_invalidate_variants_and_scenes_and_lighting_rebuilds_model_cards() {
+    let mut project = EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    project.catalog.push(project.catalog[0].clone());
+    let editor = Editor::new(project, Default::default());
+    let mut previews = Thumbnails::new(&mut Assets::<Image>::default(), 3, 2);
+    let environment = crate::SceneLighting::editor_default();
+    previews.model_environment = Some(environment.clone());
+    previews.completed = [
+        Target::Model(0),
+        Target::Model(1),
+        Target::Model(2),
+        Target::Scene(0),
+        Target::Scene(1),
+    ]
+    .into();
+    let mut world = World::new();
+    let root = world.spawn_empty().id();
+    let camera = world.spawn(Camera::default()).id();
+    previews.view = Some(PreviewView {
+        entity: camera,
+        studio: true,
+    });
+    previews.job = Some(job(Target::Model(0), root, camera));
+    previews.invalidate_asset(&editor.project.catalog[0].asset);
+    let mut state = SystemState::<Commands>::new(&mut world);
+    previews.refresh_models(
+        &editor,
+        &environment,
+        &mut state.get_mut(&mut world).unwrap(),
+    );
+    state.apply(&mut world);
+    assert_eq!(previews.completed, HashSet::from([Target::Model(1)]));
+    assert!(previews.job.is_none());
+    assert!(world.get_entity(root).is_err());
+    let mut darker = environment.clone();
+    darker.exposure_ev100 += 1.0;
+    previews.refresh_models(&editor, &darker, &mut state.get_mut(&mut world).unwrap());
+    state.apply(&mut world);
+    assert!(previews.completed.is_empty());
+}
+
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -108,6 +153,27 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn reloading_an_unchanged_subasset_keeps_cached_previews() {
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.0.join("models")).unwrap();
+    let path = scratch.0.join("models/block.glb");
+    std::fs::write(&path, b"first version").unwrap();
+    let project = EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    let mut editor = Editor::new(project, Default::default());
+    editor.root.clone_from(&scratch.0);
+    let mut previews = previews();
+    previews.remember_asset(&editor, "models/block.glb");
+    assert!(!previews.asset_modified(&editor, "models/block.glb"));
+    std::fs::write(&path, b"changed geometry and material").unwrap();
+    assert!(previews.asset_modified(&editor, "models/block.glb"));
+    // GLTF and Scene0 can both report the same reload.
+    assert!(!previews.asset_modified(&editor, "models/block.glb"));
 }
 
 #[test]

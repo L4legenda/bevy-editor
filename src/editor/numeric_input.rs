@@ -6,9 +6,14 @@ use bevy::{input_focus::InputFocus, prelude::*, text::EditableText, window::Wind
 use super::{Editor, Field, Selection};
 use crate::project::LensKind;
 
+#[path = "numeric_scrub.rs"]
+mod scrub;
 #[cfg(test)]
 #[path = "numeric_input_tests.rs"]
 mod tests;
+pub(in crate::editor) use scrub::{
+    Number, Scrub, cursor as scrub_cursor, input as scrub_input, lock_text,
+};
 
 struct Draft {
     room: usize,
@@ -172,6 +177,7 @@ pub(in crate::editor) fn update(
     keys: Res<ButtonInput<KeyCode>>,
     mut fields: Query<(Entity, &Field, &mut EditableText)>,
     mut close_requests: MessageReader<WindowCloseRequested>,
+    scrub: Option<Res<Scrub>>,
 ) {
     let closing = close_requests.read().last().is_some();
     if !editor.ready || editor.pending.is_some() {
@@ -229,6 +235,11 @@ pub(in crate::editor) fn update(
         state.active = active;
     }
     let Some(entity) = active else { return };
+    if scrub.as_ref().is_some_and(|scrub| scrub.active(entity)) {
+        state.active = None;
+        state.drafts.remove(&entity);
+        return;
+    }
     let Ok((_, &field, mut input)) = fields.get_mut(entity) else {
         return;
     };

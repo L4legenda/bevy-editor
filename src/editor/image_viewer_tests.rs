@@ -8,6 +8,33 @@ use std::{
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+#[path = "image_brush_size_tests.rs"]
+mod brush_sizing;
+#[path = "image_cursor_restore_tests.rs"]
+mod cursor_restoration;
+#[path = "image_edge_paint_tests.rs"]
+mod edge_painting;
+#[path = "image_eyedropper_tests.rs"]
+mod eyedropper;
+#[path = "image_layers_tests.rs"]
+mod image_layers;
+#[path = "image_layer_drag_tests.rs"]
+mod layer_drag;
+#[path = "image_layer_ux_tests.rs"]
+mod layer_ux;
+#[path = "image_paint_tests.rs"]
+mod painting;
+#[path = "image_panel_resize_tests.rs"]
+mod panel_sizing;
+#[path = "image_canvas_tests.rs"]
+mod pixel_canvas;
+#[path = "image_eraser_tests.rs"]
+mod pixel_eraser;
+#[path = "image_selection_tests.rs"]
+mod selections;
+#[path = "image_color_tests.rs"]
+mod tool_colors;
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -71,6 +98,7 @@ impl Fixture {
             .init_resource::<crate::editor::Scene>()
             .init_resource::<viewport::PointerState>()
             .add_message::<Action>()
+            .add_message::<bevy::window::WindowEvent>()
             .add_systems(
                 Update,
                 (
@@ -136,7 +164,7 @@ fn svg_decoder_preserves_color_alpha_and_original_dimensions() {
 }
 
 #[test]
-fn zoom_keeps_the_point_under_the_cursor_and_clamps_pan_on_resize() {
+fn zoom_keeps_the_point_under_the_cursor_even_when_the_image_fits() {
     let mut viewer = ImageViewer {
         dimensions: Some(UVec2::new(2000, 1000)),
         zoom: Zoom::Scale(1.0),
@@ -146,12 +174,12 @@ fn zoom_keeps_the_point_under_the_cursor_and_clamps_pan_on_resize() {
     viewer.zoom_at(2.0, anchor, Vec2::new(1000.0, 500.0));
     assert_eq!(viewer.pan, -anchor);
     assert_eq!(viewer.zoom, Zoom::Scale(2.0));
-    viewer.pan = Vec2::splat(10000.0);
-    viewer.clamp_pan(Vec2::new(1000.0, 500.0));
-    assert_eq!(viewer.pan, Vec2::new(1500.0, 750.0));
+    viewer.dimensions = Some(UVec2::new(24, 12));
+    viewer.pan = Vec2::new(135.0, -80.0);
     viewer.zoom = Zoom::Fit;
-    viewer.clamp_pan(Vec2::new(700.0, 900.0));
-    assert_eq!(viewer.pan, Vec2::ZERO);
+    viewer.zoom_at(0.5, anchor, Vec2::new(700.0, 900.0));
+    assert_eq!(viewer.pan, Vec2::new(117.5, -15.0));
+    assert_eq!(viewer.zoom, Zoom::Scale(0.5));
     assert_eq!(
         Zoom::Fit.scale(Vec2::new(24.0, 12.0), Vec2::splat(900.0)),
         1.0
@@ -161,6 +189,171 @@ fn zoom_keeps_the_point_under_the_cursor_and_clamps_pan_on_resize() {
         viewer.source_size(UVec2::new(2000, 1000)),
         Vec2::new(1000.0, 500.0)
     );
+}
+
+#[test]
+fn small_image_pans_in_view_and_edit_modes_without_modifying_the_document() {
+    use crate::editor::photo_document::PhotoTool;
+    use bevy::window::SystemCursorIcon;
+
+    let fixture = Fixture::new();
+    let source = fixture.0.join("pan.png");
+    image::RgbaImage::from_pixel(32, 16, image::Rgba([225, 110, 65, 255]))
+        .save(&source)
+        .unwrap();
+    let original = std::fs::read(&source).unwrap();
+    let mut app = fixture.app();
+    app.add_systems(Update, tool_cursor::cursor.after(update));
+    let image = file(&app, "pan.png");
+    app.world_mut().write_message(Action::ViewImage(image));
+    wait_for_image(&mut app);
+    let window = app
+        .world_mut()
+        .query_filtered::<Entity, With<PrimaryWindow>>()
+        .single(app.world())
+        .unwrap();
+    let start = Vec2::new(640.0, 360.0);
+    let delta = Vec2::new(145.0, -85.0);
+    for (editing, tool, space, button, zoom) in [
+        (
+            false,
+            PhotoTool::Hand,
+            false,
+            MouseButton::Left,
+            ImageAction::Fit,
+        ),
+        (
+            false,
+            PhotoTool::Hand,
+            false,
+            MouseButton::Left,
+            ImageAction::ActualSize,
+        ),
+        (
+            true,
+            PhotoTool::Hand,
+            false,
+            MouseButton::Left,
+            ImageAction::Fit,
+        ),
+        (
+            true,
+            PhotoTool::Brush,
+            true,
+            MouseButton::Left,
+            ImageAction::ActualSize,
+        ),
+        (
+            true,
+            PhotoTool::Eraser,
+            false,
+            MouseButton::Middle,
+            ImageAction::Fit,
+        ),
+    ] {
+        if editing
+            && !app
+                .world()
+                .resource::<ImageViewer>()
+                .edit
+                .editing(app.world().resource::<Editor>().viewing_image)
+        {
+            app.world_mut()
+                .write_message(Action::ImageEdit(edit::EditAction::Edit));
+            wait_for_edit(&mut app);
+        }
+        if editing {
+            app.world_mut()
+                .write_message(Action::ImageEdit(edit::EditAction::Tool(tool)));
+        }
+        app.world_mut().write_message(Action::ImageView(zoom));
+        app.update();
+        if space {
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .press(KeyCode::Space);
+        }
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(start));
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(button);
+        app.update();
+        assert_eq!(
+            app.world().get::<CursorIcon>(window),
+            Some(&CursorIcon::from(SystemCursorIcon::Grabbing))
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(start + delta));
+        app.update();
+        assert_eq!(
+            app.world().resource::<ImageViewer>().pan,
+            delta,
+            "Small image must move with {tool:?}, space={space}, {button:?}"
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .release(button);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.update();
+        assert_eq!(
+            app.world().resource::<ImageViewer>().pan,
+            delta,
+            "Releasing the pointer must not recenter a fitted image"
+        );
+        assert!(app.world().resource::<ImageViewer>().gesture.is_none());
+        if !editing || tool == PhotoTool::Hand || space {
+            assert_eq!(
+                app.world().get::<CursorIcon>(window),
+                Some(&CursorIcon::from(SystemCursorIcon::Grab))
+            );
+        } else {
+            assert!(matches!(
+                app.world().get::<CursorIcon>(window),
+                Some(CursorIcon::Custom(_))
+            ));
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        // Resizing the viewport must not erase the user's pan offset either.
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .resolution
+            .set(1000.0, 620.0);
+        app.update();
+        assert_eq!(app.world().resource::<ImageViewer>().pan, delta);
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .resolution
+            .set(1280.0, 760.0);
+        app.update();
+        if editing {
+            let viewer = app.world().resource::<ImageViewer>();
+            let doc = viewer.edit.document(viewer.tab).unwrap();
+            assert!(
+                !doc.dirty() && !doc.can_undo(),
+                "Panning must not paint or create history"
+            );
+        }
+    }
+    app.world_mut()
+        .write_message(Action::ImageView(ImageAction::Fit));
+    app.update();
+    assert_eq!(app.world().resource::<ImageViewer>().pan, Vec2::ZERO);
+    assert_eq!(std::fs::read(source).unwrap(), original);
 }
 
 #[test]
@@ -370,8 +563,8 @@ fn gpu_image_gallery_and_viewer_match_editor_and_block_scene_input() {
     let pane_transform = app.world().get::<UiGlobalTransform>(pane).unwrap();
     let pane_top = pane_transform.affine().translation.y - pane_node.size().y * 0.5;
     assert!(
-        pane_top >= super::super::TOP - 1.0,
-        "Image tab must leave the top document tabs accessible"
+        (pane_top - super::super::IMAGE_TOP).abs() < 1.0,
+        "Image canvas must start directly below document tabs, without the scene hint row: {pane_top}"
     );
     capture_when(
         &mut app,
@@ -387,9 +580,23 @@ fn gpu_image_gallery_and_viewer_match_editor_and_block_scene_input() {
     );
     let scene_view = app.world().resource::<Editor>().view;
     let edits = app.world().resource::<Editor>().edits.clone();
+    let layout = |app: &App| {
+        let ui = app.world().resource::<ViewerUi>();
+        [ui.overlay, ui.canvas, ui.picture].map(|entity| {
+            let node = app.world().get::<ComputedNode>(entity).unwrap();
+            let transform = app.world().get::<UiGlobalTransform>(entity).unwrap();
+            Rect::from_center_size(transform.affine().translation, node.size())
+        })
+    };
+    let original_layout = layout(&app);
     app.world_mut().write_message(Action::Drawer);
     for _ in 0..25 {
         frame(&mut app);
+        assert_eq!(
+            layout(&app),
+            original_layout,
+            "The file manager must not resize or recenter the image workspace"
+        );
     }
     assert_eq!(
         app.world().resource::<Editor>().viewing_image,
@@ -478,14 +685,36 @@ fn gpu_image_gallery_and_viewer_match_editor_and_block_scene_input() {
     for _ in 0..5 {
         frame(&mut app);
     }
+    let interface = app.world().resource::<Interface>();
+    assert_eq!(
+        app.world().get::<Node>(interface.body).unwrap().top,
+        px(super::super::TOP)
+    );
+    assert_eq!(
+        app.world().get::<Node>(interface.toolbar).unwrap().height,
+        px(super::super::TOP)
+    );
+    assert_eq!(
+        app.world().get::<Node>(interface.tool_bar).unwrap().display,
+        Display::Flex
+    );
     let editor = app.world().resource::<Editor>();
     assert!(editor.drawer && editor.viewing_image.is_none());
     assert_eq!(editor.view, scene_view);
     assert_eq!(editor.edits, edits);
     let picture = app.world().resource::<ViewerUi>().picture;
     assert_eq!(
-        app.world().get::<ImageNode>(picture).unwrap().image,
-        Handle::default()
+        app.world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(
+                &app.world()
+                    .get::<MaterialNode<CanvasMaterial>>(picture)
+                    .unwrap()
+                    .0
+            )
+            .unwrap()
+            .image,
+        None
     );
     println!("Image viewer GPU artifacts: {}", output.display());
 }
@@ -523,6 +752,16 @@ fn click_control(
     wanted: impl Fn(Action) -> bool,
     button: MouseButton,
 ) {
+    click_control_offset(app, window, wanted, button, Vec2::ZERO);
+}
+
+fn click_control_offset(
+    app: &mut App,
+    window: Entity,
+    wanted: impl Fn(Action) -> bool,
+    button: MouseButton,
+    relative_offset: Vec2,
+) {
     use crate::editor::selection_outline::render_tests::frame;
     use bevy::{
         camera::RenderTarget,
@@ -537,7 +776,7 @@ fn click_control(
             .iter(world)
             .find_map(|(control, node, transform)| {
                 (wanted(control.action) && !node.is_empty())
-                    .then_some(transform.affine().translation)
+                    .then_some(transform.affine().translation + node.size() * relative_offset)
             })
             .expect("Missing document tab control")
     };
@@ -851,6 +1090,114 @@ fn gpu_photo_editor_paints_saves_and_reopens_native_layers() {
     for _ in 0..12 {
         frame(&mut app);
     }
+    // Put real document pixels underneath the floating selector. Opening,
+    // dismissing and using it must neither paint nor start canvas panning.
+    let mode_center = {
+        let world = app.world_mut();
+        let (_, node, transform) = world
+            .query::<(&Control, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find(|(control, node, _)| {
+                matches!(control.action, Action::ImageEdit(edit::EditAction::Menu))
+                    && !node.is_empty()
+            })
+            .unwrap();
+        transform.affine().translation * node.inverse_scale_factor()
+    };
+    let old_view = {
+        let world = app.world_mut();
+        let (_, node, transform) = world
+            .query_filtered::<(Entity, &ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+            .single(world)
+            .unwrap();
+        let canvas_center = transform.affine().translation * node.inverse_scale_factor();
+        let mut viewer = world.resource_mut::<ImageViewer>();
+        let old = (viewer.zoom, viewer.pan);
+        viewer.zoom = Zoom::Scale(1.0);
+        viewer.pan = mode_center - canvas_center;
+        old
+    };
+    let id = app.world().resource::<Editor>().viewing_image;
+    let revision = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(id)
+        .unwrap()
+        .revision;
+    let menu_pan = app.world().resource::<ImageViewer>().pan;
+    click_action(&mut app, window, |a| {
+        matches!(a, Action::ImageEdit(edit::EditAction::Menu))
+    });
+    assert!(app.world().resource::<ImageViewer>().edit.menu);
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("01a-edit-mode-menu.png"),
+        |_| true,
+    );
+    lighting_ui_render::move_pointer(&mut app, window, mode_center + Vec2::Y * 160.0);
+    lighting_ui_render::mouse(&mut app, window, ButtonState::Pressed);
+    lighting_ui_render::mouse(&mut app, window, ButtonState::Released);
+    assert!(!app.world().resource::<ImageViewer>().edit.menu);
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(id)
+            .unwrap()
+            .revision,
+        revision
+    );
+    assert_eq!(app.world().resource::<ImageViewer>().pan, menu_pan);
+    click_action(&mut app, window, |a| {
+        matches!(a, Action::ImageEdit(edit::EditAction::Menu))
+    });
+    click_action(&mut app, window, |a| {
+        matches!(a, Action::ImageEdit(edit::EditAction::View))
+    });
+    assert!(!app.world().resource::<ImageViewer>().edit.editing(id));
+    assert_eq!(app.world().resource::<ImageViewer>().pan, menu_pan);
+    click_action(&mut app, window, |a| {
+        matches!(a, Action::ImageEdit(edit::EditAction::Menu))
+    });
+    click_action(&mut app, window, |a| {
+        matches!(a, Action::ImageEdit(edit::EditAction::Edit))
+    });
+    {
+        let mut viewer = app.world_mut().resource_mut::<ImageViewer>();
+        assert!(viewer.edit.editing(id));
+        assert_eq!(viewer.edit.document(id).unwrap().revision, revision);
+        viewer.zoom = old_view.0;
+        viewer.pan = old_view.1;
+    }
+    click_control(
+        &mut app,
+        window,
+        |a| matches!(a, Action::ImageEdit(edit::EditAction::DrawingTool)),
+        MouseButton::Right,
+    );
+    assert!(app.world().resource::<ImageViewer>().edit.paint_menu);
+    click_control(
+        &mut app,
+        window,
+        |a| matches!(a, Action::ImageEdit(edit::EditAction::DrawingTool)),
+        MouseButton::Right,
+    );
+    assert!(!app.world().resource::<ImageViewer>().edit.paint_menu);
+    app.world_mut()
+        .get_mut::<Window>(window)
+        .unwrap()
+        .set_cursor_position(Some(Vec2::new(700.0, 400.0)));
+    for _ in 0..80 {
+        frame(&mut app);
+    }
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("05-selected-brush.png"),
+        |_| true,
+    );
     click_control(
         &mut app,
         window,
@@ -1018,6 +1365,137 @@ fn gpu_photo_editor_paints_saves_and_reopens_native_layers() {
             .len(),
         2
     );
+    let (old_zoom, old_color) = {
+        let mut viewer = app.world_mut().resource_mut::<ImageViewer>();
+        let previous = (viewer.zoom, viewer.edit.color());
+        viewer.zoom = Zoom::Scale(32.0);
+        previous
+    };
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Color([
+            0.0, 0.0, 0.0, 1.0,
+        ])));
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    let workspace = |app: &App| {
+        let ui = app.world().resource::<ViewerUi>();
+        [ui.canvas, ui.picture].map(|entity| {
+            let node = app.world().get::<ComputedNode>(entity).unwrap();
+            let transform = app.world().get::<UiGlobalTransform>(entity).unwrap();
+            Rect::from_center_size(transform.affine().translation, node.size())
+        })
+    };
+    let fixed = workspace(&app);
+    let handle = app.world().resource::<ImageViewer>().image.clone().unwrap();
+    let original = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(&handle)
+        .unwrap()
+        .data
+        .clone()
+        .unwrap();
+    app.world_mut().write_message(Action::Drawer);
+    for _ in 0..25 {
+        frame(&mut app);
+        assert_eq!(
+            workspace(&app),
+            fixed,
+            "The file manager must overlay the editor throughout its animation"
+        );
+    }
+    for height in [260.0, 500.0] {
+        app.world_mut()
+            .resource_mut::<DrawerSize>()
+            .preferred_height = Some(height);
+        for _ in 0..4 {
+            frame(&mut app);
+            assert_eq!(workspace(&app), fixed);
+        }
+    }
+    let point = Vec2::new(
+        fixed[0].center().x,
+        900.0 - super::super::FOOT - app.world().resource::<DrawerMotion>().visible_height + 64.0,
+    );
+    for button in [MouseButton::Left, MouseButton::Middle] {
+        for (position, state) in [
+            (point, ButtonState::Pressed),
+            (point + Vec2::new(30.0, 5.0), ButtonState::Released),
+        ] {
+            app.world_mut()
+                .get_mut::<Window>(window)
+                .unwrap()
+                .set_cursor_position(Some(position));
+            app.world_mut()
+                .write_message(bevy::window::WindowEvent::CursorMoved(
+                    bevy::window::CursorMoved {
+                        window,
+                        position,
+                        delta: None,
+                    },
+                ));
+            let event = MouseButtonInput {
+                window,
+                button,
+                state,
+            };
+            app.world_mut()
+                .write_message(bevy::window::WindowEvent::MouseButtonInput(event));
+            app.world_mut().write_message(event);
+            frame(&mut app);
+        }
+    }
+    app.world_mut()
+        .write_message(bevy::input::mouse::MouseWheel {
+            window,
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 2.0,
+            phase: bevy::input::touch::TouchPhase::Moved,
+        });
+    frame(&mut app);
+    assert_eq!(
+        app.world().resource::<ImageViewer>().zoom,
+        Zoom::Scale(32.0)
+    );
+    assert_eq!(app.world().resource::<ImageViewer>().pan, Vec2::ZERO);
+    assert!(
+        !app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(id))
+            .unwrap()
+            .dirty(),
+        "Clicks on the file manager must not paint through it"
+    );
+    assert_eq!(
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(&handle)
+            .unwrap()
+            .data
+            .as_ref()
+            .unwrap(),
+        &original
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("06-file-manager-overlay.png"),
+        |_| true,
+    );
+    app.world_mut().write_message(Action::Drawer);
+    for _ in 0..25 {
+        frame(&mut app);
+        assert_eq!(workspace(&app), fixed);
+    }
+    app.world_mut().resource_mut::<ImageViewer>().zoom = old_zoom;
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Color(old_color)));
+    for _ in 0..4 {
+        frame(&mut app);
+    }
     app.world_mut()
         .get_mut::<Window>(window)
         .unwrap()
@@ -1075,4 +1553,256 @@ fn gpu_photo_editor_paints_saves_and_reopens_native_layers() {
         2
     );
     println!("PhotoCraft editor screenshots: {}", output.display());
+}
+
+#[test]
+#[ignore = "requires GPU adapter; verifies brush cursor contrast, zoom, DPI and cursor restoration"]
+fn gpu_photo_cursor_is_visible_on_light_dark_and_grey_and_tracks_zoom() {
+    use crate::editor::{
+        photo_document::PhotoTool,
+        selection_outline::render_tests::{capture_when, frame},
+    };
+    use bevy::window::{CursorIcon, CustomCursor, SystemCursorIcon};
+
+    let fixture = Fixture::new();
+    image::RgbaImage::from_fn(512, 512, |x, _| {
+        let value = if x < 171 {
+            255
+        } else if x < 341 {
+            0
+        } else {
+            128
+        };
+        image::Rgba([value, value, value, 255])
+    })
+    .save(fixture.0.join("cursor.png"))
+    .unwrap();
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.0.clone();
+            editor.project.asset_root = fixture.0.clone();
+            editor.drawer = false;
+            browser.refresh(&mut editor.project);
+        });
+    for _ in 0..30 {
+        frame(&mut app);
+    }
+    let index = file(&app, "cursor.png");
+    app.world_mut().write_message(Action::ViewImage(index));
+    for _ in 0..30 {
+        frame(&mut app);
+    }
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    for _ in 0..120 {
+        frame(&mut app);
+        let world = app.world();
+        if world
+            .resource::<ImageViewer>()
+            .edit
+            .editing(world.resource::<Editor>().viewing_image)
+        {
+            break;
+        }
+    }
+    app.world_mut()
+        .write_message(Action::ImageView(ImageAction::ActualSize));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Tool(PhotoTool::Brush)));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Size(32.0)));
+    for _ in 0..8 {
+        frame(&mut app);
+    }
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/photo-cursor-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    let previous = CursorIcon::from(SystemCursorIcon::Default);
+    app.world_mut().entity_mut(window).insert(previous.clone());
+    let center = {
+        let world = app.world_mut();
+        let mut query =
+            world.query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>();
+        let (node, transform) = query.single(world).unwrap();
+        transform.affine().translation * node.inverse_scale_factor()
+    };
+    let move_to = |app: &mut App, position| {
+        app.world_mut()
+            .get_mut::<Window>(window)
+            .unwrap()
+            .set_cursor_position(Some(position));
+        for _ in 0..4 {
+            frame(app);
+        }
+    };
+    let native = |app: &App| {
+        let CursorIcon::Custom(CustomCursor::Image(image)) =
+            app.world().get::<CursorIcon>(window).unwrap()
+        else {
+            panic!("The visible tool needs an OS-owned bitmap cursor");
+        };
+        image.clone()
+    };
+    for (name, offset, background) in [
+        ("white", -128.0, 255i16),
+        ("black", 0.0, 0),
+        ("grey", 128.0, 128),
+    ] {
+        let point = center + Vec2::new(offset, 0.0);
+        move_to(&mut app, point);
+        let cursor = native(&app);
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&cursor.handle)
+            .unwrap();
+        assert_eq!(image.width(), 39);
+        assert_eq!(cursor.hotspot, (19, 19));
+        let screenshot = capture_when(
+            &mut app,
+            &target,
+            &output.join(format!("{name}.png")),
+            |_| true,
+        );
+        // Sample the perimeter away from the centre marker. A white-only ring fails on white.
+        let mut visible = 0;
+        for y in -19..=19 {
+            for x in -19..=19 {
+                let radius = (x as f32).hypot(y as f32);
+                if (14.0..=19.0).contains(&radius) {
+                    let pixel = screenshot
+                        .get_pixel((point.x as i32 + x) as u32, (point.y as i32 + y) as u32);
+                    visible += usize::from((i16::from(pixel[0]) - background).abs() > 45);
+                }
+            }
+        }
+        assert!(
+            visible > 45,
+            "Brush outline disappears on {name}: {visible}"
+        );
+    }
+    let old = native(&app);
+    app.world_mut().resource_mut::<ImageViewer>().zoom = Zoom::Scale(2.0);
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    let enlarged = native(&app);
+    assert_ne!(old.handle, enlarged.handle);
+    assert_eq!(
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(&enlarged.handle)
+            .unwrap()
+            .width(),
+        71
+    );
+    let frames = app.world().resource::<Assets<Image>>().len();
+    move_to(&mut app, center + Vec2::new(20.0, 20.0));
+    assert_eq!(
+        native(&app),
+        enlarged,
+        "Pointer motion must reuse the OS cursor bitmap"
+    );
+    assert_eq!(app.world().resource::<Assets<Image>>().len(), frames);
+
+    app.world_mut().resource_mut::<ImageViewer>().zoom = Zoom::Scale(1.0);
+    {
+        let mut window = app.world_mut().get_mut::<Window>(window).unwrap();
+        window.resolution.set_scale_factor_override(Some(2.0));
+        window.resolution.set(1280.0, 900.0);
+    }
+    app.world_mut()
+        .resource_mut::<Assets<Image>>()
+        .get_mut(&target)
+        .unwrap()
+        .resize(bevy::render::render_resource::Extent3d {
+            width: 2560,
+            height: 1800,
+            depth_or_array_layers: 1,
+        });
+    {
+        let world = app.world_mut();
+        let mut cameras = world
+            .query_filtered::<&mut bevy::camera::RenderTarget, With<bevy::ui::IsDefaultUiCamera>>();
+        *cameras.single_mut(world).unwrap() =
+            bevy::camera::RenderTarget::Image(bevy::camera::ImageRenderTarget {
+                handle: target.clone(),
+                scale_factor: 2.0,
+            });
+    }
+    for _ in 0..6 {
+        frame(&mut app);
+    }
+    let rect = {
+        let world = app.world_mut();
+        let mut query =
+            world.query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>();
+        let (node, transform) = query.single(world).unwrap();
+        Rect::from_center_size(
+            transform.affine().translation * node.inverse_scale_factor(),
+            node.size() * node.inverse_scale_factor(),
+        )
+    };
+    move_to(&mut app, rect.center());
+    let dense = native(&app);
+    assert_eq!(
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(&dense.handle)
+            .unwrap()
+            .width(),
+        41,
+        "At 1:1 the tip remains 32 physical pixels across; DPI changes the contrast halo"
+    );
+
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .press(KeyCode::Space);
+    frame(&mut app);
+    assert!(matches!(
+        app.world().get::<CursorIcon>(window),
+        Some(CursorIcon::System(SystemCursorIcon::Grab))
+    ));
+    app.world_mut()
+        .resource_mut::<ButtonInput<KeyCode>>()
+        .release(KeyCode::Space);
+    frame(&mut app);
+    assert!(matches!(
+        app.world().get::<CursorIcon>(window),
+        Some(CursorIcon::Custom(_))
+    ));
+    app.world_mut()
+        .resource_mut::<ImageViewer>()
+        .edit
+        .paint_menu = true;
+    frame(&mut app);
+    assert_eq!(app.world().get::<CursorIcon>(window), Some(&previous));
+    app.world_mut()
+        .resource_mut::<ImageViewer>()
+        .edit
+        .paint_menu = false;
+    move_to(&mut app, Vec2::new(8.0, 8.0));
+    assert_eq!(app.world().get::<CursorIcon>(window), Some(&previous));
+    let image_tab = app.world().resource::<Editor>().viewing_image.unwrap();
+    move_to(&mut app, rect.center());
+    native(&app);
+    app.world_mut().write_message(Action::Open(0));
+    frame(&mut app);
+    assert!(app.world().resource::<Editor>().viewing_image.is_none());
+    assert_eq!(app.world().get::<CursorIcon>(window), Some(&previous));
+    assert!(app.world().resource::<ImageViewer>().brush_cursor.is_none());
+    app.world_mut()
+        .write_message(Action::OpenImageTab(image_tab));
+    for _ in 0..6 {
+        frame(&mut app);
+    }
+    native(&app);
+    app.world_mut()
+        .write_message(Action::CloseImageTab(image_tab));
+    frame(&mut app);
+    assert!(app.world().resource::<Editor>().viewing_image.is_none());
+    assert_eq!(app.world().get::<CursorIcon>(window), Some(&previous));
+    assert!(app.world().resource::<ImageViewer>().brush_cursor.is_none());
+    println!("Painting cursor captures: {}", output.display());
 }

@@ -23,12 +23,13 @@ fn dimension(
             ..column(5.0)
         },
     );
-    text(commands, group, handle, label, 12.0, TEXT);
+    text(commands, group, handle, format!("{label}, px"), 12.0, MUTED);
     commands
         .spawn((
             TextInput,
+            Number::decimal(1.0, 8192.0, 1.0, 0),
             EditableText::new("1024"),
-            TextCursorStyle::default(),
+            crate::ui_theme::text_cursor_style(),
             AccessibleLabel(format!("{label} изображения")),
             font(handle, 14.0),
             TextColor(TEXT),
@@ -71,67 +72,6 @@ pub(super) fn setup(commands: &mut Commands, dialog: Entity, font: &Handle<Font>
     );
     let width = dimension(commands, fields, font, "Ширина");
     let height = dimension(commands, fields, font, "Высота");
-    let presets = node(
-        commands,
-        root,
-        Node {
-            width: percent(100),
-            column_gap: px(6),
-            flex_wrap: FlexWrap::Wrap,
-            row_gap: px(6),
-            ..default()
-        },
-    );
-    for (w, h) in [(512, 512), (1024, 1024), (1920, 1080)] {
-        let button = button(
-            commands,
-            presets,
-            font,
-            format!("{w} × {h}"),
-            Action::BrowserImageSize(w, h),
-            Look::Regular,
-        );
-        commands
-            .entity(button)
-            .entry::<Node>()
-            .and_modify(|mut node| {
-                node.flex_grow = 1.0;
-                node.justify_content = JustifyContent::Center;
-                node.padding = UiRect::axes(px(6), px(7));
-            });
-    }
-    let format = node(
-        commands,
-        root,
-        Node {
-            column_gap: px(8),
-            align_items: AlignItems::Center,
-            ..default()
-        },
-    );
-    commands.spawn((
-        Node {
-            width: px(18),
-            height: px(18),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(3)),
-            ..default()
-        },
-        BackgroundColor(Color::WHITE),
-        BorderColor::all(EDGE),
-        Pickable::IGNORE,
-        ChildOf(format),
-    ));
-    text(commands, format, font, "PNG · Белый фон", 12.0, TEXT);
-    let limits = text(
-        commands,
-        root,
-        font,
-        "Размер в пикселях · До 8192 px по стороне и 16 Мп",
-        11.0,
-        MUTED,
-    );
-    commands.entity(limits).insert(TextLayout::default());
     SizeUi {
         root,
         width,
@@ -140,6 +80,21 @@ pub(super) fn setup(commands: &mut Commands, dialog: Entity, font: &Handle<Font>
 }
 
 impl SizeUi {
+    pub fn limits(&self, inputs: &Query<&EditableText>, numbers: &mut Query<&mut Number>) {
+        for (entity, other) in [(self.width, self.height), (self.height, self.width)] {
+            let other = inputs
+                .get(other)
+                .ok()
+                .and_then(|text| text.value().to_string().trim().parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1);
+            let max = (crate::editor::photo_document::MAX_PIXELS / u64::from(other)).clamp(1, 8192)
+                as f32;
+            if let Ok(mut number) = numbers.get_mut(entity) {
+                number.set_if_neq(Number::decimal(1.0, max, 1.0, 0));
+            }
+        }
+    }
     pub fn set(&self, inputs: &mut Query<&mut EditableText>, width: u32, height: u32) {
         for (entity, value) in [(self.width, width), (self.height, height)] {
             if let Ok(mut input) = inputs.get_mut(entity) {

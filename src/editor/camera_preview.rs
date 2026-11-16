@@ -8,8 +8,8 @@ use bevy::{
 };
 
 use super::{
-    Action, DrawerMotion, Editor, Look, MUTED, Selection, TEXT, WELL, button, column, node,
-    scene_input_rect, surface, text, viewport,
+    Action, Editor, Look, MUTED, Selection, TEXT, WELL, button, column, node, surface, text,
+    viewport, viewport_rect,
 };
 use crate::data::CameraPlacement;
 
@@ -34,12 +34,8 @@ pub(in crate::editor) struct Preview {
     last_view: Option<(usize, CameraPlacement)>,
 }
 
-pub(in crate::editor) fn rect(
-    window: &Window,
-    drawer: &DrawerMotion,
-    sidebar: &super::SidebarLayout,
-) -> Rect {
-    let scene = scene_input_rect(window, drawer, sidebar);
+pub(in crate::editor) fn rect(window: &Window, sidebar: &super::SidebarLayout) -> Rect {
+    let scene = viewport_rect(window, sidebar);
     if scene.width() < WIDTH + MARGIN * 2.0 || scene.height() < HEIGHT + MARGIN * 2.0 {
         return Rect::default();
     }
@@ -168,7 +164,6 @@ pub(in crate::editor) fn update(
     mut commands: Commands,
     editor: Res<Editor>,
     mut preview: ResMut<Preview>,
-    drawer: Res<DrawerMotion>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut cameras: Query<(&mut Camera, &mut Transform, &mut Projection), With<PreviewCamera>>,
     mut panes: Query<&mut Node>,
@@ -218,9 +213,7 @@ pub(in crate::editor) fn update(
         Some(Selection::Camera(shot)) if editor.ready => Some(shot),
         _ => None,
     };
-    let shown = selected.is_some()
-        && !editor.pilot
-        && rect(&window, &drawer, &editor.sidebar).width() > 0.0;
+    let shown = selected.is_some() && !editor.pilot && rect(&window, &editor.sidebar).width() > 0.0;
     for (entity, visible) in [
         (preview.card, shown),
         (preview.exit, selected.is_some() && editor.pilot),
@@ -236,7 +229,7 @@ pub(in crate::editor) fn update(
                 pane.display = display;
             }
             if entity != preview.exit {
-                let bottom = px(MARGIN + drawer.visible_height);
+                let bottom = px(MARGIN);
                 if pane.bottom != bottom {
                     pane.bottom = bottom;
                 }

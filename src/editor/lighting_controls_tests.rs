@@ -206,7 +206,10 @@ fn switching_documents_finishes_the_drag_before_stashing_and_blocks_old_input() 
 #[test]
 fn choosing_a_hue_on_white_keeps_it_until_saturation_changes() {
     let (mut app, _, plane) = fixture();
-    app.world_mut().resource_mut::<Editor>().lighting_defaults.ambient_color = [1.0; 3];
+    app.world_mut()
+        .resource_mut::<Editor>()
+        .lighting_defaults
+        .ambient_color = [1.0; 3];
     let dummy = app.world_mut().spawn_empty().id();
     let hue = app
         .world_mut()

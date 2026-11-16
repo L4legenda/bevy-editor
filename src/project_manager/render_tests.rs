@@ -250,6 +250,24 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     set(&mut app, ui::Input::Folder, &scratch.0.to_string_lossy());
     assert_controls_fit(&mut app, 1100.0, 760.0);
     screenshot(&mut app, &target, &output.join("02-create.png"));
+    {
+        let world = app.world_mut();
+        let mut inputs = world.query::<(Entity, &ui::Input, &mut EditableText)>();
+        let (entity, _, mut title) = inputs
+            .iter_mut(world)
+            .find(|(_, field, _)| **field == ui::Input::Title)
+            .unwrap();
+        title.queue_edit(bevy::text::TextEdit::SelectAll);
+        world
+            .resource_mut::<InputFocus>()
+            .set(entity, bevy::input_focus::FocusCause::Pressed);
+    }
+    warm(&mut app);
+    screenshot(
+        &mut app,
+        &target,
+        &output.join("02-create-selected-title.png"),
+    );
     activate(&mut app, "Создать");
     assert!(app.world().resource::<Manager>().form.is_none());
     let file = scratch

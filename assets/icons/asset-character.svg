@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <radialGradient id="halo"><stop stop-color="#d5af72" stop-opacity=".14"/><stop offset="1" stop-color="#d5af72" stop-opacity="0"/></radialGradient>
+    <linearGradient id="card" x1="28" y1="20" x2="101" y2="108" gradientUnits="userSpaceOnUse"><stop stop-color="#39303d"/><stop offset="1" stop-color="#17191f"/></linearGradient>
+    <linearGradient id="gold" x1="49" y1="34" x2="79" y2="90" gradientUnits="userSpaceOnUse"><stop stop-color="#f6dfb5"/><stop offset="1" stop-color="#bb8953"/></linearGradient>
+    <linearGradient id="badge" x1="84" y1="83" x2="106" y2="106" gradientUnits="userSpaceOnUse"><stop stop-color="#d1bfee"/><stop offset="1" stop-color="#8773b1"/></linearGradient>
+  </defs>
+  <circle cx="64" cy="65" r="59" fill="url(#halo)"/>
+  <rect x="36" y="20" width="70" height="88" rx="15" transform="rotate(10 71 64)" fill="#201e29" stroke="#62536f" stroke-opacity=".65" stroke-width="1.5"/>
+  <rect x="27" y="18" width="74" height="92" rx="15" fill="url(#card)" stroke="#d7b47d" stroke-width="1.5"/>
+  <path d="M42 19h44" stroke="#f7e3be" stroke-opacity=".55" stroke-linecap="round"/>
+  <circle cx="64" cy="53" r="27" fill="#b7a0db" fill-opacity=".07"/>
+  <path d="M38 88c1-15 11-24 26-24s25 9 26 24" fill="url(#gold)"/>
+  <path d="M54 65l10 11 10-11" stroke="#66505a" stroke-opacity=".55" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M51 45c0-9 5-15 13-15s13 6 13 15v5c0 9-6 15-13 15s-13-6-13-15v-5Z" fill="url(#gold)"/>
+  <path d="M51 45c-2-10 4-18 13-18 10 0 16 7 14 19-7-1-13-5-17-10-1 6-5 9-10 9Z" fill="#ad87b6"/>
+  <path d="M56 31c6-4 14-2 18 3" stroke="#dcc4e0" stroke-opacity=".65" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M43 97h26m-26 5h17" stroke="#ad95b9" stroke-opacity=".7" stroke-width="2" stroke-linecap="round"/>
+  <rect x="83" y="83" width="24" height="24" rx="8" fill="#24202e" stroke="#bca1d2" stroke-width="1.5"/>
+  <path d="m95 87 2.7 5.3L103 95l-5.3 2.7L95 103l-2.7-5.3L87 95l5.3-2.7L95 87Z" fill="url(#badge)"/>
+  <circle cx="17" cy="46" r="2" fill="#d7b47d" fill-opacity=".65"/>
+  <path d="M111 54v6m-3-3h6" stroke="#b29acd" stroke-opacity=".65" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="22" cy="94" r="1.5" fill="#b29acd" fill-opacity=".5"/>
+</svg>

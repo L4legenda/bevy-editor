@@ -10,22 +10,87 @@ rust-version = "1.95"
 repository = "https://github.com/storytold/photocraft"
 
 [workspace.dependencies]
+
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["serde"] }
+# internal
 photocraft-geom = { path = "crates/geom" }
-photocraft-cms = { path = "crates/cms" }
 photocraft-color = { path = "crates/color" }
+photocraft-cms = { path = "crates/cms" }
 photocraft-raster = { path = "crates/raster" }
 photocraft-doc = { path = "crates/doc" }
+photocraft-ops = { path = "crates/ops" }
+# PSD/PSB and the Photoshop resource files (ABR, ASL, ACO, ATN, ...): the shared reader and writer (craft-libs#875).
+craft-psd = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+photocraft-codecs = { path = "crates/codecs" }
+photocraft-raw = { path = "crates/raw" }
+photocraft-affinity = { path = "crates/affinity" }
+photocraft-compose = { path = "crates/compose" }
+photocraft-paint = { path = "crates/paint" }
+photocraft-algo = { path = "crates/algo" }
+photocraft-io = { path = "crates/io" }
+photocraft-text = { path = "crates/text" }
+photocraft-vector = { path = "crates/vector" }
+photocraft-format = { path = "crates/format" }
+photocraft-plugins = { path = "crates/plugins" }
+photocraft-engine = { path = "crates/engine" }
+photocraft-ipp = { path = "crates/ipp" }
+
+# external
+# DDS, DICOM, FITS, IFF/ILBM, PCX, PNM and XPM: the shared decoders and encoders (craft-libs#880).
+# DPX and Cineon frames (craft-libs#887); the mapping onto images stays in crates/codecs.
+craft-dpx = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+# The Targa writer (craft-libs#892).
+craft-tga = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+# GIF blocks without decoding: the first frame's colour table, the frame walk (craft-libs#939).
+craft-gif = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+# OpenEXR channel naming and Cryptomatte IDs, manifests and streams (craft-libs#929).
+craft-exr = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+craft-raster-codecs = { git = "https://github.com/storytold/craft-libs", rev = "09dcbc225b95232998498a40ca56e24716571d53" }
+craft-print = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+# HEIC/HEIF: the shared decoder (replaces crates/heif; craft-libs#784).
+craft-heif = { git = "https://github.com/storytold/craft-libs", rev = "081078bb1b44aeedfa5bef3d4f13d978dc77510a" }
+craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["raster"] }
+craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+craft-jpeg = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
 craft-pcraft-format = { path = "crates/pcraft-format" }
+# Interface translations: lookup, fallback, CLDR plurals and language names over the craft-i18n
+# catalogs that `crates/ui-egui/build.rs` embeds from `CRAFT_I18N_DIR` (storytold/craft-i18n, at
+# the commit in `craft-i18n.rev`). Already in the tree through craft-ui.
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+# craft-update: app-specific pretend versions apply to startup and manual checks.
+craft-update = { git = "https://github.com/storytold/craft-libs", version = "=0.1.0", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["egui"] }
+thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4.6.11"
+clap_mangen = { version = "0.3.3", features = ["env"] }
+arc-swap = "1"
+bytemuck = { version = "1", features = ["derive"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
+image = { version = "0.25", default-features = false }
+# Baseline-JPEG decode of lossy DNG tiles (compression 34892), shared with zune-jpeg.
+zune-core = "0.5"
+zune-jpeg = "0.5"
+proptest = "1"
+eframe = { version = "0.37", default-features = false }
+# Without `default_fonts`, which embeds egui's fonts uncompressed: ui-egui ships them deflated
+# (egui_fonts.rs; the web build's size gate).
+egui = { version = "0.37", default-features = false }
+egui_kittest = "0.37"
+rfd = "0.17"
+log = "0.4"
+# All date/time conversion goes through chrono (no hand-rolled calendar code beyond the 400-year range extension; AGENTS.md).
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 rayon = "1"
 rustc-hash = "2.1.3"
-flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
-proptest = "1"
+criterion = { version = "0.8", default-features = false }
+getrandom = "0.3"
+# Monotonic clock on native and wasm (screenshot deadlines: a wall clock can jump).
+web-time = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-
 [workspace.lints.clippy]
 dbg_macro = "warn"

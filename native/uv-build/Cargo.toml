@@ -1,0 +1,11 @@
+[package]
+name = "bevy-uv-build"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cc = { version = "=1.11.0", features = ["parallel"] }
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"
+zip = { version = "=9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }

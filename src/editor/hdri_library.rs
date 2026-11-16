@@ -408,7 +408,7 @@ fn setup(
         .spawn((
             TextInput,
             EditableText::new(""),
-            TextCursorStyle::default(),
+            crate::ui_theme::text_cursor_style(),
             font(&interface.font, 13.0),
             TextColor(TEXT),
             BackgroundColor(WELL),

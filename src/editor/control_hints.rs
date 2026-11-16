@@ -1,4 +1,6 @@
 //! Short explanations for the control under the pointer or keyboard focus.
+use super::image_viewer::edit::EraserMode;
+use super::model_viewer::{ModelViewAction, editing::EditAction as ModelEditAction};
 use bevy::{input_focus::InputFocusVisible, prelude::*};
 
 use super::{
@@ -8,6 +10,22 @@ use super::{
 
 const WIDTH: f32 = 326.0;
 const DELAY: f32 = 0.45;
+
+/// Explanations may also belong to sliders and fields without a button action.
+#[derive(Component)]
+pub(in crate::editor) struct Help(pub String);
+
+/// Labels can explain themselves without intercepting clicks on nearby controls.
+pub(in crate::editor) fn attach(commands: &mut Commands, entity: Entity, hint: impl Into<String>) {
+    commands.entity(entity).insert((
+        Help(hint.into()),
+        super::Hovered::default(),
+        Pickable {
+            is_hoverable: true,
+            should_block_lower: false,
+        },
+    ));
+}
 
 #[derive(Resource)]
 pub(in crate::editor) struct Hints {
@@ -34,7 +52,7 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font: &Handle<Font>) 
     );
     commands
         .entity(panel)
-        .insert((GlobalZIndex(90), Pickable::IGNORE));
+        .insert((GlobalZIndex(1500), Pickable::IGNORE));
     let label = text(commands, panel, font, "", 12.0, TEXT);
     commands.entity(label).insert(TextLayout::default());
     commands.insert_resource(Hints {
@@ -53,6 +71,16 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
     };
     if !available(editor, browser, action) {
         return Some(match action {
+            Action::Generation(super::GenerationAction::Generate) => {
+                if editor.generation.running {
+                    "Генерация уже выполняется. Дождитесь завершения или отмените её.".into()
+                } else if !editor.generation.backend_ready {
+                    "Установите веса Mini и нажмите «Включить модель» во вкладке 3D генерации."
+                        .into()
+                } else {
+                    "Выберите изображение и проверьте параметры генерации.".into()
+                }
+            }
             Action::Undo => "Пока нет действий для отмены.".into(),
             Action::Redo => "Нет отменённых действий для повтора.".into(),
             Action::Align if editor.pilot => "Сначала выйдите из вида камеры через Esc.".into(),
@@ -71,7 +99,42 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             _ => "Выберите подходящий объект в дереве сцены.".into(),
         });
     }
+    if editor.viewing_model.is_some() {
+        use super::model_viewer::editing::{EditAction, toolbar_action};
+        let model_hint = match toolbar_action(action) {
+            Some(EditAction::Tool(Tool::Universal)) => Some(
+                "Выделение (Q) · Щелчок выбирает объект или элемент сетки, перетаскивание ЛКМ выделяет рамкой. Shift добавляет, Ctrl исключает.",
+            ),
+            Some(EditAction::Tool(Tool::Move)) => Some(
+                "Перемещение (G) · Перетаскивайте выделение за цветные оси. G, затем X/Y/Z и число задают точное смещение.",
+            ),
+            Some(EditAction::Tool(Tool::Rotate)) => Some(
+                "Поворот (R) · Вращайте выделение за цветные кольца. R, затем X/Y/Z и число задают угол в градусах.",
+            ),
+            Some(EditAction::Tool(Tool::Scale)) => Some(
+                "Масштаб (S) · Меняйте размер выделения за манипулятор. S, затем X/Y/Z и число задают точный масштаб.",
+            ),
+            Some(EditAction::Local) => Some(
+                "Локальные оси модели · Оси манипулятора следуют повороту активного объекта. Повторное нажатие возвращает мировые оси.",
+            ),
+            Some(EditAction::Snap) => Some(
+                "Привязка модели: 0,25 при движении, 15° при вращении и 0,1 при масштабировании. Ctrl временно включает привязку.",
+            ),
+            _ => None,
+        };
+        if let Some(hint) = model_hint {
+            return Some(hint.into());
+        }
+    }
     Some(match action {
+        Action::Generation(super::GenerationAction::Open) => "Открыть генерацию 3D модели по изображению. Настройки сохраняются при переключении вкладок.".into(),
+        Action::Generation(super::GenerationAction::Toggle) if editor.generation.active => "Закрыть вкладку генерации и вернуться к предыдущему документу.".into(),
+        Action::Generation(super::GenerationAction::Toggle) => "Открыть генерацию 3D модели по изображению.".into(),
+        Action::Generation(super::GenerationAction::Close) => "Закрыть вкладку генерации и вернуться к предыдущему документу.".into(),
+        Action::Generation(super::GenerationAction::Advanced) => "Шаги диффузии, CFG, разрешение поверхности, размер блока и seed.".into(),
+        Action::Generation(super::GenerationAction::RandomSeed) => "При подключении генерации новое случайное число даст другой вариант. Выключите для повторяемого результата.".into(),
+        Action::Generation(super::GenerationAction::Simplify) => "Создать облегчённую сетку с указанным целевым числом треугольников.".into(),
+        Action::Generation(super::GenerationAction::ToggleWireframe) => "Показать рёбра полигонов поверх модели. Повторное нажатие скрывает сетку.".into(),
         Action::Open(room) => format!(
             "{} · Открыть сцену «{}». Правки остальных вкладок останутся в памяти.",
             editor.project.scenes[room].asset, editor.project.scenes[room].label
@@ -84,7 +147,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             "{command}+O · Найти и открыть сцену через файловый менеджер. Открытые сцены появятся во вкладках."
         ),
         Action::Tool(Tool::Universal) => {
-            "Выбор и преобразование (Q) · Выбирать объекты в сцене и дереве, перемещать за стрелки и площадки, вращать за дуги. Для изменения размера включите Масштаб (R). Режим выбран по умолчанию."
+            "Выделение (Q) · Щелчок выбирает объект, перетаскивание ЛКМ выделяет рамкой. Shift добавляет, Ctrl исключает. Поля инспектора относятся к активному объекту."
                 .into()
         }
         Action::Tool(Tool::Move) => "Двигать (W) · Перемещать объект за цветные оси в 3D-виде.".into(),
@@ -109,9 +172,8 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         ),
         Action::Redo => format!("{command}+Y · Повторить отменённое действие."),
         Action::Save => format!("{command}+S · Сохранить текущую сцену, объекты и камеры."),
-        Action::Play => {
-            "Запустить игровое окно с текущей сценой. Сначала сохраните изменения.".into()
-        }
+        Action::Play if editor.play.running() => "F5 · Остановить запущенное игровое окно и вернуться к редактированию.".into(),
+        Action::Play => "F5 · Запустить открытый уровень в Bevy с текущими изменениями. Используется выбранная камера или первая камера сцены. В игре: ПКМ + WASD / Q E, Shift — быстрее, Esc — выход.".into(),
         Action::Focus => "Num . · Плавно подлететь к выбранному объекту.".into(),
         Action::Pilot if editor.pilot => {
             "Esc · Вернуться к свободному виду, сохранив перемещения камеры.".into()
@@ -135,6 +197,13 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::BrowseClear => "Очистить поиск и показать содержимое текущей папки.".into(),
         Action::BrowserNewFolder => "Ctrl+Shift+N · Создать папку в выбранной папке файлового менеджера.".into(),
         Action::BrowserNewImage => "Создать PNG-изображение с белым фоном в выбранной папке.".into(),
+        Action::BrowserNewScene => "Создать пустую сцену в выбранной папке.".into(),
+        Action::BrowserOpenEntry => "Открыть выбранный файл или папку.".into(),
+        Action::BrowserCreateScene => "Enter · Создать сцену.".into(),
+        Action::BrowserDialogueMenu => "Создать диалог или персонажа в этой папке · наведите курсор для выбора документа.".into(),
+        Action::BrowserPrimitiveMenu => "Создать 3D-фигуру в этой папке · наведите курсор для выбора фигуры.".into(),
+        Action::BrowserCreatePrimitive(primitive) => format!("{} · задать название и параметры новой 3D-модели.", primitive.label()),
+        Action::BrowserConfirmPrimitive => "Enter · Создать GLB-модель с указанными размерами и детализацией.".into(),
         Action::BrowserCreateImage => "Enter · Создать изображение выбранного размера.".into(),
         Action::BrowserCreateFolder => "Enter · Создать папку с указанным названием.".into(),
         Action::BrowserCancelPopup => "Esc · Закрыть меню или отменить создание папки.".into(),
@@ -150,25 +219,37 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             super::ImageEditAction::Edit => "Редактировать изображение. Рядом создаётся проект слоёв .pcraft.".into(),
             super::ImageEditAction::Save => "Ctrl+S · Сохранить слои .pcraft и обновить исходное изображение.".into(),
             super::ImageEditAction::Undo => "Ctrl+Z · Отменить последнее изменение изображения.".into(),
+            super::ImageEditAction::SizeMenu => "Настройки кисти: размер, жёсткость и непрозрачность. Колесо или Shift + движение мыши — размер.".into(),
             super::ImageEditAction::Redo => "Ctrl+Shift+Z / Ctrl+Y · Повторить изменение изображения.".into(),
-            super::ImageEditAction::ColorPanel => "Нажмите на цвет, чтобы раскрыть или свернуть палитру HSV. HEX применяется по Enter.".into(),
+            super::ImageEditAction::ColorPicker(_) => "Выбрать цвет. Изменения применяются по ОК; Esc — отмена.".into(),
+            super::ImageEditAction::SwapColors => "X · Поменять основной и фоновый цвета местами.".into(),
+            super::ImageEditAction::ResetColors => "D · Вернуть чёрный основной и белый фоновый цвет.".into(),
+            super::ImageEditAction::ColorConfirm => "Применить выбранный цвет · Enter.".into(),
+            super::ImageEditAction::ColorCancel => "Отменить выбор цвета · Esc.".into(),
+            super::ImageEditAction::AddSwatch => "Добавить новый цвет в образцы.".into(),
+            super::ImageEditAction::EraserMode(mode) => match mode {
+                EraserMode::Brush => "Обычный ластик с настройкой жёсткости.".into(),
+                EraserMode::Pixel => "Стирать целые пиксели без сглаживания.".into(),
+            },
             super::ImageEditAction::Tool(tool) => match tool {
                 crate::editor::photo_document::PhotoTool::Pencil => "B · Карандаш. Рисование по пиксельной сетке без сглаживания. ПКМ по инструменту — выбрать кисть или карандаш.".into(),
                 crate::editor::photo_document::PhotoTool::Brush => "B · Кисть PhotoCraft со сглаживанием. Рисует в выбранном слое.".into(),
-                crate::editor::photo_document::PhotoTool::Eraser => "E · Ластик. Убирает пиксели выбранного слоя.".into(),
+                crate::editor::photo_document::PhotoTool::Eraser => "E · Стирать. Стрелка или ПКМ — выбрать обычный или пиксельный ластик.".into(),
                 crate::editor::photo_document::PhotoTool::Fill => "G · Заливка связанной области выбранным цветом.".into(),
                 crate::editor::photo_document::PhotoTool::Eyedropper => "I · Пипетка. Взять цвет изображения.".into(),
                 crate::editor::photo_document::PhotoTool::Move => "V · Перетащить содержимое выбранного слоя.".into(),
                 crate::editor::photo_document::PhotoTool::Hand => "H / Пробел · Перемещать изображение в окне.".into(),
+                crate::editor::photo_document::PhotoTool::Select(_) => "Выделение. Shift — добавить, Alt — вычесть, Shift+Alt — пересечь. Ctrl+D — снять.".into(),
+                crate::editor::photo_document::PhotoTool::Transform => "Ctrl+T · Трансформация выделения или слоёв. Enter — применить, Esc — отменить.".into(),
             },
             super::ImageEditAction::AddLayer => "Создать прозрачный слой над выбранным.".into(),
-            super::ImageEditAction::DrawingTool => "B · Рисование. ПКМ — выбрать кисть со сглаживанием или пиксельный карандаш. Shift+B — переключить инструмент.".into(),
-            super::ImageEditAction::DuplicateLayer => "Дублировать выбранный слой.".into(),
+            super::ImageEditAction::DrawingTool => "B · Рисование. Стрелка рядом или ПКМ — выбрать кисть или карандаш. Shift+B — переключить инструмент.".into(),
+            super::ImageEditAction::PaintMenu => "Выбрать кисть со сглаживанием или пиксельный карандаш. Shift+B — переключить инструмент.".into(),
+            super::ImageEditAction::EraserMenu => "Выбрать обычный или пиксельный ластик.".into(),
             super::ImageEditAction::DeleteLayer => "Удалить выбранный слой. Ctrl+Z отменяет удаление.".into(),
-            super::ImageEditAction::LayerUp => "Переместить слой выше.".into(),
-            super::ImageEditAction::LayerDown => "Переместить слой ниже.".into(),
             super::ImageEditAction::Visible(_) => "Показать или скрыть слой.".into(),
             super::ImageEditAction::SelectLayer(_) => "Выбрать слой для рисования и редактирования.".into(),
+            super::ImageEditAction::Layers(action) => super::image_viewer::edit::layers::ux::action_help(action),
             _ => "Настройки цвета и инструментов PhotoCraft.".into(),
         },
         Action::ImageView(action) => match action {
@@ -190,6 +271,46 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             "Закрыть вкладку изображения: {}",
             editor.image_tab(id)?.path.display()
         ),
+        Action::BrowserDuplicateFile => "Создать копию сохранённого файла в той же папке. Файл слоёв изображения и настройки импорта копируются вместе с ним.".into(),
+        Action::BrowserRenameFile => "F2 · Переименовать выбранный файл. Расширение сохраняется, ссылки проекта обновляются.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Menu)) =>
+            "Выберите режим: объект, редактирование сетки, UV-развёртка или рисование. Tab возвращает к объекту.".into(),
+        Action::ModelView(ModelViewAction::Paint(action)) => action.hint().into(),
+        Action::ModelView(ModelViewAction::Uv(action)) => {
+            use super::model_viewer::editing::uv::UvAction;
+            match action {
+                UvAction::Unwrap => "Автоматически развернуть активный объект через PartUV Geometric. Расчёт идёт в фоне; Ctrl+Z отменяет результат.",
+                UvAction::Pack => "Упаковать текущие острова в атлас с выбранным отступом. Швы сохраняются; Ctrl+Z отменяет упаковку.",
+                UvAction::Cancel => "Остановить расчёт. Исходная UV-карта останется без изменений.",
+                UvAction::Compare => "Показать исходную UV-карту и вернуться к результату без изменения документа.",
+                UvAction::Checker => "Шахматная текстура помогает заметить растяжение. Это только просмотр: материалы модели сохраняются.",
+                UvAction::Seams => "Показать границы UV-островов на 3D-модели.",
+                UvAction::Fit => "Вписать атлас 0–1 в окно UV-карты. Колесо приближает под курсором.",
+                UvAction::SelectAll => "Выделить все UV-острова активного объекта.",
+                UvAction::Deselect => "Снять выделение островов.",
+                UvAction::Rotate => "Повернуть выбранные UV-острова на 90° вокруг центра выделения.",
+                UvAction::ScaleUp | UvAction::ScaleDown => "Изменить размер выделенных UV-островов. Геометрия модели не меняется.",
+                UvAction::Resolution => "Разрешение следующего атласа: 1024, 2048 или 4096. Отступ задаётся в пикселях.",
+                UvAction::Padding => "Расстояние между островами для следующей авторазвёртки: 4, 8 или 16 пикселей.",
+                UvAction::Quality(_) => "Выберите баланс между растяжением поверхности и количеством швов для следующей развёртки.",
+            }.into()
+        },
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Xray)) =>
+            "Alt+Z · X-Ray: полупрозрачная модель, скрытые вершины и рёбра, выделение сквозь геометрию.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Wireframe)) =>
+            "Показать сетку поверх всех объектов модели. Повторное нажатие скрывает сетку; исходный GLB не меняется.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Operate(
+            crate::editor::model_document::Operation::Extrude,
+        ))) =>
+            "E · Экструдировать выделенные грани или замкнутую область. Расстояние задаётся полем «Шаг операции» в инспекторе.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Element(kind))) => {
+            use crate::editor::model_mesh::Element;
+            match kind {
+                Element::Vertex => "1 · Выбирать вершины сетки.",
+                Element::Edge => "2 · Выбирать рёбра сетки.",
+                Element::Face => "3 · Выбирать грани сетки.",
+            }.into()
+        }
         Action::ViewModel(index) => format!(
             "Нажмите, чтобы рассмотреть «{}». Перетащите модель в 3D-вид, чтобы добавить её в сцену.",
             editor.project.catalog[index].label
@@ -206,6 +327,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
 
 pub(in crate::editor) fn update(
     mut hints: ResMut<Hints>,
+    viewer: Option<Res<crate::editor::ui::ImageViewer>>,
     editor: Res<Editor>,
     browser: Res<Browser>,
     focus: Res<InputFocus>,
@@ -216,7 +338,8 @@ pub(in crate::editor) fn update(
     controls: Query<
         (
             Entity,
-            &Control,
+            Option<&Control>,
+            Option<&Help>,
             &super::Hovered,
             &ComputedNode,
             &UiGlobalTransform,
@@ -224,22 +347,29 @@ pub(in crate::editor) fn update(
         Without<super::drawer::FileCard>,
     >,
     mut panels: Query<&mut Node>,
+    geometry: Query<&ComputedNode>,
     mut labels: Query<(&mut Text, &mut TextColor)>,
 ) {
     let target = if editor.pending.is_some()
+        || viewer.as_ref().is_some_and(|v| v.edit.size_menu)
         || mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
     {
         None
     } else {
         controls
             .iter()
-            .find(|(_, _, hovered, computed, _)| hovered.0 && computed.size().min_element() > 0.0)
+            .filter(|(_, control, help, hovered, computed, _)| {
+                (control.is_some() || help.is_some())
+                    && hovered.0
+                    && computed.size().min_element() > 0.0
+            })
+            .min_by(|a, b| (a.4.size().x * a.4.size().y).total_cmp(&(b.4.size().x * b.4.size().y)))
             .or_else(|| {
                 focus
                     .get()
                     .filter(|_| focus_visible.0)
                     .and_then(|entity| controls.get(entity).ok())
-                    .filter(|(_, _, _, computed, _)| computed.size().min_element() > 0.0)
+                    .filter(|(_, _, _, _, computed, _)| computed.size().min_element() > 0.0)
             })
     };
     let entity = target.map(|(entity, ..)| entity);
@@ -249,24 +379,29 @@ pub(in crate::editor) fn update(
     } else {
         hints.elapsed += time.delta_secs();
     }
-    let content =
-        target.and_then(|(_, control, _, _, _)| description(control.action, &editor, &browser));
+    let content = target.and_then(|(_, control, help, _, _, _)| {
+        help.map(|h| h.0.clone())
+            .or_else(|| control.and_then(|c| description(c.action, &editor, &browser)))
+    });
     let shown = content.is_some() && hints.elapsed >= DELAY;
     if let Ok(mut panel) = panels.get_mut(hints.panel) {
         let display = if shown { Display::Flex } else { Display::None };
         if panel.display != display {
             panel.display = display;
         }
-        if let Some((_, _, _, computed, transform)) = target.filter(|_| shown) {
+        if let Some((_, _, _, _, computed, transform)) = target.filter(|_| shown) {
             let scale = window.scale_factor();
             let center = transform.affine().translation / scale;
             let half = computed.size() / scale * 0.5;
             let x = (center.x - half.x).clamp(8.0, (window.width() - WIDTH - 8.0).max(8.0));
             let below = center.y + half.y + 7.0;
-            let y = if below + 88.0 < window.height() {
+            let height = geometry
+                .get(hints.panel)
+                .map_or(150.0, |n| (n.size().y / scale).max(110.0));
+            let y = if below + height + 8.0 < window.height() {
                 below
             } else {
-                (center.y - half.y - 88.0).max(8.0)
+                (center.y - half.y - height - 7.0).max(8.0)
             };
             if panel.left != px(x) || panel.top != px(y) {
                 panel.left = px(x);

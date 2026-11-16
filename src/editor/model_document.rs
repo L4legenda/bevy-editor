@@ -1,0 +1,801 @@
+//! Editable model state and transactions. Scene documents never share these meshes.
+use super::model_mesh::{Corner, Face, Geometry, Selection};
+use bevy::{
+    asset::RenderAssetUsages,
+    mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
+    prelude::*,
+};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+    sync::Arc,
+};
+
+#[path = "model_glb.rs"]
+pub(super) mod glb;
+
+#[derive(Clone, Debug)]
+pub(super) struct MaterialSlot {
+    pub material: Handle<StandardMaterial>,
+    pub source: serde_json::Value,
+    pub paint: Option<Arc<super::model_paint_data::Surface>>,
+}
+impl PartialEq for MaterialSlot {
+    fn eq(&self, other:&Self)->bool {
+        self.material==other.material && self.source==other.source && match(&self.paint,&other.paint){
+            (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b)||a.same(b),_=>false
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(super) struct MeshData(Arc<Geometry>);
+impl From<Geometry> for MeshData {
+    fn from(mesh: Geometry) -> Self {
+        Self(Arc::new(mesh))
+    }
+}
+impl Deref for MeshData {
+    type Target = Geometry;
+    fn deref(&self) -> &Geometry {
+        &self.0
+    }
+}
+impl DerefMut for MeshData {
+    fn deref_mut(&mut self) -> &mut Geometry {
+        Arc::make_mut(&mut self.0)
+    }
+}
+impl PartialEq for MeshData {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Object {
+    pub id: usize,
+    pub source_node: Option<usize>,
+    pub name: String,
+    pub geometry: MeshData,
+    pub transform: Transform,
+    pub materials: Vec<MaterialSlot>,
+    pub hidden: bool,
+}
+impl PartialEq for Object {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.source_node == other.source_node
+            && self.name == other.name
+            && self.geometry == other.geometry
+            && self.transform == other.transform
+            && self.materials == other.materials
+    }
+}
+#[derive(Clone, Debug)]
+pub(super) struct Snapshot {
+    pub objects: Vec<Object>,
+    pub active: Option<usize>,
+    pub selected: BTreeSet<usize>,
+    pub selection: Selection,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum Mode {
+    #[default]
+    Object,
+    Edit,
+    Uv,
+    Paint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::editor) enum Operation {
+    Extrude,
+    Inset,
+    Subdivide,
+    Triangulate,
+    Quads,
+    Dissolve,
+    Delete,
+    DeleteFaces,
+    Duplicate,
+    MergeCenter,
+    MergeDistance,
+    Fill,
+    FlipNormals,
+    RecalculateNormals,
+    Smooth,
+    ShadeSmooth,
+    ShadeFlat,
+    Mirror(usize),
+    LoopCut,
+    BevelVertices,
+    ProjectUv(usize),
+    SphericalUv,
+    Separate,
+    Join,
+    ApplyTransform,
+    OriginToGeometry,
+}
+
+pub(super) struct Document {
+    pub source: glb::Glb,
+    pub objects: Vec<Object>,
+    pub original: Vec<Object>,
+    pub saved: Vec<Object>,
+    pub active: Option<usize>,
+    pub selected: BTreeSet<usize>,
+    pub selection: Selection,
+    pub mode: Mode,
+    pub undo: Vec<Snapshot>,
+    pub redo: Vec<Snapshot>,
+    pub revision: u64,
+    pub ui_revision: u64,
+    pub amount: f32,
+    pub paint_busy: bool,
+    pub paint_pending: bool,
+}
+impl Document {
+    pub fn new(source: glb::Glb, objects: Vec<Object>) -> Self {
+        let active = objects.first().map(|o| o.id);
+        let selected = active.into_iter().collect();
+        Self {
+            source,
+            original: objects.clone(),
+            saved: objects.clone(),
+            objects,
+            active,
+            selected,
+            selection: Selection::default(),
+            mode: Mode::Object,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            revision: 0,
+            ui_revision: 0,
+            amount: 0.1,
+            paint_busy: false,
+            paint_pending: false,
+        }
+    }
+    pub fn dirty(&self) -> bool {
+        self.paint_pending || self.objects != self.saved
+    }
+    pub fn active(&self) -> Option<&Object> {
+        let id = self.active?;
+        self.objects.iter().find(|o| o.id == id)
+    }
+    pub fn active_mut(&mut self) -> Option<&mut Object> {
+        let id = self.active?;
+        self.objects.iter_mut().find(|o| o.id == id)
+    }
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            objects: self.objects.clone(),
+            active: self.active,
+            selected: self.selected.clone(),
+            selection: self.selection.clone(),
+        }
+    }
+    pub fn restore(&mut self, state: Snapshot) {
+        self.objects = state.objects;
+        self.active = state.active;
+        self.selected = state.selected;
+        self.selection = state.selection;
+        self.revision += 1;
+        self.ui_revision += 1;
+    }
+    pub fn checkpoint(&mut self, before: Snapshot) {
+        if before.objects == self.objects {
+            return;
+        }
+        self.undo.push(before);
+        if self.undo.len() > 32 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.revision += 1;
+        self.ui_revision += 1;
+    }
+    pub fn undo(&mut self) {
+        if let Some(previous) = self.undo.pop() {
+            self.redo.push(self.snapshot());
+            self.restore(previous);
+        }
+    }
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.snapshot());
+            self.restore(next);
+        }
+    }
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        if mode == Mode::Edit
+            && self
+                .selection
+                .selected_vertices(
+                    self.active()
+                        .map(|o| &*o.geometry)
+                        .unwrap_or(&Geometry::default()),
+                )
+                .is_empty()
+        {
+            if let Some(object) = self.active() {
+                let mesh = object.geometry.clone();
+                self.selection.all(&mesh);
+            }
+        }
+        self.ui_revision += 1;
+    }
+    pub fn select_object(&mut self, id: usize, toggle: bool) {
+        if !self.objects.iter().any(|o| o.id == id) {
+            return;
+        }
+        if !toggle {
+            self.selected.clear();
+        }
+        if toggle && !self.selected.insert(id) {
+            self.selected.remove(&id);
+        } else {
+            self.selected.insert(id);
+            self.active = Some(id);
+        }
+        self.selection.clear();
+        self.ui_revision += 1;
+    }
+    pub fn pivot(&self) -> Option<Vec3> {
+        if self.mode == Mode::Edit {
+            let o = self.active()?;
+            let selected = self.selection.selected_vertices(&o.geometry);
+            if selected.is_empty() {
+                return None;
+            }
+            Some(
+                selected
+                    .iter()
+                    .map(|&v| o.transform.transform_point(o.geometry.positions[v]))
+                    .sum::<Vec3>()
+                    / selected.len() as f32,
+            )
+        } else {
+            let objects: Vec<_> = self
+                .objects
+                .iter()
+                .filter(|o| self.selected.contains(&o.id))
+                .collect();
+            if objects.is_empty() {
+                None
+            } else {
+                Some(
+                    objects
+                        .iter()
+                        .map(|o| o.transform.translation)
+                        .sum::<Vec3>()
+                        / objects.len() as f32,
+                )
+            }
+        }
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        let mut count = 0;
+        for o in &self.objects {
+            count += o.geometry.positions.len();
+            if !o.transform.translation.is_finite()
+                || !o.transform.rotation.is_finite()
+                || !o.transform.scale.is_finite()
+                || o.transform.scale.abs().min_element() < 1.0e-7
+            {
+                return Err("Недопустимое преобразование объекта".into());
+            }
+            o.geometry.validate()?;
+        }
+        if count > 250_000 {
+            return Err(
+                "Для интерактивного редактирования поддерживается до 250 000 вершин".into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn transform(&mut self, base: &Snapshot, matrix: Mat4, proportional: Option<(f32, bool)>) {
+        self.objects = base.objects.clone();
+        if self.mode == Mode::Object {
+            for o in &mut self.objects {
+                if base.selected.contains(&o.id) {
+                    let target = matrix * o.transform.to_matrix();
+                    let mut transform = Transform::from_matrix(target);
+                    transform.rotation = transform.rotation.normalize();
+                    // A world-axis scale of a rotated object may contain shear.
+                    // Bake only the residual into its owned mesh to preserve the
+                    // exact shape while keeping the inspector's TRS editable.
+                    let residual = transform.to_matrix().inverse() * target;
+                    if !residual.abs_diff_eq(Mat4::IDENTITY, 0.00001) {
+                        let normal_matrix = residual.inverse().transpose();
+                        for p in &mut o.geometry.positions {
+                            *p = residual.transform_point3(*p);
+                        }
+                        for face in &mut o.geometry.faces {
+                            for c in &mut face.corners {
+                                c.source_normal = c.source_normal.map(|n| {
+                                    normal_matrix.transform_vector3(n).normalize_or_zero()
+                                });
+                            }
+                        }
+                    }
+                    o.transform = transform;
+                }
+            }
+        } else if let Some(o) = self.active_mut() {
+            let matrix = o.transform.to_matrix().inverse() * matrix * o.transform.to_matrix();
+            o.geometry.transform(&base.selection, matrix, proportional);
+            if !matrix.abs_diff_eq(Mat4::IDENTITY, 1.0e-7) {
+                o.geometry.discard_normals();
+            }
+        }
+        self.revision += 1;
+    }
+    #[cfg(test)]
+    pub fn save(&mut self) -> Result<(), String> {
+        self.validate()?;
+        self.source.save(&self.objects, &self.original)?;
+        self.saved = self.objects.clone();
+        self.ui_revision += 1;
+        Ok(())
+    }
+    pub fn operate(&mut self, operation: Operation) -> Result<(), String> {
+        let before = self.snapshot();
+        let result = self.apply(operation).and_then(|_| {
+            if !matches!(operation, Operation::ProjectUv(_) | Operation::SphericalUv) {
+                for object in &mut self.objects {
+                    if before
+                        .objects
+                        .iter()
+                        .find(|old| old.id == object.id)
+                        .is_some_and(|old| old.geometry != object.geometry)
+                    {
+                        object.geometry.discard_normals();
+                    }
+                }
+            }
+            self.validate()
+        });
+        match result {
+            Ok(()) => {
+                self.checkpoint(before);
+                Ok(())
+            }
+            Err(error) => {
+                self.restore(before);
+                Err(error)
+            }
+        }
+    }
+    fn apply(&mut self, operation: Operation) -> Result<(), String> {
+        if self.mode == Mode::Object {
+            return self.object_operation(operation);
+        }
+        let id = self.active.ok_or("Выберите объект")?;
+        let index = self
+            .objects
+            .iter()
+            .position(|o| o.id == id)
+            .ok_or("Объект не найден")?;
+        let radius = self.objects[index].geometry.radius();
+        let amount = self.amount.max(radius * 0.00001);
+        if matches!(operation, Operation::Separate) {
+            let chosen = self.selection.selected_faces(&self.objects[index].geometry);
+            if chosen.is_empty() {
+                return Err("Выберите грани для отделения".into());
+            }
+            let mut object = self.objects[index].clone();
+            object.id = self.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+            object.source_node = None;
+            object.name = format!("{} · отделено", object.name);
+            object.geometry.faces = object
+                .geometry
+                .faces
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| chosen.contains(i))
+                .map(|(_, f)| f.clone())
+                .collect();
+            object.geometry.compact();
+            self.objects[index]
+                .geometry
+                .delete(&mut self.selection, true);
+            self.objects.push(object);
+            return Ok(());
+        }
+        let mesh = &mut self.objects[index].geometry;
+        match operation {
+            Operation::Extrude => mesh.extrude(&mut self.selection, amount)?,
+            Operation::Inset => mesh.inset(&mut self.selection, amount)?,
+            Operation::Subdivide => mesh.subdivide(&mut self.selection)?,
+            Operation::Triangulate => mesh.triangulate(&mut self.selection),
+            Operation::Quads => mesh.dissolve(&mut self.selection, true)?,
+            Operation::Dissolve => mesh.dissolve(&mut self.selection, false)?,
+            Operation::Delete => mesh.delete(&mut self.selection, false),
+            Operation::DeleteFaces => mesh.delete(&mut self.selection, true),
+            Operation::Duplicate => mesh.duplicate(&mut self.selection)?,
+            Operation::MergeCenter => mesh.merge(&mut self.selection, None)?,
+            Operation::MergeDistance => mesh.merge(&mut self.selection, Some(amount))?,
+            Operation::Fill => mesh.fill(&mut self.selection)?,
+            Operation::FlipNormals => mesh.recalculate_normals(&self.selection, true),
+            Operation::RecalculateNormals => mesh.recalculate_normals(&self.selection, false),
+            Operation::Smooth => mesh.smooth_vertices(&self.selection, 0.5),
+            Operation::ShadeSmooth | Operation::ShadeFlat => {
+                let faces = self.selection.selected_faces(mesh);
+                for i in faces {
+                    mesh.faces[i].smooth = matches!(operation, Operation::ShadeSmooth);
+                    for c in &mut mesh.faces[i].corners {
+                        c.source_normal = None;
+                    }
+                }
+            }
+            Operation::Mirror(axis) => {
+                let vertices = self.selection.selected_vertices(mesh);
+                if vertices.is_empty() {
+                    return Err("Нет выделенных вершин".into());
+                }
+                let pivot = vertices.iter().map(|&v| mesh.positions[v]).sum::<Vec3>()
+                    / vertices.len() as f32;
+                for v in vertices {
+                    mesh.positions[v][axis] = 2.0 * pivot[axis] - mesh.positions[v][axis];
+                }
+                let selected = self.selection.selected_faces(mesh);
+                for i in selected {
+                    mesh.faces[i].corners.reverse();
+                }
+            }
+            Operation::LoopCut => {
+                let edge = self
+                    .selection
+                    .edges
+                    .first()
+                    .copied()
+                    .or_else(|| {
+                        self.selection
+                            .selected_faces(mesh)
+                            .first()
+                            .and_then(|&i| mesh.faces[i].edges().next())
+                            .map(|(a, b)| super::model_mesh::Edge::new(a, b))
+                    })
+                    .ok_or("Выберите ребро для разреза петли")?;
+                mesh.loop_cut(edge)?;
+                self.selection.all(mesh);
+            }
+            Operation::BevelVertices => mesh.bevel_vertices(&mut self.selection, amount)?,
+            Operation::ProjectUv(axis) => mesh.project_uv(&self.selection, axis, false),
+            Operation::SphericalUv => mesh.project_uv(&self.selection, 0, true),
+            _ => return Err("Операция доступна в режиме «Объект»".into()),
+        }
+        Ok(())
+    }
+    fn object_operation(&mut self, operation: Operation) -> Result<(), String> {
+        if self.selected.is_empty() {
+            return Err("Выберите объект".into());
+        }
+        match operation {
+            Operation::Delete => {
+                self.objects.retain(|o| !self.selected.contains(&o.id));
+                self.active = self.objects.first().map(|o| o.id);
+                self.selected = self.active.into_iter().collect();
+            }
+            Operation::Duplicate => {
+                let mut next = self.objects.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+                let mut copies = Vec::new();
+                for o in &self.objects {
+                    if self.selected.contains(&o.id) {
+                        let mut copy = o.clone();
+                        copy.id = next;
+                        next += 1;
+                        copy.source_node = None;
+                        copy.name = format!("{}.001", copy.name);
+                        copies.push(copy);
+                    }
+                }
+                self.selected = copies.iter().map(|o| o.id).collect();
+                self.active = copies.first().map(|o| o.id);
+                self.objects.extend(copies);
+            }
+            Operation::Join => {
+                let active = self.active.ok_or("Нет активного объекта")?;
+                let index = self
+                    .objects
+                    .iter()
+                    .position(|o| o.id == active)
+                    .ok_or("Нет активного объекта")?;
+                let inverse = self.objects[index].transform.to_matrix().inverse();
+                let others: Vec<_> = self
+                    .objects
+                    .iter()
+                    .filter(|o| o.id != active && self.selected.contains(&o.id))
+                    .cloned()
+                    .collect();
+                if others.is_empty() {
+                    return Err("Для объединения выберите несколько объектов с Shift".into());
+                }
+                for o in others {
+                    let offset = self.objects[index].geometry.positions.len();
+                    let material_offset = self.objects[index].materials.len();
+                    let m = inverse * o.transform.to_matrix();
+                    self.objects[index]
+                        .geometry
+                        .positions
+                        .extend(o.geometry.positions.iter().map(|p| m.transform_point3(*p)));
+                    self.objects[index]
+                        .geometry
+                        .faces
+                        .extend(o.geometry.faces.iter().map(|f| {
+                            let mut f = f.clone();
+                            f.material += material_offset;
+                            for c in &mut f.corners {
+                                c.vertex += offset;
+                            }
+                            if m.determinant() < 0.0 {
+                                f.corners.reverse();
+                            }
+                            f
+                        }));
+                    self.objects[index].materials.extend(o.materials);
+                }
+                self.objects
+                    .retain(|o| o.id == active || !self.selected.contains(&o.id));
+                self.selected = [active].into();
+            }
+            Operation::ApplyTransform => {
+                for o in &mut self.objects {
+                    if self.selected.contains(&o.id) {
+                        let m = Mat4::from_scale_rotation_translation(
+                            o.transform.scale,
+                            o.transform.rotation,
+                            Vec3::ZERO,
+                        );
+                        for p in &mut o.geometry.positions {
+                            *p = m.transform_point3(*p);
+                        }
+                        if o.transform.scale.element_product() < 0.0 {
+                            for f in &mut o.geometry.faces {
+                                f.corners.reverse();
+                            }
+                        }
+                        o.transform.rotation = Quat::IDENTITY;
+                        o.transform.scale = Vec3::ONE;
+                    }
+                }
+            }
+            Operation::OriginToGeometry => {
+                for o in &mut self.objects {
+                    if self.selected.contains(&o.id) && !o.geometry.positions.is_empty() {
+                        let center = o.geometry.positions.iter().sum::<Vec3>()
+                            / o.geometry.positions.len() as f32;
+                        for p in &mut o.geometry.positions {
+                            *p -= center;
+                        }
+                        o.transform.translation = o.transform.transform_point(center);
+                    }
+                }
+            }
+            Operation::ShadeFlat | Operation::ShadeSmooth => {
+                for o in &mut self.objects {
+                    if self.selected.contains(&o.id) {
+                        for f in &mut o.geometry.faces {
+                            f.smooth = matches!(operation, Operation::ShadeSmooth);
+                            for c in &mut f.corners {
+                                c.source_normal = None;
+                            }
+                        }
+                    }
+                }
+            }
+            Operation::Mirror(axis) => {
+                for o in &mut self.objects {
+                    if self.selected.contains(&o.id) {
+                        for p in &mut o.geometry.positions {
+                            p[axis] = -p[axis];
+                        }
+                        for f in &mut o.geometry.faces {
+                            f.corners.reverse();
+                        }
+                    }
+                }
+            }
+            _ => return Err("Для правки топологии включите «Редактирование»".into()),
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn from_mesh(
+    mesh: &Mesh,
+    geometry: &mut Geometry,
+    material: usize,
+) -> Result<(), String> {
+    from_mesh_with_topology(mesh, geometry, material, None)
+}
+
+pub(super) fn from_mesh_with_topology(
+    mesh: &Mesh,
+    geometry: &mut Geometry,
+    material: usize,
+    polygons: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return Err("В меше нет координат вершин".into());
+    };
+    let normals = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(v)) => Some(v),
+        _ => None,
+    };
+    let uv = match mesh.attribute(Mesh::ATTRIBUTE_UV_0) {
+        Some(VertexAttributeValues::Float32x2(v)) => Some(v),
+        _ => None,
+    };
+    let uv1 = match mesh.attribute(Mesh::ATTRIBUTE_UV_1) {
+        Some(VertexAttributeValues::Float32x2(v)) => Some(v),
+        _ => None,
+    };
+    let colors = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(VertexAttributeValues::Float32x4(v)) => Some(v),
+        _ => None,
+    };
+    if [
+        normals.map(Vec::len),
+        uv.map(Vec::len),
+        uv1.map(Vec::len),
+        colors.map(Vec::len),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|count| count != positions.len())
+    {
+        return Err("Число нормалей, UV или цветов не совпадает с числом вершин".into());
+    }
+    let mut shared: HashMap<[u32; 3], usize> = geometry
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                p.to_array().map(|x| if x == 0.0 { 0 } else { x.to_bits() }),
+                i,
+            )
+        })
+        .collect();
+    let mapped: Vec<_> = positions
+        .iter()
+        .map(|p| {
+            *shared
+                .entry(p.map(|x| if x == 0.0 { 0 } else { x.to_bits() }))
+                .or_insert_with(|| {
+                    let i = geometry.positions.len();
+                    geometry.positions.push(Vec3::from_array(*p));
+                    i
+                })
+        })
+        .collect();
+    let indices: Vec<_> = mesh
+        .indices()
+        .map(|v| v.iter().collect())
+        .unwrap_or_else(|| (0..positions.len()).collect());
+    let triangles: Vec<[usize; 3]> = match mesh.primitive_topology() {
+        PrimitiveTopology::TriangleList => indices
+            .chunks_exact(3)
+            .map(|v| [v[0], v[1], v[2]])
+            .collect(),
+        PrimitiveTopology::TriangleStrip => indices
+            .windows(3)
+            .enumerate()
+            .map(|(i, v)| {
+                if i % 2 == 0 {
+                    [v[0], v[1], v[2]]
+                } else {
+                    [v[1], v[0], v[2]]
+                }
+            })
+            .collect(),
+        _ => return Err("Редактирование поддерживает треугольные поверхности".into()),
+    };
+    if triangles.iter().flatten().any(|&v| v >= positions.len()) {
+        return Err("Некорректные индексы геометрии".into());
+    }
+    let make_face = |vertices: &[usize]| {
+        let smooth = normals.is_some_and(|n| {
+            let a = Vec3::from_array(n[vertices[0]]);
+            vertices
+                .iter()
+                .any(|&i| a.distance_squared(Vec3::from_array(n[i])) > 0.0001)
+        });
+        Face {
+            corners: vertices
+                .iter()
+                .map(|&i| Corner {
+                    vertex: mapped[i],
+                    uv: uv.map_or(Vec2::ZERO, |v| Vec2::from_array(v[i])),
+                    uv1: uv1.map_or(Vec2::ZERO, |v| Vec2::from_array(v[i])),
+                    color: colors.map_or(Vec4::ONE, |v| Vec4::from_array(v[i])),
+                    source_normal: normals
+                        .map(|v| Vec3::from_array(v[i]).normalize_or_zero())
+                        .filter(|n| n.length_squared() > 0.0),
+                })
+                .collect(),
+            material,
+            smooth,
+        }
+    };
+    if let Some(polygons) = polygons {
+        let error = "Повреждена полигональная топология модели";
+        let polygons: Vec<Vec<usize>> =
+            serde_json::from_value(polygons.clone()).map_err(|_| error.to_owned())?;
+        if polygons.len() > triangles.len()
+            || polygons
+                .iter()
+                .any(|p| !(3..=4096).contains(&p.len()) || p.iter().any(|&i| i >= positions.len()))
+        {
+            return Err(error.into());
+        }
+        let faces: Vec<_> = polygons.iter().map(|p| make_face(p)).collect();
+        fn counts(triangles: impl Iterator<Item = [usize; 3]>) -> HashMap<[usize; 3], usize> {
+            let mut counts = HashMap::new();
+            for mut triangle in triangles {
+                let first = (0..3).min_by_key(|&i| triangle[i]).unwrap();
+                triangle.rotate_left(first);
+                *counts.entry(triangle).or_default() += 1;
+            }
+            counts
+        }
+        let restored = counts(faces.iter().zip(&polygons).flat_map(|(face, polygon)| {
+            geometry
+                .triangles(face)
+                .into_iter()
+                .map(move |t| t.map(|i| polygon[i]))
+        }));
+        if restored != counts(triangles.into_iter()) {
+            return Err(error.into());
+        }
+        geometry.faces.extend(faces);
+        return Ok(());
+    }
+    let first_face = geometry.faces.len();
+    for triangle in triangles {
+        if mapped[triangle[0]] == mapped[triangle[1]]
+            || mapped[triangle[1]] == mapped[triangle[2]]
+            || mapped[triangle[0]] == mapped[triangle[2]]
+        {
+            continue;
+        }
+        geometry.faces.push(make_face(&triangle));
+    }
+    // glTF and Bevy render triangles. Restore polygon pairs for editing,
+    // including primitives created in the editor, without crossing material slots.
+    let mut selection = Selection {
+        kind: super::model_mesh::Element::Face,
+        faces: (first_face..geometry.faces.len()).collect(),
+        ..default()
+    };
+    // No compatible pair is a valid result for a triangular surface.
+    let _ = geometry.dissolve(&mut selection, true);
+    Ok(())
+}
+
+pub(super) fn render_mesh(buffers: super::model_mesh::Buffers) -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, buffers.positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, buffers.normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, buffers.uv);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, buffers.uv1);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, buffers.colors);
+    mesh.insert_indices(Indices::U32(buffers.indices));
+    let _ = mesh.generate_tangents();
+    mesh
+}
+
+pub(super) fn source_path(root: &std::path::Path, asset: &str) -> Result<PathBuf, String> {
+    crate::asset_paths::resolve_asset_path(root, asset)
+        .map(|path| root.join(path))
+        .map_err(|e| e.to_string())
+}
