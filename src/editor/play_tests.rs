@@ -3,7 +3,7 @@ use crate::{CameraPlacement, EditorProject, LevelEdits};
 
 fn editor() -> Editor {
     let project = EditorProject::load(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/project.json"),
     )
     .unwrap();
     let edits = project.read_scene(0).unwrap();

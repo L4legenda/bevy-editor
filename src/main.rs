@@ -48,15 +48,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "bevy-editor [project folder | project.bevyeditor | project.json]\n\
                 Without arguments, opens the project manager.\n\
-                --example         Open the bundled example\n\
                 --project PATH    Open a project directly\n\
                 --play-snapshot PATH  Run an editor level snapshot in Bevy\n\
                 --manager         Open the project manager"
             );
             return Ok(());
-        }
-        [flag] if flag == "--example" => {
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"))
         }
         [path] if !path.to_string_lossy().starts_with('-') => Some(PathBuf::from(path)),
         [flag, path] if flag == "--project" => Some(PathBuf::from(path)),

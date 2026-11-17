@@ -6,7 +6,7 @@ use crate::{
 
 fn app() -> App {
     let project = EditorProject::load(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/project.json"),
     )
     .unwrap();
     let edits = project.read_scene(0).unwrap();
@@ -274,7 +274,7 @@ mod gpu {
     #[ignore = "requires GPU; renames and removes a real outliner object using its context menu, F2 and undo"]
     fn gpu_scene_objects_context_rename_delete_and_undo() {
         let project = EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/project.json"),
         )
         .unwrap();
         let (mut app, window, target_image) = lighting_ui_render::fixture_project(project);

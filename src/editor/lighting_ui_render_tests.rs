@@ -242,7 +242,7 @@ fn gpu_native_scene_documents_open_edit_save_and_preview() {
         std::env::temp_dir().join(format!("bevy-editor-native-scene-{}", std::process::id()));
     std::fs::create_dir_all(directory.join("models")).unwrap();
     let mut project = EditorProject::load(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/project.json"),
     )
     .unwrap();
     for model in &project.catalog {

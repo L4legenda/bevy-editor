@@ -1,27 +1,47 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use super::*;
 use std::{fs, path::Path};
 
 fn fixture() -> (CameraSavePath, EditorProject) {
     let scratch = CameraSavePath::new();
-    let mut project =
-        EditorProject::load(Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/project.json"))
-            .unwrap();
-    fs::create_dir_all(scratch.0.join("models")).unwrap();
-    for model in &project.catalog {
-        fs::copy(
-            project.asset_root.join(&model.asset),
-            scratch.0.join(&model.asset),
-        )
-        .unwrap();
-    }
-    for index in 0..project.scenes.len() {
-        let document = project.read_scene(index).unwrap();
-        document
-            .write(&scratch.0, &project.scenes[index].file)
-            .unwrap();
-    }
-    project.asset_root = scratch.0.clone();
+    let project = create_project(&scratch.0);
     (scratch, project)
+}
+
+pub(super) fn create_project(directory: &Path) -> EditorProject {
+    let mut project = crate::project_manager::create_test_project(directory).unwrap();
+    let mut document = project.read_scene(0).unwrap();
+    let model = document.models[0].clone();
+    document.models = [-2.0, 0.0, 2.0]
+        .into_iter()
+        .enumerate()
+        .map(|(index, x)| {
+            let mut placed = model.clone();
+            placed.id = index as u32 + 1;
+            placed.pose.position[0] = x;
+            placed
+        })
+        .collect();
+    document
+        .write(&project.asset_root, &project.scenes[0].file)
+        .unwrap();
+
+    let mut second = project.scenes[0].clone();
+    second.label = "Second test scene".into();
+    second.file = "scenes/second.scene".into();
+    document.models = vec![model];
+    document.scene.as_mut().unwrap().label = second.label.clone();
+    document.write(&project.asset_root, &second.file).unwrap();
+    project.scenes.push(second);
+
+    project.asset_root = "assets".into();
+    fs::write(
+        directory.join(crate::project::PROJECT_FILE_NAME),
+        serde_json::to_vec_pretty(&project).unwrap(),
+    )
+    .unwrap();
+    EditorProject::load(directory).unwrap()
 }
 
 #[test]
@@ -30,8 +50,8 @@ fn a_scene_file_contains_objects_cameras_and_lighting_without_a_source_glb() {
     let definition = &project.scenes[0];
     assert!(definition.is_native());
     assert!(definition.asset.is_empty());
-    assert!(!scratch.0.join("levels").exists());
-    assert!(!scratch.0.join("scenes/workshop.glb").exists());
+    assert!(!project.asset_root.join("levels").exists());
+    assert!(!project.asset_root.join("scenes/main.glb").exists());
     let mut document = project.read_scene(0).unwrap();
     assert_eq!(document.models.len(), 3);
     assert_eq!(document.scene.as_ref().unwrap().cameras, definition.cameras);
@@ -45,10 +65,12 @@ fn a_scene_file_contains_objects_cameras_and_lighting_without_a_source_glb() {
             lens: 65.0,
         },
     );
-    document.write(&scratch.0, &definition.file).unwrap();
+    document
+        .write(&project.asset_root, &definition.file)
+        .unwrap();
     assert_eq!(project.read_scene(0).unwrap(), document);
     let mut manifest = project.clone();
-    manifest.asset_root = ".".into();
+    manifest.asset_root = "assets".into();
     fs::write(
         scratch.0.join("project.bevyeditor"),
         serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -58,7 +80,7 @@ fn a_scene_file_contains_objects_cameras_and_lighting_without_a_source_glb() {
         serde_json::from_slice(&fs::read(scratch.0.join("project.bevyeditor")).unwrap()).unwrap();
     assert_eq!(
         json["scenes"][0],
-        serde_json::json!({"file":"scenes/workshop.scene"})
+        serde_json::json!({"file":"scenes/main.scene"})
     );
     let reopened = EditorProject::load(&scratch.0).unwrap();
     assert_eq!(reopened.read_scene(0).unwrap(), document);
@@ -72,7 +94,7 @@ fn browser_discovers_unlisted_scene_files_and_treats_every_glb_as_a_model() {
     let mut browser = browser::Browser::new(&mut project);
     assert_eq!(project.scenes.len(), 2);
     assert!(project.scenes.iter().all(SceneDefinition::is_native));
-    assert_eq!(project.catalog.len(), 2);
+    assert_eq!(project.catalog.len(), 1);
     assert!(browser.files.iter().all(|file| file.extension == "scene"));
     browser.set_search(".scene".into());
     for entry in browser.entries(&project.catalog) {
@@ -83,17 +105,17 @@ fn browser_discovers_unlisted_scene_files_and_treats_every_glb_as_a_model() {
 
 #[test]
 fn missing_or_invalid_scene_documents_never_silently_open_as_empty_scenes() {
-    let (scratch, project) = fixture();
+    let (_scratch, project) = fixture();
     let path = &project.scenes[0].file;
-    let original = fs::read(scratch.0.join(path)).unwrap();
+    let original = fs::read(project.asset_root.join(path)).unwrap();
     assert!(
         RoomEdits::<String>::default()
-            .write(&scratch.0, path)
+            .write(&project.asset_root, path)
             .is_err()
     );
-    assert_eq!(fs::read(scratch.0.join(path)).unwrap(), original);
-    assert!(RoomEdits::<String>::read(&scratch.0, "scenes/missing.scene").is_err());
-    fs::write(scratch.0.join(path), b"{}").unwrap();
+    assert_eq!(fs::read(project.asset_root.join(path)).unwrap(), original);
+    assert!(RoomEdits::<String>::read(&project.asset_root, "scenes/missing.scene").is_err());
+    fs::write(project.asset_root.join(path), b"{}").unwrap();
     assert!(project.read_scene(0).is_err());
 }
 

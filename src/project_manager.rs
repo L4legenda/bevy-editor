@@ -226,6 +226,12 @@ pub fn remember_project(path: impl AsRef<Path>) -> io::Result<()> {
     recent.save(&registry)
 }
 
+#[cfg(test)]
+pub(crate) fn create_test_project(directory: &Path) -> io::Result<EditorProject> {
+    let file = projects::create_project(directory, "Test project", Template::Starter)?;
+    EditorProject::load(file)
+}
+
 /// Start here when launching the standalone editor without a project argument.
 pub fn create_project_manager_app() -> Result<App, Box<dyn std::error::Error>> {
     let manager = Manager::load(projects::config_file()?, std::env::current_exe()?);

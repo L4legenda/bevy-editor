@@ -14,7 +14,7 @@ use bevy::{
 use std::time::Duration;
 
 fn native_level() -> (PathBuf, GameLevel) {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/assets");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/assets");
     let level = GameLevel::read(&root, "scenes/small_room.scene").unwrap();
     (root, level)
 }
