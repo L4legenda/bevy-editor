@@ -3,6 +3,8 @@ use bevy_cargo_cache::{
     cache::{BuildLock, INDEX, Root, State},
     snapshot_key,
 };
+#[cfg(windows)]
+use std::process::Stdio;
 use std::{
     ffi::OsString,
     fs,
@@ -30,7 +32,7 @@ cache-fixture-dep={path="dep"}
         "project with spaces/src/lib.rs",
         b"pub fn number() -> u32 { cache_fixture_dep::number() }\n",
     );
-    temp.file("project with spaces/src/main.rs",br##"fn main(){println!(r#"{{"reason":"compiler-artifact","filenames":["untracked.txt"]}}"#);if std::env::args().any(|a|a=="fail"){std::process::exit(7);}}"##);
+    temp.file("project with spaces/src/main.rs",br##"fn main(){println!(r#"{{"reason":"compiler-artifact","filenames":["untracked.txt"]}}"#);if std::env::args().any(|a|a=="hold"){std::thread::sleep(std::time::Duration::from_secs(30));}if std::env::args().any(|a|a=="fail"){std::process::exit(7);}}"##);
     temp.file(
         "project with spaces/dep/Cargo.toml",
         b"[package]\nname=\"cache-fixture-dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
@@ -46,7 +48,6 @@ fn invoke(temp: &Sandbox, extra: &[&str]) -> Output {
     command
         .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg(temp.path.join("target"))
-        .arg("0.000000001")
         .arg(extra[0])
         .arg("--offline")
         .arg("--manifest-path")
@@ -63,6 +64,15 @@ fn success(output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+#[cfg(windows)]
+fn failed_with(output: &Output, message: &str) {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success() && text.contains(message), "{text}");
+}
 fn state(temp: &Sandbox) -> State {
     State::load(&Root::new(&temp.path.join("target")).unwrap()).unwrap()
 }
@@ -71,7 +81,7 @@ fn key(command: &str) -> String {
 }
 
 #[test]
-fn real_cargo_fresh_dependencies_test_artifacts_and_unknown_files_are_kept() {
+fn real_cargo_keeps_fresh_dependencies_tests_and_superseded_artifacts() {
     let temp = fixture();
     success(&invoke(&temp, &["build"]));
     success(&invoke(&temp, &["test"]));
@@ -109,10 +119,8 @@ fn real_cargo_fresh_dependencies_test_artifacts_and_unknown_files_are_kept() {
         fs::read(root.path.join("untracked.txt")).unwrap(),
         b"unknown"
     );
-    assert!(!root.path.join("obsolete.rlib").exists());
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("current and untracked files were kept")
-    );
+    assert!(root.path.join("obsolete.rlib").exists());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Cache: removed"));
     let bytes = fs::read(root.path.join(INDEX)).unwrap();
     temp.file(
         "project with spaces/src/lib.rs",
@@ -152,7 +160,7 @@ fn a_corrupt_index_does_not_fail_a_successful_build_or_delete_files() {
     temp.file("target/keep.rlib", b"keep");
     let output = invoke(&temp, &["build"]);
     success(&output);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Cache maintenance skipped"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cache inventory update skipped"));
     assert_eq!(
         fs::read(temp.path.join("target").join(INDEX)).unwrap(),
         b"{broken"
@@ -175,12 +183,24 @@ fn another_process_cannot_build_until_the_owner_releases_the_lock() {
 
 #[cfg(windows)]
 #[test]
-fn powershell_launcher_builds_and_locks_without_python_on_path() {
+fn powershell_builds_keep_cache_and_manual_script_cleans_only_when_idle() {
     let temp = fixture();
     let source = Path::new(env!("CARGO_MANIFEST_DIR"));
     temp.file(
         "tools/cargo.ps1",
         &fs::read(source.parent().unwrap().join("cargo.ps1")).unwrap(),
+    );
+    temp.file(
+        "clean-cache.cmd",
+        &fs::read(
+            source
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("clean-cache.cmd"),
+        )
+        .unwrap(),
     );
     for file in [
         "Cargo.toml",
@@ -214,7 +234,7 @@ fn powershell_launcher_builds_and_locks_without_python_on_path() {
             .arg(temp.path.join("project with spaces/Cargo.toml"))
             .env("PATH", &path)
             .env("CARGO_NET_OFFLINE", "true")
-            .env("BEVY_EDITOR_TARGET_LIMIT_GB", "0.000000001")
+            .env("BEVY_EDITOR_TARGET_LIMIT_GB", "invalid-and-ignored")
             .current_dir(&temp.path)
             .output()
             .unwrap()
@@ -222,10 +242,72 @@ fn powershell_launcher_builds_and_locks_without_python_on_path() {
     success(&launch());
     assert!(temp.path.join("target").join(INDEX).is_file());
     let root = Root::new(&temp.path.join("target")).unwrap();
+    temp.file("target/obsolete.rlib", b"keep until manual cleanup");
+    let mut index = state(&temp);
+    index.known.insert("obsolete.rlib".into());
+    index.save(&root).unwrap();
     let lock = BuildLock::acquire(&root).unwrap();
     let output = launch();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Another editor build is active"));
     drop(lock);
     success(&launch());
+    assert!(root.path.join("obsolete.rlib").is_file());
+
+    temp.file(
+        "Cargo.toml",
+        b"[package]\nname=\"launcher-root\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+    );
+    temp.file("src/main.rs", b"fn main() {}\n");
+    temp.file("keep-outside-target.txt", b"user project data");
+    let clean = || {
+        Command::new(&powershell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(temp.path.join("tools/cargo.ps1"))
+            .arg("clean")
+            .env("PATH", &path)
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("BEVY_EDITOR_TARGET_LIMIT_GB", "invalid-and-ignored")
+            .current_dir(&temp.path)
+            .output()
+            .unwrap()
+    };
+    let lock = BuildLock::acquire(&root).unwrap();
+    let output = clean();
+    failed_with(&output, "Another editor build is active");
+    assert!(root.path.join("obsolete.rlib").is_file());
+    drop(lock);
+
+    struct RunningProgram(std::process::Child);
+    impl Drop for RunningProgram {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let program = RunningProgram(
+        Command::new(root.path.join("debug/cache-fixture-app.exe"))
+            .arg("hold")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let output = clean();
+    failed_with(&output, "Close programs running from target");
+    assert!(root.path.join("obsolete.rlib").is_file());
+    drop(program);
+
+    success(&clean());
+    assert!(!temp.path.join("target").exists());
+    assert_eq!(
+        fs::read(temp.path.join("keep-outside-target.txt")).unwrap(),
+        b"user project data"
+    );
+    assert!(temp.path.join("project with spaces/Cargo.toml").is_file());
 }

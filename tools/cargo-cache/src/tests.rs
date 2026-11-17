@@ -163,15 +163,6 @@ fn categories_profiles_and_targets_respect_the_program_argument_separator() {
     );
 }
 
-#[test]
-fn six_gib_default_and_invalid_limits() {
-    assert_eq!(limit_bytes("6").unwrap(), 6 * 1024u64.pow(3));
-    assert_eq!(limit_bytes("1.5").unwrap(), 1536 * 1024u64.pow(2));
-    for value in ["0", "-1", "NaN", "inf", "no", "1e100"] {
-        assert!(limit_bytes(value).is_err(), "{value}");
-    }
-}
-
 #[cfg(any(windows, unix))]
 #[test]
 fn directory_links_are_not_traversed_or_accepted_as_a_target() {

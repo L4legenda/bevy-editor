@@ -1,5 +1,5 @@
 pub mod cache;
-use cache::{BuildLock, Root, State, prune};
+use cache::{BuildLock, Root, State};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -43,17 +43,6 @@ pub fn snapshot_key(args: &[OsString]) -> String {
     serde_json::to_string(&[group, &profile, &target]).unwrap()
 }
 
-pub fn limit_bytes(text: &str) -> Result<u64, String> {
-    let gib: f64 = text
-        .parse()
-        .map_err(|_| "BEVY_EDITOR_TARGET_LIMIT_GB must be a finite positive number.")?;
-    let bytes = gib * 1024f64.powi(3);
-    if !gib.is_finite() || gib <= 0. || !bytes.is_finite() || bytes >= u64::MAX as f64 {
-        return Err("BEVY_EDITOR_TARGET_LIMIT_GB must be a finite positive number.".into());
-    }
-    Ok(bytes as u64)
-}
-
 struct OwnedChild {
     process: Child,
     waited: bool,
@@ -67,7 +56,7 @@ impl Drop for OwnedChild {
     }
 }
 
-pub fn run(cargo: &Path, target: &Path, limit: u64, args: &[OsString]) -> io::Result<i32> {
+pub fn run(cargo: &Path, target: &Path, args: &[OsString]) -> io::Result<i32> {
     let Some(command) = args.first().and_then(|s| s.to_str()) else {
         return Err(io::Error::other("Missing Cargo command"));
     };
@@ -149,29 +138,16 @@ pub fn run(cargo: &Path, target: &Path, limit: u64, args: &[OsString]) -> io::Re
     let status = child.process.wait()?;
     child.waited = true;
     if status.success() && finished == Some(true) && !artifacts.is_empty() {
-        let maintenance = (|| -> io::Result<()> {
+        let inventory = (|| -> io::Result<()> {
             let mut state = State::load(&root)?;
             state.known.extend(artifacts.iter().cloned());
             state.snapshots.insert(snapshot_key(args), artifacts);
-            let report = prune(&root, &mut state, limit)?;
-            if report.removed > 0 {
-                writeln!(
-                    stdout,
-                    "Cache: removed {:.1} MiB of superseded artifacts.",
-                    report.removed as f64 / 1024f64.powi(2)
-                )?;
-            }
-            if report.remaining > limit {
-                writeln!(
-                    stdout,
-                    "Cache: size remains above the threshold; current and untracked files were kept."
-                )?;
-            }
             state.save(&root)
         })();
-        // Cache maintenance must never turn a successful Cargo command into a failure.
-        if let Err(error) = maintenance {
-            eprintln!("Cache maintenance skipped: {error}");
+        // Inventory errors must never turn a successful Cargo command into a failure.
+        // Builds only record artifacts; cache deletion is an explicit user action.
+        if let Err(error) = inventory {
+            eprintln!("Cache inventory update skipped: {error}");
         }
     }
     #[cfg(unix)]
@@ -186,16 +162,14 @@ pub fn run(cargo: &Path, target: &Path, limit: u64, args: &[OsString]) -> io::Re
 }
 
 pub fn main_args(mut args: impl Iterator<Item = OsString>) -> Result<i32, String> {
-    let usage = "Usage: bevy-cargo-cache <cargo> <target-dir> <limit-GiB> <build|check|test|run|clippy> [Cargo arguments]";
+    let usage = "Usage: bevy-cargo-cache <cargo> <target-dir> <build|check|test|run|clippy> [Cargo arguments]";
     let cargo = args.next().ok_or(usage)?;
     if cargo == "--help" {
         println!("{usage}");
         return Ok(0);
     }
     let target = PathBuf::from(args.next().ok_or(usage)?);
-    let limit = args.next().ok_or(usage)?;
-    let limit = limit_bytes(limit.to_str().ok_or(usage)?)?;
-    run(Path::new(&cargo), &target, limit, &args.collect::<Vec<_>>()).map_err(|e| e.to_string())
+    run(Path::new(&cargo), &target, &args.collect::<Vec<_>>()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
