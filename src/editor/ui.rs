@@ -1126,7 +1126,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                         _ => true,
                     })
         }
-        Action::Select(_) => editor.has_scene() && editor.ready && editor.tool == Tool::Universal,
+        Action::Select(_) => editor.has_scene() && editor.ready,
         Action::ToggleVisibility(target) => {
             editor.has_scene() && editor.ready && editor.can_toggle_visibility(target)
         }

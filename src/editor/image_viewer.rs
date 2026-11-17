@@ -22,6 +22,9 @@ pub(in crate::editor) use canvas_material::{CanvasMaterial, ImageCanvasPlugin};
 mod paint_input;
 #[path = "image_panel_resize.rs"]
 mod panel_resize;
+#[cfg(target_os = "windows")]
+#[path = "image_wintab.rs"]
+mod wintab;
 pub(in crate::editor) use panel_resize::resize as resize_panel;
 #[path = "image_cursor.rs"]
 mod tool_cursor;
@@ -108,6 +111,7 @@ pub(in crate::editor) struct ImageViewer {
     last_cursor: Option<CursorIcon>,
     brush_cursor: Option<tool_cursor::Tip>,
     brush_cursor_position: Option<Vec2>,
+    pen_cursor: Option<Vec2>,
     native_brush_cursor: bool,
     pipette_preview: Option<tool_cursor::PipetteSample>,
 }
@@ -568,10 +572,11 @@ pub(in crate::editor) fn update(
     mut focus: ResMut<InputFocus>,
     mut browser_ui: Option<ResMut<drawer::BrowserUi>>,
     drawer: Option<Res<DrawerMotion>>,
-    (keys, mut strokes, mut events): (
+    (keys, mut strokes, mut events, _window_thread): (
         Res<ButtonInput<KeyCode>>,
         Local<paint_input::Samples>,
         MessageReader<bevy::window::WindowEvent>,
+        bevy::ecs::system::NonSendMarker,
     ),
     inputs: Query<(), With<TextInput>>,
 ) {
@@ -582,6 +587,7 @@ pub(in crate::editor) fn update(
         window.cursor_position(),
         &mouse,
     );
+    viewer.pen_cursor = strokes.pen_cursor();
     let pressed_controls = samples.iter().any(|sample| {
         matches!(sample, paint_input::Sample::Down(point) if over_controls(&controls, *point))
     });
@@ -772,12 +778,16 @@ pub(in crate::editor) fn update(
         edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
         return;
     }
+    let mut drawing_mouse = (*mouse).clone();
+    if strokes.pen_down() {
+        drawing_mouse.press(MouseButton::Left);
+    }
     let edit_pointer = edit::pointer(
         &mut viewer,
         &mut editor,
         rect,
         input_rect,
-        &mouse,
+        &drawing_mouse,
         &keys,
         &mut focus,
         &samples,

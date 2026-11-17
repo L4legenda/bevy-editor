@@ -49,6 +49,7 @@ pub(in crate::editor) enum LayerAction {
     SetBlend(photocraft_color::BlendMode),
     Fill(f32, bool),
     Lock(&'static str),
+    ToggleLock(u64),
     Move(u64, u64, &'static str, bool),
     Properties,
     Copy,
@@ -660,6 +661,14 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             state.layers.blend_menu = false;
         }
         Blend => state.layers.blend_menu ^= true,
+        ToggleLock(id) => {
+            if let Some(layer) = doc.document.layer(LayerId(id)) {
+                call = Some((
+                    "layer.setProps",
+                    json!({"layers":[id],"locks":{"all":!layer.locks.all}}),
+                ));
+            }
+        }
         Lock(key) => {
             let locks = doc
                 .active_id()

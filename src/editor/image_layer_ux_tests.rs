@@ -43,6 +43,66 @@ fn effects(app: &App) -> usize {
 }
 
 #[test]
+fn layer_ux_row_lock_targets_its_layer_and_preserves_selection() {
+    let (_fixture, mut app) = editing();
+    let original = {
+        let viewer = app.world().resource::<ImageViewer>();
+        viewer
+            .edit
+            .document(viewer.tab)
+            .unwrap()
+            .active_id()
+            .unwrap()
+    };
+    layer(&mut app, L::Quick("layer.duplicate"));
+    let (active, selected) = {
+        let viewer = app.world().resource::<ImageViewer>();
+        let doc = viewer.edit.document(viewer.tab).unwrap();
+        (doc.active_id().unwrap(), doc.selected.clone())
+    };
+    layer(&mut app, L::ToggleLock(original.0));
+    {
+        let viewer = app.world().resource::<ImageViewer>();
+        let doc = viewer.edit.document(viewer.tab).unwrap();
+        assert!(doc.document.layer(original).unwrap().locks.all);
+        assert!(!doc.document.layer(active).unwrap().locks.all);
+        assert_eq!(doc.active_id(), Some(active));
+        assert_eq!(doc.selected, selected);
+        assert!(viewer.edit.active(
+            edit::EditAction::Layers(L::ToggleLock(original.0)),
+            viewer.tab
+        ));
+    }
+    layer(&mut app, L::ToggleLock(original.0));
+    {
+        let viewer = app.world().resource::<ImageViewer>();
+        assert!(
+            !viewer
+                .edit
+                .document(viewer.tab)
+                .unwrap()
+                .document
+                .layer(original)
+                .unwrap()
+                .locks
+                .all
+        );
+    }
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    app.update();
+    let revision = {
+        let viewer = app.world().resource::<ImageViewer>();
+        let doc = viewer.edit.document(viewer.tab).unwrap();
+        assert!(doc.document.layer(original).unwrap().locks.all);
+        doc.revision
+    };
+    layer(&mut app, L::ToggleLock(u64::MAX));
+    let viewer = app.world().resource::<ImageViewer>();
+    assert_eq!(viewer.edit.document(viewer.tab).unwrap().revision, revision);
+}
+
+#[test]
 fn layer_ux_quick_actions_create_copy_group_and_mask_without_parameter_forms() {
     let (_fixture, mut app) = editing();
     layer(&mut app, L::Quick("layer.duplicate"));
@@ -265,7 +325,10 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
             frame(app);
         }
     };
-    click(&mut app, |a| matches!(a, L::Quick("layer.duplicate")));
+    layer(&mut app, L::Quick("layer.duplicate"));
+    for _ in 0..4 {
+        frame(&mut app);
+    }
     assert_eq!(
         app.world()
             .resource::<ImageViewer>()

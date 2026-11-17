@@ -271,10 +271,101 @@ mod gpu {
     }
 
     #[test]
+    #[ignore = "requires GPU; selects outliner rows and deletes objects without leaving W/E/R"]
+    fn gpu_scene_objects_tree_and_delete_work_with_every_transform_tool() {
+        let project = EditorProject::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/native/project.json"),
+        )
+        .unwrap();
+        let (mut app, window, target_image) = lighting_ui_render::fixture_project(project);
+        app.world_mut().resource_mut::<Editor>().drawer = false;
+        warm(&mut app, 8);
+        let (target, other, original) = {
+            let editor = app.world().resource::<Editor>();
+            assert!(editor.edits.models.len() >= 2);
+            (
+                Selection::Model(editor.edits.models[0].id),
+                Selection::Model(editor.edits.models[1].id),
+                editor.edits.clone(),
+            )
+        };
+        let output =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/scene-objects-qa");
+        std::fs::create_dir_all(&output).unwrap();
+        for (tool, name) in [
+            (Tool::Move, "move"),
+            (Tool::Rotate, "rotate"),
+            (Tool::Scale, "scale"),
+        ] {
+            {
+                let mut editor = app.world_mut().resource_mut::<Editor>();
+                editor.select(None);
+                editor.tool = tool;
+            }
+            warm(&mut app, 4);
+            {
+                let world = app.world_mut();
+                let mut rows = world.query::<(&Control, Has<bevy::ui::InteractionDisabled>)>();
+                let (_, disabled) = rows
+                    .iter(world)
+                    .find(|(control, _)| matches!(control.action, Action::Select(t) if t == target))
+                    .unwrap();
+                assert!(!disabled, "The tree row must remain enabled in {tool:?}");
+            }
+            for selection in [target, other] {
+                let point = control_point(
+                    &mut app,
+                    |action| matches!(action, Action::Select(t) if t == selection),
+                );
+                click(&mut app, window, point, MouseButton::Left);
+                let editor = app.world().resource::<Editor>();
+                assert_eq!(
+                    editor.selection,
+                    Some(selection),
+                    "Tree selection must work in {tool:?}"
+                );
+                assert_eq!(editor.tool, tool);
+                assert_eq!(
+                    editor.edits, original,
+                    "Selecting a row must not transform the object"
+                );
+            }
+            // Right-click a different object: deletion must use this row rather
+            // than the previously selected object, and must keep the active tool.
+            let point = control_point(
+                &mut app,
+                |action| matches!(action, Action::Select(t) if t == target),
+            );
+            click(&mut app, window, point, MouseButton::Right);
+            assert!(app.world().resource::<Editor>().scene_object_popup);
+            assert_eq!(app.world().resource::<Editor>().selection, Some(target));
+            capture_when(
+                &mut app,
+                &target_image,
+                &output.join(format!("{name}-context-menu.png")),
+                |_| true,
+            );
+            let point = control_point(&mut app, |action| {
+                matches!(action, Action::SceneObject(ObjectAction::Remove))
+            });
+            click(&mut app, window, point, MouseButton::Left);
+            let editor = app.world().resource::<Editor>();
+            assert!(editor.pose(target).is_none());
+            assert!(editor.pose(other).is_some());
+            assert_eq!(editor.tool, tool);
+            app.world_mut().write_message(Action::Undo);
+            warm(&mut app, 5);
+            assert_eq!(app.world().resource::<Editor>().edits, original);
+        }
+    }
+
+    #[test]
     #[ignore = "requires GPU; renames and removes a real outliner object using its context menu, F2 and undo"]
     fn gpu_scene_objects_context_rename_delete_and_undo() {
         let project = EditorProject::load(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native/project.json"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/native/project.json"),
         )
         .unwrap();
         let (mut app, window, target_image) = lighting_ui_render::fixture_project(project);

@@ -285,6 +285,7 @@ pub(in crate::editor) fn cursor(
         .as_ref()
         .map_or(rect, |drawer| drawer.input_rect(rect, window.height()));
     let editing = viewer.edit.editing(editor.viewing_image);
+    let pointer = viewer.pen_cursor.or_else(|| window.cursor_position());
     let resize_center = viewer.edit.size_adjust.center();
     let active = editor.viewing_image.is_some()
         && !layer_drag.as_ref().is_some_and(|drag| drag.active)
@@ -304,7 +305,7 @@ pub(in crate::editor) fn cursor(
         && !viewer.panel.blocks_canvas()
         && viewer.dimensions.is_some()
         && resize_center
-            .or_else(|| window.cursor_position())
+            .or(pointer)
             .is_some_and(|point| input_rect.contains(point) && !over_controls(&controls, point));
     viewer.brush_cursor = None;
     viewer.brush_cursor_position = None;
@@ -323,7 +324,7 @@ pub(in crate::editor) fn cursor(
             });
         }
         if viewer.edit.eyedropper(&keys, editor.viewing_image) {
-            viewer.pipette_preview = window.cursor_position().and_then(|cursor| {
+            viewer.pipette_preview = pointer.and_then(|cursor| {
                 let dimensions = viewer.dimensions?;
                 let image = viewer.image_rect(dimensions, rect);
                 let doc = viewer.edit.document(editor.viewing_image)?;
@@ -344,7 +345,7 @@ pub(in crate::editor) fn cursor(
                     let dims = viewer.dimensions?;
                     let image = viewer.image_rect(dims, rect);
                     let scale = image.width() / dims.x as f32;
-                    let point = (window.cursor_position()? - image.min) / scale;
+                    let point = (pointer? - image.min) / scale;
                     super::edit::selection::hit(t.quad, point, scale)
                 })
                 .map_or(SystemCursorIcon::Move, |hit| match hit {
@@ -373,7 +374,7 @@ pub(in crate::editor) fn cursor(
         let tip = Tip::new(diameter, viewer.edit.pixel_square(), window.scale_factor());
         let pixel_tool = viewer.edit.pixel_tool();
         let position = resize_center
-            .or_else(|| window.cursor_position())
+            .or(pointer)
             .map(|cursor| {
                 if resize_center.is_none()
                     && pixel_tool
@@ -404,6 +405,7 @@ pub(in crate::editor) fn cursor(
             tip,
             &mut images,
             resize_center.is_some()
+                || viewer.pen_cursor.is_some()
                 || viewer.edit.tool == PhotoTool::Pencil
                 || (pixel_tool && tip.outline()),
         );

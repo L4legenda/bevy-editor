@@ -9,6 +9,7 @@ mod generation;
 mod generation_backend;
 mod generation_model;
 mod hdri_catalog;
+mod image_brush_rail_fx;
 mod image_previews;
 mod image_texture;
 mod lighting;
@@ -1025,6 +1026,7 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         area_selection::register(app);
         app.add_plugins(ui::LayerDragFxPlugin);
+        app.add_plugins(image_brush_rail_fx::BrushRailFxPlugin);
         wireframe::register(app);
         if !app.is_plugin_added::<crate::HdriPlugin>() {
             app.add_plugins(crate::HdriPlugin);
@@ -1770,9 +1772,7 @@ fn handle_actions(
                 editor.status = "Продолжайте редактирование".into();
             }
             Action::DiscardAndContinue => continue_pending(&mut editor),
-            Action::Select(target)
-                if editor.ready && editor.has_scene() && editor.tool == Tool::Universal =>
-            {
+            Action::Select(target) if editor.ready && editor.has_scene() => {
                 if !editor.hierarchy_parent_target(target) {
                     editor.select(Some(target))
                 }

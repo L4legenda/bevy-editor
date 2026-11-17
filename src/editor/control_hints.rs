@@ -318,8 +318,6 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             "Нажмите, чтобы рассмотреть «{}». Перетащите модель в 3D-вид, чтобы добавить её в сцену.",
             editor.project.catalog[index].label
         ),
-        Action::Select(_) if editor.tool != Tool::Universal =>
-            "Для выбора другого объекта включите режим со стрелкой (Q).".into(),
         Action::Select(target) => format!(
             "{} · Выбрать для редактирования. Num . приблизит свободный вид.",
             editor.label(target)

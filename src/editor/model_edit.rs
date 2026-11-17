@@ -305,6 +305,7 @@ pub(super) fn initialize(
     viewer: Res<Viewer>,
     editor: Res<Editor>,
     gltfs: Res<Assets<Gltf>>,
+    server: Res<AssetServer>,
     gltf_meshes: Res<Assets<GltfMesh>>,
     gltf_materials: Res<Assets<GltfMaterial>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -319,16 +320,16 @@ pub(super) fn initialize(
     if state.documents.contains_key(&index) || state.errors.contains_key(&index) {
         return;
     }
-    if !materials.contains(state.default_material.id()) {
-        state.default_material = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.72, 0.73, 0.76),
-            perceptual_roughness: 0.65,
-            ..default()
-        });
-    }
     let Some(asset) = viewer.source.as_ref().and_then(|source| gltfs.get(source)) else {
         return;
     };
+    // Handle::default() is Bevy's pink diagnostic material. Reuse the GLTF
+    // loader's fallback so unassigned primitives match their scene instances.
+    state.default_material = server.load(
+        bevy::asset::AssetPath::from(editor.project.catalog[index].asset.clone()).with_label(
+            format!("{}/std", bevy::gltf::GltfAssetLabel::DefaultMaterial),
+        ),
+    );
     let path = match document::source_path(&editor.root, &editor.project.catalog[index].asset) {
         Ok(path) => path,
         Err(error) => {

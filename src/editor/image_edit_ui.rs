@@ -1,6 +1,10 @@
 //! Bevy-native controls using the editor's existing colors, buttons and icons.
 use super::*;
-use bevy::ui_widgets::{Slider, SliderRange, SliderThumb, SliderValue, TrackClick, ValueChange};
+use crate::editor::image_brush_rail_fx as rail_fx;
+use bevy::ui_widgets::{
+    Slider, SliderDragState, SliderOrientation, SliderRange, SliderStep, SliderThumb, SliderValue,
+    TrackClick, ValueChange,
+};
 
 #[derive(Clone, Copy, Component)]
 enum Binding {
@@ -32,6 +36,7 @@ pub(in crate::editor) struct EditUi {
     name: Entity,
     status: Entity,
     size_group: Entity,
+    brush_rail: Entity,
     size_button: Entity,
     size_value: Entity,
     size_menu: Entity,
@@ -160,14 +165,230 @@ fn size_label(size: f32) -> String {
         .to_owned()
 }
 
+const RAIL_THUMB_HEIGHT: f32 = 28.0;
+
+#[derive(Component)]
+pub(in crate::editor) struct RailControl {
+    fill: Entity,
+    badge: Entity,
+    energy: Entity,
+    emphasis: f32,
+}
+
+// Eight octaves give small brushes useful travel without limiting large tips.
+fn rail_size(position: f32) -> f32 {
+    2.0_f32.powf(position.clamp(0.0, 1.0) * 8.0)
+}
+fn rail_position(size: f32) -> f32 {
+    size.clamp(1.0, 256.0).log2() / 8.0
+}
+
+/// Floating controls belong to the canvas so they stay clear of the layers panel.
+fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font>) -> Entity {
+    let rail = surface(
+        commands,
+        canvas,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            left: px(8),
+            top: percent(50),
+            width: px(72),
+            height: percent(80),
+            max_height: px(460),
+            padding: UiRect::all(px(7)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(12)),
+            ..column(14.0)
+        },
+        Color::NONE,
+    );
+    commands.entity(rail).insert((
+        CanvasControl,
+        ZIndex(8),
+        BorderColor::all(Color::NONE),
+        BoxShadow(vec![ShadowStyle {
+            color: Color::srgba(0.0, 0.0, 0.0, 0.65),
+            x_offset: px(3),
+            y_offset: px(4),
+            blur_radius: px(12),
+            spread_radius: px(1),
+        }]),
+        UiTransform::from_translation(Val2::percent(0, -50)),
+        AccessibleLabel("Быстрые настройки кисти".into()),
+    ));
+    rail_fx::attach(commands, rail, rail_fx::Kind::Glass, 7.0);
+    for (glyph, label, binding, range) in [
+        (
+            icons::Glyph::Brush,
+            "Размер кисти · слева",
+            Binding::Size,
+            (0.0, 1.0),
+        ),
+        (
+            icons::Glyph::Eye,
+            "Непрозрачность кисти · слева",
+            Binding::BrushOpacity,
+            (0.01, 1.0),
+        ),
+    ] {
+        let group = node(
+            commands,
+            rail,
+            Node {
+                width: percent(100),
+                flex_grow: 1.0,
+                flex_basis: px(0),
+                min_height: px(0),
+                align_items: AlignItems::Center,
+                ..column(6.0)
+            },
+        );
+        icons::spawn(commands, group, glyph, 16.0, Color::srgb(0.85, 0.77, 0.64));
+        let slider = commands
+            .spawn((
+                Slider {
+                    orientation: SliderOrientation::Vertical,
+                    track_click: TrackClick::Drag,
+                },
+                SliderRange::new(range.0, range.1),
+                SliderValue(range.0),
+                SliderStep(0.01),
+                TabIndex(0),
+                Hovered::default(),
+                AccessibleLabel(label.into()),
+                Node {
+                    width: percent(100),
+                    flex_grow: 1.0,
+                    min_height: px(RAIL_THUMB_HEIGHT),
+                    ..default()
+                },
+                ChildOf(group),
+            ))
+            .observe(slider_change)
+            .id();
+        let track = surface(
+            commands,
+            slider,
+            Node {
+                position_type: PositionType::Absolute,
+                left: percent(50),
+                top: px(RAIL_THUMB_HEIGHT * 0.5),
+                bottom: px(RAIL_THUMB_HEIGHT * 0.5),
+                width: px(10),
+                border_radius: BorderRadius::MAX,
+                border: UiRect::all(px(1)),
+                ..default()
+            },
+            Color::srgb(0.055, 0.065, 0.085),
+        );
+        commands.entity(track).insert((
+            Pickable::IGNORE,
+            BorderColor::all(Color::srgb(0.30, 0.25, 0.35)),
+            UiTransform::from_translation(Val2::percent(-50, 0)),
+        ));
+        let fill = surface(
+            commands,
+            slider,
+            Node {
+                position_type: PositionType::Absolute,
+                left: percent(50),
+                bottom: px(RAIL_THUMB_HEIGHT * 0.5),
+                width: px(6),
+                height: px(0),
+                border_radius: BorderRadius::MAX,
+                ..default()
+            },
+            Color::NONE,
+        );
+        commands.entity(fill).insert((
+            Pickable::IGNORE,
+            UiTransform::from_translation(Val2::percent(-50, 0)),
+        ));
+        let seed = if matches!(binding, Binding::Size) {
+            11.0
+        } else {
+            47.0
+        };
+        rail_fx::attach(commands, fill, rail_fx::Kind::Flow, seed);
+        let thumb = surface(
+            commands,
+            slider,
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(1),
+                right: px(1),
+                top: px(0),
+                height: px(RAIL_THUMB_HEIGHT),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(7)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..column(3.0)
+            },
+            Color::NONE,
+        );
+        commands.entity(thumb).insert((
+            SliderThumb,
+            Pickable::IGNORE,
+            BorderColor::all(Color::NONE),
+        ));
+        let energy = rail_fx::energy(commands, thumb, seed);
+        let badge = surface(
+            commands,
+            slider,
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                left: percent(100),
+                margin: UiRect::left(px(18)),
+                height: px(30),
+                min_width: px(68),
+                padding: UiRect::horizontal(px(10)),
+                border: UiRect::all(px(1)),
+                border_radius: BorderRadius::all(px(7)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Color::srgb(0.13, 0.14, 0.18),
+        );
+        commands.entity(badge).insert((
+            Pickable::IGNORE,
+            BorderColor::all(FOCUS),
+            AccessibleLabel(format!("Значение: {label}")),
+        ));
+        let readout = text(commands, badge, font_handle, "", 13.0, TEXT);
+        commands.entity(readout).insert(Pickable::IGNORE);
+        commands.entity(slider).insert((
+            PhotoSlider {
+                binding,
+                thumb,
+                readout,
+            },
+            RailControl {
+                fill,
+                badge,
+                energy,
+                emphasis: 0.0,
+            },
+        ));
+    }
+    rail
+}
+
 fn slider_change(
     event: On<ValueChange<f32>>,
-    sliders: Query<&PhotoSlider>,
+    sliders: Query<(&PhotoSlider, Option<&RailControl>)>,
     mut actions: MessageWriter<Action>,
 ) {
-    if let Ok(slider) = sliders.get(event.source) {
+    if let Ok((slider, rail)) = sliders.get(event.source) {
         let action = match slider.binding {
-            Binding::Size => EditAction::Size(event.value),
+            Binding::Size => EditAction::Size(if rail.is_some() {
+                rail_size(event.value)
+            } else {
+                event.value
+            }),
             Binding::Hardness => EditAction::Hardness(event.value),
             Binding::BrushOpacity => EditAction::BrushOpacity(event.value),
             Binding::LayerOpacity => EditAction::Opacity(event.value, event.is_final),
@@ -241,7 +462,7 @@ pub(super) fn tool_button(
     icons::themed(commands, button, glyph, 18.0);
 }
 
-fn tool_menu_hint(commands: &mut Commands, parent: Entity) {
+pub(super) fn tool_menu_hint(commands: &mut Commands, parent: Entity) {
     let hint = icons::spawn(commands, parent, icons::Glyph::SubmenuDown, 12.0, MUTED);
     commands.entity(hint).insert((
         Node {
@@ -264,6 +485,7 @@ pub(in crate::editor) fn setup(
     root: Entity,
     font_handle: &Handle<Font>,
 ) {
+    let brush_rail = brush_rail(commands, canvas, font_handle);
     let size_group = node(
         commands,
         toolbar,
@@ -827,6 +1049,7 @@ pub(in crate::editor) fn setup(
         name,
         status,
         size_group,
+        brush_rail,
         size_button,
         size_value,
         size_menu,
@@ -1040,14 +1263,30 @@ pub(in crate::editor) fn refresh(
     mut focus: ResMut<InputFocus>,
     mut nodes: Query<&mut Node>,
     mut labels: Query<&mut Text>,
-    sliders: Query<(Entity, &PhotoSlider, &SliderValue, &SliderRange)>,
+    sliders: Query<(
+        Entity,
+        &PhotoSlider,
+        &SliderValue,
+        &SliderRange,
+        &Slider,
+        &ComputedNode,
+    )>,
     mut inputs: Query<&mut EditableText>,
     mut borders: Query<&mut BorderColor>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>,
     parents: Query<&ChildOf>,
     mut colors: Query<&mut BackgroundColor>,
+    mut rails: Query<(&mut RailControl, &Hovered, &SliderDragState)>,
+    time: Res<Time>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
+    if let Ok(mut rail) = nodes.get_mut(ui.brush_rail) {
+        rail.display = if editing && viewer.edit.sizeable() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
     for (entity, visible) in [
         (ui.hardness_group, viewer.edit.tool != PhotoTool::Pencil),
         (ui.pencil_shapes, viewer.edit.tool == PhotoTool::Pencil),
@@ -1209,7 +1448,7 @@ pub(in crate::editor) fn refresh(
         {
             input.editor_mut().set_text(&active.name);
         }
-        for (entity, slider, value, range) in &sliders {
+        for (entity, slider, value, range, control, computed) in &sliders {
             let (number, label) = match slider.binding {
                 Binding::Size => (
                     viewer.edit.size,
@@ -1231,8 +1470,27 @@ pub(in crate::editor) fn refresh(
                     (active.opacity, format!("{:.0}%", active.opacity * 100.0))
                 }
             };
-            if value.0 != number {
-                commands.entity(entity).try_insert(SliderValue(number));
+            let rail_position = if matches!(control.orientation, SliderOrientation::Vertical)
+                && matches!(slider.binding, Binding::Size)
+            {
+                rail_position(number)
+            } else {
+                number
+            };
+            if value.0 != rail_position {
+                commands
+                    .entity(entity)
+                    .try_insert(SliderValue(rail_position));
+            }
+            if matches!(control.orientation, SliderOrientation::Vertical)
+                && matches!(slider.binding, Binding::Size)
+            {
+                let step = if viewer.edit.pixel_tool() {
+                    ((number + 1.0).min(256.0).log2() / 8.0 - rail_position).max(0.001)
+                } else {
+                    0.01
+                };
+                commands.entity(entity).try_insert(SliderStep(step));
             }
             if matches!(slider.binding, Binding::Hardness) {
                 if viewer.edit.pixel_tool() {
@@ -1244,8 +1502,38 @@ pub(in crate::editor) fn refresh(
             if let Ok(mut label_node) = labels.get_mut(slider.readout) {
                 label_node.set_if_neq(Text(label));
             }
-            if let Ok(mut thumb) = nodes.get_mut(slider.thumb) {
-                thumb.left = percent(((number - range.start()) / range.span()) * 94.0);
+            let position = ((rail_position - range.start()) / range.span()).clamp(0.0, 1.0);
+            if let Ok((mut rail, hovered, drag)) = rails.get_mut(entity) {
+                let travel = (computed.size().y * computed.inverse_scale_factor()
+                    - RAIL_THUMB_HEIGHT)
+                    .max(0.0);
+                let top = travel * (1.0 - position);
+                if let Ok(mut thumb) = nodes.get_mut(slider.thumb) {
+                    thumb.top = px(top);
+                }
+                if let Ok(mut fill) = nodes.get_mut(rail.fill) {
+                    fill.height = px(travel * position);
+                }
+                let engaged = editing && (hovered.0 || drag.dragging);
+                if let Ok(mut badge) = nodes.get_mut(rail.badge) {
+                    badge.display = if engaged {
+                        Display::Flex
+                    } else {
+                        Display::None
+                    };
+                    badge.top = px(top - 1.0);
+                }
+                let goal = if engaged { 1.0 } else { 0.0 };
+                let emphasis = rail.emphasis
+                    + (goal - rail.emphasis) * (1.0 - (-time.delta_secs().min(0.05) * 18.0).exp());
+                rail.emphasis = emphasis;
+                for surface in [rail.energy, rail.fill] {
+                    commands
+                        .entity(surface)
+                        .insert(rail_fx::Interaction { emphasis, position });
+                }
+            } else if let Ok(mut thumb) = nodes.get_mut(slider.thumb) {
+                thumb.left = percent(position * 94.0);
             }
         }
     }

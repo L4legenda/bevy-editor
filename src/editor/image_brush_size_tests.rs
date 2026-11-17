@@ -354,6 +354,264 @@ fn assert_centered(image: &image::RgbaImage, center: Vec2, diameter: f32) {
 }
 
 #[test]
+#[ignore = "requires GPU; drags the left brush controls without painting or moving the canvas"]
+fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
+    let fixture = Fixture::new();
+    image::RgbaImage::from_pixel(1200, 900, image::Rgba([255, 255, 255, 255]))
+        .save(fixture.0.join("rail-canvas.png"))
+        .unwrap();
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.0.clone();
+            editor.project.asset_root = fixture.0.clone();
+            editor.drawer = false;
+            browser.refresh(&mut editor.project);
+        });
+    let file = file(&app, "rail-canvas.png");
+    app.world_mut().write_message(Action::ViewImage(file));
+    for _ in 0..30 {
+        frame(&mut app);
+    }
+    let size = entity(&mut app, "Размер кисти · слева");
+    let opacity = entity(&mut app, "Непрозрачность кисти · слева");
+    assert!(bounds(&mut app, size).is_empty());
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    for _ in 0..120 {
+        frame(&mut app);
+        if app
+            .world()
+            .resource::<ImageViewer>()
+            .edit
+            .editing(app.world().resource::<Editor>().viewing_image)
+        {
+            break;
+        }
+    }
+    for _ in 0..6 {
+        frame(&mut app);
+    }
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .editing(app.world().resource::<Editor>().viewing_image)
+    );
+    let top = bounds(&mut app, size);
+    let bottom = bounds(&mut app, opacity);
+    assert!(top.min.x < 80.0 && top.height() > top.width());
+    assert!(top.max.y < bottom.min.y);
+    assert!(bottom.max.y < 900.0);
+    let before_pan = app.world().resource::<ImageViewer>().pan;
+    let original = {
+        let viewer = app.world().resource::<ImageViewer>();
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(viewer.image.as_ref().unwrap())
+            .unwrap()
+            .data
+            .clone()
+            .unwrap()
+    };
+    let thumb = |app: &mut App, slider: Entity| {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<Entity, With<bevy::ui_widgets::SliderThumb>>();
+        let thumbs: Vec<_> = query.iter(world).collect();
+        let thumb = world
+            .get::<Children>(slider)
+            .unwrap()
+            .iter()
+            .find(|entity| thumbs.contains(entity))
+            .unwrap();
+        bounds(app, thumb)
+    };
+    for slider in [size, opacity] {
+        assert!(matches!(
+            app.world()
+                .get::<bevy::ui_widgets::Slider>(slider)
+                .unwrap()
+                .orientation,
+            bevy::ui_widgets::SliderOrientation::Vertical
+        ));
+        let track = bounds(&mut app, slider);
+        let handle = thumb(&mut app, slider);
+        assert!(handle.height() >= 28.0 && handle.width() >= 48.0);
+        // Grabbing away from the handle's centre must not jump to another value.
+        let start = handle.center() + Vec2::new(0.0, 9.0);
+        let before = app
+            .world()
+            .get::<bevy::ui_widgets::SliderValue>(slider)
+            .unwrap()
+            .0;
+        let end = start
+            + Vec2::new(
+                0.0,
+                track.height() * if slider == size { -0.10 } else { 0.20 },
+            );
+        pointer(&mut app, window, start, None);
+        pointer(&mut app, window, start, Some(ButtonState::Pressed));
+        assert!(
+            (app.world()
+                .get::<bevy::ui_widgets::SliderValue>(slider)
+                .unwrap()
+                .0
+                - before)
+                .abs()
+                < 0.0001
+        );
+        pointer(&mut app, window, end, None);
+        // Pointer capture must keep the stroke blocked even outside the rail.
+        let release = end + Vec2::new(100.0, 0.0);
+        pointer(&mut app, window, release, None);
+        pointer(&mut app, window, release, Some(ButtonState::Released));
+    }
+    let viewer = app.world().resource::<ImageViewer>();
+    assert!(
+        (40.0..60.0).contains(&viewer.edit.size),
+        "{}",
+        viewer.edit.size
+    );
+    assert!(
+        (0.7..0.85).contains(&viewer.edit.opacity),
+        "{}",
+        viewer.edit.opacity
+    );
+    assert_eq!(viewer.pan, before_pan);
+    let document = viewer.edit.document(viewer.tab).unwrap();
+    assert!(!document.dirty() && !document.can_undo());
+    assert_eq!(
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(viewer.image.as_ref().unwrap())
+            .unwrap()
+            .data
+            .as_ref()
+            .unwrap(),
+        &original
+    );
+    // Both the popover and the rail must follow changes from other size controls.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Size(37.5)));
+    frame(&mut app);
+    frame(&mut app);
+    assert!(
+        (app.world()
+            .get::<bevy::ui_widgets::SliderValue>(size)
+            .unwrap()
+            .0
+            - 37.5_f32.log2() / 8.0)
+            .abs()
+            < 0.01
+    );
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/photo-brush-rail-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    let size_badge = entity(&mut app, "Значение: Размер кисти · слева");
+    let opacity_badge = entity(&mut app, "Значение: Непрозрачность кисти · слева");
+    // Resting controls contain no visible captions or numeric labels.
+    pointer(&mut app, window, Vec2::new(600.0, 430.0), None);
+    for _ in 0..8 {
+        frame(&mut app);
+    }
+    assert!(bounds(&mut app, size_badge).is_empty());
+    assert!(bounds(&mut app, opacity_badge).is_empty());
+    let handle = thumb(&mut app, size);
+    let cosmic_pixels = |image: &image::RgbaImage| {
+        (handle.min.y as u32..handle.max.y as u32)
+            .flat_map(|y| (handle.min.x as u32..handle.max.x as u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = image.get_pixel(x, y).0;
+                p[2] > p[1].saturating_add(20) && p[2] > p[0].saturating_add(8)
+            })
+            .count()
+    };
+    let resting = capture_when(
+        &mut app,
+        &target,
+        &output.join("left-sliders.png"),
+        |image| cosmic_pixels(image) > 30,
+    );
+    for _ in 0..30 {
+        frame(&mut app);
+    }
+    let animated = capture_when(
+        &mut app,
+        &target,
+        &output.join("left-sliders-flow.png"),
+        |image| {
+            let changed = (handle.min.y as u32..handle.max.y as u32)
+                .flat_map(|y| (handle.min.x as u32..handle.max.x as u32).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    image.get_pixel(x, y).0[..3]
+                        .iter()
+                        .zip(&resting.get_pixel(x, y).0[..3])
+                        .any(|(a, b)| a.abs_diff(*b) > 8)
+                })
+                .count();
+            changed > 40
+        },
+    );
+    assert_eq!(resting.dimensions(), animated.dimensions());
+    assert_eq!(
+        thumb(&mut app, size),
+        handle,
+        "Plasma motion must not move the input geometry"
+    );
+    assert!(
+        app.world()
+            .resource::<Assets<crate::editor::image_brush_rail_fx::CosmicMaterial>>()
+            .len()
+            <= 5
+    );
+    // Small tips have enough travel for a controlled, six-pixel adjustment.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Size(4.0)));
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    let start = thumb(&mut app, size).center();
+    pointer(&mut app, window, start, None);
+    pointer(&mut app, window, start, Some(ButtonState::Pressed));
+    pointer(&mut app, window, start - Vec2::new(0.0, 6.0), None);
+    let small_size = app.world().resource::<ImageViewer>().edit.size;
+    assert!((4.1..6.5).contains(&small_size), "{small_size}");
+    assert!(!bounds(&mut app, size_badge).is_empty());
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("left-sliders-active.png"),
+        |_| true,
+    );
+    pointer(
+        &mut app,
+        window,
+        start - Vec2::new(0.0, 6.0),
+        Some(ButtonState::Released),
+    );
+    let viewer = app.world().resource::<ImageViewer>();
+    let document = viewer.edit.document(viewer.tab).unwrap();
+    assert!(!document.dirty() && !document.can_undo());
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Tool(PhotoTool::Pencil)));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Size(1.0)));
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    app.world_mut()
+        .resource_mut::<InputFocus>()
+        .set(size, FocusCause::Auto);
+    key(&mut app, window, KeyCode::ArrowRight, Key::ArrowRight);
+    assert_eq!(
+        app.world().resource::<ImageViewer>().edit.size,
+        2.0,
+        "The log scale must preserve one-pixel keyboard adjustments"
+    );
+    println!("Left brush controls capture: {}", output.display());
+}
+
+#[test]
 #[ignore = "requires GPU; changes size through the toolbar, typed decimals and Shift, checks cursor and untouched pixels"]
 fn gpu_brush_size_toolbar_and_shift_update_tip_without_painting() {
     let fixture = Fixture::new();

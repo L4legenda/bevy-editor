@@ -26,6 +26,8 @@ mod layer_ux;
 mod painting;
 #[path = "image_panel_resize_tests.rs"]
 mod panel_sizing;
+#[path = "image_pen_tests.rs"]
+mod pen_pressure;
 #[path = "image_pencil_tests.rs"]
 mod pencil;
 #[path = "image_canvas_tests.rs"]

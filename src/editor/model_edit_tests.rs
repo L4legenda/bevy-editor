@@ -119,6 +119,68 @@ fn copy_directory(source: &Path, destination: &Path) {
     }
 }
 
+#[test]
+#[ignore = "requires GPU; compares unassigned GLTF materials in scenes and editable model tabs"]
+fn gpu_unassigned_model_material_matches_scene_instead_of_pink_placeholder() {
+    let directory = std::env::temp_dir().join(format!(
+        "bevy-model-material-{}",
+        bevy::asset::uuid::Uuid::new_v4()
+    ));
+    let mut project = EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    )
+    .unwrap();
+    copy_directory(&project.asset_root, &directory);
+    project.asset_root = directory.clone();
+    let path = directory.join("models/block.glb");
+    let mut source = document::glb::Glb::load(&path).unwrap();
+    source.json.as_object_mut().unwrap().remove("materials");
+    for mesh in source.json["meshes"].as_array_mut().unwrap() {
+        for primitive in mesh["primitives"].as_array_mut().unwrap() {
+            primitive.as_object_mut().unwrap().remove("material");
+        }
+    }
+    std::fs::write(&path, source.encode(&[], &[]).unwrap()).unwrap();
+    let (mut app, _, target) = fixture_project(project);
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    let scene_handle = app
+        .world()
+        .resource::<AssetServer>()
+        .get_handle::<StandardMaterial>("models/block.glb#DefaultMaterial/std")
+        .unwrap();
+    let state = app.world().resource::<State>();
+    let materials = app.world().resource::<Assets<StandardMaterial>>();
+    let scene = materials.get(&scene_handle).unwrap();
+    assert_eq!(scene.base_color, Color::WHITE);
+    for object in &state.documents[&0].objects {
+        for slot in &object.materials {
+            assert_ne!(slot.material, Handle::default());
+            let shown = materials.get(&slot.material).unwrap();
+            assert_eq!(shown.base_color, scene.base_color);
+            assert_eq!(shown.metallic, scene.metallic);
+            assert_eq!(shown.perceptual_roughness, scene.perceptual_roughness);
+            assert_eq!(shown.alpha_mode, scene.alpha_mode);
+        }
+    }
+    let rect = canvas_rect(&mut app);
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/model-edit-qa/unassigned-material.png");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    capture_when(&mut app, &target, &output, |image| {
+        image
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| {
+                rect.contains(Vec2::new(*x as f32, *y as f32))
+                    && pixel[0] > 180
+                    && u16::from(pixel[0]) > u16::from(pixel[1]) + 70
+                    && u16::from(pixel[2]) > u16::from(pixel[1]) + 40
+            })
+            .count()
+            < 30
+    });
+}
+
 fn scene_workspace_interactions(app: &mut App, window: Entity) {
     use crate::editor::viewport::{
         TransformHandle as Handle,

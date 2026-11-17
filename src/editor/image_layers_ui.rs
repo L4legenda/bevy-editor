@@ -269,40 +269,6 @@ pub(in crate::editor) fn setup(
             ..column(5.0)
         },
     );
-    let add_row = node(
-        commands,
-        stack,
-        Node {
-            width: percent(100),
-            ..row(4.0)
-        },
-    );
-    let add = button(
-        commands,
-        add_row,
-        font,
-        "Новый слой",
-        Action::ImageEdit(EditAction::AddLayer),
-        Look::Regular,
-    );
-    commands.entity(add).entry::<Node>().and_modify(|mut n| {
-        n.flex_grow = 1.0;
-        n.justify_content = JustifyContent::Center;
-    });
-    let plus = icons::themed(commands, add, icons::Glyph::Plus, 16.0);
-    commands.entity(add).insert_children(0, &[plus]);
-    ux::help(
-        commands,
-        add,
-        "Создать прозрачный слой над выбранным. Рисуйте на новом слое, чтобы не менять исходное изображение.",
-    );
-    dropdown(
-        commands,
-        add_row,
-        font,
-        "Тип",
-        LayerAction::Category("Создать"),
-    );
     let host = scroll_node(
         commands,
         stack,
@@ -328,27 +294,29 @@ pub(in crate::editor) fn setup(
         },
     );
     commands.entity(footer).insert(BorderColor::all(EDGE));
+    let add = icons::button(
+        commands,
+        footer,
+        icons::Glyph::Plus,
+        "Новый слой",
+        Action::ImageEdit(EditAction::AddLayer),
+        Look::Regular,
+    );
+    commands.entity(add).entry::<Node>().and_modify(|mut n| {
+        n.height = px(30);
+        n.padding = UiRect::ZERO;
+    });
+    ux::help(
+        commands,
+        add,
+        "Создать прозрачный слой над выбранным. Рисуйте на новом слое, чтобы не менять исходное изображение.",
+    );
     for (glyph, label, action) in [
-        (
-            icons::Glyph::Copy,
-            "Дублировать слой",
-            LayerAction::Quick("layer.duplicate"),
-        ),
         (icons::Glyph::Folder, "Сгруппировать", LayerAction::Group),
         (
             icons::Glyph::Mask,
             "Добавить маску",
             LayerAction::Quick("layer.layerMask.revealAll"),
-        ),
-        (
-            icons::Glyph::ChevronUp,
-            "Поднять слой",
-            LayerAction::Quick("layer.arrange.bringForward"),
-        ),
-        (
-            icons::Glyph::ChevronDown,
-            "Опустить слой",
-            LayerAction::Quick("layer.arrange.sendBackward"),
         ),
         (
             icons::Glyph::Trash,
@@ -359,6 +327,8 @@ pub(in crate::editor) fn setup(
         let e = icons::button(commands, footer, glyph, label, act(action), Look::Regular);
         commands.entity(e).entry::<Node>().and_modify(|mut n| {
             n.width = px(30);
+            n.min_width = px(24);
+            n.flex_shrink = 1.0;
             n.height = px(30);
             n.padding = UiRect::ZERO;
         });
@@ -907,15 +877,6 @@ fn panel(
             ux::blend(layer.blend),
             LayerAction::Blend,
         );
-        let lock = icons::button(
-            commands,
-            properties,
-            icons::Glyph::Lock,
-            "Защитить слой",
-            act(LayerAction::Lock("all")),
-            Look::Regular,
-        );
-        ux::help(commands, lock, ux::action_help(LayerAction::Lock("all")));
         if doc.mask_target {
             compact(
                 commands,
@@ -1345,6 +1306,28 @@ fn panel(
                 LayerAction::Effects(index),
             );
         }
+        let lock = icons::button(
+            commands,
+            row_entity,
+            icons::Glyph::Lock,
+            if layer.locks.all {
+                "Разблокировать слой"
+            } else {
+                "Заблокировать слой"
+            },
+            act(LayerAction::ToggleLock(layer.id.0)),
+            Look::Regular,
+        );
+        commands.entity(lock).entry::<Node>().and_modify(|mut n| {
+            n.width = px(26);
+            n.height = px(28);
+            n.padding = UiRect::ZERO;
+        });
+        ux::help(
+            commands,
+            lock,
+            ux::action_help(LayerAction::ToggleLock(layer.id.0)),
+        );
         if let LayerContent::Smart(s) = &layer.content {
             for (filter, value) in s.smart_filters.iter().enumerate().rev() {
                 let filter_row = node(

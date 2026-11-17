@@ -112,6 +112,7 @@ enum Gesture {
         checkpoint: Option<photo_document::Snapshot>,
         renderer: photocraft_paint::StrokeRenderer,
         last: Option<Vec2>,
+        last_pressure: f32,
         tail: photocraft_geom::Rect,
     },
     Move {
@@ -232,6 +233,10 @@ impl State {
             EditAction::Layers(layers::LayerAction::Preview) => self.layers.preview_enabled,
             EditAction::Layers(layers::LayerAction::BlendMore) => self.layers.blend_more,
             EditAction::Layers(layers::LayerAction::SetBlend(blend)) => self.document(id).and_then(PhotoDocument::active_layer).is_some_and(|l|l.blend==blend),
+            EditAction::Layers(layers::LayerAction::ToggleLock(layer)) => self
+                .document(id)
+                .and_then(|doc| doc.document.layer(photocraft_doc::LayerId(layer)))
+                .is_some_and(|layer| layer.locks.all),
             EditAction::Layers(layers::LayerAction::Lock(key)) => self
                 .document(id)
                 .and_then(PhotoDocument::active_layer)
@@ -398,6 +403,7 @@ impl State {
             background: self.background(),
             erase: self.tool == PhotoTool::Eraser,
             aliased: pencil,
+            pressure_size: !pencil,
             square: self.tool == PhotoTool::Pencil && self.pencil_shape == PencilShape::Square,
             ..Default::default()
         }
@@ -1067,9 +1073,14 @@ pub(super) fn pointer(
     let state = &mut viewer.edit;
     let mut points = Vec::new();
     let mut position = None;
+    let mut pressure = 1.0;
     for &sample in samples {
         use super::paint_input::Sample;
         let (cursor, down, up) = match sample {
+            Sample::Pressure(value) => {
+                pressure = value;
+                continue;
+            }
             Sample::Down(point) => (point, true, false),
             Sample::Move(point) => (point, false, false),
             Sample::Up(point) => (point, false, true),
@@ -1137,6 +1148,7 @@ pub(super) fn pointer(
                         checkpoint: Some(session.doc.snapshot()),
                         renderer,
                         last: None,
+                        last_pressure: -1.0,
                         tail: photocraft_geom::Rect::EMPTY,
                     }
                 };
@@ -1146,12 +1158,21 @@ pub(super) fn pointer(
         sample_color(state, id, point, dimensions);
         let point = state.snap_point(point);
         position = Some(point);
-        if let Some((gesture_id, Gesture::Paint { last, .. })) = &mut state.gesture
+        if let Some((
+            gesture_id,
+            Gesture::Paint {
+                last,
+                last_pressure,
+                ..
+            },
+        )) = &mut state.gesture
             && *gesture_id == id
-            && last.is_none_or(|last| last.distance_squared(point) > 0.01)
+            && (last.is_none_or(|last| last.distance_squared(point) > 0.01)
+                || *last_pressure != pressure)
         {
-            points.push(StrokePoint::new(point.x as f64, point.y as f64, 1.0));
+            points.push(StrokePoint::new(point.x as f64, point.y as f64, pressure));
             *last = Some(point);
+            *last_pressure = pressure;
         }
         if up {
             flush(state, id, &points, position, true);

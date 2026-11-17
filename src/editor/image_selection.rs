@@ -799,6 +799,7 @@ pub(super) fn pointer(
     for sample in samples {
         use super::super::paint_input::Sample;
         let (cursor, down, up) = match *sample {
+            Sample::Pressure(_) => continue,
             Sample::Down(p) => (p, true, false),
             Sample::Move(p) => (p, false, false),
             Sample::Up(p) => (p, false, true),

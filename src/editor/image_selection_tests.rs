@@ -458,9 +458,29 @@ fn gpu_image_selection_and_transform_tools_match_canvas_and_preserve_history() {
     let id = app.world().resource::<Editor>().viewing_image.unwrap();
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/image-selection-qa");
     std::fs::create_dir_all(&output).unwrap();
-    click_action(&mut app, window, |a| {
-        matches!(a, Action::ImageEdit(edit::EditAction::Selection(Op::Menu)))
-    });
+    assert!(
+        !app.world_mut()
+            .query::<&Control>()
+            .iter(app.world())
+            .any(|control| {
+                matches!(
+                    control.action,
+                    Action::ImageEdit(edit::EditAction::Selection(Op::Menu))
+                )
+            }),
+        "The submenu indicator must not be a separate button"
+    );
+    click_control(
+        &mut app,
+        window,
+        |a| {
+            matches!(
+                a,
+                Action::ImageEdit(edit::EditAction::Selection(Op::UseTool))
+            )
+        },
+        MouseButton::Right,
+    );
     for _ in 0..3 {
         frame(&mut app);
     }

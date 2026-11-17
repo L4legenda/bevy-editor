@@ -1,21 +1,27 @@
 use super::*;
 
 #[test]
-fn cursor_mode_is_the_default_and_tree_picking_is_exclusive_to_it() {
+fn cursor_mode_is_the_default_and_tree_selection_works_in_every_tool() {
     let mut app = app();
     app.world_mut().resource_mut::<Editor>().ready = true;
     assert_eq!(Tool::default(), Tool::Universal);
     assert_eq!(app.world().resource::<Editor>().tool, Tool::Universal);
     assert!(Tool::Universal.operations().is_empty());
-    action(&mut app, Action::Select(Selection::Camera(0)));
-    for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
-        // Set mode directly: cameras intentionally don't support the Scale tool.
+    for tool in [Tool::Universal, Tool::Move, Tool::Rotate, Tool::Scale] {
+        // Cameras intentionally don't support the Scale tool; changing the tree
+        // selection must still work without forcing the user back to Q.
         app.world_mut().resource_mut::<Editor>().tool = tool;
         action(&mut app, Action::Select(Selection::Environment));
         assert_eq!(
             app.world().resource::<Editor>().selection,
+            Some(Selection::Environment)
+        );
+        action(&mut app, Action::Select(Selection::Camera(0)));
+        assert_eq!(
+            app.world().resource::<Editor>().selection,
             Some(Selection::Camera(0))
         );
+        assert_eq!(app.world().resource::<Editor>().tool, tool);
     }
     action(&mut app, Action::Tool(Tool::Universal));
     action(&mut app, Action::Select(Selection::Environment));

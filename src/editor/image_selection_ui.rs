@@ -132,26 +132,7 @@ pub fn setup(
         "Выделение · M / L / W · ПКМ — инструменты выделения".into(),
     ));
     let icon = icons::themed(commands, choose, icons::Glyph::Selection, 18.0);
-    let arrow = control(
-        commands,
-        group,
-        Action::ImageEdit(EditAction::Selection(Op::Menu)),
-        Look::Tool,
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: px(0),
-            right: px(0),
-            width: px(14),
-            height: px(14),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-    );
-    commands
-        .entity(arrow)
-        .insert((ZIndex(1), AccessibleLabel("Варианты выделения".into())));
-    icons::themed(commands, arrow, icons::Glyph::SubmenuDown, 12.0);
+    super::interface::tool_menu_hint(commands, choose);
     let transform = control(
         commands,
         tools,
@@ -316,6 +297,7 @@ pub fn setup(
 }
 fn popup_input(
     mut viewer: ResMut<ImageViewer>,
+    mut actions: MessageWriter<Action>,
     ui: Res<ToolsUi>,
     mouse: Res<ButtonInput<MouseButton>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -331,11 +313,7 @@ fn popup_input(
             .is_ok_and(|(n, t)| !n.is_empty() && n.contains_point(*t, point))
     };
     if mouse.just_pressed(MouseButton::Right) && hit(ui.button) {
-        viewer.edit.selection.menu = if viewer.edit.selection.menu == 1 {
-            0
-        } else {
-            1
-        };
+        actions.write(Action::ImageEdit(EditAction::Selection(Op::Menu)));
     }
     if mouse.just_pressed(MouseButton::Left)
         && viewer.edit.selection.menu != 0
