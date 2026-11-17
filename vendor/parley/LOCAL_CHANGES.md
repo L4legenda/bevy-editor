@@ -1,11 +1,19 @@
 # Local changes from Parley 0.11.1
 
-The crate is vendored unmodified except `src/editing/editor.rs`:
+The crate is vendored with the following local patches.
+
+## Owned ranged styles (`src/editing/editor.rs`)
 
 - `PlainEditor::set_ranged_styles` accepts owned UTF-8 ranges and style properties.
 - The existing ranged layout builder receives those properties before IME styling.
 - Buffer edits remap ranges and inherit insertion style before layout, keeping native
   cursor positions, hit testing, selection and line wrapping consistent with rich text.
 - Editors without ranged styles keep the normal plain-text behaviour.
+
+## Bidirectional class masks (`src/bidi.rs`)
+
+- Named `BidiClass` values map to private bit positions for the resolver's class sets.
+- The Unicode bidirectional algorithm no longer calls the numeric ICU4C conversion
+  deprecated in ICU4X 2.3; its class groups and resolution rules are unchanged.
 
 Upstream: https://github.com/linebender/parley, version 0.11.1.
