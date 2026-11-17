@@ -87,7 +87,6 @@ pub(in crate::editor) enum NarrativeAction {
     Target(u32),
     Speaker,
     SetSpeaker(Option<usize>),
-    Portrait,
     SetPortrait(usize),
     AddPortrait,
     PickImage(usize),
@@ -785,18 +784,6 @@ fn actions(
         } else {
             action
         };
-        if matches!(action, NarrativeAction::Portrait) {
-            if matches!(editor.narrative.current().map(|doc| (&doc.content, doc.selected)), Some((Content::Dialogue(d), id)) if d.node(id).is_some_and(|n| n.kind == NodeKind::Line && n.speaker.is_some()))
-            {
-                ui.picker = Some(Picker::Portrait);
-                ui.modal_key.clear();
-                ui.linking = None;
-                ui.clear_node_drag();
-                ui.panning = false;
-                focus.clear();
-            }
-            continue;
-        }
         if let NarrativeAction::SetSpeaker(index) = action {
             if let Some(selection) = speaker_menu::select(&mut editor, &browser, index) {
                 ui.picker = selection.portraits.then_some(Picker::Portrait);

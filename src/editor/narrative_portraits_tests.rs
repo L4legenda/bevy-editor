@@ -350,7 +350,7 @@ fn gpu_narrative_portrait_selection() {
         editor.narrative.active = Some(id);
     }
     resize_qa(&mut app, window, &target, 700, 620);
-    action(&mut app, NarrativeAction::Portrait);
+    action(&mut app, NarrativeAction::Speaker);
     warm(&mut app, 8);
     capture_when(
         &mut app,
@@ -381,7 +381,7 @@ fn gpu_narrative_portrait_selection() {
         d.node_mut(1).unwrap().portrait = 0;
     }
     app.world_mut().resource_mut::<NarrativeUi>().generation += 1;
-    action(&mut app, NarrativeAction::Portrait);
+    action(&mut app, NarrativeAction::Speaker);
     capture_when(
         &mut app,
         &target,
