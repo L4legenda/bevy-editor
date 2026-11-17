@@ -36,12 +36,13 @@ pub fn build() {
         (executable, dlls)
     } else {
         let mut command = Command::new(env::var_os("CARGO").unwrap());
+        // This independent lockfile can require crates the editor build did not fetch.
+        // Keep versions locked while allowing Cargo's normal network configuration.
         command
             .args([
                 "build",
                 "--release",
                 "--locked",
-                "--offline",
                 "--message-format=json",
                 "--manifest-path",
             ])

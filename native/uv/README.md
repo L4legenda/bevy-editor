@@ -15,6 +15,8 @@ The isolated native process lets cancellation terminate all native threads and k
 
 Build the editor normally with Cargo. `build.rs` invokes `native/uv-build`, builds this independent Cargo package and embeds the executable and required runtime DLLs. Windows builds require the usual Rust MSVC and Visual C++ build tools on the developer machine. These tools are not required on the user's machine.
 
+The worker has its own `Cargo.lock`, so a clean build may download Rust dependencies that the editor's lockfile does not use. The nested build uses `--locked` and respects Cargo's network configuration. For offline builds, first run `cargo fetch --locked --manifest-path native/uv/Cargo.toml`, then set `CARGO_NET_OFFLINE=true` when building the editor.
+
 ```powershell
 cargo build --locked --bin bevy-editor
 cargo build --locked --manifest-path native/uv/Cargo.toml --release
