@@ -287,7 +287,6 @@ pub(in crate::editor) fn setup(
         stack,
         Node {
             width: percent(100),
-            justify_content: JustifyContent::SpaceBetween,
             padding: UiRect::vertical(px(5)),
             border: UiRect::top(px(1)),
             ..row(2.0)
@@ -303,6 +302,9 @@ pub(in crate::editor) fn setup(
         Look::Regular,
     );
     commands.entity(add).entry::<Node>().and_modify(|mut n| {
+        n.width = px(30);
+        n.min_width = px(24);
+        n.flex_shrink = 1.0;
         n.height = px(30);
         n.padding = UiRect::ZERO;
     });
@@ -324,6 +326,16 @@ pub(in crate::editor) fn setup(
             LayerAction::Quick("layer.delete"),
         ),
     ] {
+        if matches!(action, LayerAction::Quick("layer.delete")) {
+            node(
+                commands,
+                footer,
+                Node {
+                    flex_grow: 1.0,
+                    ..default()
+                },
+            );
+        }
         let e = icons::button(commands, footer, glyph, label, act(action), Look::Regular);
         commands.entity(e).entry::<Node>().and_modify(|mut n| {
             n.width = px(30);

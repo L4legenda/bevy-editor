@@ -2363,6 +2363,13 @@ pub(super) fn refresh(
         }
         let photo_tool =
             matches!(control.look, Look::Tool) && matches!(control.action, Action::ImageEdit(_));
+        let layer_row_control = matches!(
+            control.action,
+            Action::ImageEdit(ImageEditAction::SelectLayer(_))
+                | Action::ImageEdit(ImageEditAction::Layers(
+                    image_viewer::edit::layers::LayerAction::ToggleLock(_)
+                ))
+        );
         // Menus block activation without making the selected file/object look deselected.
         let preserve_selection = (asset_open && browser_context.is_menu())
             || (editor.scene_object_popup && active && matches!(control.look, Look::Outline));
@@ -2406,6 +2413,12 @@ pub(super) fn refresh(
         }
         let color = if !visual_enabled || photo_options {
             Color::NONE
+        } else if layer_row_control {
+            if hovered.0 || pressed {
+                HOVER
+            } else {
+                Color::NONE
+            }
         } else if matches!(control.look, Look::Tab) {
             Color::NONE
         } else if matches!(control.look, Look::TabClose) {
@@ -2434,7 +2447,7 @@ pub(super) fn refresh(
             Color::NONE
         };
         tint.set_if_neq(BackgroundColor(color));
-        let fill = if photo_tool {
+        let fill = if photo_tool || layer_row_control {
             BackgroundGradient::default()
         } else if enabled
             && (matches!(control.look, Look::Primary)

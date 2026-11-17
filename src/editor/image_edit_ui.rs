@@ -108,8 +108,8 @@ fn slider_track(
         slider,
         Node {
             position_type: PositionType::Absolute,
-            left: px(7),
-            right: px(7),
+            left: px(6),
+            right: px(6),
             top: px(8),
             height: px(4),
             border_radius: BorderRadius::MAX,
@@ -171,7 +171,7 @@ const RAIL_THUMB_HEIGHT: f32 = 28.0;
 pub(in crate::editor) struct RailControl {
     fill: Entity,
     badge: Entity,
-    energy: Entity,
+    handle: Entity,
     emphasis: f32,
 }
 
@@ -193,10 +193,10 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
             position_type: PositionType::Absolute,
             left: px(8),
             top: percent(50),
-            width: px(72),
-            height: percent(80),
-            max_height: px(460),
-            padding: UiRect::all(px(7)),
+            width: px(46.8),
+            height: percent(68),
+            max_height: px(391),
+            padding: UiRect::axes(px(4), px(7)),
             border: UiRect::all(px(1)),
             border_radius: BorderRadius::all(px(12)),
             ..column(14.0)
@@ -204,29 +204,25 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
         Color::NONE,
     );
     commands.entity(rail).insert((
+        rail_fx::Reveal::default(),
+        rail_fx::RevealTarget(false),
         CanvasControl,
         ZIndex(8),
         BorderColor::all(Color::NONE),
         BoxShadow(vec![ShadowStyle {
-            color: Color::srgba(0.0, 0.0, 0.0, 0.65),
+            color: Color::srgba(0.0, 0.0, 0.0, 0.45),
             x_offset: px(3),
             y_offset: px(4),
-            blur_radius: px(12),
+            blur_radius: px(8),
             spread_radius: px(1),
         }]),
         UiTransform::from_translation(Val2::percent(0, -50)),
         AccessibleLabel("Быстрые настройки кисти".into()),
     ));
-    rail_fx::attach(commands, rail, rail_fx::Kind::Glass, 7.0);
-    for (glyph, label, binding, range) in [
+    rail_fx::attach(commands, rail, rail_fx::Kind::Panel);
+    for (label, binding, range) in [
+        ("Размер кисти · слева", Binding::Size, (0.0, 1.0)),
         (
-            icons::Glyph::Brush,
-            "Размер кисти · слева",
-            Binding::Size,
-            (0.0, 1.0),
-        ),
-        (
-            icons::Glyph::Eye,
             "Непрозрачность кисти · слева",
             Binding::BrushOpacity,
             (0.01, 1.0),
@@ -244,7 +240,6 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
                 ..column(6.0)
             },
         );
-        icons::spawn(commands, group, glyph, 16.0, Color::srgb(0.85, 0.77, 0.64));
         let slider = commands
             .spawn((
                 Slider {
@@ -275,18 +270,20 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
                 left: percent(50),
                 top: px(RAIL_THUMB_HEIGHT * 0.5),
                 bottom: px(RAIL_THUMB_HEIGHT * 0.5),
-                width: px(10),
+                width: px(15),
                 border_radius: BorderRadius::MAX,
                 border: UiRect::all(px(1)),
                 ..default()
             },
-            Color::srgb(0.055, 0.065, 0.085),
+            WELL,
         );
         commands.entity(track).insert((
+            rail_fx::Track,
             Pickable::IGNORE,
-            BorderColor::all(Color::srgb(0.30, 0.25, 0.35)),
+            BorderColor::all(EDGE),
             UiTransform::from_translation(Val2::percent(-50, 0)),
         ));
+        commands.entity(track).remove::<BackgroundGradient>();
         let fill = surface(
             commands,
             slider,
@@ -294,7 +291,7 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
                 position_type: PositionType::Absolute,
                 left: percent(50),
                 bottom: px(RAIL_THUMB_HEIGHT * 0.5),
-                width: px(6),
+                width: px(9),
                 height: px(0),
                 border_radius: BorderRadius::MAX,
                 ..default()
@@ -305,12 +302,7 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
             Pickable::IGNORE,
             UiTransform::from_translation(Val2::percent(-50, 0)),
         ));
-        let seed = if matches!(binding, Binding::Size) {
-            11.0
-        } else {
-            47.0
-        };
-        rail_fx::attach(commands, fill, rail_fx::Kind::Flow, seed);
+        rail_fx::attach(commands, fill, rail_fx::Kind::Fill);
         let thumb = surface(
             commands,
             slider,
@@ -333,7 +325,7 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
             Pickable::IGNORE,
             BorderColor::all(Color::NONE),
         ));
-        let energy = rail_fx::energy(commands, thumb, seed);
+        let handle = rail_fx::handle(commands, thumb);
         let badge = surface(
             commands,
             slider,
@@ -369,7 +361,7 @@ fn brush_rail(commands: &mut Commands, canvas: Entity, font_handle: &Handle<Font
             RailControl {
                 fill,
                 badge,
-                energy,
+                handle,
                 emphasis: 0.0,
             },
         ));
@@ -1280,13 +1272,9 @@ pub(in crate::editor) fn refresh(
     time: Res<Time>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
-    if let Ok(mut rail) = nodes.get_mut(ui.brush_rail) {
-        rail.display = if editing && viewer.edit.sizeable() {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
+    commands
+        .entity(ui.brush_rail)
+        .insert(rail_fx::RevealTarget(editing && viewer.edit.sizeable()));
     for (entity, visible) in [
         (ui.hardness_group, viewer.edit.tool != PhotoTool::Pencil),
         (ui.pencil_shapes, viewer.edit.tool == PhotoTool::Pencil),
@@ -1527,13 +1515,14 @@ pub(in crate::editor) fn refresh(
                 let emphasis = rail.emphasis
                     + (goal - rail.emphasis) * (1.0 - (-time.delta_secs().min(0.05) * 18.0).exp());
                 rail.emphasis = emphasis;
-                for surface in [rail.energy, rail.fill] {
+                for surface in [rail.handle, rail.fill] {
                     commands
                         .entity(surface)
-                        .insert(rail_fx::Interaction { emphasis, position });
+                        .insert(rail_fx::Interaction { emphasis });
                 }
             } else if let Ok(mut thumb) = nodes.get_mut(slider.thumb) {
-                thumb.left = percent(position * 94.0);
+                let travel = (computed.size().x * computed.inverse_scale_factor() - 12.0).max(0.0);
+                thumb.left = px(position * travel);
             }
         }
     }

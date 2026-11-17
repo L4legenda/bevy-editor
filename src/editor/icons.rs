@@ -331,6 +331,20 @@ fn tint(
     let Some((control, hovered, _)) = owner else {
         return TEXT;
     };
+    if let Action::ImageEdit(
+        action @ super::ImageEditAction::Layers(
+            super::image_viewer::edit::layers::LayerAction::ToggleLock(_),
+        ),
+    ) = control.action
+    {
+        return if image_viewer
+            .is_some_and(|viewer| viewer.edit.active(action, editor.viewing_image))
+        {
+            FOCUS
+        } else {
+            TEXT
+        };
+    }
     match control.look {
         Look::Tool => {
             let active = match control.action {

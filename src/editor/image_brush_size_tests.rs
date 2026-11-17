@@ -437,7 +437,7 @@ fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
         ));
         let track = bounds(&mut app, slider);
         let handle = thumb(&mut app, slider);
-        assert!(handle.height() >= 28.0 && handle.width() >= 48.0);
+        assert!(handle.height() >= 28.0 && handle.width() >= 30.0);
         // Grabbing away from the handle's centre must not jump to another value.
         let start = handle.center() + Vec2::new(0.0, 9.0);
         let before = app
@@ -517,12 +517,14 @@ fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
     assert!(bounds(&mut app, size_badge).is_empty());
     assert!(bounds(&mut app, opacity_badge).is_empty());
     let handle = thumb(&mut app, size);
-    let cosmic_pixels = |image: &image::RgbaImage| {
+    let neutral_pixels = |image: &image::RgbaImage| {
         (handle.min.y as u32..handle.max.y as u32)
             .flat_map(|y| (handle.min.x as u32..handle.max.x as u32).map(move |x| (x, y)))
             .filter(|&(x, y)| {
                 let p = image.get_pixel(x, y).0;
-                p[2] > p[1].saturating_add(20) && p[2] > p[0].saturating_add(8)
+                let min = *p[..3].iter().min().unwrap();
+                let max = *p[..3].iter().max().unwrap();
+                min >= 100 && max <= 190 && max - min <= 12
             })
             .count()
     };
@@ -530,37 +532,48 @@ fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
         &mut app,
         &target,
         &output.join("left-sliders.png"),
-        |image| cosmic_pixels(image) > 30,
+        |image| neutral_pixels(image) > 200,
+    );
+    let rail_entity = entity(&mut app, "Быстрые настройки кисти");
+    let rail = bounds(&mut app, rail_entity);
+    let center_y = rail.center().y as u32;
+    let panel_color = resting.get_pixel(rail.min.x as u32 + 10, center_y).0;
+    let tools_color = resting.get_pixel(27, center_y).0;
+    assert!(
+        panel_color[..3]
+            .iter()
+            .zip(&tools_color[..3])
+            .all(|(a, b)| a.abs_diff(*b) <= 4),
+        "The panel must match the tools sidebar: {panel_color:?} vs {tools_color:?}"
+    );
+    let rim = resting.get_pixel(rail.min.x as u32 + 2, center_y).0;
+    assert!(
+        rim[0] > rim[1].saturating_add(8) && rim[1] > rim[2].saturating_add(8),
+        "Keep the gold frame: {rim:?}"
     );
     for _ in 0..30 {
         frame(&mut app);
     }
-    let animated = capture_when(
+    let stable = capture_when(
         &mut app,
         &target,
-        &output.join("left-sliders-flow.png"),
-        |image| {
-            let changed = (handle.min.y as u32..handle.max.y as u32)
-                .flat_map(|y| (handle.min.x as u32..handle.max.x as u32).map(move |x| (x, y)))
-                .filter(|&(x, y)| {
-                    image.get_pixel(x, y).0[..3]
-                        .iter()
-                        .zip(&resting.get_pixel(x, y).0[..3])
-                        .any(|(a, b)| a.abs_diff(*b) > 8)
-                })
-                .count();
-            changed > 40
-        },
+        &output.join("left-sliders-stable.png"),
+        |_| true,
     );
-    assert_eq!(resting.dimensions(), animated.dimensions());
-    assert_eq!(
-        thumb(&mut app, size),
-        handle,
-        "Plasma motion must not move the input geometry"
-    );
+    let changed = (handle.min.y as u32..handle.max.y as u32)
+        .flat_map(|y| (handle.min.x as u32..handle.max.x as u32).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            stable.get_pixel(x, y).0[..3]
+                .iter()
+                .zip(&resting.get_pixel(x, y).0[..3])
+                .any(|(a, b)| a.abs_diff(*b) > 3)
+        })
+        .count();
+    assert_eq!(changed, 0, "Idle handles must not shimmer or pulse");
+    assert_eq!(thumb(&mut app, size), handle);
     assert!(
         app.world()
-            .resource::<Assets<crate::editor::image_brush_rail_fx::CosmicMaterial>>()
+            .resource::<Assets<crate::editor::image_brush_rail_fx::RailMaterial>>()
             .len()
             <= 5
     );
@@ -608,6 +621,40 @@ fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
         2.0,
         "The log scale must preserve one-pixel keyboard adjustments"
     );
+    // Tool changes animate out, then remove the rail from layout and hit testing.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Tool(PhotoTool::Hand)));
+    frame(&mut app);
+    let transition = app.world().get::<UiTransform>(rail_entity).unwrap().scale.x;
+    assert!((0.86..1.0).contains(&transition));
+    assert_eq!(
+        app.world().get::<Node>(rail_entity).unwrap().display,
+        Display::Flex
+    );
+    for _ in 0..20 {
+        frame(&mut app);
+    }
+    assert_eq!(
+        app.world().get::<Node>(rail_entity).unwrap().display,
+        Display::None
+    );
+    for tool in [PhotoTool::Brush, PhotoTool::Pencil, PhotoTool::Eraser] {
+        app.world_mut()
+            .write_message(Action::ImageEdit(edit::EditAction::Tool(tool)));
+        for _ in 0..20 {
+            frame(&mut app);
+        }
+        assert_eq!(
+            app.world().get::<Node>(rail_entity).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<UiTransform>(rail_entity).unwrap().scale,
+            Vec2::ONE
+        );
+        let rect = bounds(&mut app, rail_entity);
+        assert!((rect.height() - 391.0).abs() < 1.0);
+    }
     println!("Left brush controls capture: {}", output.display());
 }
 
