@@ -1,6 +1,6 @@
 //! Commands and spatial entities for authored hierarchies and scene instances.
 use super::*;
-use crate::hierarchy::SceneHierarchy;
+use crate::hierarchy::{SceneHierarchy, TreeDrop};
 use std::io;
 
 #[cfg(test)]
@@ -14,12 +14,15 @@ pub(super) enum HierarchyAction {
     Fold(u32),
     PickParent,
     ToRoot,
+    SiblingEarlier,
+    SiblingLater,
     CancelParent,
     OpenSource,
     ResetOverrides,
     Unpack,
     Refresh,
     Insert(Room),
+    Drop(Room, Selection, TreeDrop<Selection>),
 }
 
 pub(super) fn available(editor: &Editor, action: HierarchyAction) -> bool {
@@ -51,9 +54,16 @@ pub(super) fn available(editor: &Editor, action: HierarchyAction) -> bool {
             .hierarchy
             .as_ref()
             .is_some_and(|h| h.node(key).is_some()),
-        HierarchyAction::PickParent | HierarchyAction::ToRoot => {
-            node.is_some_and(|n| !n.inherited())
-        }
+        HierarchyAction::PickParent | HierarchyAction::ToRoot => node.is_some(),
+        HierarchyAction::SiblingEarlier | HierarchyAction::SiblingLater => node.is_some_and(|n| {
+            editor
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .sibling_offset(n.key, matches!(action, HierarchyAction::SiblingLater))
+                .is_some()
+        }),
         HierarchyAction::CancelParent => editor.hierarchy_parenting.is_some(),
         HierarchyAction::OpenSource => node.is_some_and(|n| n.inherited() || n.instance.is_some()),
         HierarchyAction::ResetOverrides => {
@@ -67,6 +77,9 @@ pub(super) fn available(editor: &Editor, action: HierarchyAction) -> bool {
                     .scenes
                     .get(room)
                     .is_some_and(|s| s.is_native())
+        }
+        HierarchyAction::Drop(room, _, _) => {
+            room == editor.room && editor.hierarchy_parenting.is_none()
         }
     }
 }
@@ -306,6 +319,90 @@ impl Editor {
         self.selection_group = None;
         Ok(())
     }
+    fn drop_in_tree(&mut self, source: Selection, destination: TreeDrop<Selection>) {
+        let before = self.edits.clone();
+        let result = (|| -> io::Result<_> {
+            let flat = self.edits.hierarchy.is_none();
+            let mut graph = if let Some(graph) = &self.edits.hierarchy {
+                (**graph).clone()
+            } else {
+                let previous = std::fs::read(self.root.join(&self.definition().file)).ok();
+                let bytes = crate::scene_io::encode(&self.edits, previous.as_deref())?;
+                let mut scene =
+                    crate::scene_format::Scene::from_slice(&bytes).map_err(io::Error::other)?;
+                // Preserve the order displayed by the flat outliner on first use.
+                scene.entities.sort_by(|a, b| {
+                    let section = |entity: &crate::scene_format::Entity| {
+                        if entity.components.contains_key("light") {
+                            0
+                        } else if entity.components.contains_key("camera") {
+                            1
+                        } else {
+                            2
+                        }
+                    };
+                    section(a)
+                        .cmp(&section(b))
+                        .then(a.order.cmp(&b.order))
+                        .then(a.id.cmp(&b.id))
+                });
+                for (index, entity) in scene.entities.iter_mut().enumerate() {
+                    entity.order = index as i32;
+                }
+                SceneHierarchy::load(scene, &self.root)?
+            };
+            let key_for = |target| {
+                if !flat {
+                    return self.hierarchy_key(target);
+                }
+                graph
+                    .nodes
+                    .iter()
+                    .find(|node| match target {
+                        Selection::Model(id) => {
+                            node.entity.model.is_some()
+                                && crate::scene_io::number(&node.entity.id, "model") == id
+                        }
+                        Selection::Light(id) => {
+                            node.entity.components.contains_key("light")
+                                && crate::scene_io::number(&node.entity.id, "light") == id
+                        }
+                        Selection::Camera(shot) => self
+                            .definition()
+                            .cameras
+                            .get(shot)
+                            .is_some_and(|camera| node.camera.as_ref() == Some(&camera.id)),
+                        _ => false,
+                    })
+                    .map(|node| node.key)
+            };
+            let missing = || io::Error::other("Объект больше не существует");
+            let key = key_for(source).ok_or_else(missing)?;
+            let target = destination.try_map(key_for).ok_or_else(missing)?;
+            if !graph.drop_node(key, target)? {
+                return Ok(None);
+            }
+            let parent = graph.parent(key).map(|node| node.key);
+            let edits: RoomEdits = graph.project()?;
+            edits.validate(&self.root)?;
+            Ok(Some((edits, key, parent)))
+        })();
+        match result {
+            Ok(Some((edits, key, parent))) => {
+                self.edits = edits;
+                self.sync_hierarchy_metadata();
+                self.finish_edit(before);
+                if self.hierarchy_key(self.hierarchy_selection(key)) == Some(key) {
+                    if let Some(parent) = parent {
+                        self.hierarchy_collapsed.remove(&(self.room, parent));
+                    }
+                    self.select(Some(self.hierarchy_selection(key)));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.status = format!("Перенос не выполнен · {error}"),
+        }
+    }
     pub(super) fn hierarchy_roots(&self) -> Vec<u32> {
         let keys: Vec<_> = self
             .selected_targets()
@@ -368,6 +465,10 @@ impl Editor {
     }
     pub(super) fn hierarchy_action(&mut self, action: HierarchyAction) {
         if !available(self, action) {
+            return;
+        }
+        if let HierarchyAction::Drop(_, source, destination) = action {
+            self.drop_in_tree(source, destination);
             return;
         }
         if let HierarchyAction::Fold(key) = action {
@@ -474,6 +575,14 @@ impl Editor {
                 }
                 changed
             }),
+            HierarchyAction::SiblingEarlier | HierarchyAction::SiblingLater => {
+                key.is_some_and(|key| {
+                    self.edit_hierarchy(|h| {
+                        h.move_sibling(key, matches!(action, HierarchyAction::SiblingLater))
+                    })
+                    .is_some()
+                })
+            }
             HierarchyAction::ResetOverrides => {
                 key.is_some_and(|key| self.edit_hierarchy(|h| h.reset_overrides(key)).is_some())
             }

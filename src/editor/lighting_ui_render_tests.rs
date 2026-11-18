@@ -527,6 +527,68 @@ fn gpu_scene_hierarchy_outliner_instances_and_affine_rendering() {
             .unwrap()
             .overridden(mesh)
     );
+    let (stand, sibling, other) = {
+        let editor = app.world().resource::<Editor>();
+        let graph = editor.edits.hierarchy.as_ref().unwrap();
+        (
+            graph.by_id("a/stand").unwrap().key,
+            graph.by_id("b/stand").unwrap().key,
+            graph.by_id("b").unwrap().key,
+        )
+    };
+    let row_point = |app: &mut App, key, offset: f32| {
+        let world = app.world_mut();
+        let mut query = world.query::<(&ui::Control, &ComputedNode, &UiGlobalTransform)>();
+        let (_, node, transform) = query
+            .iter(world)
+            .find(|(c, node, _)| {
+                matches!(c.action, Action::Select(Selection::Node(id)) if id == key)
+                    && !node.is_empty()
+            })
+            .unwrap();
+        transform
+            .affine()
+            .transform_point2(Vec2::Y * offset * node.size().y)
+    };
+    let drag_row = |app: &mut App, source, destination: Vec2| {
+        let start = row_point(app, source, 0.0);
+        move_pointer(app, window, start);
+        mouse(app, window, ButtonState::Pressed);
+        move_pointer(app, window, destination);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 3);
+    };
+    let count = app.world().resource::<Editor>().undo.len();
+    let destination = row_point(&mut app, other, 0.0);
+    drag_row(&mut app, stand, destination);
+    let graph = |app: &App| {
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(graph(&app).parent(stand).unwrap().key, other);
+    assert!(graph(&app).sibling_offset(stand, true).is_none());
+    let destination = row_point(&mut app, sibling, -0.38);
+    drag_row(&mut app, stand, destination);
+    assert!(graph(&app).sibling_offset(stand, false).is_none());
+    assert_eq!(app.world().resource::<Editor>().undo.len(), count + 2);
+    drag_row(&mut app, stand, Vec2::new(400.0, 400.0));
+    assert_eq!(app.world().resource::<Editor>().undo.len(), count + 2);
+    app.world_mut().write_message(Action::Save);
+    warm(&mut app, 5);
+    let saved = crate::LevelEdits::<String>::read(&files.root, "room.scene")
+        .unwrap()
+        .hierarchy
+        .unwrap();
+    assert_eq!(saved.parent(stand).unwrap().key, other);
+    assert!(saved.sibling_offset(stand, false).is_none());
+    assert_eq!(
+        std::fs::read(files.root.join("lamp.scene")).unwrap(),
+        original_prefab
+    );
     app.world_mut().write_message(Action::OpenBrowser);
     warm(&mut app, 180);
     assert!(

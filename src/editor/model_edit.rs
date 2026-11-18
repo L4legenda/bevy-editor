@@ -38,6 +38,8 @@ pub(in crate::editor) enum EditAction {
     ToggleMode,
     Element(Element),
     Operate(Operation),
+    ExtrudeTool,
+    BeginExtrude,
     SelectAll,
     Deselect,
     Invert,
@@ -103,6 +105,7 @@ pub(in crate::editor) struct State {
     pub(super) bvh_stamp: Option<(usize, u64)>,
     pub(super) last_model: Option<usize>,
     pub tool: Tool,
+    pub(super) extrude_tool: bool,
     pub xray: bool,
     pub wireframe: bool,
     pub local: bool,
@@ -136,6 +139,7 @@ impl Default for State {
             bvh_stamp: None,
             last_model: None,
             tool: Tool::Universal,
+            extrude_tool: false,
             xray: false,
             wireframe: false,
             local: false,
@@ -216,7 +220,8 @@ impl State {
         match action {
             EditAction::Mode(mode) => self.mode(index) == mode,
             EditAction::Element(kind) => doc.is_some_and(|d| d.selection.kind == kind),
-            EditAction::Tool(tool) => self.tool == tool,
+            EditAction::Tool(tool) => !self.extrude_tool && self.tool == tool,
+            EditAction::ExtrudeTool => self.extrude_tool && self.mode(index) == Mode::Edit,
             EditAction::SelectObject(id) => doc.is_some_and(|d| d.selected.contains(&id)),
             EditAction::Xray => self.xray,
             EditAction::Wireframe => self.wireframe,
@@ -267,12 +272,24 @@ impl State {
             EditAction::Save => doc.dirty() || doc.paint_busy,
             EditAction::Element(_) => doc.mode == Mode::Edit,
             EditAction::Knife => doc.mode == Mode::Edit,
+            EditAction::ExtrudeTool => {
+                self.gesture.is_none()
+                    && doc.mode == Mode::Edit
+                    && (self.extrude_tool || self.available(EditAction::BeginExtrude, index))
+            }
+            EditAction::BeginExtrude => {
+                self.available(EditAction::Operate(Operation::Extrude), index)
+            }
             EditAction::Operate(op) => match op {
                 Operation::Extrude => {
                     doc.mode == Mode::Edit
                         && self.gesture.is_none()
                         && doc.active().is_some_and(|object| {
-                            !doc.selection.selected_faces(&object.geometry).is_empty()
+                            !object.hidden && match doc.selection.kind {
+                                Element::Vertex => !doc.selection.vertices.is_empty(),
+                                Element::Edge => !doc.selection.edges.is_empty(),
+                                Element::Face => !doc.selection.faces.is_empty(),
+                            }
                         })
                 }
                 Operation::Join | Operation::ApplyTransform | Operation::OriginToGeometry => {
@@ -406,7 +423,8 @@ pub(super) fn initialize(
                         bevy::gltf::gltf::mesh::Mode::TriangleStrip => {
                             PrimitiveTopology::TriangleStrip
                         }
-                        _ => return Err("Правка поддерживает треугольные поверхности".into()),
+                        bevy::gltf::gltf::mesh::Mode::Lines => PrimitiveTopology::LineList,
+                        _ => return Err("Правка поддерживает треугольные поверхности и рёбра".into()),
                     };
                     let mut data = Mesh::new(topology, bevy::asset::RenderAssetUsages::MAIN_WORLD);
                     data.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
@@ -598,7 +616,9 @@ pub(super) fn render(
         let edges = old
             .as_ref()
             .filter(|old| {
-                old.geometry == object.geometry || old.geometry.faces == object.geometry.faces
+                old.geometry == object.geometry
+                    || (old.geometry.faces == object.geometry.faces
+                        && old.geometry.loose_edges == object.geometry.loose_edges)
             })
             .map_or_else(
                 || Arc::new(object.geometry.edges()),
@@ -633,6 +653,18 @@ pub(super) fn render(
                 Mesh3d(handle.clone()),
                 MeshMaterial3d(material.clone()),
                 xray::SourceMaterial(material),
+                RenderLayers::layer(LAYER),
+                ChildOf(entity),
+            ));
+        }
+        if !object.geometry.loose_edges.is_empty() {
+            let positions = object.geometry.line_positions();
+            let mut mesh = Mesh::new(PrimitiveTopology::LineList, bevy::asset::RenderAssetUsages::default());
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0., 1., 0.]; positions.len()]);
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(state.default_material.clone()),
                 RenderLayers::layer(LAYER),
                 ChildOf(entity),
             ));
@@ -793,6 +825,26 @@ pub(super) fn process_actions(
                 state.box_armed = false;
                 state.knife = false;
                 state.knife_start = None;
+                state.extrude_tool = false;
+            }
+            EditAction::ExtrudeTool => {
+                if state.available(action, Some(index)) {
+                    state.extrude_tool = !state.extrude_tool;
+                    state.box_start = None;
+                    state.box_armed = false;
+                    state.knife = false;
+                    state.knife_start = None;
+                }
+            }
+            EditAction::BeginExtrude => {
+                if state.available(action, Some(index)) {
+                    let doc = &state.documents[&index];
+                    state.gesture = input::Gesture::extrude(doc, index);
+                    state.box_start = None;
+                    viewer.gesture = None;
+                } else {
+                    state.status = "Выделите вершины, рёбра или грани для экструдирования".into();
+                }
             }
             EditAction::Begin(tool) => {
                 state.box_start = None;
@@ -808,6 +860,7 @@ pub(super) fn process_actions(
                 state.box_start = None;
                 state.box_auto = false;
                 state.tool = tool;
+                state.extrude_tool = false;
                 state.clear_gesture(Some(index), true);
             }
             EditAction::Xray => state.xray = !state.xray,
@@ -821,6 +874,7 @@ pub(super) fn process_actions(
                 state.knife = false;
             }
             EditAction::Knife => {
+                state.extrude_tool = false;
                 state.knife = state.mode(Some(index)) == Mode::Edit;
                 state.knife_start = None;
                 state.box_armed = false;
@@ -850,6 +904,7 @@ pub(super) fn process_actions(
                 let result: Result<(), String> = (|| {
                     match action {
                         EditAction::Mode(mode) => {
+                            state.extrude_tool = false;
                             state.box_start = None;
                             doc.set_mode(mode);
                             state.menu = false;
@@ -858,6 +913,7 @@ pub(super) fn process_actions(
                             viewer.gesture = None;
                         }
                         EditAction::ToggleMode => {
+                            state.extrude_tool = false;
                             state.box_start = None;
                             doc.set_mode(if doc.mode == Mode::Object {
                                 Mode::Edit
@@ -1152,7 +1208,7 @@ pub(in crate::editor) fn shortcuts(
     } else if keys.just_pressed(KeyCode::KeyS) {
         Some(EditAction::Begin(Tool::Scale))
     } else if keys.just_pressed(KeyCode::KeyE) {
-        Some(EditAction::Operate(Operation::Extrude))
+        Some(EditAction::BeginExtrude)
     } else if keys.just_pressed(KeyCode::KeyI) {
         Some(EditAction::Operate(Operation::Inset))
     } else if keys.just_pressed(KeyCode::KeyD) && shift {

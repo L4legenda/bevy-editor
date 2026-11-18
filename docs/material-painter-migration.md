@@ -67,9 +67,13 @@ device/queue, with no second graphics context:
 2. Rasterize screen/UV brush coverage into a persistent floating-point mask. Flow
    accumulates there. Only stamp coordinates and brush uniforms cross from CPU to
    GPU while drawing; a stationary brush enqueues no extra work.
-3. A compute shader applies that mask to a GPU copy of the layer taken at stroke
-   start, preserving opacity caps and straight-alpha erasing. Visible layers in
-   the active channel are then composited on GPU.
+3. Above 1024px, fragments flag touched 8 × 8 UV tiles. A GPU compaction pass builds
+   an indirect dispatch list; apply/composite/present visit those tiles only.
+   Height painting includes neighboring tiles for derived normal gradients.
+   At 1024px and below, simple dense dispatches avoid tile-list/indirect overhead.
+   Both paths use a stroke-start GPU snapshot for opacity caps and straight-alpha
+   erasing. The lower layer stack is cached until the document/layer configuration
+   changes; compositing resumes at the active layer, including visible layers above.
 4. GPU passes pack color/opacity and metallic/roughness, derive height/normal detail,
    and copy into the existing material/2D preview textures without recreating them.
 5. At release, asynchronously copy the active layer to a readback buffer. A worker
@@ -78,6 +82,11 @@ device/queue, with no second graphics context:
    Save/close wait for outstanding snapshots; runtime code never waits on the GPU.
 
 Shader pipelines are created at renderer startup, before the first brush press.
+Depth/visibility checks run only after a texel passes the brush-disc test.
+The first display pass initializes the full persistent output texture; later
+partial passes preserve untouched pixels. The final copy into Bevy's existing
+sRGB-compatible material textures is still a full GPU-to-GPU copy. Geometry is
+still rasterized for each stamp batch to preserve overlapping UV projections.
 Initial previews and standalone layer configuration/undo still use the CPU
 compositor; they are not on the interactive stamp path. The old CPU rasterizers
 remain under `cfg(test)` as correctness/performance references.
@@ -87,6 +96,9 @@ occlusion, erasing/fill, orthographic views, stable image allocations, history a
 GLB save/reopen. `gpu_model_paint_benchmark_40k` measures a held stroke over 40,000
 triangles and asserts zero readbacks during drawing; the earlier CPU benchmark
 remains available for comparison.
+
+`tools/paint-perf/README.md` describes the shared 262,144-triangle comparison with
+upstream, including measurement boundaries and reproducible commands.
 
 ## Remaining functional migration
 

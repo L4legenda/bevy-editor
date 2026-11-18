@@ -612,6 +612,7 @@ mod tests {
         n.choices.push(Choice {
             text: "Второй".into(),
             target: None,
+            dialogue: None,
         });
         state.add(1, n, 1.);
         state.observe(Some((1, &d)), 1.);
@@ -638,10 +639,12 @@ mod tests {
             Choice {
                 text: "Второй".into(),
                 target: Some(7),
+                dialogue: None,
             },
             Choice {
                 text: "Третий".into(),
                 target: Some(8),
+                dialogue: None,
             },
         ]);
         let before = d.clone();

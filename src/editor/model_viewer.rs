@@ -388,6 +388,7 @@ fn actions(
     if editing.last_model != editor.viewing_model {
         editing.clear_gesture(None, false);
         editing.last_model = editor.viewing_model;
+        editing.extrude_tool = false;
         editing.menu = false;
         editing.add_menu = false;
         editing.box_start = None;
@@ -855,16 +856,22 @@ fn refresh(
             {
                 "Alt+ЛКМ — орбита · Ctrl+S — сохранить".into()
             } else if let Some(gesture) = &editing.gesture {
-                format!(
-                    "{:?} {} {} · X/Y/Z — ось · число — значение · Ctrl — привязка · Enter — применить · Esc — отмена",
-                    gesture.tool,
-                    gesture.axis.map_or("", |i| ["X", "Y", "Z"][i]),
-                    gesture.typed
-                )
+                if gesture.is_extruding() {
+                    "Двигайте курсор, чтобы задать расстояние · Ctrl — привязка к шагу".into()
+                } else {
+                    format!(
+                        "{:?} {} {} · X/Y/Z — ось · число — значение · Ctrl — привязка · Enter — применить · Esc — отмена",
+                        gesture.tool,
+                        gesture.axis.map_or("", |i| ["X", "Y", "Z"][i]),
+                        gesture.typed
+                    )
+                }
             } else if editing.knife {
                 "Нож: отметьте две точки в 3D-виде · Esc — отмена".into()
             } else if editing.box_armed || editing.box_start.is_some() {
                 "Рамка: протяните ЛКМ · Shift — добавить · Ctrl — исключить · Esc — отмена".into()
+            } else if editing.extrude_tool {
+                "Потяните «+» на выделении · E — начать вытягивание · Esc — выйти из инструмента".into()
             } else {
                 "ЛКМ — выбор / рамка · Shift — добавить · Ctrl — исключить · ПКМ + WASD / Q E — полёт · Alt+ЛКМ — орбита · G/R/S — трансформации".into()
             };

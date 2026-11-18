@@ -1347,6 +1347,16 @@ fn gpu_narrative_workflow() {
         )
         .unwrap();
     }
+    let mut continuation = Dialogue::new("Орбитальная станция".into());
+    let arrival = continuation.add(NodeKind::Line, 0);
+    continuation.node_mut(arrival).unwrap().text = "Стыковка завершена.".into();
+    Content::Dialogue(continuation)
+        .save(&lab, std::path::Path::new("NPC/Орбитальная станция.dialog"))
+        .unwrap();
+    let drag_filename = "Переход с ассетов.dialog";
+    Content::Dialogue(Dialogue::new("Переход с ассетов".into()))
+        .save(&lab, std::path::Path::new(drag_filename))
+        .unwrap();
     let (mut app, window, target) = fixture_project(project);
     app.world_mut().resource_mut::<Editor>().drawer = false;
     action(&mut app, NarrativeAction::Create(false));
@@ -1582,6 +1592,212 @@ fn gpu_narrative_workflow() {
             .unwrap()
             .dirty()
     );
+    click(&mut app, window, "+ Другой диалог");
+    let jump = app
+        .world()
+        .resource::<Editor>()
+        .narrative
+        .current()
+        .unwrap()
+        .selected;
+    assert_eq!(branch_target(&app, 1, 0), Some(2));
+    click(&mut app, window, "Выбрать диалог…");
+    let picker_path = std::path::Path::new("NPC").join("Орбитальная станция.dialog");
+    let picker_label = "NPC/Орбитальная станция.dialog";
+    assert!(app.world().resource::<speaker_menu::Menu>().visible());
+    let overlay = app.world().resource::<NarrativeUi>().overlay;
+    assert_eq!(
+        app.world().get::<Node>(overlay).unwrap().display,
+        Display::None
+    );
+    edit_named(&mut app, "Поиск диалога", "станция");
+    {
+        let world = app.world_mut();
+        let mut q = world.query::<(&Control, &AccessibleLabel)>();
+        let results: Vec<_> = q
+            .iter(world)
+            .filter_map(|(c, label)| {
+                matches!(
+                    c.action,
+                    Action::Narrative(NarrativeAction::SetDialogue(Some(_), _))
+                )
+                .then_some(label.0.as_str())
+            })
+            .collect();
+        assert_eq!(results, vec![picker_label]);
+    }
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("dialogue-search-dropdown.png"),
+        |_| true,
+    );
+    click(&mut app, window, picker_label);
+    begin_connection(&mut app, window, 1, 0);
+    let input = control_point(&mut app, &format!("Вход ноды #{jump}"));
+    move_pointer(&mut app, window, input);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 4);
+    assert_eq!(branch_target(&app, 1, 0), Some(jump));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("dialogue-jump-node.png"),
+        |_| true,
+    );
+    action(&mut app, NarrativeAction::Save);
+    {
+        let editor = app.world().resource::<Editor>();
+        let doc = editor.narrative.current().unwrap();
+        let Content::Dialogue(saved) = Content::read(&editor.root, &doc.path).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(saved.node(1).unwrap().choices[0].target, Some(jump));
+        let jump_node = saved.node(jump).unwrap();
+        assert_eq!(jump_node.kind, NodeKind::Jump);
+        assert_eq!(
+            jump_node.dialogue.as_deref(),
+            Some("NPC/Орбитальная станция.dialog")
+        );
+    }
+    click(&mut app, window, "Проверить");
+    click(&mut app, window, "Исследовать сигнал");
+    {
+        let ui = app.world().resource::<NarrativeUi>();
+        assert_eq!(ui.playing, Some(arrival));
+        assert_eq!(
+            ui.preview_dialogue.as_ref().unwrap().1.title,
+            "Орбитальная станция"
+        );
+        assert_eq!(app.world().resource::<Editor>().narrative.active, Some(id));
+    }
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("preview-other-dialogue.png"),
+        |_| true,
+    );
+    action(&mut app, NarrativeAction::Restart);
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_dialogue
+            .is_none()
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    let jump_header = format!("Выбрать ДРУГОЙ ДИАЛОГ #{jump}");
+    click(&mut app, window, &jump_header);
+    assert_eq!(app.world().resource::<Editor>().narrative.active, Some(id));
+    click(&mut app, window, &jump_header);
+    let opened = app
+        .world()
+        .resource::<Editor>()
+        .narrative
+        .current()
+        .unwrap();
+    assert_eq!(opened.path, picker_path);
+    let opened_id = opened.id;
+    action(&mut app, NarrativeAction::Close(opened_id));
+    assert_eq!(app.world().resource::<Editor>().narrative.active, Some(id));
+    for _ in 0..3 {
+        action(&mut app, NarrativeAction::Undo);
+    }
+    assert_eq!(branch_target(&app, 1, 0), Some(2));
+    action(&mut app, NarrativeAction::Save);
+    // A file card can link to the graph that is currently being edited.
+    let own_path = app
+        .world()
+        .resource::<Editor>()
+        .narrative
+        .current()
+        .unwrap()
+        .path
+        .clone();
+    let own_label = own_path.to_string_lossy().replace('\\', "/");
+    app.world_mut()
+        .resource_mut::<Browser>()
+        .set_search(own_label.clone());
+    app.world_mut().write_message(Action::Drawer);
+    warm(&mut app, 30);
+    let file = app
+        .world()
+        .resource::<Browser>()
+        .files
+        .iter()
+        .position(|f| f.path == own_path)
+        .unwrap();
+    let start = {
+        let world = app.world_mut();
+        world
+            .query::<(&drawer::FileCard, &UiGlobalTransform)>()
+            .iter(world)
+            .find_map(|(card, transform)| {
+                (card.0 == crate::editor::browser::Entry::File(file))
+                    .then_some(transform.translation)
+            })
+            .unwrap()
+    };
+    let destination = Vec2::new(135.0, 406.0);
+    move_pointer(&mut app, window, start);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, destination);
+    let Some(drawer::DropTarget::Dialogue { document, local }) =
+        app.world().resource::<AssetDrag>().target
+    else {
+        panic!("Dialogue canvas did not accept the file card")
+    };
+    assert_eq!(document, id);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 4);
+    let dropped_id = {
+        let editor = app.world().resource::<Editor>();
+        let doc = editor.narrative.current().unwrap();
+        assert_eq!(doc.id, id);
+        let Content::Dialogue(d) = &doc.content else {
+            unreachable!()
+        };
+        let dropped = d.node(doc.selected).unwrap();
+        assert_eq!(dropped.kind, NodeKind::Jump);
+        assert_eq!(dropped.dialogue.as_deref(), Some(own_label.as_str()));
+        assert!((Vec2::from_array(dropped.position) * doc.zoom + doc.pan).abs_diff_eq(local, 0.01));
+        assert_eq!(d.node(1).unwrap().choices[0].target, Some(2));
+        dropped.id
+    };
+    app.world_mut().write_message(Action::Drawer);
+    warm(&mut app, 30);
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("dialogue-file-dropped.png"),
+        |_| true,
+    );
+    action(&mut app, NarrativeAction::Connect(1, 0, dropped_id));
+    action(&mut app, NarrativeAction::Preview);
+    action(&mut app, NarrativeAction::Advance(0));
+    assert_eq!(app.world().resource::<NarrativeUi>().playing, Some(1));
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_error
+            .is_none()
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Undo);
+    action(&mut app, NarrativeAction::Connect(0, 0, dropped_id));
+    action(&mut app, NarrativeAction::Preview);
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_error
+            .is_some()
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Undo);
+    action(&mut app, NarrativeAction::Undo);
+    assert_eq!(branch_target(&app, 1, 0), Some(2));
+    app.world_mut()
+        .resource_mut::<Browser>()
+        .set_search(String::new());
     action(&mut app, NarrativeAction::Create(true));
     let character_id = app.world().resource::<Editor>().narrative.active.unwrap();
     capture_when(

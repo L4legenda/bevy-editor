@@ -44,6 +44,8 @@ mod control_hints;
 mod play_ui;
 #[path = "scene_hierarchy_ui.rs"]
 mod scene_hierarchy_ui;
+#[path = "scene_tree_drag.rs"]
+pub(super) mod scene_tree_drag;
 pub(super) use play_ui::update as refresh_play;
 #[path = "drawer.rs"]
 mod drawer;
@@ -98,6 +100,7 @@ pub(super) use drawer::{
 };
 pub(super) use icons::SvgIconsPlugin;
 pub(super) use image_viewer::edit::layers::ui::drag_ui::fx::LayerDragFxPlugin;
+pub(super) use image_viewer::edit::layers::ui::flyout_fx::LayerFlyoutFxPlugin;
 pub(super) use image_viewer::edit::color_drop::{ColorDropPlugin, input as color_drop_input};
 pub(super) use image_viewer::edit::layers::ui::drag_ui::{
     LayerDrag, input as drag_photo_layers, visuals as refresh_photo_layer_drag,
@@ -880,6 +883,11 @@ fn object_outline_entry(
         !hidden && light.is_none_or(|light| light.enabled),
     );
     commands.entity(item).observe(scene_objects::pointer_menu);
+    if editor.has_scene() && editor.definition().is_native()
+        && matches!(target, Selection::Model(_) | Selection::Light(_) | Selection::Camera(_))
+    {
+        scene_tree_drag::mark(commands, item, Some(target));
+    }
     let eye = control(
         commands,
         container,
@@ -1078,6 +1086,14 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
     match action {
         Action::Hierarchy(action) => super::scene_hierarchy::available(editor, action),
         Action::ImageEdit(_) => editor.viewing_image.is_some(),
+        Action::EditBrowserImage(file, revision) => {
+            editor.drawer
+                && revision == browser.scan_revision
+                && browser
+                    .files
+                    .get(file)
+                    .is_some_and(|file| file.kind == browser::FileKind::Image)
+        }
         Action::ImageView(ImageAction::Previous) => {
             editor.viewing_image.is_some()
                 && image_viewer::neighbor(editor, browser, false).is_some()
@@ -1289,6 +1305,7 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
     mut messages: MessageWriter<Action>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     color_drop: Option<Res<image_viewer::edit::color_drop::ColorDrop>>,
+    tree_drag: Option<Res<scene_tree_drag::TreeDrag>>,
 ) {
     // Bevy's Button emits Activate for secondary clicks as well. Reserve those
     // for context menus even when press and release arrive in the same frame.
@@ -1299,6 +1316,9 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
         return;
     }
     let entity = activate.event_target();
+    if tree_drag.is_some_and(|drag| drag.suppresses(window.cursor_position())) {
+        return;
+    }
     if color_drop.as_ref().is_some_and(|drag| drag.suppresses(entity)) {
         return;
     }
@@ -1337,15 +1357,18 @@ pub(super) fn shortcuts(
     image_viewer: Option<Res<ImageViewer>>,
     model_edit: Option<Res<model_viewer::editing::State>>,
     sliders: Query<(), With<bevy::ui_widgets::Slider>>,
-    (pointer, scrub): (
+    (pointer, scrub, tree_drag): (
         Option<Res<viewport::PointerState>>,
         Option<Res<NumberScrub>>,
+        Option<Res<scene_tree_drag::TreeDrag>>,
     ),
 ) {
     if editor.scene_object_popup {
         return;
     }
-    if layer_drag.as_ref().is_some_and(|drag| drag.capturing()) {
+    if layer_drag.as_ref().is_some_and(|drag| drag.capturing())
+        || tree_drag.is_some_and(|drag| drag.suppresses(None))
+    {
         return;
     }
     if image_viewer.as_ref().is_some_and(|viewer| viewer.edit.color_dragging) {
@@ -1969,6 +1992,7 @@ pub(super) fn refresh(
         } else if editor.has_scene() {
             if editor.definition().is_native() {
                 scene_hierarchy_ui::toolbar(&mut commands, interface.outliner, &interface.font);
+                scene_tree_drag::root_row(&mut commands, interface.outliner, &interface.font);
             }
             heading(&mut commands, "ОСВЕЩЕНИЕ");
             outline_entry(
@@ -2421,6 +2445,12 @@ pub(super) fn refresh(
         }
         let color = if !visual_enabled || photo_options {
             Color::NONE
+        } else if matches!(control.action, Action::EditBrowserImage(..)) {
+            if hovered.0 || pressed {
+                HOVER
+            } else {
+                PANEL
+            }
         } else if layer_row_control {
             if hovered.0 || pressed {
                 HOVER

@@ -32,6 +32,12 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     swatches: Vec<Handle<Image>>,
     showing: bool,
 }
+#[cfg(test)]
+impl PaintUi {
+    pub(super) fn retained_labels(&self) -> [Entity; 2] {
+        [self.layer_name, self.brush_name]
+    }
+}
 fn button(
     commands: &mut Commands,
     parent: Entity,
@@ -174,8 +180,19 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     let font = &interface.font;
     commands.spawn((
         engine::BrushCursor,
-        Node{position_type:PositionType::Absolute,width:px(70),height:px(70),border:UiRect::all(px(1.5)),border_radius:BorderRadius::MAX,..default()},
-        BorderColor::all(Color::srgba(0.98,0.88,0.66,0.95)),Visibility::Hidden,ZIndex(90),Pickable::IGNORE,ChildOf(viewer.overlay),
+        Node {
+            position_type: PositionType::Absolute,
+            width: px(70),
+            height: px(70),
+            border: UiRect::all(px(1.5)),
+            border_radius: BorderRadius::MAX,
+            ..default()
+        },
+        BorderColor::all(Color::srgba(0.98, 0.88, 0.66, 0.95)),
+        Visibility::Hidden,
+        ZIndex(90),
+        Pickable::IGNORE,
+        ChildOf(viewer.overlay),
     ));
     let original = nodes
         .iter()
@@ -217,8 +234,12 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         PaintAction::Reset,
     );
     super::super::super::button(
-        &mut commands, toolbar, font, "Сохранить",
-        Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)), Look::Primary,
+        &mut commands,
+        toolbar,
+        font,
+        "Сохранить",
+        Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)),
+        Look::Primary,
     );
     let views = node(
         &mut commands,
@@ -667,7 +688,16 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     mut nodes: Query<&mut Node>,
     mut labels: Query<&mut Text>,
     mut fields: Query<(Entity, &Value, &mut EditableText, &mut BorderColor)>,
-    buttons: Query<(Entity, &PaintButton)>,
+    buttons: Query<
+        (
+            Entity,
+            &PaintButton,
+            &BackgroundColor,
+            &BorderColor,
+            Option<&bevy::ui::InteractionDisabled>,
+        ),
+        Without<Value>,
+    >,
     mut images: ResMut<Assets<Image>>,
     runtime: Res<engine::Runtime>,
     mut texture_nodes: Query<&mut ImageNode, With<engine::TextureCanvas>>,
@@ -678,6 +708,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let showing = doc.is_some_and(|doc| doc.mode == Mode::Paint)
         && editor.viewing_image.is_none()
         && editor.pending.is_none();
+    let view = editor
+        .viewing_model
+        .and_then(|i| paint.sessions.get(&i))
+        .map_or(View::Split, |s| s.view);
     if showing != ui.showing {
         if showing {
             for entity in ui.original.clone() {
@@ -698,21 +732,26 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     if showing {
         for &entity in &ui.original {
             if let Ok(mut node) = nodes.get_mut(entity) {
-                node.display = Display::None;
+                if node.display != Display::None {
+                    node.display = Display::None;
+                }
             }
         }
     }
     for &entity in &ui.roots {
         if let Ok(mut node) = nodes.get_mut(entity) {
-            node.display = if showing {
+            let display = if showing && (entity != ui.three_title || view != View::Two) {
                 Display::Flex
             } else {
                 Display::None
             };
+            if node.display != display {
+                node.display = display;
+            }
         }
     }
     if let Ok(mut node) = nodes.get_mut(ui.content) {
-        node.padding = if showing {
+        let padding = if showing {
             UiRect {
                 left: px(44),
                 top: px(118),
@@ -722,25 +761,41 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         } else {
             UiRect::ZERO
         };
+        if node.padding != padding {
+            node.padding = padding;
+        }
     }
     if let Ok(mut node) = nodes.get_mut(viewer.toolbar) {
-        node.right = if showing {
+        let right = if showing {
             px(180)
         } else if !doc.is_some_and(|d| d.mode == Mode::Uv) {
             px(140)
         } else {
             node.right
         };
+        if node.right != right {
+            node.right = right;
+        }
     }
     if let Ok(mut node) = nodes.get_mut(ui.canvas) {
-        node.display = Display::Flex;
+        let display = if showing && view == View::Two {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if node.display != display {
+            node.display = display;
+        }
     }
     if let Ok(mut node) = nodes.get_mut(ui.uv) {
-        node.display = if showing {
+        let display = if showing && view != View::Three {
             Display::Flex
         } else {
             Display::None
         };
+        if node.display != display {
+            node.display = display;
+        }
     }
     if !showing {
         ui.stamp = None;
@@ -750,31 +805,28 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let doc = doc.unwrap();
     let session = paint.sessions.entry(index).or_default();
     if let Ok(mut node) = nodes.get_mut(ui.uv) {
-        node.display = if session.view == View::Three {
-            Display::None
-        } else {
-            Display::Flex
-        };
-        node.width = percent(if session.view == View::Two { 100. } else { 49. });
-    }
-    if let Ok(mut node) = nodes.get_mut(ui.canvas) {
-        node.display = if session.view == View::Two {
-            Display::None
-        } else {
-            Display::Flex
-        };
+        let width = percent(if session.view == View::Two { 100. } else { 49. });
+        if node.width != width {
+            node.width = width;
+        }
     }
     if let Ok(mut node) = nodes.get_mut(ui.three_title) {
-        node.display = if session.view == View::Two {
+        let display = if session.view == View::Two {
             Display::None
         } else {
             Display::Flex
         };
-        node.width = percent(if session.view == View::Three {
+        let width = percent(if session.view == View::Three {
             96.
         } else {
             48.
         });
+        if node.display != display {
+            node.display = display;
+        }
+        if node.width != width {
+            node.width = width;
+        }
     }
     for (entity, parameter, mut input, mut border) in &mut fields {
         if focus.get() == Some(entity) {
@@ -785,47 +837,58 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     if session.value(parameter.0) != value {
                         session.set_value(parameter.0, value);
                     }
-                    *border = BorderColor::all(FOCUS);
+                    border.set_if_neq(BorderColor::all(FOCUS));
                 }
-                _ => *border = BorderColor::all(ERROR),
+                _ => {
+                    border.set_if_neq(BorderColor::all(ERROR));
+                }
             }
         } else {
             let value = format!("{:.0}", session.value(parameter.0));
             if input.value().to_string() != value {
                 input.editor_mut().set_text(&value);
             }
-            *border = BorderColor::all(EDGE);
+            border.set_if_neq(BorderColor::all(EDGE));
         }
     }
-    for (entity, button) in &buttons {
-        if session.available(button.0) {
+    for (entity, button, background, border, disabled) in &buttons {
+        if session.available(button.0) && disabled.is_some() {
             commands
                 .entity(entity)
                 .try_remove::<bevy::ui::InteractionDisabled>();
-        } else {
+        } else if !session.available(button.0) && disabled.is_none() {
             commands
                 .entity(entity)
                 .try_insert(bevy::ui::InteractionDisabled);
         }
         let active = session.active(button.0);
-        commands.entity(entity).try_insert((
-            BackgroundColor(if active { ACTIVE } else { Color::NONE }),
-            BorderColor::all(if active {
-                FOCUS.with_alpha(0.7)
-            } else {
-                EDGE.with_alpha(0.3)
-            }),
-        ));
+        let next_background = BackgroundColor(if active { ACTIVE } else { Color::NONE });
+        let next_border = BorderColor::all(if active {
+            FOCUS.with_alpha(0.7)
+        } else {
+            EDGE.with_alpha(0.3)
+        });
+        if *background != next_background || *border != next_border {
+            commands
+                .entity(entity)
+                .try_insert((next_background, next_border));
+        }
     }
     if let Ok(mut text) = labels.get_mut(ui.layer_name) {
-        text.0 = session
+        let value = session
             .stack
             .layers
             .get(session.stack.selected)
             .map_or_else(|| "Выберите слой".into(), |layer| layer.name.clone());
+        if text.0 != value {
+            text.0 = value;
+        }
     }
     if let Ok(mut text) = labels.get_mut(ui.brush_name) {
-        text.0 = format!("{} · круглая", session.tool.label());
+        let value = format!("{} · круглая", session.tool.label());
+        if text.0 != value {
+            text.0 = value;
+        }
     }
     let stamp = (index, session.revision, doc.revision);
     if ui.stamp != Some(stamp) {
@@ -1081,7 +1144,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         .or_else(|| doc.active().map(|object| (object, 0)));
     if let Some((object, slot)) = selected {
         if let Ok(mut image) = texture_nodes.single_mut() {
-            image.image = runtime.preview(index, object.id, slot, session.channel).unwrap_or_else(||ui.uv_image.clone());
+            let handle = runtime
+                .preview(index, object.id, slot, session.channel)
+                .unwrap_or_else(|| ui.uv_image.clone());
+            if image.image != handle {
+                image.image = handle;
+            }
         }
         let stamp = (index, object.id, slot, doc.revision);
         if ui.uv_stamp != Some(stamp) {
@@ -1100,7 +1168,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         if ui.uv_stamp == Some(stamp) {
             if let Ok(mut info) = labels.get_mut(ui.uv_info) {
                 info.0 = if has_uv {
-                    format!("{} × {} · UV 0–1",session.texture_size,session.texture_size)
+                    format!(
+                        "{} × {} · UV 0–1",
+                        session.texture_size, session.texture_size
+                    )
                 } else {
                     "UV-развёртка отсутствует".into()
                 };

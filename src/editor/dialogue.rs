@@ -26,6 +26,7 @@ pub(super) enum NodeKind {
     Start,
     Line,
     End,
+    Jump,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +39,8 @@ pub(super) struct DialogueNode {
     #[serde(default)]
     pub portrait: usize,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue: Option<String>,
     #[serde(default, skip_serializing_if = "TextFormat::is_default")]
     pub text_format: TextFormat,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -49,6 +52,14 @@ pub(super) struct DialogueNode {
 pub(super) struct Choice {
     pub text: String,
     pub target: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialogue: Option<String>,
+}
+
+impl Choice {
+    pub fn connected(&self) -> bool {
+        self.target.is_some() || self.dialogue.is_some()
+    }
 }
 
 impl Dialogue {
@@ -63,11 +74,13 @@ impl Dialogue {
                 speaker: None,
                 portrait: 0,
                 text: String::new(),
+                dialogue: None,
                 text_format: TextFormat::default(),
                 text_spans: Vec::new(),
                 choices: vec![Choice {
                     text: "Начать".into(),
                     target: None,
+                    dialogue: None,
                 }],
             }],
         }
@@ -88,16 +101,22 @@ impl Dialogue {
             .checked_add(1)
             .unwrap_or_else(|| (1..u32::MAX).find(|id| self.node(*id).is_none()).unwrap());
         let source = self.node(from);
-        let mut position =
-            source.map_or([380.0, 180.0], |n| [n.position[0] + 320.0, n.position[1]]);
+        let mut position = source.map_or([380.0, 180.0], |n| {
+            [
+                n.position[0] + if kind == NodeKind::Jump { 440.0 } else { 320.0 },
+                n.position[1],
+            ]
+        });
         while self.nodes.iter().any(|n| {
-            (n.position[0] - position[0]).abs() < 260.0
+            (n.position[0] - position[0]).abs() < if kind == NodeKind::Jump { 380.0 } else { 260.0 }
                 && (n.position[1] - position[1]).abs() < 200.0
         }) {
             position[1] += 230.0;
         }
-        if let Some(source) = self.node_mut(from) {
-            if let Some(choice) = source.choices.iter_mut().find(|c| c.target.is_none()) {
+        if kind != NodeKind::Jump
+            && let Some(source) = self.node_mut(from)
+        {
+            if let Some(choice) = source.choices.iter_mut().find(|c| !c.connected()) {
                 choice.target = Some(id);
             }
         }
@@ -113,12 +132,14 @@ impl Dialogue {
                 "Новая реплика"
             }
             .into(),
+            dialogue: None,
             text_format: TextFormat::default(),
             text_spans: Vec::new(),
             choices: if kind == NodeKind::Line {
                 vec![Choice {
                     text: "Продолжить".into(),
                     target: None,
+                    dialogue: None,
                 }]
             } else {
                 vec![]
@@ -126,6 +147,26 @@ impl Dialogue {
         });
         id
     }
+    fn migrate_jumps(&mut self) {
+        let links: Vec<_> = self
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                node.choices.iter().enumerate().filter_map(|(i, choice)| {
+                    choice.dialogue.clone().map(|path| (node.id, i, path))
+                })
+            })
+            .take(2000usize.saturating_sub(self.nodes.len()))
+            .collect();
+        for (from, index, path) in links {
+            let id = self.add(NodeKind::Jump, from);
+            self.node_mut(id).unwrap().dialogue = Some(path);
+            let choice = &mut self.node_mut(from).unwrap().choices[index];
+            choice.dialogue = None;
+            choice.target = Some(id);
+        }
+    }
+
     pub fn delete(&mut self, id: u32) {
         if self.node(id).is_none_or(|n| n.kind == NodeKind::Start) {
             return;
@@ -161,11 +202,14 @@ impl Dialogue {
             if !reachable.contains(&n.id) {
                 result.push(format!("Реплика #{} недоступна из начала", n.id));
             }
-            if n.kind != NodeKind::End && n.choices.is_empty() {
+            if n.kind == NodeKind::Jump && n.dialogue.is_none() {
+                result.push(format!("Переход #{}: выберите диалог", n.id));
+            }
+            if matches!(n.kind, NodeKind::Start | NodeKind::Line) && n.choices.is_empty() {
                 result.push(format!("Узел #{}: добавьте переход или завершение", n.id));
             }
             for (i, c) in n.choices.iter().enumerate() {
-                if c.target.is_none() {
+                if !c.connected() {
                     result.push(format!("Узел #{} · ответ {}: нет перехода", n.id, i + 1));
                 }
             }
@@ -205,8 +249,21 @@ impl Dialogue {
             {
                 return Err("Переход ссылается на отсутствующий узел".into());
             }
-            if n.kind == NodeKind::End && !n.choices.is_empty() {
-                return Err("Завершение не может иметь переходов".into());
+            if n.choices.iter().any(|c| {
+                c.dialogue
+                    .as_ref()
+                    .is_some_and(|path| c.target.is_some() || !valid_dialogue_path(path))
+            }) {
+                return Err("Переход должен указывать на один файл .dialog внутри ассетов".into());
+            }
+            if n.dialogue
+                .as_ref()
+                .is_some_and(|path| n.kind != NodeKind::Jump || !valid_dialogue_path(path))
+            {
+                return Err("Некорректный файл перехода".into());
+            }
+            if matches!(n.kind, NodeKind::End | NodeKind::Jump) && !n.choices.is_empty() {
+                return Err("Узел без выходов не может иметь ответов".into());
             }
             if n.speaker.as_ref().is_some_and(|p| !safe_relative(p)) {
                 return Err("Путь персонажа должен быть относительно ассетов".into());
@@ -229,6 +286,13 @@ pub(super) struct Character {
 pub(super) struct Portrait {
     pub label: String,
     pub path: String,
+}
+
+fn valid_dialogue_path(path: &str) -> bool {
+    safe_relative(path)
+        && Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("dialog"))
 }
 
 pub(super) fn safe_relative(path: &str) -> bool {
@@ -274,7 +338,7 @@ impl Content {
             return Err("Документ превышает 8 МБ".into());
         }
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let content = if relative
+        let mut content = if relative
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("dialog"))
         {
@@ -288,6 +352,9 @@ impl Content {
             return Err("Ожидается .dialog или .dcharacter".into());
         };
         content.validate()?;
+        if let Self::Dialogue(d) = &mut content {
+            d.migrate_jumps();
+        }
         Ok(content)
     }
     fn validate(&self) -> Result<(), String> {

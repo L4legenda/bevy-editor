@@ -205,6 +205,43 @@ fn entries(editor: &Editor, browser: &Browser, selected: Option<&str>) -> Vec<En
     result.sort_by_cached_key(|e| (!e.current, normalized(&e.name), normalized(&e.path)));
     result
 }
+fn dialogue_entries(browser: &Browser, selected: Option<&str>) -> Vec<Entry> {
+    let mut result: Vec<_> = browser
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| is_dialogue_file(file))
+        .map(|(index, file)| {
+            let path = file.path.to_string_lossy().replace('\\', "/");
+            let name = file
+                .path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            Entry {
+                index,
+                haystack: normalized(&format!("{name} {path}")),
+                name,
+                current: selected.is_some_and(|selected| same_asset_path(selected, &path)),
+                path,
+                portrait: None,
+                duplicate: true,
+            }
+        })
+        .collect();
+    result.sort_by_cached_key(|e| (!e.current, normalized(&e.name), normalized(&e.path)));
+    result
+}
+
+fn choose(picker: Option<Picker>, index: usize, revision: u64) -> NarrativeAction {
+    if picker == Some(Picker::Dialogue) {
+        NarrativeAction::SetDialogue(Some(index), revision)
+    } else {
+        NarrativeAction::SetSpeaker(Some(index))
+    }
+}
+
 impl Menu {
     fn filter(&mut self, query: &str) {
         self.query = query.to_owned();
@@ -251,7 +288,11 @@ pub(super) fn input(
     window: Single<&Window, With<PrimaryWindow>>,
     rows: Query<(&ChoiceRow, &Hovered)>,
 ) {
-    if !matches!(ui.picker, Some(Picker::Speaker | Picker::Portrait)) || menu.context.is_none() {
+    if !matches!(
+        ui.picker,
+        Some(Picker::Speaker | Picker::Portrait | Picker::Dialogue)
+    ) || menu.context.is_none()
+    {
         return;
     }
     if !window.focused {
@@ -288,9 +329,7 @@ pub(super) fn input(
             .get(menu.cursor)
             .and_then(|i| menu.entries.get(*i))
         {
-            actions.write(Action::Narrative(NarrativeAction::SetSpeaker(Some(
-                e.index,
-            ))));
+            actions.write(Action::Narrative(choose(ui.picker, e.index, menu.revision)));
         }
     }
 }
@@ -449,14 +488,24 @@ pub(super) fn refresh(
     server: Res<AssetServer>,
     time: Res<Time>,
     mut fx: ResMut<picker_fx::State>,
+    drawer: Res<DrawerMotion>,
 ) {
+    let dialogue = ui.picker == Some(Picker::Dialogue);
     let doc = editor.narrative.current();
-    let active =
-        matches!(ui.picker, Some(Picker::Speaker | Picker::Portrait)) && editor.pending.is_none();
+    let active = matches!(
+        ui.picker,
+        Some(Picker::Speaker | Picker::Portrait | Picker::Dialogue)
+    ) && editor.pending.is_none();
     let context = doc.filter(|_| active).and_then(|doc| match &doc.content {
         Content::Dialogue(d)
-            if d.node(doc.selected)
-                .is_some_and(|n| n.kind == NodeKind::Line) =>
+            if d.node(doc.selected).is_some_and(|n| {
+                n.kind
+                    == if dialogue {
+                        NodeKind::Jump
+                    } else {
+                        NodeKind::Line
+                    }
+            }) =>
         {
             Some(Context {
                 document: doc.id,
@@ -482,7 +531,13 @@ pub(super) fn refresh(
     };
     let doc = doc.unwrap();
     let selected = match &doc.content {
-        Content::Dialogue(d) => d.node(context.node).and_then(|n| n.speaker.as_deref()),
+        Content::Dialogue(d) => d.node(context.node).and_then(|n| {
+            if dialogue {
+                n.dialogue.as_deref()
+            } else {
+                n.speaker.as_deref()
+            }
+        }),
         _ => None,
     };
     let Some((computed, transform)) = anchors
@@ -514,12 +569,27 @@ pub(super) fn refresh(
         .max(360.)
         .min(420.)
         .min((root_size.x - 16.).max(100.));
-    let opened = menu.context != Some(context);
+    let opened =
+        menu.context != Some(context) || (dialogue && menu.revision != browser.scan_revision);
     let continuing = menu
         .context
         .is_some_and(|old| old.document == context.document && old.node == context.node);
     let new_session = opened && !continuing;
     if opened {
+        commands
+            .entity(menu.root)
+            .insert(AccessibleLabel(if dialogue {
+                "Выбор диалога".into()
+            } else {
+                "Выбор говорящего".into()
+            }));
+        commands
+            .entity(menu.panel)
+            .insert(AccessibleLabel(if dialogue {
+                "Список диалогов".into()
+            } else {
+                "Список персонажей".into()
+            }));
         menu.context = Some(context);
         if !continuing {
             menu.opened = time.elapsed_secs_f64();
@@ -535,24 +605,47 @@ pub(super) fn refresh(
                 width: percent(100),
                 height: px(36),
                 flex_shrink: 0.,
-                ..default()
+                ..row(6.)
             },
         );
         let search = input_field(
             &mut commands,
             search_row,
             &ui.font,
-            "Поиск персонажа",
-            "",
+            if dialogue {
+                "Поиск диалога"
+            } else {
+                "Поиск персонажа"
+            },
+            &ui.search,
             DraftField::Search,
             false,
         );
+        if dialogue && selected.is_some() {
+            commands.entity(search).entry::<Node>().and_modify(|mut n| {
+                n.width = px(0);
+                n.flex_grow = 1.;
+                n.min_width = px(0);
+            });
+            act(
+                &mut commands,
+                search_row,
+                &ui.font,
+                "Сбросить",
+                NarrativeAction::SetDialogue(None, browser.scan_revision),
+                false,
+            );
+        }
         menu.search = Some(search);
         let placeholder = text(
             &mut commands,
             search_row,
             &ui.font,
-            "Найти персонажа…",
+            if dialogue {
+                "Найти диалог…"
+            } else {
+                "Найти персонажа…"
+            },
             13.,
             MUTED,
         );
@@ -566,17 +659,21 @@ pub(super) fn refresh(
             },
         ));
         menu.placeholder = Some(placeholder);
-        let extra = expressions(
-            &mut commands,
-            menu.panel,
-            &ui.font,
-            &editor,
-            doc,
-            &browser,
-            &server,
-            width,
-            ui.picker == Some(Picker::Portrait),
-        );
+        let extra = if dialogue {
+            0.
+        } else {
+            expressions(
+                &mut commands,
+                menu.panel,
+                &ui.font,
+                &editor,
+                doc,
+                &browser,
+                &server,
+                width,
+                ui.picker == Some(Picker::Portrait),
+            )
+        };
         menu.base = 80. + if extra > 0. { extra + 6. } else { 0. };
         let list = node(
             &mut commands,
@@ -602,7 +699,9 @@ pub(super) fn refresh(
             MUTED,
         );
         picker_fx::layer(&mut commands, menu.panel, 0, false, None, context.node);
-        ui.search.clear();
+        if !dialogue {
+            ui.search.clear();
+        }
         let portrait = if ui.picker == Some(Picker::Portrait) {
             match &doc.content {
                 Content::Dialogue(d) => d.node(context.node).map(|n| n.portrait),
@@ -630,7 +729,11 @@ pub(super) fn refresh(
         });
     }
     if opened || menu.revision != browser.scan_revision {
-        menu.entries = entries(&editor, &browser, selected);
+        menu.entries = if dialogue {
+            dialogue_entries(&browser, selected)
+        } else {
+            entries(&editor, &browser, selected)
+        };
         menu.revision = browser.scan_revision;
         menu.filter(&ui.search);
     } else if menu.query != ui.search {
@@ -646,7 +749,14 @@ pub(super) fn refresh(
         }
     }
     let desired = menu.base + menu.entries.len().clamp(1, 5) as f32 * ROW;
-    let below = (root_size.y - 10. - anchor.max.y - 6.).max(0.);
+    let usable_height = if dialogue {
+        root_size
+            .y
+            .min(window.height() - FOOT - drawer.visible_height - root_min.y)
+    } else {
+        root_size.y
+    };
+    let below = (usable_height - 10. - anchor.max.y - 6.).max(0.);
     let above = (anchor.min.y - 14.).max(0.);
     let down = if new_session {
         below >= desired || below >= above
@@ -679,7 +789,7 @@ pub(super) fn refresh(
             let row = control(
                 &mut commands,
                 list,
-                Action::Narrative(NarrativeAction::SetSpeaker(Some(e.index))),
+                Action::Narrative(choose(ui.picker, e.index, menu.revision)),
                 Look::Regular,
                 Node {
                     width: percent(100),
@@ -693,7 +803,11 @@ pub(super) fn refresh(
             );
             commands.entity(row).insert((
                 ChoiceRow(position),
-                AccessibleLabel(format!("Выбрать персонажа: {}", e.name)),
+                AccessibleLabel(if dialogue {
+                    e.path.clone()
+                } else {
+                    format!("Выбрать персонажа: {}", e.name)
+                }),
             ));
             let avatar = surface(
                 &mut commands,
@@ -710,7 +824,9 @@ pub(super) fn refresh(
                 WELL,
             );
             commands.entity(avatar).insert(Pickable::IGNORE);
-            if let Some(path) = &e.portrait {
+            if dialogue {
+                icons::spawn(&mut commands, avatar, icons::Glyph::DialogueFile, 18., BLUE);
+            } else if let Some(path) = &e.portrait {
                 portrait(&mut commands, avatar, &server, &editor.root, path, 32.);
             } else {
                 text(
@@ -761,7 +877,11 @@ pub(super) fn refresh(
                 list,
                 &ui.font,
                 if menu.entries.is_empty() {
-                    "Создайте персонажа в файловом менеджере."
+                    if dialogue {
+                        "В проекте пока нет других диалогов."
+                    } else {
+                        "Создайте персонажа в файловом менеджере."
+                    }
                 } else {
                     "Ничего не найдено. Попробуйте другое имя."
                 },

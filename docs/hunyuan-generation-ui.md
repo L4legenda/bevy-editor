@@ -35,6 +35,15 @@ neutral material, without texturing or automatic background removal.
 
 ## Build and distribution
 
+For a Windows source checkout, start `run-editor.vbs` or `run-editor.cmd`.
+They use `tools/build-editor.ps1` to build the editor and, when an NVIDIA driver
+is detected, prepare `bevy-hunyuan.exe` and all required CUDA DLLs in `target/debug`.
+Cargo checks the generator's freshness after a pull. First-time preparation can
+download the pinned CUDA toolkit and compile kernels; model weights are loaded
+only after pressing **Включить модель** in the editor. `BEVY_EDITOR_PREPARE_3D=0`
+skips the optional CUDA preparation; `1` forces it. The shared build lock covers
+generator preparation too. Plain `cargo run` does not invoke this launcher step.
+
 On Windows with Rust and Visual Studio C++ build tools:
 
 ```powershell

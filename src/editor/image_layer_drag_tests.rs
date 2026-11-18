@@ -24,6 +24,147 @@ fn document(app: &App) -> &crate::editor::photo_document::PhotoDocument {
     let v = app.world().resource::<ImageViewer>();
     v.edit.document(v.tab).unwrap()
 }
+
+#[test]
+#[ignore = "requires GPU: verifies the layer flyout with real pointer events"]
+fn gpu_layer_flyout_opens_beside_the_row_and_dismisses_without_painting() {
+    let fixture = Fixture::new();
+    let (mut app, window, target) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.0.clone();
+            editor.project.asset_root = fixture.0.clone();
+            editor.drawer = false;
+            browser.refresh(&mut editor.project);
+        });
+    let file = file(&app, "b-transparent.png");
+    app.world_mut().write_message(Action::ViewImage(file));
+    wait_for_image(&mut app);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    wait_for_edit(&mut app);
+    layer(&mut app, L::Quick("layer.new.layer"));
+    let right_click = |app: &mut App, index| {
+        click_control(
+            app,
+            window,
+            |action| matches!(action, Action::ImageEdit(edit::EditAction::SelectLayer(i)) if i == index),
+            MouseButton::Right,
+        );
+        warm(app, 12);
+    };
+    right_click(&mut app, 0);
+    assert_eq!(document(&app).active, 0);
+    let layer_id = document(&app).layer(0).unwrap().id.0;
+    let row = rect(&mut app, Some(layer_id));
+    let menu = {
+        let world = app.world_mut();
+        let (node, transform) = world
+            .query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find_map(|(label, node, transform)| {
+                (label.0 == "Меню слоя" && !node.is_empty()).then_some((node, transform))
+            })
+            .unwrap();
+        Rect::from_center_size(
+            transform.affine().translation * node.inverse_scale_factor(),
+            node.size() * node.inverse_scale_factor(),
+        )
+    };
+    assert!(menu.max.x < row.min.x);
+    assert!((menu.min.y..menu.max.y).contains(&row.center().y));
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/layer-flyout.png");
+    capture_when(&mut app, &target, &output, |_| true);
+    click_action(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ImageEdit(edit::EditAction::Layers(L::Category("Эффекты")))
+        )
+    });
+    assert!(visible(&mut app, "Меню слоя"));
+    assert_eq!(
+        app.world().resource::<ImageViewer>().edit.layers.category,
+        "Эффекты"
+    );
+    right_click(&mut app, 1);
+    assert_eq!(document(&app).active, 1);
+    assert!(visible(&mut app, "Меню слоя"));
+    let revision = document(&app).revision;
+    move_pointer(&mut app, window, Vec2::new(520.0, 450.0));
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert!(!app.world().resource::<ImageViewer>().edit.layers.menu);
+    assert!(
+        visible(&mut app, "Меню слоя"),
+        "The closing menu should still be animating"
+    );
+    warm(&mut app, 14);
+    assert!(!visible(&mut app, "Меню слоя"));
+    assert_eq!(document(&app).revision, revision);
+    right_click(&mut app, 1);
+    escape(&mut app, window);
+    assert!(!app.world().resource::<ImageViewer>().edit.layers.menu);
+    assert!(visible(&mut app, "Меню слоя"));
+    warm(&mut app, 14);
+    assert!(!visible(&mut app, "Меню слоя"));
+}
+
+#[test]
+#[ignore = "requires GPU: verifies Alt-click, the clipping arrow and composited pixels"]
+fn gpu_alt_click_toggles_clipping_on_the_clicked_layer() {
+    let fixture = Fixture::new();
+    let (mut app, window, _) = lighting_ui_render::fixture();
+    app.world_mut()
+        .resource_scope(|world, mut browser: Mut<Browser>| {
+            let mut editor = world.resource_mut::<Editor>();
+            editor.root = fixture.0.clone();
+            editor.project.asset_root = fixture.0.clone();
+            editor.drawer = false;
+            browser.refresh(&mut editor.project);
+        });
+    let file = file(&app, "b-transparent.png");
+    app.world_mut().write_message(Action::ViewImage(file));
+    wait_for_image(&mut app);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    wait_for_edit(&mut app);
+    layer(&mut app, L::Quick("layer.newFillLayer.solidColor"));
+    let upper = document(&app).active_id().unwrap();
+    let arrow = "Обтравочная маска по нижнему слою";
+    let alpha =
+        |app: &App, x: usize, y: usize| document(app).composite().pixels[(y * 300 + x) * 4 + 3];
+    let alt_click = |app: &mut App, index| {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::AltLeft);
+        click_action(
+            app,
+            window,
+            |action| matches!(action, Action::ImageEdit(edit::EditAction::SelectLayer(i)) if i == index),
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::AltLeft);
+    };
+    assert_eq!(alpha(&app, 0, 0), 255);
+    alt_click(&mut app, 0);
+    assert!(
+        !visible(&mut app, arrow),
+        "The bottom layer has no clipping base"
+    );
+    alt_click(&mut app, 1);
+    assert!(document(&app).document.layer(upper).unwrap().clipped);
+    assert!(visible(&mut app, arrow));
+    assert_eq!(alpha(&app, 0, 0), 0);
+    assert_eq!(alpha(&app, 150, 100), 255);
+    alt_click(&mut app, 1);
+    assert!(!visible(&mut app, arrow));
+    assert_eq!(alpha(&app, 0, 0), 255);
+    undo(&mut app);
+    assert!(visible(&mut app, arrow));
+    assert_eq!(alpha(&app, 0, 0), 0);
+}
 fn order(app: &App) -> Vec<u64> {
     document(app)
         .document

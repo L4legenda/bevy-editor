@@ -113,12 +113,53 @@ pub(super) fn values_of(e: &Effect, light: f32) -> Value {
                 }),
             );
             set(&mut v, "overprint", json!(s.overprint));
+            let gradient = if let FxPaint::Gradient(gradient) = &s.paint {
+                Some(gradient)
+            } else {
+                None
+            };
+            set(
+                &mut v,
+                "strokePaint",
+                json!(if gradient.is_some() {
+                    "gradient"
+                } else {
+                    "solid"
+                }),
+            );
+            set(
+                &mut v,
+                "from",
+                json!(
+                    gradient
+                        .and_then(|g| g.stops.first())
+                        .map_or("#000000".into(), |(_, c)| hex(c))
+                ),
+            );
+            set(
+                &mut v,
+                "to",
+                json!(
+                    gradient
+                        .and_then(|g| g.stops.last())
+                        .map_or("#ffffff".into(), |(_, c)| hex(c))
+                ),
+            );
+            set(&mut v, "angle", json!(gradient.map_or(90.0, |g| g.angle)));
+            use photocraft_doc::effects::GradientStyle;
+            set(
+                &mut v,
+                "style",
+                json!(match gradient.map(|g| g.style) {
+                    Some(GradientStyle::Radial) => "radial",
+                    Some(GradientStyle::Angle) => "angle",
+                    Some(GradientStyle::Reflected) => "reflected",
+                    Some(GradientStyle::Diamond) => "diamond",
+                    _ => "linear",
+                }),
+            );
             if let FxPaint::Color(c) = &s.paint {
                 set(&mut v, "color", json!(hex(c)));
-            } else {
-                // A gradient/pattern stroke: the dialog's colour field doesn't model
-                // the paint, so the key is left out and the snapshot carries it.
-                drop_keys(&mut v, &["color"]);
             }
         }
         Effect::ColorOverlay { common, color } => {

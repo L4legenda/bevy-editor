@@ -1,4 +1,4 @@
-//! A glossy colour bead, a hold ring, elastic pickup/return, and a brief landing ripple.
+//! A solid colour swatch, a hold ring, elastic pickup/return, and a brief landing ripple.
 use super::*;
 use bevy::{
     asset::{AssetPath, embedded_asset, embedded_path},

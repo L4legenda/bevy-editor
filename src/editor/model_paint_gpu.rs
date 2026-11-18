@@ -1,5 +1,8 @@
 //! Resident GPU stroke masks, layer buffers and compositing on Bevy's own device.
 //! The only readback is an asynchronous layer snapshot at a stroke boundary.
+#[cfg(test)]
+#[path = "model_paint_gpu_perf_tests.rs"]
+mod perf_tests;
 use super::*;
 use bevy::{
     asset::AssetId,
@@ -275,12 +278,15 @@ struct Pipelines {
     apply_layout: BindGroupLayout,
     blend_layout: BindGroupLayout,
     present_layout: BindGroupLayout,
+    tiles_layout: BindGroupLayout,
     depth: RenderPipeline,
     uv: RenderPipeline,
     mask: RenderPipeline,
     apply: ComputePipeline,
     blend: ComputePipeline,
     present: ComputePipeline,
+    present_full: ComputePipeline,
+    tiles: ComputePipeline,
 }
 impl Pipelines {
     fn new(device: &RenderDevice) -> Self {
@@ -293,6 +299,7 @@ impl Pipelines {
                 texture(2, TextureSampleType::Depth),
                 texture(3, TextureSampleType::Uint),
                 texture(4, TextureSampleType::Uint),
+                storage(5, false),
             ],
         );
         let apply_layout = device.create_bind_group_layout(
@@ -302,11 +309,18 @@ impl Pipelines {
                 texture(1, TextureSampleType::Float { filterable: false }),
                 storage(2, true),
                 storage(3, false),
+                storage(4, true),
             ],
         );
         let blend_layout = device.create_bind_group_layout(
             "paint blend",
-            &[uniform(0), storage(1, true), storage(2, false)],
+            &[
+                uniform(0),
+                storage(1, true),
+                storage(2, false),
+                storage(3, true),
+                storage(4, true),
+            ],
         );
         let present_layout = device.create_bind_group_layout(
             "paint present",
@@ -318,7 +332,12 @@ impl Pipelines {
                 texture(4, TextureSampleType::Float { filterable: false }),
                 output(5),
                 output(6),
+                storage(7, true),
             ],
+        );
+        let tiles_layout = device.create_bind_group_layout(
+            "paint dirty tiles",
+            &[uniform(0), storage(1, true), storage(2, false)],
         );
         let mask_shader = shader(
             device,
@@ -466,18 +485,33 @@ impl Pipelines {
             include_str!("model_paint_gpu_present.wgsl"),
             "present",
         );
+        let tiles = make_compute(
+            "paint dirty tiles",
+            &tiles_layout,
+            include_str!("model_paint_gpu_tiles.wgsl"),
+            "compact",
+        );
+        let present_full = make_compute(
+            "initialize paint display",
+            &present_layout,
+            include_str!("model_paint_gpu_present.wgsl"),
+            "present_full",
+        );
         Self {
             scene_layout,
             mask_layout,
             apply_layout,
             blend_layout,
             present_layout,
+            tiles_layout,
             depth,
             uv,
             mask,
             apply,
             blend,
             present,
+            present_full,
+            tiles,
         }
     }
 }
@@ -489,6 +523,7 @@ struct LayerBuffer {
 struct Composition {
     base: Buffer,
     result: Buffer,
+    below: Buffer,
     layers: Vec<LayerBuffer>,
 }
 struct Context {
@@ -509,6 +544,10 @@ struct Context {
     auxiliary: Buffer,
     snapshot: Buffer,
     params: Option<(Brush, View)>,
+    dirty: Buffer,
+    tiles: Buffer,
+    grid: Buffer,
+    presented: bool,
 }
 fn composition(device: &RenderDevice, surface: &Surface, channel: usize) -> Composition {
     let bytes = (surface.size as u64).pow(2) * 4;
@@ -534,6 +573,7 @@ fn composition(device: &RenderDevice, surface: &Surface, channel: usize) -> Comp
     Composition {
         base,
         result,
+        below: empty(device, "paint cached lower layers", bytes, usage),
         layers,
     }
 }
@@ -543,19 +583,26 @@ fn blend(
     encoder: &mut CommandEncoder,
     composition: &Composition,
     size: u32,
+    range: std::ops::Range<usize>,
+    tiles: Option<&Buffer>,
 ) {
-    encoder.copy_buffer_to_buffer(
-        &composition.base,
-        0,
-        &composition.result,
-        0,
-        size as u64 * size as u64 * 4,
-    );
-    for layer in composition.layers.iter().filter(|l| l.visible) {
+    if range.start == 0 && tiles.is_none() {
+        encoder.copy_buffer_to_buffer(
+            &composition.base,
+            0,
+            &composition.result,
+            0,
+            size as u64 * size as u64 * 4,
+        );
+    }
+    let mut first = true;
+    for layer in composition.layers[range].iter().filter(|l| l.visible) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&size.to_le_bytes());
         bytes.extend_from_slice(&layer.opacity.to_le_bytes());
-        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(&u32::from(tiles.is_some() && first).to_le_bytes());
+        bytes.extend_from_slice(&u32::from(tiles.is_some() && size > 1024).to_le_bytes());
+        first = false;
         let u = buffer(device, "paint layer opacity", &bytes, BufferUsages::UNIFORM);
         let bg = device.create_bind_group(
             "paint layer blend",
@@ -573,6 +620,14 @@ fn blend(
                     binding: 2,
                     resource: composition.result.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: composition.below.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: tiles.unwrap_or(&composition.base).as_entire_binding(),
+                },
             ],
         );
         let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -581,7 +636,11 @@ fn blend(
         });
         pass.set_pipeline(&pipelines.blend);
         pass.set_bind_group(0, &*bg, &[]);
-        pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 1);
+        if let Some(tiles) = tiles.filter(|_| size > 1024) {
+            pass.dispatch_workgroups_indirect(tiles, 0);
+        } else {
+            pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 1);
+        }
     }
 }
 fn params(
@@ -720,7 +779,15 @@ impl Context {
         let composition = composition(device, surface, channel);
         let auxiliary = if channel == 3 || channel == 6 {
             let aux = composition_for_aux(device, surface, channel);
-            blend(device, pipelines, encoder, &aux, size);
+            blend(
+                device,
+                pipelines,
+                encoder,
+                &aux,
+                size,
+                0..aux.layers.len(),
+                None,
+            );
             aux.result
         } else {
             empty(device, "paint auxiliary", 16, BufferUsages::STORAGE)
@@ -730,6 +797,39 @@ impl Context {
         } else {
             buffer(device, "paint mesh", &scene.vertices, BufferUsages::VERTEX)
         };
+        // Document/layer changes invalidate this context, so the lower stack stays
+        // valid for every stamp and consecutive stroke on the selected layer.
+        blend(
+            device,
+            pipelines,
+            encoder,
+            &composition,
+            size,
+            0..surface.stack.selected,
+            None,
+        );
+        encoder.copy_buffer_to_buffer(
+            &composition.result,
+            0,
+            &composition.below,
+            0,
+            size as u64 * size as u64 * 4,
+        );
+        blend(
+            device,
+            pipelines,
+            encoder,
+            &composition,
+            size,
+            surface.stack.selected..composition.layers.len(),
+            None,
+        );
+        let columns = size.div_ceil(8);
+        let tile_count = columns * columns;
+        let mut grid_bytes = Vec::new();
+        for v in [columns, columns, u32::from(channel == 3), 0] {
+            grid_bytes.extend_from_slice(&v.to_le_bytes());
+        }
         Self {
             size,
             channel,
@@ -790,6 +890,25 @@ impl Context {
             composition,
             auxiliary,
             params: None,
+            dirty: empty(
+                device,
+                "paint touched tile flags",
+                tile_count as u64 * 4,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            ),
+            tiles: empty(
+                device,
+                "paint indirect tiles",
+                (tile_count as u64 + 4) * 4,
+                BufferUsages::STORAGE | BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            ),
+            grid: buffer(
+                device,
+                "paint tile grid",
+                &grid_bytes,
+                BufferUsages::UNIFORM,
+            ),
+            presented: false,
         }
     }
     fn begin(
@@ -890,7 +1009,7 @@ impl Context {
         });
     }
     fn points(
-        &self,
+        &mut self,
         device: &RenderDevice,
         pipelines: &Pipelines,
         encoder: &mut CommandEncoder,
@@ -900,6 +1019,12 @@ impl Context {
         let Some((brush, view)) = self.params else {
             return;
         };
+        // At 1K, a single dense cached-layer pass is cheaper than compaction
+        // and indirect dispatch. Larger textures benefit from sparse UV tiles.
+        if self.size > 1024 {
+            encoder.clear_buffer(&self.dirty, 0, None);
+            encoder.clear_buffer(&self.tiles, 0, None);
+        }
         let u = buffer(
             device,
             "paint brush",
@@ -950,6 +1075,10 @@ impl Context {
                     binding: 4,
                     resource: BindingResource::TextureView(&self.uv_ids.view),
                 },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: self.dirty.as_entire_binding(),
+                },
             ],
         );
         raster(
@@ -963,6 +1092,35 @@ impl Context {
             None,
             false,
         );
+        if self.size > 1024 {
+            let tiles = device.create_bind_group(
+                "paint dirty tiles",
+                &pipelines.tiles_layout,
+                &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: self.grid.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: self.dirty.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: self.tiles.as_entire_binding(),
+                    },
+                ],
+            );
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("compact paint tiles"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipelines.tiles);
+                pass.set_bind_group(0, &*tiles, &[]);
+                pass.dispatch_workgroups((self.size.div_ceil(8).pow(2)).div_ceil(64), 1, 1);
+            }
+        }
         let apply = device.create_bind_group(
             "paint apply",
             &pipelines.apply_layout,
@@ -985,10 +1143,29 @@ impl Context {
                         .buffer
                         .as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: self.tiles.as_entire_binding(),
+                },
             ],
         );
-        compute(encoder, "paint apply", &pipelines.apply, &apply, self.size);
-        blend(device, pipelines, encoder, &self.composition, self.size);
+        compute_tiles(
+            encoder,
+            "paint apply",
+            &pipelines.apply,
+            &apply,
+            &self.tiles,
+            self.size,
+        );
+        blend(
+            device,
+            pipelines,
+            encoder,
+            &self.composition,
+            self.size,
+            self.selected..self.composition.layers.len(),
+            Some(&self.tiles),
+        );
         let present = device.create_bind_group(
             "paint present",
             &pipelines.present_layout,
@@ -1025,15 +1202,31 @@ impl Context {
                     binding: 6,
                     resource: BindingResource::TextureView(&self.outputs[1].view),
                 },
+                BindGroupEntry {
+                    binding: 7,
+                    resource: self.tiles.as_entire_binding(),
+                },
             ],
         );
-        compute(
-            encoder,
-            "paint present",
-            &pipelines.present,
-            &present,
-            self.size,
-        );
+        if self.presented {
+            compute_tiles(
+                encoder,
+                "paint present",
+                &pipelines.present,
+                &present,
+                &self.tiles,
+                self.size,
+            );
+        } else {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("initialize paint display"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipelines.present_full);
+            pass.set_bind_group(0, &*present, &[]);
+            pass.dispatch_workgroups(self.size.div_ceil(8), self.size.div_ceil(8), 1);
+            self.presented = true;
+        }
         let destinations: &[usize] = match self.channel {
             0 => &[0],
             1 => &[1, 4],
@@ -1064,11 +1257,12 @@ impl Context {
 fn composition_for_aux(device: &RenderDevice, surface: &Surface, channel: usize) -> Composition {
     composition(device, surface, if channel == 3 { 6 } else { 3 })
 }
-fn compute(
+fn compute_tiles(
     encoder: &mut CommandEncoder,
     label: &'static str,
     pipeline: &ComputePipeline,
     bg: &BindGroup,
+    tiles: &Buffer,
     size: u32,
 ) {
     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -1077,7 +1271,11 @@ fn compute(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &**bg, &[]);
-    pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 1);
+    if size > 1024 {
+        pass.dispatch_workgroups_indirect(tiles, 0);
+    } else {
+        pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 1);
+    }
 }
 fn execute(
     mut pending: ResMut<Pending>,
@@ -1147,7 +1345,7 @@ fn execute(
             }
             Command::Points { id, points } => {
                 if !points.is_empty() {
-                    if let Some(context) = contexts.get(&id) {
+                    if let Some(context) = contexts.get_mut(&id) {
                         context.points(&device, pipelines, &mut encoder, &points, &images);
                         pending.stats.batches.fetch_add(1, Ordering::Relaxed);
                         pending

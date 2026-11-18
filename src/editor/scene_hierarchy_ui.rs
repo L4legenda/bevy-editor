@@ -34,6 +34,7 @@ pub(super) fn toolbar(commands: &mut Commands, parent: Entity, font: &Handle<Fon
 }
 pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>, editor: &Editor) {
     toolbar(commands, parent, font);
+    scene_tree_drag::root_row(commands, parent, font);
     outline_entry(
         commands,
         parent,
@@ -161,6 +162,7 @@ pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>,
             !hidden,
         );
         commands.entity(item).observe(scene_objects::pointer_menu);
+        scene_tree_drag::mark(commands, item, Some(target));
         if entry.instance.is_some() {
             control_hints::attach(
                 commands,
@@ -311,10 +313,10 @@ pub(super) fn inspector(
         Action::SceneObject(SceneObjectAction::Rename(target)),
         Look::Regular,
     );
-    if !entry.inherited() {
-        action(commands, line, font, "Сменить родителя", H::PickParent);
-        action(commands, line, font, "В корень", H::ToRoot);
-    }
+    action(commands, line, font, "Сменить родителя", H::PickParent);
+    action(commands, line, font, "В корень", H::ToRoot);
+    action(commands, line, font, "Выше", H::SiblingEarlier);
+    action(commands, line, font, "Ниже", H::SiblingLater);
     let source = graph.source_path(key);
     if let Some(source) = source {
         let label = text(

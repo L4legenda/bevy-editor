@@ -412,6 +412,7 @@ mod tests {
             .map(|i| Choice {
                 text: format!("Ответ {i}"),
                 target: Some(i + 10),
+                dialogue: None,
             })
             .collect();
         let mut state = State::default();

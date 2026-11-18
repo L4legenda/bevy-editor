@@ -237,7 +237,7 @@ impl Glb {
             } else {
                 map.insert("matrix".into(), json!(local.to_cols_array()));
             }
-            if object.geometry.faces.is_empty() {
+            if object.geometry.faces.is_empty() && object.geometry.loose_edges.is_empty() {
                 map.remove("mesh");
                 continue;
             }
@@ -291,6 +291,12 @@ impl Glb {
                 map.insert("mode".into(), json!(4));
                 primitives.push(primitive);
                 topology.push(buffers.polygons);
+            }
+            if !object.geometry.loose_edges.is_empty() {
+                let lines = object.geometry.line_positions();
+                let position = append_vec::<3>(&mut root, &mut bin, &lines, "VEC3", true);
+                primitives.push(json!({"attributes":{"POSITION":position},"mode":1}));
+                topology.push(Vec::new());
             }
             if primitives.is_empty() {
                 root["nodes"][node].as_object_mut().unwrap().remove("mesh");

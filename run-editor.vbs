@@ -24,11 +24,10 @@ If Not files.FolderExists(logs) Then files.CreateFolder logs
 logFile = files.BuildPath(logs, "launcher.log")
 If Not launchBuilt Then
     command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File " _
-        & QuoteArgument(files.BuildPath(root, "tools\cargo.ps1")) & " build --locked --manifest-path " _
-        & QuoteArgument(files.BuildPath(root, "Cargo.toml")) & " --bin bevy-editor"
+        & QuoteArgument(files.BuildPath(root, "tools\build-editor.ps1"))
     If console Then
-        WScript.Echo "Bevy Editor: checking the build..."
-        WScript.Echo "After code changes, compilation can take a few minutes. Cargo progress follows."
+        WScript.Echo "Bevy Editor: checking the editor and native components..."
+        WScript.Echo "First-time CUDA preparation and compilation can take several minutes. Progress follows."
         WScript.Echo "Please keep this window open until: Starting Bevy Editor..."
         Set output = files.CreateTextFile(logFile, True, True)
         Set build = shell.Exec(QuoteArgument(shell.ExpandEnvironmentStrings("%COMSPEC%")) _

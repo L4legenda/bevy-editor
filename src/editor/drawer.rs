@@ -1130,6 +1130,31 @@ pub(crate) fn refresh(
                         Visibility::Inherited,
                     ));
                     file_picture(&mut commands, well, index, browser.scan_revision);
+                    if crate::editor::photo_document::source_format(&file.path).is_ok() {
+                        let edit = control(
+                            &mut commands,
+                            well,
+                            Action::EditBrowserImage(index, browser.scan_revision),
+                            Look::Regular,
+                            Node {
+                                position_type: PositionType::Absolute,
+                                right: px(5),
+                                bottom: px(5),
+                                width: px(28),
+                                height: px(28),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(px(6)),
+                                border: UiRect::all(px(1)),
+                                ..default()
+                            },
+                        );
+                        commands.entity(edit).insert((
+                            ZIndex(1),
+                            AccessibleLabel(format!("Редактировать {}", file.filename)),
+                        ));
+                        icons::themed(&mut commands, edit, icons::Glyph::Pencil, 15.0);
+                    }
                     format!("{} · Загрузка…", file.extension.to_uppercase())
                 } else {
                     let placeholder =

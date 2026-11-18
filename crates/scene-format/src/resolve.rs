@@ -257,6 +257,9 @@ impl Resolver<'_> {
     }
 
     fn apply_patches(&mut self) -> Result<()> {
+        if self.patches.is_empty() {
+            return Ok(());
+        }
         let index: HashMap<_, _> = self
             .entities
             .iter()
@@ -285,6 +288,14 @@ impl Resolver<'_> {
             if let Some(transform) = patch.transform {
                 entity.transform = transform;
             }
+            if let Some(parent) = &patch.parent {
+                entity.parent = Some(scoped(&pending.context, parent));
+            } else if patch.detach {
+                entity.parent = pending.context.strip_suffix('/').map(str::to_owned);
+            }
+            if let Some(order) = patch.order {
+                entity.order = order;
+            }
             if patch.remove_model {
                 entity.model = None;
             }
@@ -303,6 +314,17 @@ impl Resolver<'_> {
                 entity.components.insert(kind.clone(), value);
             }
         }
+        if removed.is_empty() {
+            return Ok(());
+        }
+        // Check the effective links before removal can hide structural conflicts.
+        if self
+            .patches
+            .iter()
+            .any(|p| p.patch.detach || p.patch.parent.is_some())
+        {
+            topological_order(&self.entities, false)?;
+        }
         let mut children = vec![Vec::new(); self.entities.len()];
         for (i, entity) in self.entities.iter().enumerate() {
             if let Some(parent) = &entity.parent {
@@ -310,6 +332,12 @@ impl Resolver<'_> {
                     .get(parent)
                     .ok_or_else(|| Error(format!("Missing parent {parent}")))?]
                 .push(i);
+            }
+            if let Some((mount, _)) = entity.id.rsplit_once('/')
+                && entity.parent.as_deref() != Some(mount)
+                && let Some(&owner) = index.get(mount)
+            {
+                children[owner].push(i);
             }
         }
         let mut pending: Vec<_> = removed.iter().copied().collect();

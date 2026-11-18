@@ -165,8 +165,7 @@ pub(super) fn hover(
         Port::Output(from, choice) => d
             .node(from)
             .and_then(|n| n.choices.get(choice))
-            .and_then(|c| c.target)
-            .is_some_and(|target| d.node(target).is_some()),
+            .is_some_and(Choice::connected),
         Port::Input(target) => {
             d.node(target).is_some()
                 && d.nodes
@@ -189,7 +188,9 @@ pub(super) fn connect(doc: &mut Document, from: u32, choice: usize, target: u32)
     }
     doc.checkpoint();
     if let Content::Dialogue(d) = &mut doc.content {
-        d.node_mut(from).unwrap().choices[choice].target = Some(target);
+        let choice = &mut d.node_mut(from).unwrap().choices[choice];
+        choice.target = Some(target);
+        choice.dialogue = None;
     }
     true
 }
@@ -371,7 +372,7 @@ pub(super) fn style(
                 ui.linking == Some((id, choice)),
                 d.node(id)
                     .and_then(|n| n.choices.get(choice))
-                    .is_some_and(|c| c.target.is_some()),
+                    .is_some_and(Choice::connected),
             ),
         };
         let pointed = match *port {

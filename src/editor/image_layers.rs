@@ -24,6 +24,7 @@ pub(in crate::editor) enum LayerAction {
     BlendMore,
     PanelSection(PanelSection),
     Menu,
+    ContextMenu(f32),
     Category(&'static str),
     Command(&'static str),
     Apply,
@@ -38,6 +39,7 @@ pub(in crate::editor) enum LayerAction {
     EffectToggle(usize, usize),
     EffectRemove(usize, usize),
     Select(usize, bool, bool),
+    ToggleClipping(u64),
     Collapse(u64),
     Mask(usize),
     MaskPreview(bool),
@@ -103,6 +105,8 @@ pub(in crate::editor) struct LayerState {
     pub locks_open: bool,
     pub ui_revision: u64,
     pub menu: bool,
+    pub context_menu_y: Option<f32>,
+    pub context_menu_dismissed: bool,
     pub category: &'static str,
     pub search: String,
     pub filter: String,
@@ -400,6 +404,7 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         action,
         Cancel
             | Menu
+            | ContextMenu(_)
             | Category(_)
             | Command(_)
             | Properties
@@ -493,7 +498,12 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         FieldNumber(..) | FieldStep(..) | Preview => {}
         Advanced => state.layers.advanced ^= true,
         BlendMore => state.layers.blend_more ^= true,
-        Quick(command) => call = Some((command, json!({}))),
+        Quick(command) => {
+            if state.layers.context_menu_y.take().is_some() {
+                state.layers.menu = false;
+            }
+            call = Some((command, json!({})));
+        }
         Group => {
             call = Some((
                 if doc.selected.len() > 1 {
@@ -551,15 +561,23 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         Copy => {
             state.layers.clipboard = doc.copy_layers();
             state.layers.menu = false;
+            state.layers.context_menu_y = None;
         }
         Paste => {
             if let Err(error) = doc.paste_layers(&state.layers.clipboard) {
                 state.error = Some(error);
             }
             state.layers.menu = false;
+            state.layers.context_menu_y = None;
         }
-        Menu => {
-            state.layers.menu ^= true;
+        Menu | ContextMenu(_) => {
+            let anchor = match action {
+                ContextMenu(y) => Some(y),
+                _ => None,
+            };
+            state.layers.menu =
+                anchor.is_some() || !state.layers.menu || state.layers.context_menu_y.is_some();
+            state.layers.context_menu_y = anchor;
             state.layers.form = None;
             state.layers.blend_menu = false;
             state.layers.category = "";
@@ -572,6 +590,7 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             state.layers.blend_menu = false;
         }
         Cancel => {
+            state.layers.context_menu_y = None;
             state.layers.form = None;
             state.layers.menu = false;
             state.layers.blend_menu = false;
@@ -598,6 +617,24 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             doc.select(index, toggle, false);
             if let Some(ids) = ids {
                 doc.selected = ids;
+            }
+        }
+        ToggleClipping(id) => {
+            let id = LayerId(id);
+            if let Some(layer) = doc.document.layer(id) {
+                let command = if layer.clipped {
+                    "layer.releaseClippingMask"
+                } else if doc
+                    .document
+                    .path_of(id)
+                    .and_then(|path| path.last().copied())
+                    .is_some_and(|index| index > 0)
+                {
+                    "layer.createClippingMask"
+                } else {
+                    return;
+                };
+                call = Some((command, json!({"layer":id.0})));
             }
         }
         Mask(index) => {
@@ -801,6 +838,7 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
                     state.layers.form = Some(form);
                 }
                 state.layers.menu = false;
+                state.layers.context_menu_y = None;
             }
         }
         Properties => {

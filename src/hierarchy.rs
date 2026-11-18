@@ -11,6 +11,29 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) const TREE_ORDER_SETTING: &str = "editor.scene_tree_order";
+
+#[cfg(feature = "editor")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeDrop<T> {
+    Root,
+    Inside(T),
+    Before(T),
+    After(T),
+}
+
+#[cfg(feature = "editor")]
+impl<T> TreeDrop<T> {
+    pub(crate) fn try_map<U>(self, map: impl FnOnce(T) -> Option<U>) -> Option<TreeDrop<U>> {
+        Some(match self {
+            Self::Root => TreeDrop::Root,
+            Self::Inside(target) => TreeDrop::Inside(map(target)?),
+            Self::Before(target) => TreeDrop::Before(map(target)?),
+            Self::After(target) => TreeDrop::After(map(target)?),
+        })
+    }
+}
+
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -492,6 +515,12 @@ impl SceneHierarchy {
             if let Some(transform) = patch.transform {
                 entity.transform = transform;
             }
+            if patch.detach || patch.parent.is_some() {
+                entity.parent = patch.parent;
+            }
+            if let Some(order) = patch.order {
+                entity.order = order;
+            }
             if patch.remove_model {
                 entity.model = None;
             }
@@ -524,6 +553,13 @@ impl SceneHierarchy {
         }
         if patch.transform.is_some() {
             target.transform = patch.transform;
+        }
+        if patch.detach || patch.parent.is_some() {
+            target.parent = patch.parent;
+            target.detach = patch.detach;
+        }
+        if patch.order.is_some() {
+            target.order = patch.order;
         }
         if patch.model.is_some() || patch.remove_model {
             target.model = patch.model;
@@ -800,39 +836,199 @@ impl SceneHierarchy {
         Ok(self.by_id(&id).unwrap().key)
     }
     pub fn reparent(&mut self, key: u32, parent: Option<u32>) -> io::Result<()> {
+        let mut next = self.clone();
+        if let Some(patch) = self.parent_patch(key, parent)? {
+            next.patch(&self.node(key).unwrap().entity.id, patch)?;
+            next.resolve(None)?;
+            *self = next;
+        }
+        Ok(())
+    }
+    fn parent_patch(&self, key: u32, parent: Option<u32>) -> io::Result<Option<EntityPatch>> {
         let node = self
             .node(key)
             .ok_or_else(|| invalid("Object no longer exists"))?;
-        if node.inherited() {
-            return Err(invalid(
-                "Для изменения родителя откройте исходную сцену или распакуйте экземпляр",
-            ));
+        let parent_node = parent
+            .map(|k| {
+                self.node(k)
+                    .ok_or_else(|| invalid("Родитель больше не существует"))
+            })
+            .transpose()?;
+        let parent_id = parent_node.map(|n| n.entity.id.clone());
+        if node.entity.parent == parent_id {
+            return Ok(None);
         }
-        let id = node.entity.id.clone();
-        let mut cursor = parent.and_then(|k| self.node(k));
+        let mut cursor = parent_node;
         while let Some(ancestor) = cursor {
             if ancestor.key == key {
                 return Err(invalid("Нельзя поместить объект внутрь самого себя"));
             }
             cursor = self.parent(ancestor.key);
         }
-        let parent_node = parent.and_then(|k| self.node(k));
         let pose = affine_pose(
             parent_node
                 .map_or(Affine3A::IDENTITY, |n| n.affine())
                 .inverse()
                 * node.affine(),
         )?;
-        let parent = parent_node.map(|n| n.entity.id.clone());
-        let entity = self
-            .source
-            .entities
-            .iter_mut()
-            .find(|e| e.id == id)
-            .unwrap();
-        entity.parent = parent;
-        entity.transform = crate::scene_io::transform(pose);
-        self.resolve(None)
+        Ok(Some(EntityPatch {
+            detach: parent_id.is_none(),
+            parent: parent_id,
+            transform: Some(crate::scene_io::transform(pose)),
+            ..Default::default()
+        }))
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn drop_node(&mut self, key: u32, destination: TreeDrop<u32>) -> io::Result<bool> {
+        let Some(node) = self.node(key) else {
+            return Err(invalid("Объект больше не существует"));
+        };
+        let (parent, anchor) = match destination {
+            TreeDrop::Root => (None, None),
+            TreeDrop::Inside(parent) => (Some(parent), None),
+            TreeDrop::Before(target) | TreeDrop::After(target) => {
+                if target == key {
+                    return Ok(false);
+                }
+                self.node(target)
+                    .ok_or_else(|| invalid("Целевой объект больше не существует"))?;
+                (self.parent(target).map(|n| n.key), Some(target))
+            }
+        };
+        let parent_patch = self.parent_patch(key, parent)?;
+        let parent_id = parent
+            .and_then(|key| self.node(key))
+            .map(|n| n.entity.id.as_str());
+        let mut siblings: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|n| n.entity.parent.as_deref() == parent_id)
+            .collect();
+        let old_index = siblings.iter().position(|n| n.key == key);
+        if let Some(index) = old_index {
+            siblings.remove(index);
+        }
+        let index = if let Some(anchor) = anchor {
+            siblings.iter().position(|n| n.key == anchor).unwrap()
+                + usize::from(matches!(destination, TreeDrop::After(_)))
+        } else {
+            siblings.len()
+        };
+        if parent_patch.is_none() && old_index == Some(index) {
+            return Ok(false);
+        }
+
+        let mut next = self.clone();
+        let mut patch = parent_patch.unwrap_or_default();
+        let lower = index.checked_sub(1).map(|i| &siblings[i].entity);
+        let upper = siblings.get(index).map(|n| &n.entity);
+        // Use the existing ID tie-break if it gives the requested position.
+        let min = lower.map_or(i32::MIN as i64, |n| {
+            i64::from(n.order) + i64::from(n.id >= node.entity.id)
+        });
+        let max = upper.map_or(i32::MAX as i64, |n| {
+            i64::from(n.order) - i64::from(n.id <= node.entity.id)
+        });
+        if min <= max && min <= i64::from(i32::MAX) && max >= i64::from(i32::MIN) {
+            let order = i64::from(node.entity.order).clamp(min, max) as i32;
+            if order != node.entity.order {
+                patch.order = Some(order);
+            }
+        } else {
+            // Tied orders may leave no slot. Only renumber the destination siblings.
+            siblings.insert(index, node);
+            for (order, sibling) in siblings.into_iter().enumerate() {
+                let order = order as i32;
+                if sibling.key == key {
+                    patch.order = Some(order);
+                } else if sibling.entity.order != order {
+                    next.patch(
+                        &sibling.entity.id,
+                        EntityPatch {
+                            order: Some(order),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+            }
+        }
+        next.patch(&node.entity.id, patch)?;
+        next.source
+            .settings
+            .insert(TREE_ORDER_SETTING.into(), Value::Bool(true));
+        next.resolve(None)?;
+        *self = next;
+        Ok(true)
+    }
+    pub fn sibling_offset(&self, key: u32, later: bool) -> Option<usize> {
+        let node = self.node(key)?;
+        let siblings = self
+            .nodes
+            .iter()
+            .filter(|n| n.entity.parent == node.entity.parent);
+        let count = siblings.clone().count();
+        let index = siblings.into_iter().position(|n| n.key == key)?;
+        if later {
+            (index + 1 < count).then_some(index + 1)
+        } else {
+            index.checked_sub(1)
+        }
+    }
+    pub fn move_sibling(&mut self, key: u32, later: bool) -> io::Result<()> {
+        let Some(destination) = self.sibling_offset(key, later) else {
+            return Ok(());
+        };
+        let node = self.node(key).unwrap();
+        let mut siblings: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|n| n.entity.parent == node.entity.parent)
+            .map(|n| (n.entity.id.clone(), n.entity.order, n.key))
+            .collect();
+        let index = siblings.iter().position(|n| n.2 == key).unwrap();
+        let mut next = self.clone();
+        let first = siblings[index].1;
+        let second = siblings[destination].1;
+        if first != second
+            && siblings
+                .iter()
+                .filter(|n| n.1 == first || n.1 == second)
+                .count()
+                == 2
+        {
+            next.patch(
+                &siblings[index].0,
+                EntityPatch {
+                    order: Some(second),
+                    ..Default::default()
+                },
+            )?;
+            next.patch(
+                &siblings[destination].0,
+                EntityPatch {
+                    order: Some(first),
+                    ..Default::default()
+                },
+            )?;
+        } else {
+            siblings.swap(index, destination);
+            for (order, (id, previous, _)) in siblings.into_iter().enumerate() {
+                let order = order as i32;
+                if previous != order {
+                    next.patch(
+                        &id,
+                        EntityPatch {
+                            order: Some(order),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+            }
+        }
+        next.resolve(None)?;
+        *self = next;
+        Ok(())
     }
     pub fn subtree(&self, key: u32) -> BTreeSet<String> {
         let Some(root) = self.node(key) else {
@@ -853,31 +1049,41 @@ impl SceneHierarchy {
         ids
     }
     pub fn delete(&mut self, keys: &[u32]) -> io::Result<()> {
-        let ids: BTreeSet<_> = keys.iter().flat_map(|&k| self.subtree(k)).collect();
-        self.source.entities.retain(|e| !ids.contains(&e.id));
-        for id in &ids {
-            if let Some((mount, child)) = id.split_once('/') {
-                if let Some(instance) = self
-                    .source
-                    .entities
-                    .iter_mut()
-                    .find(|e| e.id == mount)
-                    .and_then(|e| e.instance.as_mut())
-                {
-                    instance.overrides.retain(|target, _| {
-                        target != child && !target.starts_with(&format!("{child}/"))
-                    });
-                }
+        let mut next = self.clone();
+        next.delete_nodes(keys)?;
+        *self = next;
+        Ok(())
+    }
+    fn delete_nodes(&mut self, keys: &[u32]) -> io::Result<()> {
+        let mut ids = BTreeSet::new();
+        let mut children = HashMap::<&str, Vec<&SceneNode>>::new();
+        for node in &self.nodes {
+            if let Some(parent) = node.entity.parent.as_deref() {
+                children.entry(parent).or_default().push(node);
+            }
+            if let Some((owner, _)) = node.entity.id.rsplit_once('/') {
+                children.entry(owner).or_default().push(node);
             }
         }
-        // Only patch the highest removed inherited node; the resolver removes descendants.
+        let mut pending: Vec<_> = keys.iter().filter_map(|&key| self.node(key)).collect();
+        while let Some(node) = pending.pop() {
+            if ids.insert(node.entity.id.clone()) {
+                pending.extend(
+                    children
+                        .get(node.entity.id.as_str())
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+            }
+        }
+        self.source.entities.retain(|e| !ids.contains(&e.id));
         for id in &ids {
-            if id.contains('/')
-                && self
-                    .by_id(id)
-                    .and_then(|n| n.entity.parent.as_ref())
-                    .is_none_or(|p| !ids.contains(p))
+            if let Some((owner, _)) = id.split_once('/')
+                && !ids.contains(owner)
             {
+                // Dropping a parent override can move this node back outside the
+                // deleted branch. Keep an explicit removal for each affected node.
                 self.patch(
                     id,
                     EntityPatch {
@@ -890,6 +1096,12 @@ impl SceneHierarchy {
         self.resolve(None)
     }
     pub fn reset_overrides(&mut self, key: u32) -> io::Result<()> {
+        let mut next = self.clone();
+        next.clear_overrides(key)?;
+        *self = next;
+        Ok(())
+    }
+    fn clear_overrides(&mut self, key: u32) -> io::Result<()> {
         let descendants = self.subtree(key);
         let id = self
             .node(key)
@@ -947,7 +1159,8 @@ impl SceneHierarchy {
             self.source.entities.push(SceneEntity::new(id));
         }
         // Include inherited paths when remapping parent and typed references.
-        for id in &ids {
+        for node in &self.nodes {
+            let id = &node.entity.id;
             if !map.contains_key(id) {
                 if let Some((prefix, rest)) = id.split_once('/') {
                     if let Some(copy) = map.get(prefix) {
@@ -994,7 +1207,13 @@ impl SceneHierarchy {
             return Err(invalid("Выберите корень экземпляра вложенной сцены"));
         }
         let root = node.entity.id.clone();
-        let ids = self.subtree(key);
+        let prefix = format!("{root}/");
+        let ids: BTreeSet<_> = self
+            .nodes
+            .iter()
+            .filter(|n| n.entity.id == root || n.entity.id.starts_with(&prefix))
+            .map(|n| n.entity.id.clone())
+            .collect();
         let mut map = BTreeMap::new();
         for id in &ids {
             let mapped = if self.source.entities.iter().any(|e| e.id == *id) {
@@ -1018,6 +1237,11 @@ impl SceneHierarchy {
         for node in self.nodes.iter().filter(|n| ids.contains(&n.entity.id)) {
             let mut entity = node.entity.clone();
             remap_entity(&mut entity, &map, &resources);
+            if let Some(id) = &node.camera
+                && let Some(camera) = entity.components.get_mut("camera")
+            {
+                camera["id"] = id.clone().into();
+            }
             entity.instance = None;
             let slot = self
                 .source
@@ -1340,6 +1564,9 @@ fn remap_entity(
     if let Some(i) = &mut e.instance {
         mapped(&mut i.resource, resources);
         for p in i.overrides.values_mut() {
+            if let Some(parent) = &mut p.parent {
+                mapped(parent, ids);
+            }
             if let Some(m) = &mut p.model {
                 mapped(m, resources);
             }

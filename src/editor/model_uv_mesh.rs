@@ -81,6 +81,7 @@ pub(super) fn apply(mesh: &Geometry, input: &Input, output: &Output) -> Result<G
     let mut result = Geometry {
         positions: mesh.positions.clone(),
         faces: Vec::new(),
+        loose_edges: mesh.loose_edges.clone(),
     };
     for (fi, face) in mesh.faces.iter().enumerate() {
         if split.contains(&fi) {
@@ -240,6 +241,7 @@ mod tests {
     use crate::editor::model_mesh::Corner;
     fn quad() -> Geometry {
         Geometry {
+            loose_edges: default(),
             positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
             faces: vec![Face {
                 corners: (0..4)

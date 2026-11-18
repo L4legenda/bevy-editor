@@ -765,6 +765,26 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
         )
     });
     warm(&mut app, 15);
+    // Keeping the same UI values must not request text shaping/image extraction.
+    let stable_labels = app.world().resource::<ui::PaintUi>().retained_labels();
+    let ticks = stable_labels.map(|e| {
+        app.world()
+            .entity(e)
+            .get_ref::<Text>()
+            .unwrap()
+            .last_changed()
+    });
+    warm(&mut app, 3);
+    assert_eq!(
+        ticks,
+        stable_labels.map(|e| app
+            .world()
+            .entity(e)
+            .get_ref::<Text>()
+            .unwrap()
+            .last_changed()),
+        "idle paint labels must not be rewritten every frame"
+    );
     assert_eq!(
         app.world().resource::<editing::State>().mode(Some(0)),
         Mode::Paint

@@ -184,6 +184,142 @@ fn scene_hierarchy_ui_group_duplicate_delete_and_history_keep_authoring_structur
 }
 
 #[test]
+fn scene_hierarchy_ui_inherited_structure_actions_are_undoable_and_saveable() {
+    let f = fixture();
+    let mut app = app(&f);
+    let inherited = key(&app, "a/stand");
+    let parent = key(&app, "b");
+    send(&mut app, Action::Select(Selection::Node(inherited)));
+    send(&mut app, Action::Hierarchy(HierarchyAction::PickParent));
+    send(&mut app, Action::Select(Selection::Node(parent)));
+    let graph = |app: &App| {
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(graph(&app).parent(inherited).unwrap().key, parent);
+    send(&mut app, Action::Hierarchy(HierarchyAction::SiblingLater));
+    assert!(graph(&app).sibling_offset(inherited, true).is_none());
+    send(&mut app, Action::Undo);
+    assert!(graph(&app).sibling_offset(inherited, true).is_some());
+    send(&mut app, Action::Undo);
+    assert_eq!(graph(&app).parent(inherited).unwrap().entity.id, "a");
+    send(&mut app, Action::Redo);
+    send(&mut app, Action::Save);
+    let saved = RoomEdits::<String>::read(&f.root, "room.scene").unwrap();
+    assert_eq!(
+        saved.hierarchy.unwrap().parent(inherited).unwrap().key,
+        parent
+    );
+}
+
+#[test]
+fn scene_hierarchy_tree_drop_is_atomic_and_preserves_instance_ids() {
+    let f = fixture();
+    let mut app = app(&f);
+    let stand = key(&app, "a/stand");
+    let target = key(&app, "b/stand");
+    let mount = key(&app, "b");
+    let graph = |app: &App| {
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .clone()
+            .unwrap()
+    };
+    let before = graph(&app);
+    send(
+        &mut app,
+        Action::Hierarchy(HierarchyAction::Drop(
+            0,
+            Selection::Node(stand),
+            TreeDrop::Before(Selection::Node(target)),
+        )),
+    );
+    let after = graph(&app);
+    assert_eq!(after.parent(stand).unwrap().key, mount);
+    assert!(
+        after
+            .node(stand)
+            .unwrap()
+            .affine()
+            .abs_diff_eq(before.node(stand).unwrap().affine(), 1e-5)
+    );
+    assert!(after.node(stand).unwrap().entity.id == "a/stand");
+    assert!(after.overridden(stand));
+    assert_eq!(app.world().resource::<Editor>().undo.len(), 1);
+    send(
+        &mut app,
+        Action::Hierarchy(HierarchyAction::Drop(
+            0,
+            Selection::Node(stand),
+            TreeDrop::Before(Selection::Node(target)),
+        )),
+    );
+    assert_eq!(app.world().resource::<Editor>().undo.len(), 1);
+    send(
+        &mut app,
+        Action::Hierarchy(HierarchyAction::Drop(
+            0,
+            Selection::Node(mount),
+            TreeDrop::Inside(Selection::Node(stand)),
+        )),
+    );
+    assert_eq!(graph(&app), after);
+    assert_eq!(app.world().resource::<Editor>().undo.len(), 1);
+    send(&mut app, Action::Undo);
+    assert_eq!(graph(&app), before);
+}
+
+#[test]
+fn scene_hierarchy_tree_drop_flat_order_survives_reopen() {
+    let f = fixture();
+    let model = |id| PlacedModel {
+        id,
+        asset: "models/block.glb".into(),
+        pose: Transform::IDENTITY.into(),
+        bounds: None,
+    };
+    let flat = RoomEdits::<String> {
+        scene: Some(crate::SceneSettings {
+            label: f.project.scenes[0].label.clone(),
+            cameras: f.project.scenes[0].cameras.clone(),
+        }),
+        models: vec![model(1), model(2)],
+        ..default()
+    };
+    std::fs::write(
+        f.root.join("room.scene"),
+        serde_json::to_vec(&flat).unwrap(),
+    )
+    .unwrap();
+    let mut app = app(&f);
+    send(
+        &mut app,
+        Action::Hierarchy(HierarchyAction::Drop(
+            0,
+            Selection::Model(2),
+            TreeDrop::Before(Selection::Model(1)),
+        )),
+    );
+    send(&mut app, Action::Save);
+    let reloaded = RoomEdits::<String>::read(&f.root, "room.scene").unwrap();
+    let graph = reloaded.hierarchy.unwrap();
+    let models: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.entity.model.is_some())
+        .map(|n| n.entity.id.as_str())
+        .collect();
+    assert_eq!(models, ["model:2", "model:1"]);
+    assert!(graph.nodes.iter().all(|n| n.entity.parent.is_none()));
+}
+
+#[test]
 fn scene_hierarchy_ui_parent_picker_is_undoable_and_preserves_world_pose() {
     let f = fixture();
     let mut app = app(&f);

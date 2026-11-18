@@ -118,6 +118,8 @@ pub(in crate::editor) fn sync(
         if editor.pending.is_some()
             || editor.viewing_image.is_some()
             || state.tool.operations().is_empty()
+            || state.extrude_tool
+            || state.gesture.as_ref().is_some_and(|g| g.is_extruding())
         {
             continue;
         }

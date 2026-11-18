@@ -122,20 +122,22 @@ pub(crate) fn decode<K: Ord + serde::de::DeserializeOwned>(
     root: &std::path::Path,
 ) -> io::Result<LevelEdits<K>> {
     let scene = Scene::from_slice(bytes).map_err(invalid)?;
-    if scene.entities.iter().any(|entity| {
-        entity.parent.is_some()
-            || entity.instance.is_some()
-            || (entity.model.is_none()
-                && !entity.components.contains_key("camera")
-                && !entity.components.contains_key("light"))
-            || usize::from(entity.model.is_some())
-                + usize::from(entity.components.contains_key("camera"))
-                + usize::from(entity.components.contains_key("light"))
-                > 1
-    }) || !scene
-        .entities
-        .iter()
-        .any(|entity| entity.components.contains_key("camera"))
+    if scene.settings.get(crate::hierarchy::TREE_ORDER_SETTING) == Some(&Value::Bool(true))
+        || scene.entities.iter().any(|entity| {
+            entity.parent.is_some()
+                || entity.instance.is_some()
+                || (entity.model.is_none()
+                    && !entity.components.contains_key("camera")
+                    && !entity.components.contains_key("light"))
+                || usize::from(entity.model.is_some())
+                    + usize::from(entity.components.contains_key("camera"))
+                    + usize::from(entity.components.contains_key("light"))
+                    > 1
+        })
+        || !scene
+            .entities
+            .iter()
+            .any(|entity| entity.components.contains_key("camera"))
     {
         crate::hierarchy::SceneHierarchy::load(scene, root)?.project()
     } else {

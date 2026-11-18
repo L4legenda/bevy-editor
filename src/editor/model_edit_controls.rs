@@ -63,7 +63,7 @@ pub(in crate::editor::ui) fn geometry_toolbar(commands: &mut Commands, parent: E
         .and_modify(|mut node| {
             node.display = Display::None;
         });
-    let action = EditAction::Operate(Operation::Extrude);
+    let action = EditAction::ExtrudeTool;
     let button = icons::button(
         commands,
         section,
@@ -417,7 +417,11 @@ pub(in crate::editor::ui::model_viewer) fn setup(
                 group,
                 &interface.font,
                 label,
-                EditAction::Operate(op),
+                if op == Operation::Extrude {
+                    EditAction::ExtrudeTool
+                } else {
+                    EditAction::Operate(op)
+                },
             );
         }
     }

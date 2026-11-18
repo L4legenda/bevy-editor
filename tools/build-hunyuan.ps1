@@ -1,10 +1,17 @@
 param([switch]$Release, [string]$Destination)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+function Copy-Component([string]$SourcePath, [string]$DestinationDirectory) {
+    $source = Get-Item -LiteralPath $SourcePath -ErrorAction Stop
+    $target = Join-Path $DestinationDirectory $source.Name
+    $existing = Get-Item -LiteralPath $target -ErrorAction SilentlyContinue
+    if ($existing -and $existing.Length -eq $source.Length -and $existing.LastWriteTimeUtc -eq $source.LastWriteTimeUtc) { return }
+    Copy-Item -LiteralPath $source.FullName -Destination $target -Force
+}
 # This is a developer build helper, never used to run inference. The shipped worker
 # and image/model processing are Rust; CUDA redistributables are NVIDIA libraries.
 $cudaRoot = $env:CUDA_PATH
-if (-not $cudaRoot -or -not (Test-Path (Join-Path $cudaRoot 'bin/nvcc.exe'))) {
+if (-not $cudaRoot -or -not (Test-Path (Join-Path $cudaRoot 'bin/nvcc.exe')) -or -not (Test-Path (Join-Path $cudaRoot 'bin/nvrtc-builtins64_128.dll'))) {
     $cache = Join-Path $env:LOCALAPPDATA 'BevyEditor/system/runtime/cuda-12.8.1'
     $cudaRoot = Join-Path $cache 'toolkit'
     New-Item -ItemType Directory -Path $cache -Force | Out-Null
@@ -48,7 +55,7 @@ $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler'
 # PTX can JIT on all supported Ampere-and-newer GPUs, including 3060 Ti.
 if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = '80' }
 $env:RAYON_NUM_THREADS = '2'
-$arguments = @('build', '--locked', '--manifest-path', (Join-Path $repo 'crates/hunyuan-native/Cargo.toml'))
+$arguments = @('build', '--locked', '--manifest-path', (Join-Path $repo 'crates/hunyuan-native/Cargo.toml'), '--target-dir', (Join-Path $repo 'crates/hunyuan-native/target'))
 $nativeProfile = 'debug'
 if ($Release) { $arguments += '--release'; $nativeProfile = 'release' }
 & cargo @arguments
@@ -56,11 +63,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Native Hunyuan build failed' }
 if ($Destination) {
     $destinationPath = [IO.Path]::GetFullPath($Destination)
     New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $repo "crates/hunyuan-native/target/$nativeProfile/bevy-hunyuan.exe") -Destination $destinationPath -Force
+    Copy-Component (Join-Path $repo "crates/hunyuan-native/target/$nativeProfile/bevy-hunyuan.exe") $destinationPath
     foreach ($name in @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll', 'curand64_10.dll', 'nvrtc64_120_0.dll', 'nvrtc-builtins64_128.dll')) {
-        Copy-Item -LiteralPath (Join-Path $cudaRoot "bin/$name") -Destination $destinationPath -Force
+        Copy-Component (Join-Path $cudaRoot "bin/$name") $destinationPath
     }
-    Copy-Item -LiteralPath (Join-Path $repo 'crates/hunyuan-native/LICENSE-TENCENT'), (Join-Path $repo 'crates/hunyuan-native/NOTICE') -Destination $destinationPath -Force
+    Copy-Component (Join-Path $repo 'crates/hunyuan-native/LICENSE-TENCENT') $destinationPath
+    Copy-Component (Join-Path $repo 'crates/hunyuan-native/NOTICE') $destinationPath
     $licenses = Join-Path $destinationPath 'cuda-licenses'
     New-Item -ItemType Directory -Path $licenses -Force | Out-Null
     Get-ChildItem -LiteralPath $cudaRoot -File | Where-Object { $_.Name -match 'LICENSE|EULA' } | Copy-Item -Destination $licenses -Force

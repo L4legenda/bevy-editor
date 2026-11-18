@@ -1,5 +1,5 @@
 //! Editable model state and transactions. Scene documents never share these meshes.
-use super::model_mesh::{Corner, Face, Geometry, Selection};
+use super::model_mesh::{Corner, Edge, Face, Geometry, Selection};
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
@@ -398,6 +398,7 @@ impl Document {
                 .filter(|(i, _)| chosen.contains(i))
                 .map(|(_, f)| f.clone())
                 .collect();
+            object.geometry.loose_edges.clear();
             object.geometry.compact();
             self.objects[index]
                 .geometry
@@ -537,6 +538,9 @@ impl Document {
                             f
                         }));
                     self.objects[index].materials.extend(o.materials);
+                    self.objects[index].geometry.loose_edges.extend(
+                        o.geometry.loose_edges.iter().map(|e| Edge::new(e.0 + offset, e.1 + offset))
+                    );
                 }
                 self.objects
                     .retain(|o| o.id == active || !self.selected.contains(&o.id));
@@ -679,6 +683,15 @@ pub(super) fn from_mesh_with_topology(
         .indices()
         .map(|v| v.iter().collect())
         .unwrap_or_else(|| (0..positions.len()).collect());
+    if mesh.primitive_topology() == PrimitiveTopology::LineList {
+        if indices.len() % 2 != 0 || indices.iter().any(|&i| i >= mapped.len()) {
+            return Err("Некорректные индексы свободных рёбер".into());
+        }
+        geometry.loose_edges.extend(indices.chunks_exact(2)
+            .map(|e| Edge::new(mapped[e[0]], mapped[e[1]]))
+            .filter(|e| e.0 != e.1));
+        return Ok(());
+    }
     let triangles: Vec<[usize; 3]> = match mesh.primitive_topology() {
         PrimitiveTopology::TriangleList => indices
             .chunks_exact(3)

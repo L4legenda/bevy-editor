@@ -1,5 +1,6 @@
 //! File-card drag gestures and their overlay. Filesystem writes stay in actions.
 use super::*;
+use crate::editor::ui::narrative::NarrativeUi;
 use bevy::ui::CalculatedClip;
 use std::path::Path;
 
@@ -16,6 +17,7 @@ pub(crate) enum DropTarget {
     Folder(usize),
     Scene(Vec2),
     GenerationSource,
+    Dialogue { document: usize, local: Vec2 },
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +219,8 @@ pub(crate) fn pointer(
     mut actions: MessageWriter<Action>,
     lighting: Option<Res<LightingUi>>,
     viewer: Option<Res<ImageViewer>>,
+    narrative: Option<Res<NarrativeUi>>,
+    canvas: Query<(&ComputedNode, &UiGlobalTransform, Option<&CalculatedClip>)>,
 ) {
     drag.cancelled_this_frame = false;
     if mouse.just_pressed(MouseButton::Left)
@@ -306,6 +310,24 @@ pub(crate) fn pointer(
                 .then_some(DropTarget::GenerationSource)
             })
             .or_else(|| {
+                let Entry::File(index) = payload.entry else {
+                    return None;
+                };
+                let ui = narrative.as_ref()?;
+                let doc = editor.narrative.current()?;
+                if motion.covers(cursor, &window)
+                    || !ui.accepts_dialogue_drop(doc, browser.files.get(index)?)
+                {
+                    return None;
+                }
+                let (size, transform, clip) = canvas.get(ui.canvas).ok()?;
+                hit(size, transform, clip, physical).then(|| DropTarget::Dialogue {
+                    document: doc.id,
+                    local: (physical - transform.translation + size.size() * 0.5)
+                        / window.scale_factor(),
+                })
+            })
+            .or_else(|| {
                 (can_place(payload.entry, &browser, &editor)
                     && scene_target_contains(&editor, &window, &motion, cursor))
                 .then_some(DropTarget::Scene(cursor))
@@ -319,6 +341,16 @@ pub(crate) fn pointer(
                 }
                 DropTarget::Scene(position) => {
                     actions.write(Action::DropAsset(payload.entry, position));
+                }
+                DropTarget::Dialogue { document, local } => {
+                    if let Entry::File(file) = payload.entry {
+                        actions.write(Action::Narrative(NarrativeAction::DropDialogue {
+                            document,
+                            file,
+                            scan_revision: payload.scan_revision,
+                            local,
+                        }));
+                    }
                 }
                 DropTarget::GenerationSource => {
                     if let Some(file) = generation::source_file(&browser, payload.entry) {
@@ -410,6 +442,7 @@ pub(crate) fn visuals(
             .into(),
             BLUE,
         ),
+        Some(DropTarget::Dialogue { .. }) => ("Создать ноду диалога".into(), BLUE),
         Some(DropTarget::GenerationSource) => {
             ("Использовать в 3D генерации · Esc — отмена".into(), GREEN)
         }

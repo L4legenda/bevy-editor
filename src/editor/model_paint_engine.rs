@@ -1141,64 +1141,78 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
     let Ok((mut node, mut visible)) = cursor.single_mut() else {
         return;
     };
-    *visible = Visibility::Hidden;
-    let Some(index) = editor
-        .viewing_model
-        .filter(|i| state.mode(Some(*i)) == Mode::Paint)
-    else {
-        return;
-    };
-    let Some(session) = paint.sessions.get(&index) else {
-        return;
-    };
-    let Some(point) = window.cursor_position() else {
-        return;
-    };
-    if !window.focused
-        || editor.pending.is_some()
-        || editor.browser_popup
-        || drawer.covers(point, &window)
-        || mouse.pressed(MouseButton::Right)
-        || mouse.pressed(MouseButton::Middle)
-        || keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
-    {
-        return;
-    }
-    let over = canvases.iter().any(|e| {
-        geometry
-            .get(e)
+    let placement = (|| {
+        let Some(index) = editor
+            .viewing_model
+            .filter(|i| state.mode(Some(*i)) == Mode::Paint)
+        else {
+            return None;
+        };
+        let Some(session) = paint.sessions.get(&index) else {
+            return None;
+        };
+        let Some(point) = window.cursor_position() else {
+            return None;
+        };
+        if !window.focused
+            || editor.pending.is_some()
+            || editor.browser_popup
+            || drawer.covers(point, &window)
+            || mouse.pressed(MouseButton::Right)
+            || mouse.pressed(MouseButton::Middle)
+            || keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
+        {
+            return None;
+        }
+        let over = canvases.iter().any(|e| {
+            geometry
+                .get(e)
+                .ok()
+                .and_then(|(n, t)| node_rect(n, t))
+                .is_some_and(|r| r.contains(point))
+        });
+        let control = controls.iter().any(|e| {
+            geometry
+                .get(e)
+                .ok()
+                .and_then(|(n, t)| node_rect(n, t))
+                .is_some_and(|r| r.contains(point))
+        });
+        if !over || control {
+            return None;
+        }
+        let Some(overlay) = geometry
+            .get(ui.overlay)
             .ok()
             .and_then(|(n, t)| node_rect(n, t))
-            .is_some_and(|r| r.contains(point))
-    });
-    let control = controls.iter().any(|e| {
-        geometry
-            .get(e)
-            .ok()
-            .and_then(|(n, t)| node_rect(n, t))
-            .is_some_and(|r| r.contains(point))
-    });
-    if !over || control {
+        else {
+            return None;
+        };
+        let size = if matches!(session.tool, PaintTool::Brush | PaintTool::Eraser) {
+            session.size
+        } else {
+            10.
+        };
+        let p = point - overlay.min - Vec2::splat(size * 0.5);
+        Some((p, size))
+    })();
+    let Some((p, size)) = placement else {
+        visible.set_if_neq(Visibility::Hidden);
         return;
+    };
+    if node.left != px(p.x) {
+        node.left = px(p.x);
     }
-    let Some(overlay) = geometry
-        .get(ui.overlay)
-        .ok()
-        .and_then(|(n, t)| node_rect(n, t))
-    else {
-        return;
-    };
-    let size = if matches!(session.tool, PaintTool::Brush | PaintTool::Eraser) {
-        session.size
-    } else {
-        10.
-    };
-    let p = point - overlay.min - Vec2::splat(size * 0.5);
-    node.left = px(p.x);
-    node.top = px(p.y);
-    node.width = px(size);
-    node.height = px(size);
-    *visible = Visibility::Visible;
+    if node.top != px(p.y) {
+        node.top = px(p.y);
+    }
+    if node.width != px(size) {
+        node.width = px(size);
+    }
+    if node.height != px(size) {
+        node.height = px(size);
+    }
+    visible.set_if_neq(Visibility::Visible);
 }
 #[cfg(test)]
 #[path = "model_paint_perf_tests.rs"]

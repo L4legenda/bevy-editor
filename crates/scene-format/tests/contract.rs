@@ -735,3 +735,89 @@ fn simultaneous_writers_cannot_overwrite_each_other_with_the_same_revision() {
             .starts_with("Writer ")
     );
 }
+#[test]
+fn structural_overrides_use_declaring_document_scope_and_survive_cooking() {
+    let mut leaf = Scene::new("Leaf");
+    leaf.entities.push(Entity::new("item"));
+    let mut middle = Scene::new("Middle");
+    middle
+        .resources
+        .insert("leaf".into(), Resource::external("scene", "leaf.scene"));
+    let mut instance = Entity::new("leaf");
+    instance.instance = Some(Instance {
+        resource: "leaf".into(),
+        overrides: BTreeMap::from([(
+            "item".into(),
+            EntityPatch {
+                detach: true,
+                order: Some(3),
+                ..Default::default()
+            },
+        )]),
+    });
+    middle.entities.push(instance);
+    let mut outer = Scene::new("Outer");
+    outer
+        .resources
+        .insert("middle".into(), Resource::external("scene", "middle.scene"));
+    let mut mount = Entity::new("mount");
+    mount.instance = Some(Instance {
+        resource: "middle".into(),
+        overrides: BTreeMap::new(),
+    });
+    outer.entities = vec![mount, Entity::new("destination")];
+    let mut loader = |r: &Resource| {
+        Ok(match r.path.as_deref() {
+            Some("middle.scene") => middle.clone(),
+            Some("leaf.scene") => leaf.clone(),
+            _ => unreachable!(),
+        })
+    };
+    let find = |scene: &ResolvedScene| {
+        scene
+            .entities
+            .iter()
+            .find(|e| e.id == "mount/leaf/item")
+            .map(|e| (e.parent.clone(), e.order))
+            .unwrap()
+    };
+    assert_eq!(
+        find(&resolve(&outer, &mut loader).unwrap()),
+        (Some("mount".into()), 3)
+    );
+    let patch = EntityPatch {
+        parent: Some("destination".into()),
+        order: Some(-7),
+        ..Default::default()
+    };
+    outer.entities[0]
+        .instance
+        .as_mut()
+        .unwrap()
+        .overrides
+        .insert("leaf/item".into(), patch);
+    let resolved = resolve(&outer, &mut loader).unwrap();
+    assert_eq!(find(&resolved), (Some("destination".into()), -7));
+    let cooked = cook(&resolved).unwrap();
+    assert_eq!(
+        find(&PackedScene::open(&cooked, None).unwrap().unpack().unwrap()),
+        find(&resolved)
+    );
+
+    outer.entities[1].parent = Some("mount/leaf/item".into());
+    assert!(
+        resolve(&outer, &mut loader)
+            .unwrap_err()
+            .to_string()
+            .contains("Cyclic")
+    );
+    outer.entities[0]
+        .instance
+        .as_mut()
+        .unwrap()
+        .overrides
+        .get_mut("leaf/item")
+        .unwrap()
+        .detach = true;
+    assert!(outer.to_source().is_err());
+}

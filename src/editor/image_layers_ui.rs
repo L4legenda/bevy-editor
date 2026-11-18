@@ -3,6 +3,8 @@ use super::ux;
 use super::*;
 #[path = "image_layer_drag.rs"]
 pub(in crate::editor) mod drag_ui;
+#[path = "image_layer_flyout_fx.rs"]
+pub(in crate::editor) mod flyout_fx;
 #[path = "image_layer_form_ui.rs"]
 mod form_ui;
 #[path = "image_layer_properties_ui.rs"]
@@ -29,7 +31,9 @@ pub(in crate::editor) struct LayerUi {
     locks: Disclosure,
     shown_sections: (bool, bool, bool),
     heading: Entity,
+    panel: Entity,
     popup: Entity,
+    flyout: Option<(Entity, f64)>,
     signature: String,
     thumbnail_revision: Option<(photocraft_doc::DocId, u64, photocraft_geom::Size)>,
     popup_signature: String,
@@ -186,6 +190,7 @@ fn compact(
 pub(in crate::editor) fn setup(
     commands: &mut Commands,
     container: Entity,
+    panel: Entity,
     root: Entity,
     font: &Handle<Font>,
     heading: Entity,
@@ -429,7 +434,9 @@ pub(in crate::editor) fn setup(
         locks,
         shown_sections: (false, false, false),
         heading,
+        panel,
         popup,
+        flyout: None,
         signature: String::new(),
         thumbnail_revision: None,
         popup_signature: String::new(),
@@ -467,7 +474,12 @@ fn select(
         {
             actions.write(act(LayerAction::Select(row.index, false, false)));
         }
-        actions.write(act(LayerAction::Menu));
+        actions.write(act(LayerAction::ContextMenu(event.pointer.position.y)));
+    } else if event.button == PointerButton::Primary
+        && keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
+    {
+        ui.last_click = None;
+        actions.write(act(LayerAction::ToggleClipping(row.id)));
     } else if event.button == PointerButton::Primary
         && !keys.any_pressed([
             KeyCode::ControlLeft,
@@ -486,7 +498,6 @@ fn select(
             ui.last_click = Some((row.id, std::time::Instant::now()));
         }
     }
-    let _ = keys;
 }
 fn activate_row(
     event: On<Activate>,
@@ -540,6 +551,7 @@ pub(in crate::editor) fn input(
     window: Single<&Window, With<PrimaryWindow>>,
     geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
     editor: Res<Editor>,
+    ui: Res<LayerUi>,
     mut viewer: ResMut<ImageViewer>,
     inputs: Query<(
         Entity,
@@ -554,6 +566,7 @@ pub(in crate::editor) fn input(
     mut colour_was_open: Local<bool>,
     mut rename_confirm: Local<Option<Entity>>,
 ) {
+    viewer.edit.layers.context_menu_dismissed = false;
     // The colour picker closes earlier in the schedule. Consume the same Escape
     // here too, so one key press cannot also dismiss its parent property sheet.
     let colour_open = viewer.edit.color_picker.is_some();
@@ -562,6 +575,27 @@ pub(in crate::editor) fn input(
     if !viewer.edit.editing(editor.viewing_image) || colour_handled {
         *rename_confirm = None;
         return;
+    }
+    if viewer.edit.layers.menu
+        && viewer.edit.layers.context_menu_y.is_some()
+        && (!window.focused
+            || (mouse.any_just_pressed([
+                MouseButton::Left,
+                MouseButton::Right,
+                MouseButton::Middle,
+            ]) && window.cursor_position().is_some_and(|point| {
+                !ui.flyout.is_some_and(|(sheet, _)| {
+                    geometry.get(sheet).is_ok_and(|(node, transform)| {
+                        !node.is_empty()
+                            && node.contains_point(*transform, point / node.inverse_scale_factor())
+                    })
+                })
+            })))
+    {
+        // A click on the canvas dismisses the flyout without starting a stroke.
+        viewer.edit.layers.context_menu_dismissed = true;
+        viewer.edit.layers.menu = false;
+        viewer.edit.layers.context_menu_y = None;
     }
     let mut rename = None;
     let renaming = viewer
@@ -686,6 +720,11 @@ pub(in crate::editor) fn refresh(
     mut nodes: Query<&mut Node>,
     mouse: Res<ButtonInput<MouseButton>>,
     renames: Query<(), With<InlineName>>,
+    (window, geometry, time): (
+        Single<&Window, With<PrimaryWindow>>,
+        Query<(&ComputedNode, &UiGlobalTransform)>,
+        Res<Time>,
+    ),
 ) {
     let state = &viewer.edit.layers;
     for (entity, mut input) in &mut filters {
@@ -880,26 +919,66 @@ pub(in crate::editor) fn refresh(
             None
         };
         ui.popup_context = context;
-        commands.entity(ui.popup).despawn_related::<Children>();
+        let started = ui
+            .flyout
+            .map_or(time.elapsed_secs_f64(), |(_, started)| started);
+        let previous_flyout = ui.flyout.take();
         let show = editing
             && (state.menu
                 || state
                     .form
                     .as_ref()
                     .is_some_and(|f| f.command != "layer.renameLayer"));
+        let closing = editing && !show && previous_flyout.is_some();
+        if closing {
+            let (sheet, _) = previous_flyout.unwrap();
+            flyout_fx::close(
+                &mut commands,
+                sheet,
+                ui.results,
+                started,
+                time.elapsed_secs_f64(),
+            );
+        } else {
+            commands.entity(ui.popup).despawn_related::<Children>();
+        }
         commands
             .entity(ui.popup)
             .entry::<Node>()
-            .and_modify(move |mut n| n.display = if show { Display::Flex } else { Display::None });
+            .and_modify(move |mut n| {
+                n.display = if show || closing {
+                    Display::Flex
+                } else {
+                    Display::None
+                }
+            });
         if show {
-            let (results, scroll) = popup(
+            let flyout = state.menu && state.context_menu_y.is_some();
+            let mut parent = commands.entity(ui.popup);
+            if flyout {
+                parent
+                    .remove::<TabGroup>()
+                    .insert((Pickable::IGNORE, BackgroundColor(Color::NONE)));
+            } else {
+                parent.insert((
+                    TabGroup::modal(),
+                    Pickable::default(),
+                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.12)),
+                ));
+            }
+            let (sheet, results, scroll) = popup(
                 &mut commands,
                 ui.popup,
                 &interface.font,
                 state,
                 viewer.edit.error.as_deref(),
                 &mut focus,
+                flyout,
             );
+            if flyout {
+                ui.flyout = Some((sheet, started));
+                flyout_fx::attach(&mut commands, sheet, results, started);
+            }
             ui.results = results;
             ui.popup_scroll = scroll;
             if let (Some(scroll), Some(previous)) = (scroll, previous) {
@@ -911,11 +990,49 @@ pub(in crate::editor) fn refresh(
         }
         ui.popup_signature = popup_signature;
     }
+    if let (Some((sheet, _)), Some(anchor)) = (ui.flyout, state.context_menu_y)
+        && let Ok((panel, transform)) = geometry.get(ui.panel)
+    {
+        let scale = panel.inverse_scale_factor();
+        let panel_pos = transform.affine().translation * scale;
+        let panel_size = panel.size() * scale;
+        let left = panel_pos.x - panel_size.x * 0.5;
+        let top = (panel_pos.y - panel_size.y * 0.5 + 6.0).max(6.0);
+        let bottom = (panel_pos.y + panel_size.y * 0.5 - 6.0).min(window.height() - 6.0);
+        let height_limit = (bottom - top).max(1.0);
+        let width = 250.0_f32.min((window.width() - 16.0).max(1.0));
+        let height = geometry
+            .get(sheet)
+            .ok()
+            .map(|(node, _)| node.size().y * node.inverse_scale_factor())
+            .filter(|height| *height > 0.0)
+            .unwrap_or(405.0)
+            .min(height_limit);
+        let x = (left - width - 8.0).max(8.0);
+        let y = (anchor - height * 0.5).clamp(top, top + height_limit - height);
+        let position = [px(x), px(y), px(width), px(height_limit)];
+        let update = move |mut node: Mut<Node>| {
+            if [node.left, node.top, node.width, node.max_height] != position {
+                [node.left, node.top, node.width, node.max_height] = position;
+            }
+        };
+        if let Ok(node) = nodes.get_mut(sheet) {
+            update(node);
+        } else {
+            commands.entity(sheet).entry::<Node>().and_modify(update);
+        }
+    }
     let search_signature = format!("{}:{}", ui.popup_signature, state.search);
     if ui.search_signature != search_signature {
         if let Some(results) = ui.results {
             commands.entity(results).despawn_related::<Children>();
-            command_results(&mut commands, results, &interface.font, state);
+            command_results(
+                &mut commands,
+                results,
+                &interface.font,
+                state,
+                ui.flyout.is_some(),
+            );
         }
         ui.search_signature = search_signature;
     }
@@ -1282,10 +1399,21 @@ fn panel(
             commands,
             select,
             format!(
-                "{} · выберите слой, чтобы рисовать на нём. Двойной щелчок — переименовать. Перетаскивание — изменить порядок; Ctrl — выбрать несколько слоёв.",
-                layer.name
+                "{}{}. Alt+клик — включить или снять обтравочную маску. Двойной щелчок — переименовать. Перетаскивание — изменить порядок; Ctrl — выбрать несколько слоёв.",
+                layer.name,
+                if layer.clipped {
+                    " · виден в пределах нижнего слоя"
+                } else {
+                    ""
+                },
             ),
         );
+        if layer.clipped {
+            let arrow = icons::spawn(commands, select, icons::Glyph::LayerClipping, 17.0, FOCUS);
+            commands
+                .entity(arrow)
+                .insert(AccessibleLabel("Обтравочная маска по нижнему слою".into()));
+        }
         if !layer.is_group() && state.thumbnail != ThumbnailSize::None {
             let handle = layer_thumbnail(
                 doc,
@@ -1354,14 +1482,7 @@ fn panel(
             );
             rename_input = Some(input);
         } else {
-            text(
-                commands,
-                label,
-                font,
-                &format!("{}{}", if layer.clipped { "↳ " } else { "" }, layer.name),
-                12.0,
-                TEXT,
-            );
+            text(commands, label, font, &layer.name, 12.0, TEXT);
         }
         text(
             commands,
@@ -1548,7 +1669,8 @@ fn popup(
     state: &LayerState,
     error: Option<&str>,
     focus: &mut InputFocus,
-) -> (Option<Entity>, Option<Entity>) {
+    flyout: bool,
+) -> (Entity, Option<Entity>, Option<Entity>) {
     let sheet = surface(
         commands,
         parent,
@@ -1559,39 +1681,45 @@ fn popup(
             top: px(105),
             max_width: percent(92),
             max_height: percent(86),
-            padding: UiRect::all(px(16)),
+            padding: UiRect::all(px(if flyout { 6 } else { 16 })),
             border: UiRect::all(px(1)),
             border_radius: BorderRadius::all(px(10)),
-            ..column(10.0)
+            ..column(if flyout { 4.0 } else { 10.0 })
         },
         PANEL,
     );
     commands.entity(sheet).insert(BorderColor::all(EDGE));
-    let header = node(
-        commands,
-        sheet,
-        Node {
-            width: percent(100),
-            justify_content: JustifyContent::SpaceBetween,
-            ..row(8.0)
-        },
-    );
-    text(
-        commands,
-        header,
-        font,
-        state.form.as_ref().map_or(
-            if state.category.is_empty() {
-                "Действия со слоем"
-            } else {
-                state.category
+    if flyout {
+        commands
+            .entity(sheet)
+            .insert((CanvasControl, AccessibleLabel("Меню слоя".into())));
+    } else {
+        let header = node(
+            commands,
+            sheet,
+            Node {
+                width: percent(100),
+                justify_content: JustifyContent::SpaceBetween,
+                ..row(8.0)
             },
-            |f| f.title.as_str(),
-        ),
-        16.0,
-        TEXT,
-    );
-    compact(commands, header, font, "Закрыть · Esc", LayerAction::Cancel);
+        );
+        text(
+            commands,
+            header,
+            font,
+            state.form.as_ref().map_or(
+                if state.category.is_empty() {
+                    "Действия со слоем"
+                } else {
+                    state.category
+                },
+                |f| f.title.as_str(),
+            ),
+            16.0,
+            TEXT,
+        );
+        compact(commands, header, font, "Закрыть · Esc", LayerAction::Cancel);
+    }
     if let Some(form) = &state.form {
         let scroll = form_ui::build(commands, sheet, font, state, focus);
         if let Some(error) = error {
@@ -1654,7 +1782,7 @@ fn popup(
             Look::Primary,
         );
         ux::help(commands, apply, ux::action_help(LayerAction::Apply));
-        return (None, Some(scroll));
+        return (sheet, None, Some(scroll));
     } else {
         if state.category == "Дополнительно" {
             text(
@@ -1685,11 +1813,12 @@ fn popup(
             Node {
                 width: percent(100),
                 max_height: px(490),
+                min_height: px(0),
                 overflow: Overflow::scroll_y(),
                 ..column(3.0)
             },
         );
-        return (Some(scroll), Some(scroll));
+        return (sheet, Some(scroll), Some(scroll));
     }
 }
 
@@ -1698,6 +1827,7 @@ fn command_results(
     scroll: Entity,
     font: &Handle<Font>,
     state: &LayerState,
+    flyout: bool,
 ) {
     if state.category == "Вид панели" && state.search.is_empty() {
         panel_settings(commands, scroll, font, state);
@@ -1705,6 +1835,14 @@ fn command_results(
     }
     if state.category != "Дополнительно" && state.category != "Вид панели" {
         for (label, action) in ux::menu(state.category) {
+            if flyout
+                && matches!(
+                    action,
+                    LayerAction::Category("Создать" | "Маски" | "Вид панели" | "Дополнительно")
+                )
+            {
+                continue;
+            }
             let button = compact(commands, scroll, font, label, action);
             commands.entity(button).entry::<Node>().and_modify(|mut n| {
                 n.width = percent(100);

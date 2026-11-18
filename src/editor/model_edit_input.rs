@@ -23,6 +23,14 @@ pub(in crate::editor) struct Gesture {
     pub typed: String,
     pub start: Option<Vec2>,
     pub drag: bool,
+    extrusion: Option<Extrusion>,
+}
+struct Extrusion {
+    pivot: Vec3,
+    direction: Vec3,
+    screen_motion: Option<Vec2>,
+    vertices: Vec<(usize, Vec3, Vec3)>,
+    distance: f32,
 }
 impl Gesture {
     pub fn new(tool: Tool, base: Snapshot, model: usize) -> Self {
@@ -36,7 +44,23 @@ impl Gesture {
             typed: String::new(),
             start: None,
             drag: false,
+            extrusion: None,
         }
+    }
+    pub(super) fn extrude(doc: &Document, model: usize) -> Option<Self> {
+        let (pivot, direction) = extrusion_axis(doc)?;
+        let mut gesture = Self::new(Tool::Move, doc.snapshot(), model);
+        gesture.extrusion = Some(Extrusion {
+            pivot,
+            direction,
+            screen_motion: None,
+            vertices: Vec::new(),
+            distance: 0.0,
+        });
+        Some(gesture)
+    }
+    pub(in crate::editor) fn is_extruding(&self) -> bool {
+        self.extrusion.is_some()
     }
 }
 
@@ -130,6 +154,88 @@ fn plane_point(
     (denominator.abs() > 0.0001)
         .then(|| origin + direction * ((pivot - origin).dot(normal) / denominator))
 }
+fn extrusion_axis(doc: &Document) -> Option<(Vec3, Vec3)> {
+    let object = doc.active()?;
+    let normal = object.geometry.extrusion_direction(&doc.selection)?;
+    Some((
+        doc.pivot()?,
+        object.transform.to_matrix().transform_vector3(normal),
+    ))
+}
+
+// Pixels per local mesh unit. A face viewed head-on still has a usable handle.
+fn extrusion_motion(viewer: &Viewer, rect: Rect, pivot: Vec3, direction: Vec3) -> Vec2 {
+    let camera = view_pose(viewer);
+    let depth = (pivot - camera.translation).dot(*camera.forward());
+    let height = view_height(viewer, depth).max(0.000001);
+    let pixels_per_unit = rect.height() / height;
+    let projected = Vec2::new(direction.dot(*camera.right()), -direction.dot(*camera.up()));
+    let length = direction.length().max(0.000001);
+    if projected.length() < length * 0.15 {
+        Vec2::NEG_Y * length * pixels_per_unit
+    } else {
+        projected * pixels_per_unit
+    }
+}
+
+pub(super) fn extrusion_handle(
+    doc: &Document,
+    viewer: &Viewer,
+    rect: Rect,
+) -> Option<(Vec3, Vec2, Vec2)> {
+    let (pivot, direction) = extrusion_axis(doc)?;
+    let center = project(viewer, rect, pivot)?;
+    let handle =
+        center + extrusion_motion(viewer, rect, pivot, direction).normalize_or_zero() * 54.0;
+    Some((pivot, center, handle))
+}
+
+fn drag_extrusion(
+    gesture: &mut Gesture,
+    doc: &mut Document,
+    viewer: &Viewer,
+    rect: Rect,
+    cursor: Vec2,
+    snap: bool,
+) -> Result<(), String> {
+    let start = *gesture.start.get_or_insert(cursor);
+    let extrusion = gesture.extrusion.as_mut().unwrap();
+    let motion = *extrusion.screen_motion.get_or_insert_with(|| {
+        extrusion_motion(viewer, rect, extrusion.pivot, extrusion.direction)
+    });
+    let delta = cursor - start;
+    let mut distance = if delta.length() < 2.0 {
+        0.0
+    } else {
+        delta.dot(motion) / motion.length_squared()
+    };
+    if snap {
+        let step = doc.amount.max(0.000001);
+        distance = (distance / step).round() * step;
+    }
+    if !distance.is_finite() || distance == extrusion.distance {
+        return Ok(());
+    }
+    if distance == 0.0 {
+        doc.restore(gesture.base.clone());
+        extrusion.vertices.clear();
+    } else {
+        let mut selection = doc.selection.clone();
+        let object = doc.active_mut().ok_or("Нет активного объекта")?;
+        if extrusion.vertices.is_empty() {
+            extrusion.vertices = object.geometry.prepare_extrude(&mut selection)?;
+            object.geometry.discard_normals();
+        }
+        for &(vertex, origin, normal) in &extrusion.vertices {
+            object.geometry.positions[vertex] = origin + normal * distance;
+        }
+        doc.selection = selection;
+        doc.revision += 1;
+        doc.ui_revision += 1;
+    }
+    extrusion.distance = distance;
+    Ok(())
+}
 fn axis(doc: &Document, index: usize, local: bool) -> Vec3 {
     let unit = [Vec3::X, Vec3::Y, Vec3::Z][index];
     if local {
@@ -189,10 +295,20 @@ pub(in crate::editor) fn input(
         return;
     };
     let Some(cursor) = window.cursor_position() else {
+        if mouse.just_released(MouseButton::Left)
+            && state
+                .gesture
+                .as_ref()
+                .is_some_and(|g| g.drag && g.is_extruding())
+        {
+            state.clear_gesture(Some(index), false);
+        }
         text.clear();
         return;
     };
-    if state.box_start.is_none()
+    let extruding = state.gesture.as_ref().is_some_and(Gesture::is_extruding);
+    if !extruding
+        && state.box_start.is_none()
         && orientation
             .as_ref()
             .is_some_and(|gizmo| gizmo.blocks_input())
@@ -201,7 +317,9 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     }
-    if drawer.resizing || (state.box_start.is_none() && drawer.covers(cursor, &window)) {
+    if !extruding
+        && (drawer.resizing || (state.box_start.is_none() && drawer.covers(cursor, &window)))
+    {
         state.hover = None;
         state.box_start = None;
         if mouse.just_released(MouseButton::Left)
@@ -250,6 +368,7 @@ pub(in crate::editor) fn input(
         state.bvh_stamp = Some((index, doc.revision));
     }
     state.hover = if state.gesture.is_none()
+        && !state.extrude_tool
         && state.box_start.is_none()
         && rect.contains(cursor)
         && !keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
@@ -269,7 +388,46 @@ pub(in crate::editor) fn input(
         KeyCode::SuperRight,
     ]);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
-    if let Some(mut gesture) = state.gesture.take() {
+    if extruding && let Some(mut gesture) = state.gesture.take() {
+        let initial = gesture.start.is_none();
+        if keys.just_pressed(KeyCode::Escape) || mouse.just_pressed(MouseButton::Right) {
+            doc.restore(gesture.base);
+            state.status.clear();
+        } else if let Err(error) = drag_extrusion(
+            &mut gesture,
+            &mut doc,
+            &viewer,
+            rect,
+            cursor,
+            state.snap || ctrl,
+        ) {
+            doc.restore(gesture.base);
+            state.status = error;
+        } else if keys.just_pressed(KeyCode::Enter)
+            || (gesture.drag && !mouse.pressed(MouseButton::Left))
+            || (!initial && !gesture.drag && mouse.just_pressed(MouseButton::Left))
+        {
+            if let Err(error) = doc.validate() {
+                doc.restore(gesture.base);
+                state.status = error;
+            } else {
+                doc.checkpoint(gesture.base);
+                state.status.clear();
+            }
+        } else {
+            let distance = gesture.extrusion.as_ref().unwrap().distance;
+            let confirm = if gesture.drag {
+                "Отпустите ЛКМ"
+            } else {
+                "ЛКМ или Enter"
+            };
+            state.status =
+                format!("Экструдирование · {distance:.3} · {confirm} — применить · Esc — отменить");
+            state.gesture = Some(gesture);
+        }
+        viewer.gesture = None;
+        text.clear();
+    } else if let Some(mut gesture) = state.gesture.take() {
         let initial = gesture.start.is_none();
         let start = *gesture.start.get_or_insert(cursor);
         for (i, key) in [KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ]
@@ -554,41 +712,53 @@ pub(in crate::editor) fn input(
                     state.knife_start = Some(cursor);
                 }
             } else {
-                let frame = handles::Frame::new(&doc, &viewer, rect, state.local);
-                let hit = frame
-                    .as_ref()
-                    .and_then(|frame| frame.hit(&viewer, rect, state.tool, cursor));
-                if let Some(handle) = hit {
-                    let tool = match handle {
-                        TransformHandle::Axis { tool, .. } => tool,
-                        TransformHandle::ViewRotation => Tool::Rotate,
-                        _ => Tool::Move,
-                    };
-                    let mut gesture = Gesture::new(tool, doc.snapshot(), index);
-                    gesture.handle = Some(handle);
-                    if let TransformHandle::Axis { axis, .. } = handle {
-                        gesture.axis = Some(axis);
-                    }
-                    if let TransformHandle::Plane { normal } = handle {
-                        gesture.plane = Some(normal);
-                    }
+                let extrusion = state.extrude_tool
+                    && extrusion_handle(&doc, &viewer, rect)
+                        .is_some_and(|(_, _, handle)| handle.distance(cursor) <= 13.0);
+                if extrusion && let Some(mut gesture) = Gesture::extrude(&doc, index) {
                     gesture.start = Some(cursor);
                     gesture.drag = true;
                     state.gesture = Some(gesture);
                     viewer.gesture = None;
                 } else {
-                    if state.tool == Tool::Universal {
-                        state.box_start = Some(cursor);
-                        state.box_auto = true;
+                    let frame = (!state.extrude_tool)
+                        .then(|| handles::Frame::new(&doc, &viewer, rect, state.local))
+                        .flatten();
+                    let hit = frame
+                        .as_ref()
+                        .and_then(|frame| frame.hit(&viewer, rect, state.tool, cursor));
+                    if let Some(handle) = hit {
+                        let tool = match handle {
+                            TransformHandle::Axis { tool, .. } => tool,
+                            TransformHandle::ViewRotation => Tool::Rotate,
+                            _ => Tool::Move,
+                        };
+                        let mut gesture = Gesture::new(tool, doc.snapshot(), index);
+                        gesture.handle = Some(handle);
+                        if let TransformHandle::Axis { axis, .. } = handle {
+                            gesture.axis = Some(axis);
+                        }
+                        if let TransformHandle::Plane { normal } = handle {
+                            gesture.plane = Some(normal);
+                        }
+                        gesture.start = Some(cursor);
+                        gesture.drag = true;
+                        state.gesture = Some(gesture);
+                        viewer.gesture = None;
                     } else {
-                        area::click(
-                            &mut doc,
-                            &state,
-                            &viewer,
-                            rect,
-                            cursor,
-                            crate::editor::area_selection::Mode::keys(&keys),
-                        );
+                        if state.extrude_tool || state.tool == Tool::Universal {
+                            state.box_start = Some(cursor);
+                            state.box_auto = true;
+                        } else {
+                            area::click(
+                                &mut doc,
+                                &state,
+                                &viewer,
+                                rect,
+                                cursor,
+                                crate::editor::area_selection::Mode::keys(&keys),
+                            );
+                        }
                     }
                 }
             }
@@ -780,7 +950,48 @@ pub(in crate::editor) fn draw(
             }
         }
     }
-    if let Some(mut frame) = handles::Frame::new(doc, &viewer, rect, state.local) {
+    if state.extrude_tool
+        && state.gesture.is_none()
+        && state.box_start.is_none()
+        && let Some((pivot, center, handle)) = extrusion_handle(doc, &viewer, rect)
+    {
+        let at = |point| plane_point(&viewer, rect, point, pivot, *pose.forward());
+        let hover = window
+            .cursor_position()
+            .is_some_and(|p| p.distance(handle) <= 13.0);
+        let color = if hover {
+            Color::srgb(1.0, 0.89, 0.64)
+        } else {
+            orange
+        };
+        if let (Some(a), Some(b)) = (at(center), at(handle)) {
+            overlay.line(a, b, color);
+        }
+        for (origin, radius, color) in [
+            (center, 54.0, Color::srgba(1.0, 0.81, 0.38, 0.55)),
+            (handle, 10.0, color),
+        ] {
+            let mut previous = at(origin + Vec2::X * radius);
+            for i in 1..=48 {
+                let angle = i as f32 * std::f32::consts::TAU / 48.0;
+                let next = at(origin + Vec2::new(angle.cos(), angle.sin()) * radius);
+                if let (Some(a), Some(b)) = (previous, next) {
+                    overlay.line(a, b, color);
+                }
+                previous = next;
+            }
+        }
+        for direction in [Vec2::X, Vec2::Y] {
+            if let (Some(a), Some(b)) = (at(handle - direction * 5.0), at(handle + direction * 5.0))
+            {
+                overlay.line(a, b, color);
+            }
+        }
+    }
+    if !state.extrude_tool
+        && !state.gesture.as_ref().is_some_and(Gesture::is_extruding)
+        && let Some(mut frame) = handles::Frame::new(doc, &viewer, rect, state.local)
+    {
         if state.local
             && let Some(g) = state.gesture.as_ref().filter(|g| g.tool == Tool::Rotate)
         {

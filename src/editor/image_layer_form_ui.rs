@@ -213,6 +213,9 @@ pub(super) fn build(
         .any(|f| ux::primary(form.command, &f.key));
     let mut hidden = 0;
     for (index, field) in form.fields.iter().enumerate() {
+        if !form.stroke_field_visible(&field.key) {
+            continue;
+        }
         let caption = caption(form, field);
         if form
             .effect
@@ -264,7 +267,10 @@ pub(super) fn build(
                 ux::help(commands, button, ux::field_help(&field.key));
             } else {
                 text(commands, group, font, &caption, 12.0, TEXT);
-                if choices.len() <= 5 {
+                if choices.len() <= 5
+                    && !(form.is_stroke_field(&field.key)
+                        && field.key.rsplit('/').next() == Some("style"))
+                {
                     let row = node(
                         commands,
                         group,
@@ -275,12 +281,15 @@ pub(super) fn build(
                         },
                     );
                     for (choice, value) in choices.iter().enumerate() {
-                        let label = ux::choice(
+                        let mut label = ux::choice(
                             &value
                                 .as_str()
                                 .map(str::to_owned)
                                 .unwrap_or_else(|| value.to_string()),
                         );
+                        if field.key.rsplit('/').next() == Some("strokePaint") && value == "solid" {
+                            label = "Цвет".into();
+                        }
                         compact(
                             commands,
                             row,

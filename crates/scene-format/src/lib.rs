@@ -153,6 +153,14 @@ pub struct EntityPatch {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<Transform>,
+    /// New parent ID in the document declaring the override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Move the node to the root of the document declaring the override.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub detach: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -538,9 +546,25 @@ pub(crate) fn validate_parts<'a>(
                     "Cannot set and remove the same model",
                 )?;
                 ensure(
+                    !(patch.detach && patch.parent.is_some()),
+                    "Cannot set and detach the same parent",
+                )?;
+                if let Some(parent) = &patch.parent {
+                    ensure(
+                        parent.split('/').all(|part| identifier(part, false))
+                            && identifier(parent, true)
+                            && (ids.contains(parent.as_str()) || parent.contains('/'))
+                            && parent != &format!("{}/{}", entity.id, target),
+                        format!("Invalid override parent {parent}"),
+                    )?;
+                }
+                ensure(
                     !patch.remove
                         || (patch.name.is_none()
                             && patch.transform.is_none()
+                            && patch.parent.is_none()
+                            && !patch.detach
+                            && patch.order.is_none()
                             && patch.model.is_none()
                             && !patch.remove_model
                             && patch.components.is_empty()

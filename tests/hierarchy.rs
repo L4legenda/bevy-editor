@@ -109,6 +109,90 @@ fn setup() -> (Files, LevelEdits) {
     let edits = LevelEdits::read(&files.0, "room.scene").unwrap();
     (files, edits)
 }
+
+#[test]
+fn structural_overrides_round_trip_and_follow_their_original_instance() {
+    let (files, edits) = setup();
+    let original = std::fs::read(files.0.join("lamp.scene")).unwrap();
+    let mut graph = (**edits.hierarchy.as_ref().unwrap()).clone();
+    let group = graph.by_id("a/group").unwrap().key;
+    let other = graph.by_id("b").unwrap().key;
+    let world = graph.node(group).unwrap().affine();
+    graph.reparent(group, Some(other)).unwrap();
+    near(graph.node(group).unwrap().affine(), world);
+    graph.move_sibling(group, true).unwrap();
+    let siblings: Vec<_> = graph
+        .nodes
+        .iter()
+        .filter(|n| n.entity.parent.as_deref() == Some("b"))
+        .map(|n| n.entity.id.as_str())
+        .collect();
+    assert_eq!(siblings, ["b/group", "a/group"]);
+    let edits: LevelEdits = graph.clone().project().unwrap();
+    edits.write(&files.0, "room.scene").unwrap();
+    let loaded = LevelEdits::<String>::read(&files.0, "room.scene").unwrap();
+    let mut graph = (**loaded.hierarchy.as_ref().unwrap()).clone();
+    assert_eq!(graph.parent(group).unwrap().entity.id, "b");
+    assert_eq!(std::fs::read(files.0.join("lamp.scene")).unwrap(), original);
+    let mount = graph.by_id("a").unwrap().key;
+    let copy = graph.duplicate(mount).unwrap();
+    let copy_id = graph.node(copy).unwrap().entity.id.clone();
+    assert_eq!(
+        graph
+            .by_id(&format!("{copy_id}/group"))
+            .unwrap()
+            .entity
+            .parent
+            .as_deref(),
+        Some("b")
+    );
+    let mut unpacked = graph.clone();
+    unpacked.unpack(mount).unwrap();
+    let moved = unpacked
+        .nodes
+        .iter()
+        .find(|n| !n.inherited() && n.entity.name.as_deref() == Some("group"))
+        .unwrap();
+    assert_eq!(moved.entity.parent.as_deref(), Some("b"));
+    near(moved.affine(), world);
+    graph.delete(&[mount]).unwrap();
+    assert!(graph.by_id("a/group").is_none());
+    assert!(graph.by_id("b/group").is_some());
+}
+
+#[test]
+fn structural_override_detach_reset_and_delete_preserve_source_ownership() {
+    let (_files, edits) = setup();
+    let mut graph = (**edits.hierarchy.as_ref().unwrap()).clone();
+    let group = graph.by_id("a/group").unwrap().key;
+    let mount = graph.by_id("a").unwrap().key;
+    let world = graph.node(group).unwrap().affine();
+    graph.reparent(group, None).unwrap();
+    assert!(graph.parent(group).is_none());
+    near(graph.node(group).unwrap().affine(), world);
+    graph.reset_overrides(group).unwrap();
+    assert_eq!(graph.parent(group).unwrap().key, mount);
+    let local = graph.add_group(None).unwrap();
+    graph.reparent(group, Some(local)).unwrap();
+    graph.delete(&[local]).unwrap();
+    assert!(graph.by_id("a").is_some());
+    assert!(graph.by_id("a/group").is_none());
+    graph.reset_overrides(mount).unwrap();
+    assert_eq!(graph.parent(group).unwrap().key, mount);
+}
+
+#[test]
+fn structural_override_reset_rejects_a_cycle_without_losing_the_override() {
+    let (_files, edits) = setup();
+    let mut graph = (**edits.hierarchy.as_ref().unwrap()).clone();
+    let node = graph.by_id("a/group").unwrap().key;
+    let mount = graph.by_id("a").unwrap().key;
+    graph.reparent(node, None).unwrap();
+    graph.reparent(mount, Some(node)).unwrap();
+    let before = graph.clone();
+    assert!(graph.reset_overrides(node).is_err());
+    assert_eq!(graph, before);
+}
 fn near(a: Affine3A, b: Affine3A) {
     assert!(
         a.to_cols_array()

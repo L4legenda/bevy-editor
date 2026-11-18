@@ -212,6 +212,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::BrowserCancelPopup => "Esc · Закрыть меню или отменить создание папки.".into(),
         Action::BrowserDeleteFile => "Delete · Удалить файл. До закрытия редактора его можно вернуть через Ctrl+Z.".into(),
         Action::BrowserRestoreFile => "Ctrl+Z · Вернуть последний удалённый файл. При закрытии редактора корзина очищается окончательно.".into(),
+        Action::EditBrowserImage(..) => "Открыть изображение в режиме редактирования.".into(),
         Action::ViewImage(index) => format!(
             "Двойной щелчок — открыть «{}» во вкладке. В просмотре: ← → — листать, колесо — масштаб. Перетащите карточку в папку, чтобы переместить файл.",
             browser.files.get(index)?.filename
@@ -302,10 +303,8 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             "Alt+Z · X-Ray: полупрозрачная модель, скрытые вершины и рёбра, выделение сквозь геометрию.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Wireframe)) =>
             "Показать сетку поверх всех объектов модели. Повторное нажатие скрывает сетку; исходный GLB не меняется.".into(),
-        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Operate(
-            crate::editor::model_document::Operation::Extrude,
-        ))) =>
-            "E · Экструдировать выделенные грани или замкнутую область. Расстояние задаётся полем «Шаг операции» в инспекторе.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::ExtrudeTool)) =>
+            "Экструдировать · потяните ручку «+» над выделением. E сразу запускает вытягивание за курсором.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Element(kind))) => {
             use crate::editor::model_mesh::Element;
             match kind {

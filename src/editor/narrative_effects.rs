@@ -365,6 +365,7 @@ mod tests {
         d.node_mut(from).unwrap().choices.push(Choice {
             text: "Второй".into(),
             target: Some(target),
+            dialogue: None,
         });
         let mut answers = answers::State::default();
         answers.observe(Some((1, &d)), 0.);

@@ -58,6 +58,7 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
     d.node_mut(first).unwrap().choices.push(Choice {
         text: "Повторить".into(),
         target: Some(first),
+        dialogue: None,
     });
     assert!(d.warnings().is_empty());
     Content::Dialogue(d.clone()).save(&root, &path).unwrap();
@@ -365,5 +366,24 @@ fn case_only_narrative_rename_preserves_links() {
             .unwrap()
             .any(|entry| entry.unwrap().file_name() == "АСТРА.dcharacter")
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_dialogue_link_loads_as_a_connected_jump_node() {
+    let root = lab();
+    let file = Path::new("legacy.dialog");
+    let mut original = Dialogue::new("Сигнал".into());
+    original.nodes[0].choices[0].dialogue = Some("Дальше.dialog".into());
+    Content::Dialogue(original).save(&root, file).unwrap();
+    let Content::Dialogue(migrated) = Content::read(&root, file).unwrap() else {
+        unreachable!();
+    };
+    let choice = &migrated.nodes[0].choices[0];
+    assert!(choice.dialogue.is_none());
+    let jump = migrated.node(choice.target.unwrap()).unwrap();
+    assert_eq!(jump.kind, NodeKind::Jump);
+    assert_eq!(jump.dialogue.as_deref(), Some("Дальше.dialog"));
+    assert!(migrated.warnings().is_empty());
     fs::remove_dir_all(root).unwrap();
 }

@@ -690,6 +690,23 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
     mouse(&mut app, window, ButtonState::Pressed);
     mouse(&mut app, window, ButtonState::Released);
     warm(&mut app, 3);
+    let (center, handle) = {
+        let state = app.world().resource::<State>();
+        assert!(state.extrude_tool && state.gesture.is_none());
+        let doc = &state.documents[&0];
+        assert_eq!(doc.active().unwrap().geometry.faces.len(), 6);
+        let viewer = app.world().resource::<Viewer>();
+        let (_, center, handle) = input::extrusion_handle(doc, viewer, rect).unwrap();
+        (center, handle)
+    };
+    move_pointer(&mut app, window, handle);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert!(!app.world().resource::<State>().documents[&0].dirty());
+    move_pointer(&mut app, window, handle);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, handle + (handle - center) * 0.5);
+    mouse(&mut app, window, ButtonState::Released);
     assert_eq!(
         app.world().resource::<State>().documents[&0]
             .active()
@@ -709,9 +726,24 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
             .len(),
         6
     );
-    // The original shortcut must produce the same topology as the new header button.
+    // E starts the modal gesture without a handle press. Escape restores the mesh.
     move_pointer(&mut app, window, rect.center());
     key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
+    assert!(
+        app.world()
+            .resource::<State>()
+            .gesture
+            .as_ref()
+            .is_some_and(input::Gesture::is_extruding)
+    );
+    move_pointer(&mut app, window, rect.center() + (handle - center) * 0.5);
+    assert!(app.world().resource::<State>().documents[&0].dirty());
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    assert!(!app.world().resource::<State>().documents[&0].dirty());
+    move_pointer(&mut app, window, rect.center());
+    key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
+    move_pointer(&mut app, window, rect.center() + (handle - center) * 0.5);
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
     assert_eq!(
         app.world().resource::<State>().documents[&0]
             .active()
@@ -1942,6 +1974,69 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
     );
     assert!(!app.world().resource::<State>().documents[&0].dirty());
     println!("Warped quad screenshot: {}", output.display());
+    send(&mut app, EditAction::Element(Element::Vertex));
+    {
+        let mut state = app.world_mut().resource_mut::<State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        doc.selection.clear();
+        doc.selection.vertices.insert(0);
+    }
+    let handle = |app: &App| {
+        let state = app.world().resource::<State>();
+        let viewer = app.world().resource::<Viewer>();
+        let (_, center, handle) =
+            input::extrusion_handle(&state.documents[&0], viewer, rect).unwrap();
+        (center, handle)
+    };
+    let (center, plus) = handle(&app);
+    move_pointer(&mut app, window, rect.center());
+    key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
+    move_pointer(&mut app, window, rect.center() + (plus - center) * 0.5);
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    let edge = {
+        let state = app.world().resource::<State>();
+        let doc = &state.documents[&0];
+        let mesh = &doc.active().unwrap().geometry;
+        assert_eq!(mesh.faces.len(), 6);
+        assert_eq!(mesh.loose_edges.len(), 1);
+        *mesh.loose_edges.first().unwrap()
+    };
+    send(&mut app, EditAction::Element(Element::Edge));
+    app.world_mut()
+        .resource_mut::<State>()
+        .documents
+        .get_mut(&0)
+        .unwrap()
+        .selection
+        .edges
+        .insert(edge);
+    click_control(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ModelView(ModelViewAction::Edit(EditAction::ExtrudeTool))
+        )
+    });
+    let (center, plus) = handle(&app);
+    move_pointer(&mut app, window, plus);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, plus + (plus - center) * 0.5);
+    mouse(&mut app, window, ButtonState::Released);
+    {
+        let state = app.world().resource::<State>();
+        let mesh = &state.documents[&0].active().unwrap().geometry;
+        assert_eq!(mesh.faces.len(), 7);
+        assert!(mesh.loose_edges.is_empty());
+    }
+    send(&mut app, EditAction::Undo);
+    assert_eq!(
+        app.world().resource::<State>().documents[&0]
+            .active()
+            .unwrap()
+            .geometry
+            .loose_edges
+            .len(),
+        1
+    );
     drop(app);
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -446,7 +446,7 @@ pub(super) fn sidecar(source: &Path) -> PathBuf {
     source.with_extension("pcraft")
 }
 
-fn source_format(source: &Path) -> Result<ImageFormat, String> {
+pub(super) fn source_format(source: &Path) -> Result<ImageFormat, String> {
     let format = ImageFormat::from_path(source)
         .map_err(|_| "Редактирование доступно для PNG, JPEG, WebP, BMP, TGA и ICO.".to_owned())?;
     if matches!(

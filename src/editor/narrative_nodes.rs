@@ -37,6 +37,7 @@ fn body_height(n: &DialogueNode) -> f32 {
         NodeKind::Start => 116.0,
         NodeKind::Line => 252.0,
         NodeKind::End => 172.0,
+        NodeKind::Jump => 112.0,
     }
 }
 pub(super) fn height(n: &DialogueNode) -> f32 {
@@ -78,6 +79,7 @@ pub(super) fn accent(n: &DialogueNode) -> Color {
         NodeKind::Start => GREEN,
         NodeKind::Line => FOCUS,
         NodeKind::End => BLUE,
+        NodeKind::Jump => Color::srgb(0.73, 0.62, 0.96),
     }
 }
 fn frame_node(n: &DialogueNode, doc: &Document, height: f32) -> Node {
@@ -368,6 +370,7 @@ pub(super) fn spawn(
             NodeKind::Start => "НАЧАЛО".into(),
             NodeKind::Line => format!("РЕПЛИКА #{}", n.id),
             NodeKind::End => format!("ЗАВЕРШЕНИЕ #{}", n.id),
+            NodeKind::Jump => format!("ДРУГОЙ ДИАЛОГ #{}", n.id),
         };
         let head = control(
             commands,
@@ -566,6 +569,49 @@ pub(super) fn spawn(
                 );
                 text(commands, body, font, "ОТВЕТЫ И ПЕРЕХОДЫ", 10.0, MUTED);
             }
+            NodeKind::Jump => {
+                let configured = n.dialogue.is_some();
+                let label = n.dialogue.as_deref().unwrap_or("Выбрать диалог…");
+                let target = act(
+                    commands,
+                    body,
+                    font,
+                    label,
+                    if configured {
+                        NarrativeAction::Select(n.id)
+                    } else {
+                        NarrativeAction::DialogueTarget(n.id)
+                    },
+                    !configured,
+                );
+                if configured {
+                    commands
+                        .entity(target)
+                        .insert(control_hints::Help(label.to_owned()));
+                    let actions = node(commands, body, row(8.0));
+                    let change = act(
+                        commands,
+                        actions,
+                        font,
+                        "Изменить файл",
+                        NarrativeAction::DialogueTarget(n.id),
+                        false,
+                    );
+                    commands.entity(change).insert(speaker_menu::Anchor(n.id));
+                    icons::spawn(commands, change, icons::Glyph::ChevronDown, 11.0, MUTED);
+                    text(
+                        commands,
+                        actions,
+                        font,
+                        "Двойной щелчок — открыть",
+                        11.0,
+                        MUTED,
+                    );
+                } else {
+                    commands.entity(target).insert(speaker_menu::Anchor(n.id));
+                    icons::spawn(commands, target, icons::Glyph::ChevronDown, 12.0, MUTED);
+                }
+            }
             NodeKind::End => {
                 node_field(
                     commands,
@@ -700,7 +746,7 @@ pub(super) fn hint(
         if dialogue
             .node(from)
             .and_then(|n| n.choices.get(choice))
-            .is_some_and(|c| c.target.is_some())
+            .is_some_and(Choice::connected)
         {
             act(
                 commands,
@@ -715,6 +761,7 @@ pub(super) fn hint(
             ("+ Реплика", NarrativeAction::Add(NodeKind::Line)),
             ("+ Конец", NarrativeAction::Add(NodeKind::End)),
             ("Список нод", NarrativeAction::Target(u32::MAX)),
+            ("Другой диалог", NarrativeAction::Add(NodeKind::Jump)),
             ("Отмена · Esc", NarrativeAction::Dismiss),
         ] {
             act(commands, row, font, caption, action, false);

@@ -9,6 +9,7 @@ struct Params {
 @group(0) @binding(2) var scene_depth: texture_depth_2d;
 @group(0) @binding(3) var scene_ids: texture_2d<u32>;
 @group(0) @binding(4) var uv_ids: texture_2d<u32>;
+@group(0) @binding(5) var<storage,read_write> dirty:array<atomic<u32>>;
 struct Vertex {
     @location(0) position:vec3<f32>, @location(1) uv:vec2<f32>,
     @location(2) face:u32, @location(3) object:u32, @location(4) slot:u32,
@@ -32,24 +33,24 @@ fn output(v:Vertex,p:vec4<f32>)->Varying {
     if(v.object!=u.ids.x||v.slot!=u.ids.y){discard;}
     var pixel=u.rect.xy+v.uv*u.rect.zw;
     let dims=vec2<f32>(textureDimensions(scene_depth));
+    var ndc=vec3<f32>(0.0);
     if(u.settings.z==0u){
         let clip=u.vp*vec4<f32>(v.world,1.0);
         if(clip.w<=0.0){discard;}
-        let ndc=clip.xyz/clip.w;
+        ndc=clip.xyz/clip.w;
         if(any(abs(ndc.xy)>vec2<f32>(1.0))||ndc.z<0.0||ndc.z>1.0){discard;}
-        let at=clamp(vec2<i32>((ndc.xy*vec2<f32>(0.5,-0.5)+0.5)*dims),vec2<i32>(0),vec2<i32>(dims)-1);
-        let z=textureLoad(scene_depth,at,0);
-        if(z<=0.0){discard;}
-        let sp=(vec2<f32>(at)+0.5)/dims*vec2<f32>(2.0,-2.0)+vec2<f32>(-1.0,1.0);
-        let back=u.inverse_vp*vec4<f32>(sp,z,1.0);
-        let scene_t=dot(back.xyz/back.w-u.eye.xyz,u.forward.xyz);
-        let t=dot(v.world-u.eye.xyz,u.forward.xyz);
-        if(t>scene_t+max(u.eye.w,abs(scene_t)*0.005)){discard;}
         pixel=u.rect.xy+(ndc.xy*vec2<f32>(0.5,-0.5)+0.5)*u.rect.zw;
     }
     var keep=1.0;
     for(var i=0u;i<u.settings.y;i++){
         let stamp=stamps[i].xy;
+        var fall=1.0;
+        if(u.settings.w==0u){
+            let d=distance(pixel,stamp)/max(u.brush.x,0.5);
+            if(d>=1.0){continue;}
+            let t=clamp((d-u.brush.y)/max(1.0-u.brush.y,0.00001),0.0,1.0);
+            fall=1.0-t*t*(3.0-2.0*t);
+        }
         var face=0u;
         if(u.settings.z==0u){
             let at=clamp(vec2<i32>((stamp-u.rect.xy)/u.rect.zw*dims),vec2<i32>(0),vec2<i32>(dims)-1);
@@ -60,17 +61,27 @@ fn output(v:Vertex,p:vec4<f32>)->Varying {
             let at=clamp(vec2<i32>((stamp-u.rect.xy)/u.rect.zw*f32(u.settings.x)),vec2<i32>(0),vec2<i32>(i32(u.settings.x)-1));
             face=textureLoad(uv_ids,at,0).x;
         }
-        var fall=0.0;
         if(u.settings.w!=0u){
             fall=select(0.0,1.0,face==v.face&&face!=0u);
-        }else{
-            let d=distance(pixel,stamp)/max(u.brush.x,0.5);
-            let t=clamp((d-u.brush.y)/max(1.0-u.brush.y,0.00001),0.0,1.0);
-            fall=select(1.0-t*t*(3.0-2.0*t),0.0,d>=1.0);
         }
         keep*=1.0-fall*select(u.brush.z,1.0,u.settings.w!=0u);
     }
     let coverage=1.0-keep;
     if(coverage<=0.0){discard;}
+    // Most UV texels miss the brush. Test depth only after the cheap disc test.
+    if(u.settings.z==0u){
+        let at=clamp(vec2<i32>((ndc.xy*vec2<f32>(0.5,-0.5)+0.5)*dims),vec2<i32>(0),vec2<i32>(dims)-1);
+        let z=textureLoad(scene_depth,at,0);
+        if(z<=0.0){discard;}
+        let sp=(vec2<f32>(at)+0.5)/dims*vec2<f32>(2.0,-2.0)+vec2<f32>(-1.0,1.0);
+        let back=u.inverse_vp*vec4<f32>(sp,z,1.0);
+        let scene_t=dot(back.xyz/back.w-u.eye.xyz,u.forward.xyz);
+        let t=dot(v.world-u.eye.xyz,u.forward.xyz);
+        if(t>scene_t+max(u.eye.w,abs(scene_t)*0.005)){discard;}
+    }
+    if(u.settings.x>1024u){
+        let tile=vec2<u32>(v.position.xy)/8u;
+        atomicStore(&dirty[tile.y*((u.settings.x+7u)/8u)+tile.x],1u);
+    }
     return vec4<f32>(coverage,0.0,0.0,coverage);
 }

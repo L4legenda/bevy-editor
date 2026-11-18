@@ -22,6 +22,7 @@ fn fixture() -> (Glb, Object) {
     fs::write(&path, &bytes).unwrap();
     let source = Glb::parse(path, bytes).unwrap();
     let geometry = Geometry {
+        loose_edges: default(),
         positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
         faces: vec![Face {
             corners: (0..3).map(Corner::new).collect(),
@@ -71,6 +72,43 @@ fn model_glb_paint_round_trip_keeps_layers_and_flattened_standard_material() {
     let png=image::load_from_memory(&loaded.bin[start..start+len]).unwrap().to_rgba8();
     assert_eq!(png.get_pixel(4,4).0,[128,0,128,255]);
     assert!(bevy::gltf::gltf::Gltf::from_slice(loaded.data()).is_ok());
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
+}
+#[test]
+fn model_glb_round_trip_keeps_extruded_edge() {
+    use crate::editor::{
+        model_document::from_mesh,
+        model_mesh::{Element, Selection},
+    };
+    use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology};
+
+    let (mut source, mut object) = fixture();
+    let mut selection = Selection { vertices: [0].into(), ..default() };
+    object.geometry.extrude(&mut selection, 0.5).unwrap();
+    let line = *object.geometry.loose_edges.first().unwrap();
+    assert_eq!(selection.vertices, [line.1].into());
+    source.save(&[object.clone()], &[]).unwrap();
+
+    let parsed = bevy::gltf::gltf::Gltf::from_slice(source.data()).unwrap();
+    let mesh = parsed.meshes().next().unwrap();
+    let mut restored = (*object.geometry).clone();
+    restored.loose_edges.clear();
+    restored.positions.pop();
+    let primitive = mesh.primitives().find(|p| p.mode() == bevy::gltf::gltf::mesh::Mode::Lines).unwrap();
+    let reader = primitive.reader(|_| parsed.blob.as_deref());
+    let mut lines = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::MAIN_WORLD);
+    lines.insert_attribute(Mesh::ATTRIBUTE_POSITION, reader.read_positions().unwrap().collect::<Vec<_>>());
+    from_mesh(&lines, &mut restored, 0).unwrap();
+    assert_eq!(restored, *object.geometry);
+
+    selection.convert(Element::Edge, &restored);
+    selection.edges.insert(line);
+    restored.extrude(&mut selection, 0.25).unwrap();
+    restored.validate().unwrap();
+    assert!(restored.loose_edges.is_empty());
+    assert_eq!(restored.faces.len(), 2);
+    assert_eq!(restored.faces[1].corners.len(), 4);
+    assert_eq!(selection.edges.len(), 1);
     fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
 #[test]

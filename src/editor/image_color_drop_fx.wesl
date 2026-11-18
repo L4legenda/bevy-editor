@@ -46,17 +46,13 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(mix(vec3<f32>(0.015),vec3<f32>(0.95),
             (outline+dot)/max(alpha,0.001)),alpha);
     }
-    // A lit, opaque colour bead with a glass edge, fine dark outline and soft halo.
+    // A solid colour swatch with a light rim, dark outline and soft halo.
     let body = 1.0-smoothstep(16.0,16.9,r);
     let rim = ring(r,16.1,0.65);
     let outer = ring(r,17.5,0.8);
     let halo = exp(-pow((r-17.5)/6.5,2.0))*0.12;
-    let shade = 0.90+0.10*clamp((-p.y+16.0)/32.0,0.0,1.0);
-    let spec = exp(-pow(length((p-vec2<f32>(-5.0,-6.0))/vec2<f32>(7.0,4.0)),2.0))*0.5;
-    let small_spec = exp(-pow(length(p-vec2<f32>(-7.0,-8.0))/1.9,2.0))*0.55;
-    let body_color = mix(color*shade,vec3<f32>(1.0),spec+small_spec*0.35);
     let weights = body+rim*0.72+outer*0.85+halo;
-    let rgb = (body_color*body+vec3<f32>(0.95)*rim*0.72
+    let rgb = (color*body+vec3<f32>(0.95)*rim*0.72
         +vec3<f32>(0.008)*outer*0.85+mix(color,accent,0.45)*halo)/max(weights,0.001);
     return vec4<f32>(rgb,clamp(weights,0.0,1.0)*state.z);
 }

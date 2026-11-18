@@ -94,14 +94,17 @@ fn gpu_narrative_reorder_answers() {
             Choice {
                 text: "Проверить источник сигнала".into(),
                 target: Some(2),
+                dialogue: None,
             },
             Choice {
                 text: "Запросить помощь экипажа".into(),
                 target: Some(3),
+                dialogue: None,
             },
             Choice {
                 text: "Вернуться на корабль".into(),
                 target: Some(4),
+                dialogue: None,
             },
         ];
         d.node_mut(0).unwrap().position = [16., 20.];

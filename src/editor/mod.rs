@@ -175,6 +175,7 @@ enum Action {
     BrowserDuplicateFile,
     BrowserRestoreFile,
     ViewImage(usize),
+    EditBrowserImage(usize, u64),
     ViewModel(usize),
     ModelView(ui::ModelViewAction),
     ImageView(ui::ImageAction),
@@ -386,6 +387,7 @@ impl Editor {
                 | Action::BrowseToggle(_)
                 | Action::BrowseFile(_)
                 | Action::ViewImage(_)
+                | Action::EditBrowserImage(..)
                 | Action::OpenImageTab(_)
                 | Action::CloseImageTab(_)
                 | Action::ImageView(_)
@@ -1026,6 +1028,7 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         area_selection::register(app);
         app.add_plugins(ui::LayerDragFxPlugin);
+        app.add_plugins(ui::LayerFlyoutFxPlugin);
         app.add_plugins(ui::ColorDropPlugin);
         app.add_plugins(image_brush_rail_fx::BrushRailFxPlugin);
         wireframe::register(app);
@@ -1066,6 +1069,7 @@ impl Plugin for EditorPlugin {
         .init_resource::<ui::DrawerMotion>()
         .init_resource::<ui::DrawerSize>()
         .init_resource::<ui::AssetDrag>()
+        .init_resource::<ui::scene_tree_drag::TreeDrag>()
         .init_resource::<ui::LayerDrag>()
         .init_resource::<asset_placement::PlacementPreview>()
         .init_resource::<image_previews::ImagePreviews>()
@@ -1087,6 +1091,7 @@ impl Plugin for EditorPlugin {
                     ui::resize_sidebar,
                     ui::scrub_numbers,
                     ui::drag_assets,
+                    ui::scene_tree_drag::update,
                     ui::drag_photo_layers,
                 )
                     .chain(),
@@ -1673,6 +1678,7 @@ fn handle_actions(
                 | Action::BrowserCreateFolder
                 | Action::BrowserCancelPopup
                 | Action::ViewImage(_)
+                | Action::EditBrowserImage(..)
                 | Action::BrowserDeleteFile
                 | Action::BrowserOpenEntry
                 | Action::BrowserRevealEntry
@@ -1736,6 +1742,7 @@ fn handle_actions(
                 | Action::Lighting(_)
                 | Action::UseDownloadedHdri(_)
                 | Action::LocalSpace
+                | Action::Hierarchy(scene_hierarchy::HierarchyAction::Drop(..))
         ) && let Some(error) = numeric.as_ref().and_then(|input| input.error_message())
         {
             editor.status = error.into();

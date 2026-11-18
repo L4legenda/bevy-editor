@@ -552,7 +552,7 @@ impl Form {
                 });
             }
         }
-        Self {
+        let mut form = Self {
             command: spec.id,
             title: title(spec.id),
             fields,
@@ -561,7 +561,30 @@ impl Form {
             choice: None,
             effect: None,
             structured: false,
+        };
+        if spec.id == "layer.layerStyle.stroke" {
+            form.fields.retain(|f| f.key != "strokePaint");
+            form.fields.insert(
+                0,
+                stroke_choice(
+                    "strokePaint",
+                    if existing.get("from").is_some() || existing.get("stops").is_some() {
+                        "gradient"
+                    } else {
+                        "solid"
+                    },
+                ),
+            );
+            if let Some(style) = form.fields.iter_mut().find(|f| f.key == "style") {
+                *style = stroke_choice("style", existing["style"].as_str().unwrap_or("linear"));
+            }
+            if existing.get("angle").is_none()
+                && let Some(angle) = form.fields.iter_mut().find(|f| f.key == "angle")
+            {
+                angle.text = "90".into();
+            }
         }
+        form
     }
     pub fn structured(command: &'static str, title: String, params: Value) -> Self {
         let mut form = Self {
@@ -673,7 +696,35 @@ impl Form {
         }
         self.fields.clear();
         visit(&self.params, "", &mut self.fields);
+        // Place the paint switch before the settings it controls.
+        let mut paints = Vec::new();
+        self.fields.retain(|field| {
+            if field.key.ends_with("/strokePaint") && is_stroke_param(&self.params, &field.key) {
+                paints.push(field.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for paint in paints {
+            let prefix = paint.key.strip_suffix("strokePaint").unwrap();
+            if let Some(index) = self
+                .fields
+                .iter()
+                .position(|field| field.key.starts_with(prefix))
+            {
+                self.fields.insert(index, paint);
+            }
+        }
         for field in &mut self.fields {
+            if is_stroke_param(&self.params, &field.key) {
+                let key = field.key.rsplit('/').next().unwrap_or_default();
+                if matches!(key, "strokePaint" | "style") {
+                    let mut choice = stroke_choice(key, &field.text);
+                    choice.key = field.key.clone();
+                    *field = choice;
+                }
+            }
             if let Some(rest) = field.key.split("/stops/").nth(1) {
                 let mut parts = rest.split('/');
                 if let Some(index) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
@@ -794,6 +845,26 @@ impl Form {
     }
     pub fn values(&self) -> Result<Value, String> {
         let mut value = self.raw_values()?;
+        if self.command == "layer.layerStyle.stroke" {
+            let gradient = self
+                .fields
+                .iter()
+                .any(|f| f.key == "strokePaint" && f.text == "gradient");
+            let params = value.as_object_mut().unwrap();
+            params.remove("strokePaint");
+            if gradient {
+                params.remove("color");
+                for key in ["from", "to", "angle", "style"] {
+                    if let Some(field) = self.fields.iter().find(|f| f.key == key) {
+                        params.insert(key.into(), field.value()?);
+                    }
+                }
+            } else {
+                for key in ["from", "to", "style", "angle", "stops", "opacityStops"] {
+                    params.remove(key);
+                }
+            }
+        }
         if self.command == "layer.layerStyle.replace"
             && let Some(entries) = value["effects"].as_array_mut()
         {
@@ -808,6 +879,9 @@ impl Form {
                             .is_some_and(|old| same_parameter(old, value))
                     });
                 }
+                if entry["kind"] == "stroke" {
+                    update_stroke_snapshot(entry)?;
+                }
                 if let Some(on) = entry.get("on").and_then(Value::as_bool) {
                     let mut effect: photocraft_doc::Effect =
                         serde_json::from_value(entry["fx"].clone()).map_err(|e| e.to_string())?;
@@ -819,6 +893,111 @@ impl Form {
         }
         Ok(value)
     }
+
+    pub(super) fn is_stroke_field(&self, key: &str) -> bool {
+        self.command == "layer.layerStyle.stroke" || is_stroke_param(&self.params, key)
+    }
+
+    pub(super) fn stroke_field_visible(&self, key: &str) -> bool {
+        if !self.is_stroke_field(key) {
+            return true;
+        }
+        let (prefix, name) = key.rsplit_once('/').unwrap_or(("", key));
+        let gradient = self.fields.iter().any(|f| {
+            let (field_prefix, name) = f.key.rsplit_once('/').unwrap_or(("", &f.key));
+            prefix == field_prefix && name == "strokePaint" && f.text == "gradient"
+        });
+        match name {
+            "color" => !gradient,
+            "from" | "to" | "angle" | "style" | "method" | "smoothness" => gradient,
+            _ => true,
+        }
+    }
+}
+
+fn is_stroke_param(params: &Value, key: &str) -> bool {
+    key.strip_prefix("/effects/")
+        .and_then(|key| key.split_once("/params/"))
+        .and_then(|(index, _)| index.parse::<usize>().ok())
+        .is_some_and(|index| params["effects"][index]["kind"] == "stroke")
+}
+
+fn stroke_choice(key: &str, value: &str) -> Field {
+    let (label, choices): (_, &[&str]) = if key == "strokePaint" {
+        ("Заливка обводки", &["solid", "gradient"])
+    } else {
+        (
+            "Форма градиента",
+            &["linear", "radial", "angle", "reflected", "diamond"],
+        )
+    };
+    Field {
+        key: key.into(),
+        label: label.into(),
+        kind: FieldKind::Choice(choices.iter().map(|v| json!(v)).collect()),
+        text: value.into(),
+        enabled: true,
+    }
+}
+
+fn update_stroke_snapshot(entry: &mut Value) -> Result<(), String> {
+    use photocraft_doc::{Effect, FxPaint};
+    let params = &mut entry["params"];
+    let Some(changes) = params.as_object_mut() else {
+        return Ok(());
+    };
+    let mode = changes.remove("strokePaint");
+    let paint: serde_json::Map<String, Value> = ["color", "from", "to", "style", "angle"]
+        .into_iter()
+        .filter_map(|key| changes.remove(key).map(|v| (key.into(), v)))
+        .collect();
+    if mode.is_none() && paint.is_empty() {
+        return Ok(());
+    }
+    let mut effect: Effect =
+        serde_json::from_value(entry["fx"].clone()).map_err(|e| e.to_string())?;
+    let Effect::Stroke(stroke) = &mut effect else {
+        return Ok(());
+    };
+    let gradient = mode
+        .as_ref()
+        .map_or(matches!(stroke.paint, FxPaint::Gradient(_)), |mode| {
+            mode == "gradient"
+        });
+    let color = |key: &str| {
+        paint
+            .get(key)?
+            .as_str()
+            .and_then(parse_color)
+            .map(|[r, g, b, a]| photocraft_doc::Color::rgba(r, g, b, a))
+    };
+    if gradient {
+        if !matches!(stroke.paint, FxPaint::Gradient(_)) {
+            stroke.paint = FxPaint::Gradient(photocraft_doc::effects::Gradient::default());
+        }
+        if let FxPaint::Gradient(gradient) = &mut stroke.paint {
+            if let Some((_, target)) = gradient.stops.first_mut()
+                && let Some(color) = color("from")
+            {
+                *target = color;
+            }
+            if let Some((_, target)) = gradient.stops.last_mut()
+                && let Some(color) = color("to")
+            {
+                *target = color;
+            }
+            if let Some(angle) = paint.get("angle").and_then(Value::as_f64) {
+                gradient.angle = angle as f32;
+            }
+            if let Some(style) = paint.get("style").and_then(Value::as_str) {
+                gradient.style = photocraft_engine::layer_style::gradient_style(style);
+            }
+        }
+    } else if mode.is_some() || color("color").is_some() {
+        stroke.paint = FxPaint::Color(color("color").unwrap_or(photocraft_doc::Color::BLACK));
+    }
+    entry["fx"] = serde_json::to_value(effect).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn compound_default(key: &str, desc: &str, doc: &PhotoDocument) -> Value {
@@ -874,6 +1053,56 @@ fn compound_default(key: &str, desc: &str, doc: &PhotoDocument) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stroke_paint_switch_hides_inactive_settings_and_keeps_existing_gradient_stops() {
+        use photocraft_doc::{Effect, FxPaint, effects::GradientStyle};
+        let effect = photocraft_engine::layer_style::effect_from_params(
+            "stroke",
+            &json!({"stops":[[0,"#ff0000"],[0.4,"#00ff00"],[1,"#0000ff"]],"style":"radial"}),
+        )
+        .unwrap();
+        let snapshot = serde_json::to_value(&effect).unwrap();
+        let mut form = Form::structured(
+            "layer.layerStyle.replace",
+            "Обводка".into(),
+            json!({"effects":[{"kind":"stroke","params":effects::values_of(&effect, 120.0),"fx":snapshot}]}),
+        );
+        let key = |field| format!("/effects/0/params/{field}");
+        assert!(!form.stroke_field_visible(&key("color")));
+        assert!(form.stroke_field_visible(&key("style")));
+        assert_eq!(form.values().unwrap()["effects"][0]["fx"], snapshot);
+        form.fields
+            .iter_mut()
+            .find(|f| f.key == key("style"))
+            .unwrap()
+            .choose(4);
+        let changed = form.values().unwrap();
+        let Effect::Stroke(stroke) =
+            serde_json::from_value(changed["effects"][0]["fx"].clone()).unwrap()
+        else {
+            panic!("expected stroke")
+        };
+        let FxPaint::Gradient(gradient) = stroke.paint else {
+            panic!("expected gradient")
+        };
+        assert_eq!(gradient.style, GradientStyle::Diamond);
+        assert_eq!(gradient.stops.len(), 3);
+        assert_eq!(gradient.stops[1].1.to_rgba8(), [0, 255, 0, 255]);
+        form.fields
+            .iter_mut()
+            .find(|f| f.key == key("strokePaint"))
+            .unwrap()
+            .choose(0);
+        assert!(form.stroke_field_visible(&key("color")));
+        assert!(!form.stroke_field_visible(&key("from")));
+        let changed = form.values().unwrap();
+        let Effect::Stroke(stroke) =
+            serde_json::from_value(changed["effects"][0]["fx"].clone()).unwrap()
+        else {
+            panic!("expected stroke")
+        };
+        assert!(matches!(stroke.paint, FxPaint::Color(_)));
+    }
     #[test]
     fn command_dialog_keeps_multi_selection_and_preselects_required_presets() {
         let path = std::env::temp_dir().join(format!(

@@ -58,6 +58,7 @@ impl Face {
 pub(super) struct Geometry {
     pub positions: Vec<Vec3>,
     pub faces: Vec<Face>,
+    pub loose_edges: BTreeSet<Edge>,
 }
 
 #[derive(Default, Clone)]
@@ -217,6 +218,13 @@ impl Geometry {
         {
             return Err("Недопустимые координаты вершин".into());
         }
+        if self
+            .loose_edges
+            .iter()
+            .any(|e| e.0 >= e.1 || e.1 >= self.positions.len())
+        {
+            return Err("Повреждённое свободное ребро".into());
+        }
         for face in &self.faces {
             if face.corners.len() < 3 || face.corners.len() > 4096 {
                 return Err("Грань должна содержать от 3 до 4096 вершин".into());
@@ -293,13 +301,24 @@ impl Geometry {
         }
     }
     pub fn edges(&self) -> BTreeMap<Edge, Vec<usize>> {
-        let mut result: BTreeMap<Edge, Vec<usize>> = BTreeMap::new();
+        let mut result: BTreeMap<Edge, Vec<usize>> = self
+            .loose_edges
+            .iter()
+            .map(|&edge| (edge, Vec::new()))
+            .collect();
         for (i, face) in self.faces.iter().enumerate() {
             for (a, b) in face.edges() {
                 result.entry(Edge::new(a, b)).or_default().push(i);
             }
         }
         result
+    }
+    pub fn line_positions(&self) -> Vec<[f32; 3]> {
+        self.loose_edges
+            .iter()
+            .flat_map(|e| [e.0, e.1])
+            .map(|v| self.positions[v].to_array())
+            .collect()
     }
     pub fn triangles(&self, face: &Face) -> Vec<[usize; 3]> {
         let n = self.normal(face).abs();
@@ -434,6 +453,18 @@ impl Geometry {
         Ok(())
     }
     pub fn extrude(&mut self, selection: &mut Selection, distance: f32) -> Result<(), String> {
+        for (vertex, origin, normal) in self.prepare_extrude(selection)? {
+            self.positions[vertex] = origin + normal * distance;
+        }
+        Ok(())
+    }
+    pub fn prepare_extrude(
+        &mut self,
+        selection: &mut Selection,
+    ) -> Result<Vec<(usize, Vec3, Vec3)>, String> {
+        if selection.kind != Element::Face {
+            return self.extrude_elements(selection);
+        }
         let selected = selection.selected_faces(self);
         if selected.is_empty() {
             return Err("Для выдавливания выделите грани или замкнутую область".into());
@@ -446,8 +477,10 @@ impl Geometry {
             }
         }
         let mut remap = BTreeMap::new();
+        let mut motion = Vec::with_capacity(normals.len());
         for (v, n) in normals {
-            let p = self.positions[v] + n.normalize_or_zero() * distance;
+            let p = self.positions[v];
+            motion.push((self.positions.len(), p, n.normalize_or_zero()));
             remap.insert(v, self.positions.len());
             self.positions.push(p);
         }
@@ -481,9 +514,126 @@ impl Geometry {
             }
         }
         self.faces.extend(walls);
-        self.compact();
+        let compacted = self.compact_vertices();
+        for (vertex, _, _) in &mut motion {
+            *vertex = compacted[vertex];
+        }
         self.select_faces(selection, selected);
-        Ok(())
+        Ok(motion)
+    }
+    pub fn extrusion_direction(&self, selection: &Selection) -> Option<Vec3> {
+        let vertices = selection.selected_vertices(self);
+        if vertices.is_empty() {
+            return None;
+        }
+        let mut normals = self
+            .faces
+            .iter()
+            .enumerate()
+            .filter(|(i, face)| match selection.kind {
+                Element::Face => selection.faces.contains(i),
+                Element::Edge => face
+                    .edges()
+                    .any(|(a, b)| selection.edges.contains(&Edge::new(a, b))),
+                Element::Vertex => face.corners.iter().any(|c| vertices.contains(&c.vertex)),
+            })
+            .map(|(_, face)| self.normal(face));
+        let first = normals.next().unwrap_or(Vec3::ZERO);
+        let normal = (first + normals.sum::<Vec3>())
+            .try_normalize()
+            .or_else(|| first.try_normalize())
+            .unwrap_or(Vec3::Y);
+        let tangent = if selection.kind == Element::Edge {
+            selection.edges.first().map(|e| [e.0, e.1])
+        } else if selection.kind == Element::Vertex {
+            self.loose_edges
+                .iter()
+                .rev()
+                .find(|e| vertices.contains(&e.0) || vertices.contains(&e.1))
+                .map(|e| [e.0, e.1])
+        } else {
+            None
+        };
+        let Some([a, b]) =
+            tangent.filter(|&[a, b]| a < self.positions.len() && b < self.positions.len())
+        else {
+            return Some(normal);
+        };
+        let tangent = (self.positions[b] - self.positions[a]).normalize_or_zero();
+        if selection.kind == Element::Vertex && first == Vec3::ZERO && tangent != Vec3::ZERO {
+            return Some(tangent);
+        }
+        if normal.cross(tangent).length_squared() < 1.0e-4 && tangent != Vec3::ZERO {
+            Some(tangent.any_orthonormal_vector())
+        } else {
+            Some(normal)
+        }
+    }
+    fn extrude_elements(
+        &mut self,
+        selection: &mut Selection,
+    ) -> Result<Vec<(usize, Vec3, Vec3)>, String> {
+        let adjacency = if selection.kind == Element::Edge {
+            self.edges()
+        } else {
+            BTreeMap::new()
+        };
+        let edges: Vec<_> = selection
+            .edges
+            .iter()
+            .copied()
+            .filter(|e| adjacency.contains_key(e))
+            .collect();
+        let vertices = if selection.kind == Element::Vertex {
+            selection.selected_vertices(self)
+        } else {
+            edges.iter().flat_map(|e| [e.0, e.1]).collect()
+        };
+        let direction = self
+            .extrusion_direction(selection)
+            .filter(|_| !vertices.is_empty())
+            .ok_or("Выберите вершины или рёбра для экструдирования")?;
+        let mut remap = BTreeMap::new();
+        let mut motion = Vec::with_capacity(vertices.len());
+        for v in vertices {
+            let origin = self.positions[v];
+            let new = self.positions.len();
+            remap.insert(v, new);
+            motion.push((new, origin, direction));
+            self.positions.push(origin);
+        }
+        if selection.kind == Element::Vertex {
+            self.loose_edges
+                .extend(remap.iter().map(|(&a, &b)| Edge::new(a, b)));
+            selection.vertices = remap.into_values().collect();
+        } else {
+            selection.edges.clear();
+            for edge in edges {
+                let (a, b, material, smooth) = adjacency[&edge]
+                    .first()
+                    .and_then(|&i| {
+                        let face = &self.faces[i];
+                        face.corners
+                            .iter()
+                            .zip(face.corners.iter().cycle().skip(1))
+                            .find(|(a, b)| Edge::new(a.vertex, b.vertex) == edge)
+                            .map(|(a, b)| (b.clone(), a.clone(), face.material, face.smooth))
+                    })
+                    .unwrap_or_else(|| (Corner::new(edge.0), Corner::new(edge.1), 0, false));
+                let mut na = a.clone();
+                let mut nb = b.clone();
+                na.vertex = remap[&a.vertex];
+                nb.vertex = remap[&b.vertex];
+                selection.edges.insert(Edge::new(na.vertex, nb.vertex));
+                self.loose_edges.remove(&edge);
+                self.faces.push(Face {
+                    corners: vec![a, b, nb, na],
+                    material,
+                    smooth,
+                });
+            }
+        }
+        Ok(motion)
     }
     pub fn inset(&mut self, selection: &mut Selection, distance: f32) -> Result<(), String> {
         let selected = selection.selected_faces(self);
@@ -802,6 +952,15 @@ impl Geometry {
     pub fn delete(&mut self, selection: &mut Selection, faces_only: bool) {
         let vertices = selection.selected_vertices(self);
         let faces = selection.selected_faces(self);
+        if !faces_only {
+            match selection.kind {
+                Element::Vertex => self
+                    .loose_edges
+                    .retain(|e| !vertices.contains(&e.0) && !vertices.contains(&e.1)),
+                Element::Edge => self.loose_edges.retain(|e| !selection.edges.contains(e)),
+                Element::Face => {}
+            }
+        }
         self.faces = self
             .faces
             .iter()
@@ -822,10 +981,14 @@ impl Geometry {
         self.compact();
     }
     pub fn compact(&mut self) {
+        self.compact_vertices();
+    }
+    fn compact_vertices(&mut self) -> HashMap<usize, usize> {
         let used: BTreeSet<_> = self
             .faces
             .iter()
             .flat_map(|f| f.corners.iter().map(|c| c.vertex))
+            .chain(self.loose_edges.iter().flat_map(|e| [e.0, e.1]))
             .collect();
         let remap: HashMap<_, _> = used
             .iter()
@@ -833,11 +996,17 @@ impl Geometry {
             .map(|(new, &old)| (old, new))
             .collect();
         self.positions = used.iter().map(|&v| self.positions[v]).collect();
+        self.loose_edges = self
+            .loose_edges
+            .iter()
+            .map(|e| Edge::new(remap[&e.0], remap[&e.1]))
+            .collect();
         for f in &mut self.faces {
             for c in &mut f.corners {
                 c.vertex = remap[&c.vertex];
             }
         }
+        remap
     }
     pub fn merge(
         &mut self,
@@ -890,6 +1059,17 @@ impl Geometry {
         if remap.is_empty() {
             return Err("Нет вершин в пределах указанного расстояния".into());
         }
+        self.loose_edges = self
+            .loose_edges
+            .iter()
+            .map(|e| {
+                Edge::new(
+                    *remap.get(&e.0).unwrap_or(&e.0),
+                    *remap.get(&e.1).unwrap_or(&e.1),
+                )
+            })
+            .filter(|e| e.0 != e.1)
+            .collect();
         for f in &mut self.faces {
             for c in &mut f.corners {
                 if let Some(&v) = remap.get(&c.vertex) {

@@ -34,7 +34,11 @@ pub(in crate::editor) fn cube() -> Geometry {
         smooth: false,
     })
     .collect();
-    Geometry { positions, faces }
+    Geometry {
+        positions,
+        faces,
+        ..default()
+    }
 }
 fn closed(mesh: &Geometry) {
     mesh.validate().unwrap();
@@ -108,6 +112,7 @@ fn model_mesh_triangles_quads_and_concave_ngons_render_without_missing_faces() {
     let mesh = Geometry {
         positions,
         faces: vec![face],
+        ..default()
     };
     assert_eq!(mesh.triangles(&mesh.faces[0]).len(), 3);
     assert_eq!(mesh.buffers()[&0].indices.len(), 9);
@@ -196,6 +201,7 @@ fn split_quad() -> Geometry {
     let uv = [Vec2::ZERO, Vec2::X, Vec2::new(0.7, 0.8), Vec2::Y];
     Geometry {
         positions,
+        loose_edges: default(),
         faces: [[0, 1, 2], [0, 2, 3]]
             .into_iter()
             .map(|vertices| Face {

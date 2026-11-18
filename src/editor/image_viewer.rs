@@ -613,19 +613,27 @@ pub(in crate::editor) fn update(
         };
         viewer.views.insert(tab, view);
     }
-    let actions: Vec<_> = messages.read().copied().collect();
+    let mut actions: Vec<_> = messages.read().copied().collect();
+    let mut edit_tab = None;
     for action in &actions {
         let enabled =
             editor.pending.is_none() && !editor.browser_popup && !editor.hdri_library_open;
         match *action {
-            Action::ViewImage(file)
+            Action::ViewImage(file) | Action::EditBrowserImage(file, _)
                 if enabled
+                    && !matches!(action, Action::EditBrowserImage(_, revision)
+                        if *revision != browser.scan_revision || !editor.drawer)
                     && browser
                         .files
                         .get(file)
                         .is_some_and(|file| file.kind == FileKind::Image) =>
             {
                 editor.open_image_tab(browser.files[file].path.clone());
+                edit_tab = if matches!(action, Action::EditBrowserImage(..)) {
+                    editor.viewing_image
+                } else {
+                    None
+                };
                 if let Some(interface) = browser_ui.as_mut() {
                     interface.select(Some(browser::Entry::Image(file)));
                 }
@@ -677,6 +685,9 @@ pub(in crate::editor) fn update(
             }
             _ => {}
         }
+    }
+    if edit_tab.is_some() && edit_tab == editor.viewing_image {
+        actions.push(Action::ImageEdit(edit::EditAction::Edit));
     }
     edit::update(&actions, &mut editor, &mut viewer, &mut browser);
     viewer.views.retain(|id, _| editor.image_tab(*id).is_some());
@@ -749,7 +760,7 @@ pub(in crate::editor) fn update(
         });
     }
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
-    if viewer.edit.color_dragging {
+    if viewer.edit.color_dragging || viewer.edit.layers.context_menu_dismissed {
         viewer.gesture = None;
         return;
     }

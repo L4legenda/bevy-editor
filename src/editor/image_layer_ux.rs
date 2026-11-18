@@ -293,7 +293,15 @@ pub(super) fn primary(command: &str, key: &str) -> bool {
     if key.starts_with("/effects/") {
         return matches!(
             last,
-            "on" | "color" | "opacity" | "size" | "distance" | "angle"
+            "on" | "color"
+                | "opacity"
+                | "size"
+                | "distance"
+                | "angle"
+                | "strokePaint"
+                | "from"
+                | "to"
+                | "style"
         );
     }
     if command.ends_with("blendingOptions") {
@@ -302,6 +310,7 @@ pub(super) fn primary(command: &str, key: &str) -> bool {
     matches!(
         last,
         "name"
+            | "strokePaint"
             | "text"
             | "color"
             | "from"

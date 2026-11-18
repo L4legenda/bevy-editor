@@ -52,7 +52,7 @@ impl Runtime {
             }
         }
         candidates.into_iter().find(|p|p.is_file()).map(|executable|Self{executable})
-            .ok_or_else(||"Не найден Rust-генератор. Соберите crates/hunyuan-native или задайте BEVY_EDITOR_HUNYUAN_NATIVE.".into())
+            .ok_or_else(||"Компонент 3D генерации не подготовлен. Закройте редактор и запустите run-editor.cmd: запускатель соберёт генератор и подготовит CUDA для NVIDIA. Для готового релиза распакуйте полный архив с 3D генерацией.".into())
     }
     pub fn launch(&self, model: &Path, cache: &Path) -> Result<Service, String> {
         fs::create_dir_all(cache).map_err(|e| e.to_string())?;

@@ -1011,6 +1011,7 @@ pub(in crate::editor) fn setup(
     layers::ui::setup(
         commands,
         layers,
+        panel_root,
         root,
         font_handle,
         layer_title,

@@ -9,14 +9,14 @@ struct Params {
 @group(0) @binding(4) var rm_map:texture_2d<f32>;
 @group(0) @binding(5) var out0:texture_storage_2d<rgba8unorm,write>;
 @group(0) @binding(6) var out1:texture_storage_2d<rgba8unorm,write>;
+@group(0) @binding(7) var<storage,read> tiles:array<u32>;
 fn h(p:vec2<i32>,from_current:bool)->f32 {
     let q=clamp(p,vec2<i32>(0),vec2<i32>(i32(u.settings.x)-1));let i=u32(q.y)*u.settings.x+u32(q.x);
     if(from_current){return unpack4x8unorm(composite[i]).r;}
     return unpack4x8unorm(auxiliary[i]).r;
 }
 fn srgb(v:vec3<f32>)->vec3<f32>{return select(1.055*pow(max(v,vec3<f32>(0.0)),vec3<f32>(1.0/2.4))-0.055,v*12.92,v<=vec3<f32>(0.0031308));}
-@compute @workgroup_size(8,8)
-fn present(@builtin(global_invocation_id) p:vec3<u32>){
+fn display(p:vec3<u32>){
     if(any(p.xy>=vec2<u32>(u.settings.x))){return;}
     let at=vec2<i32>(p.xy);let i=p.y*u.settings.x+p.x;let v=unpack4x8unorm(composite[i]);
     let channel=u.ids.w;
@@ -35,3 +35,12 @@ fn present(@builtin(global_invocation_id) p:vec3<u32>){
     textureStore(out0,at,a);
     if(channel==1u||channel==2u||channel==3u||channel==4u){textureStore(out1,at,b);}
 }
+@compute @workgroup_size(8,8)
+fn present(@builtin(workgroup_id) g:vec3<u32>,@builtin(local_invocation_id) l:vec3<u32>){
+    if(u.settings.x<=1024u){display(vec3<u32>(g.xy*8u+l.xy,0u));return;}
+    let tile=g.y*64u+g.x;if(tile>=tiles[3]){return;}
+    let id=tiles[4u+tile];let columns=(u.settings.x+7u)/8u;
+    display(vec3<u32>(vec2<u32>(id%columns,id/columns)*8u+l.xy,0u));
+}
+@compute @workgroup_size(8,8)
+fn present_full(@builtin(global_invocation_id) p:vec3<u32>){display(p);}

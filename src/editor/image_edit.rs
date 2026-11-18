@@ -601,6 +601,7 @@ pub(super) fn update(
                 | Action::Open(_)
                 | Action::OpenImageTab(_)
                 | Action::ViewImage(_)
+                | Action::EditBrowserImage(..)
                 | Action::ViewModel(_)
                 | Action::CloseImageTab(_)
         ) {
@@ -609,6 +610,7 @@ pub(super) fn update(
             state.color_picker = None;
             state.layers.form = None;
             state.layers.menu = false;
+            state.layers.context_menu_y = None;
             state.layers.blend_menu = false;
         }
         if let Some(PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id)) =
@@ -694,6 +696,7 @@ pub(super) fn update(
                 state.color_picker = None;
                 state.layers.form = None;
                 state.layers.menu = false;
+                state.layers.context_menu_y = None;
                 state.layers.blend_menu = false;
                 if let Some(session) = state.sessions.get_mut(&id) {
                     session.editing = false;
