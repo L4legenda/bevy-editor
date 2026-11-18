@@ -6,6 +6,8 @@ pub fn kernel() {
     use sha2::{Digest, Sha256};
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // Apple Clang does not provide OpenMP in the default macOS toolchain.
+    let openmp = env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos");
     let archive = root.join("vendor/headers.zip");
     let bytes = fs::read(&archive).expect("vendored native UV headers");
     let hash = format!("{:x}", Sha256::digest(&bytes));
@@ -18,13 +20,24 @@ pub fn kernel() {
         hash,
         "Native UV header archive checksum"
     );
-    let headers = out.join(format!("headers-{}", &hash[..16]));
+    let headers = out.join(if openmp {
+        format!("headers-{}", &hash[..16])
+    } else {
+        format!("headers-{}-serial", &hash[..16])
+    });
     if !headers.join(".complete").is_file() {
         fs::create_dir_all(&headers).unwrap();
         zip::ZipArchive::new(std::io::Cursor::new(bytes))
             .unwrap()
             .extract(&headers)
             .expect("extract native headers");
+        if !openmp {
+            // OpenABF uses OpenMP pragmas but does not call the OpenMP API.
+            let abf = headers.join("OpenABF/ABF.hpp");
+            let source = fs::read_to_string(&abf).expect("read OpenABF header");
+            fs::write(abf, source.replace("#include <omp.h>", ""))
+                .expect("prepare OpenABF header for serial compilation");
+        }
         fs::write(headers.join(".complete"), &hash).unwrap();
     }
     let p = root.join("vendor/partuv/src");
@@ -85,7 +98,7 @@ pub fn kernel() {
             .flag("/openmp")
             .flag("/permissive-")
             .flag("/Zc:__cplusplus");
-    } else {
+    } else if openmp {
         c.flag("-fopenmp");
     }
     let tool = c.get_compiler();
@@ -134,10 +147,12 @@ pub fn kernel() {
     )
     .unwrap();
     c.compile("bevy_partuv");
-    println!(
-        "cargo:rustc-link-lib={}",
-        if msvc { "vcomp" } else { "gomp" }
-    );
+    if openmp {
+        println!(
+            "cargo:rustc-link-lib={}",
+            if msvc { "vcomp" } else { "gomp" }
+        );
+    }
     println!("cargo:rerun-if-changed=cpp");
     println!("cargo:rerun-if-changed=vendor");
 }

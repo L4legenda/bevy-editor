@@ -102,10 +102,17 @@ fn round_native_window(window: &winit::window::Window) {
 }
 
 #[derive(Resource, Default)]
-struct ChromeState {
+pub(crate) struct ChromeState {
     maximized: bool,
     owns_cursor: bool,
     previous_cursor: Option<CursorIcon>,
+}
+
+impl ChromeState {
+    pub(crate) fn set_maximized(&mut self, window: &mut Window, maximized: bool) {
+        self.maximized = maximized;
+        window.set_maximized(maximized);
+    }
 }
 
 #[derive(Component)]
@@ -235,7 +242,12 @@ pub(crate) fn resize_edges(commands: &mut Commands, root: Entity) {
     }
 }
 
-fn native_maximized(entity: Entity, fallback: bool) -> bool {
+fn native_maximized(entity: Entity, window: &Window, fallback: bool) -> bool {
+    // Winit temporarily adds a title bar to query zoom for a borderless macOS
+    // window. Doing so can interrupt a mouse click while AppKit lays it out.
+    if cfg!(target_os = "macos") && !window.decorations {
+        return fallback;
+    }
     WINIT_WINDOWS.with_borrow(|windows| {
         windows
             .get_window(entity)
@@ -244,8 +256,8 @@ fn native_maximized(entity: Entity, fallback: bool) -> bool {
 }
 
 fn toggle_maximized(window: &mut Window, state: &mut ChromeState, entity: Entity) {
-    state.maximized = !native_maximized(entity, state.maximized);
-    window.set_maximized(state.maximized);
+    let maximized = !native_maximized(entity, window, state.maximized);
+    state.set_maximized(window, maximized);
 }
 
 fn control_activated(
@@ -325,7 +337,7 @@ fn resize_pressed(
         return;
     };
     let (entity, window) = &mut *window;
-    if !window.resizable || native_maximized(*entity, state.maximized) {
+    if !window.resizable || native_maximized(*entity, window, state.maximized) {
         return;
     }
     event.propagate(false);
@@ -363,7 +375,7 @@ fn refresh(
     focus: Option<Res<InputFocus>>,
 ) {
     let (window_entity, window, cursor) = *window;
-    state.maximized = native_maximized(window_entity, state.maximized);
+    state.maximized = native_maximized(window_entity, window, state.maximized);
     for (entity, action, icon, hover, pressed, mut background, mut border, label) in &mut controls {
         let highlighted = hover.get() || pressed;
         background.set_if_neq(BackgroundColor(if highlighted {

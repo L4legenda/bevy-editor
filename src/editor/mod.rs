@@ -1220,10 +1220,11 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut editor: ResMut<Editor>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
+    mut chrome: ResMut<crate::window_chrome::ChromeState>,
     render_worker: Option<Res<render_worker::RenderWorker>>,
 ) {
     if render_worker.is_none() {
-        window.set_maximized(true);
+        chrome.set_maximized(&mut window, true);
     }
     commands.insert_resource(browser::Browser::new(&mut editor.project));
     commands.insert_resource(viewport::Surface::new(&mut images));

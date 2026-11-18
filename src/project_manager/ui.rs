@@ -129,6 +129,7 @@ fn button(
         Action::New => Some(Glyph::Plus),
         Action::Import
         | Action::Open(_)
+        | Action::OpenSelected
         | Action::PickOpen
         | Action::PickParent
         | Action::Reveal => Some(Glyph::FolderOpen),
@@ -476,7 +477,7 @@ pub(super) fn setup(
         &mut commands,
         root,
         Node {
-            height: px(34),
+            height: px(42),
             padding: UiRect::horizontal(px(16)),
             border: UiRect::top(px(1)),
             flex_shrink: 0.0,
@@ -494,22 +495,24 @@ pub(super) fn setup(
             ..default()
         },
     );
-    let hints = text(
+    button(
         &mut commands,
         status_bar,
         &font,
-        "Ctrl+N — новый   ·   Ctrl+O — открыть   ·   Enter — открыть   ·   ПКМ — действия проекта",
-        11.0,
-        MUTED,
+        "Убрать из списка",
+        Action::Forget,
+        false,
+        false,
     );
-    commands.entity(hints).insert((
-        Node {
-            min_width: px(0),
-            overflow: Overflow::clip(),
-            ..default()
-        },
-        TextLayout::no_wrap(),
-    ));
+    button(
+        &mut commands,
+        status_bar,
+        &font,
+        "Открыть проект",
+        Action::OpenSelected,
+        true,
+        false,
+    );
     commands.insert_resource(Interface {
         font,
         root,
@@ -1155,6 +1158,8 @@ pub(super) fn styles(
     {
         let disabled = (!control.modal && manager.form.is_some())
             || (manager.context.is_some() && !menu_item)
+            || (manager.selected.is_none()
+                && matches!(control.action, Action::OpenSelected | Action::Forget))
             || (picker.busy() && !matches!(control.action, Action::Close));
         tab.0 = if disabled { -1 } else { 0 };
         if disabled {

@@ -37,7 +37,6 @@
 #include <filesystem>
 
 
-#include <omp.h>
 #include <atomic>
 
 
@@ -57,8 +56,6 @@
 
 #include "AgglomerativeClustering.h"
 
-#include <omp.h>
-// omp_set_nested(1);  
 
 #include <easy/profiler.h>
 

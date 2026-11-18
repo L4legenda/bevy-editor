@@ -30,7 +30,6 @@
 #include <set>
 
 
-#include <omp.h>
 #include <functional>
 #include <optional> 
 

@@ -43,7 +43,9 @@
 #include <CGAL/Surface_mesh.h>
 #include <CGAL/Polygon_mesh_processing/self_intersections.h>
 #include <CGAL/Polygon_mesh_processing/IO/polygon_mesh_io.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <cmath>
 
 #include <iostream>
@@ -91,7 +93,7 @@ void verify_omp() {
         }
     }
 }
-#else
+#elif defined(_OPENMP)
 void verify_omp() {
     std::cout << "OpenMP verification skipped (MSVC OpenMP 2.0)" << std::endl;
 }
@@ -366,8 +368,11 @@ std::vector<UVParts> get_uv( const Eigen::MatrixXi &F,const Eigen::MatrixXd &V, 
     
     double local_total_time = 0.0;
 
-    // Parallel processing of each unwrap method.
-    std::for_each(std::execution::par, unwrap_methods.begin(), unwrap_methods.end(),
+    std::for_each(
+#if defined(__cpp_lib_parallel_algorithm)
+        std::execution::par,
+#endif
+        unwrap_methods.begin(), unwrap_methods.end(),
         [&](const std::pair<std::string, UnwrapFunction>& method_pair) {
             const std::string &func_name = method_pair.first;
             const UnwrapFunction &method = method_pair.second;
@@ -997,11 +1002,13 @@ UVParts pipeline(const std::string &tree_filename, const std::string &mesh_filen
     
     init_log_files();
 
+#ifdef _OPENMP
     omp_set_dynamic(0);
     omp_set_num_threads(CONFIG_num_omp_threads);  
 
     omp_set_nested(1);
     verify_omp();
+#endif
 
 
 
@@ -1121,11 +1128,13 @@ UVParts pipeline(const Eigen::MatrixXd& V,
         
         init_log_files();
     
+#ifdef _OPENMP
         omp_set_dynamic(0);        
         omp_set_num_threads(CONFIG_num_omp_threads);  
         
         omp_set_nested(1);
         verify_omp();
+#endif
     
     
     

@@ -91,6 +91,21 @@ fn mouse_click(app: &mut App, window: Entity, position: Vec2, button: MouseButto
         warm(app);
     }
 }
+
+fn click_control(app: &mut App, window: Entity, label: &str) {
+    let world = app.world_mut();
+    let mut controls = world.query_filtered::<
+        (&AccessibleLabel, &UiGlobalTransform),
+        (With<ui::Control>, Without<bevy::ui::InteractionDisabled>),
+    >();
+    let (_, transform) = controls
+        .iter(world)
+        .find(|(name, _)| name.0 == label)
+        .unwrap_or_else(|| panic!("Missing enabled control: {label}"));
+    let position =
+        transform.affine().translation / world.get::<Window>(window).unwrap().scale_factor();
+    mouse_click(app, window, position, MouseButton::Left);
+}
 fn set(app: &mut App, field: ui::Input, value: &str) {
     let world = app.world_mut();
     let mut query = world.query::<(Entity, &ui::Input, &mut EditableText)>();
@@ -348,7 +363,7 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
             .unwrap()
             .0
     };
-    activate(&mut app, "Мастерская");
+    click_control(&mut app, window, "Мастерская");
     assert!(
         app.world().get_entity(row).is_ok(),
         "Selection must preserve the row and its running effects"
@@ -389,12 +404,35 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         &target,
         &output.join("10-context-menu-at-edge.png"),
     );
-    activate(&mut app, "Открыть");
+    click_control(&mut app, window, "Открыть");
     assert_eq!(
         app.world().resource::<Manager>().selected,
         selected,
         "The context action must open its target project"
     );
+    for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
+        child.wait().unwrap();
+    }
+    click_control(&mut app, window, "Моя первая сцена");
+    assert_eq!(
+        app.world().resource::<Manager>().selected.as_ref(),
+        Some(&file)
+    );
+    click_control(&mut app, window, "Убрать из списка");
+    let manager = app.world().resource::<Manager>();
+    assert_eq!(manager.recent.projects.len(), 1);
+    assert_eq!(manager.selected, selected);
+    assert!(EditorProject::load(&file).is_ok());
+    assert_eq!(
+        RecentProjects::read(&manager.registry)
+            .unwrap()
+            .projects
+            .len(),
+        1
+    );
+
+    click_control(&mut app, window, "Открыть проект");
+    assert_eq!(app.world().resource::<Manager>().selected, selected);
     for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
         child.wait().unwrap();
     }

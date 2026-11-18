@@ -34,6 +34,7 @@ enum Action {
     Context(PathBuf, Vec2),
     DismissContext,
     Open(PathBuf),
+    OpenSelected,
     Favorite,
     Forget,
     Reveal,
@@ -309,6 +310,7 @@ fn actions(
                     | Action::Select(_)
                     | Action::Context(_, _)
                     | Action::Open(_)
+                    | Action::OpenSelected
                     | Action::Favorite
                     | Action::Forget
                     | Action::Reveal
@@ -366,6 +368,13 @@ fn actions(
             Action::Open(file) => {
                 if let Err(error) = manager.open(file) {
                     manager.error(error);
+                }
+            }
+            Action::OpenSelected => {
+                if let Some(file) = manager.selected.clone()
+                    && let Err(error) = manager.open(&file)
+                {
+                    manager.error(format!("Не удалось открыть проект: {error}"));
                 }
             }
             Action::Submit => {

@@ -37,7 +37,6 @@
 #include <filesystem>
 
 
-#include <omp.h>
 #include <atomic>
 
 

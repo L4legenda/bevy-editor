@@ -66,9 +66,9 @@ fn destination_available(path: &Path) -> io::Result<()> {
     }
 }
 
-fn move_destination_available(source: &Path, destination: &Path) -> io::Result<()> {
+fn move_destination_available(_source: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(windows)]
-    if destination.exists() && source.canonicalize()? == destination.canonicalize()? {
+    if destination.exists() && _source.canonicalize()? == destination.canonicalize()? {
         return Ok(());
     }
     destination_available(destination)
