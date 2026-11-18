@@ -1,4 +1,4 @@
-//! The pencil cursor uses the native dab coverage, cached once per size/shape.
+//! Pixel-tool cursors use native dab coverage, cached once per size/shape.
 use super::*;
 use photocraft_paint::{BrushContext, BrushSettings, Stroke, StrokePoint};
 
@@ -86,7 +86,7 @@ pub(in crate::editor) fn refresh(
         return;
     };
     material.pencil_rect = Vec4::ZERO;
-    if viewer.edit.tool != PhotoTool::Pencil
+    if !viewer.edit.pixel_tool()
         || !viewer.edit.editing(editor.viewing_image)
         || !viewer.cursor_owned
         || viewer.brush_cursor.is_none()
@@ -105,7 +105,7 @@ pub(in crate::editor) fn refresh(
         .edit
         .snap_point((position - image.min) / image.size() * dimensions.as_vec2());
     let size = viewer.edit.size.round().clamp(1.0, 256.0) as u16;
-    let square = viewer.edit.pencil_shape == super::super::edit::PencilShape::Square;
+    let square = viewer.edit.pixel_shape() == super::super::edit::PixelShape::Square;
     if !cache.prepare(size, square, &mut images) {
         return;
     }
@@ -118,7 +118,13 @@ pub(in crate::editor) fn refresh(
         mask.rect.width() as f32,
         mask.rect.height() as f32,
     );
-    let [r, g, b, a] = viewer.edit.color();
+    // Erasing has no paint colour: use a neutral footprint regardless of the
+    // foreground swatch. The stencil is read-only and never touches layer pixels.
+    let [r, g, b, a] = if viewer.edit.tool == PhotoTool::Eraser {
+        [1.0, 1.0, 1.0, 0.6]
+    } else {
+        viewer.edit.color()
+    };
     material.pencil_color = Vec4::from_array(
         Color::srgba(r, g, b, (a * viewer.edit.opacity).clamp(0.35, 0.85))
             .to_linear()

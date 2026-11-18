@@ -20,6 +20,8 @@ mod eyedropper;
 mod image_layers;
 #[path = "image_layer_drag_tests.rs"]
 mod layer_drag;
+#[path = "image_layer_rename_tests.rs"]
+mod layer_rename;
 #[path = "image_layer_ux_tests.rs"]
 mod layer_ux;
 #[path = "image_paint_tests.rs"]
@@ -38,6 +40,8 @@ mod pixel_eraser;
 mod selections;
 #[path = "image_color_tests.rs"]
 mod tool_colors;
+#[path = "image_color_drop_tests.rs"]
+mod color_dropping;
 
 struct Fixture(PathBuf);
 

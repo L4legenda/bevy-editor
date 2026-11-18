@@ -98,6 +98,7 @@ pub(super) use drawer::{
 };
 pub(super) use icons::SvgIconsPlugin;
 pub(super) use image_viewer::edit::layers::ui::drag_ui::fx::LayerDragFxPlugin;
+pub(super) use image_viewer::edit::color_drop::{ColorDropPlugin, input as color_drop_input};
 pub(super) use image_viewer::edit::layers::ui::drag_ui::{
     LayerDrag, input as drag_photo_layers, visuals as refresh_photo_layer_drag,
 };
@@ -1287,6 +1288,7 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
     mut focus: ResMut<InputFocus>,
     mut messages: MessageWriter<Action>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
+    color_drop: Option<Res<image_viewer::edit::color_drop::ColorDrop>>,
 ) {
     // Bevy's Button emits Activate for secondary clicks as well. Reserve those
     // for context menus even when press and release arrive in the same frame.
@@ -1297,6 +1299,9 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
         return;
     }
     let entity = activate.event_target();
+    if color_drop.as_ref().is_some_and(|drag| drag.suppresses(entity)) {
+        return;
+    }
     if !EXPLICIT && entries.contains(entity) {
         return;
     }
@@ -1341,6 +1346,9 @@ pub(super) fn shortcuts(
         return;
     }
     if layer_drag.as_ref().is_some_and(|drag| drag.capturing()) {
+        return;
+    }
+    if image_viewer.as_ref().is_some_and(|viewer| viewer.edit.color_dragging) {
         return;
     }
     if scrub.as_ref().is_some_and(|scrub| scrub.capturing())

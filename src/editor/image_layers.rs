@@ -791,6 +791,9 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         }
         Command(command) => {
             if let Some(spec) = photocraft_engine::commands::find(command) {
+                if command == "layer.renameLayer" {
+                    state.layers.settings_open = false;
+                }
                 let form = Form::new(spec, doc);
                 if form.fields.is_empty() {
                     call = Some((command, form.params));

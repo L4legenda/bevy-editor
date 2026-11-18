@@ -507,7 +507,7 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
             ("Узор…", Command("layer.newFillLayer.pattern")),
         ],
         _ => vec![
-            ("Переименовать…", Command("layer.renameLayer")),
+            ("Переименовать", Command("layer.renameLayer")),
             ("Дублировать", Quick("layer.duplicate")),
             ("Объединить с нижним", Quick("layer.mergeDown")),
             ("Создать…", Category("Создать")),

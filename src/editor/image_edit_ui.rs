@@ -43,6 +43,7 @@ pub(in crate::editor) struct EditUi {
     size_title: Entity,
     hardness_group: Entity,
     pencil_shapes: Entity,
+    shape_items: [(Entity, &'static str); 2],
     size_shown: bool,
     size_input: Entity,
     size_original: Option<f32>,
@@ -589,16 +590,16 @@ pub(in crate::editor) fn setup(
     );
     text(commands, pencil_shapes, font_handle, "Форма", 11.0, MUTED);
     let shape_buttons = node(commands, pencil_shapes, row(4.0));
-    for (title, shape) in [
-        ("Круг", PencilShape::Round),
-        ("Квадрат", PencilShape::Square),
-    ] {
+    let shape_items = [
+        ("Круг", PixelShape::Round),
+        ("Квадрат", PixelShape::Square),
+    ].map(|(title, shape)| {
         let item = button(
             commands,
             shape_buttons,
             font_handle,
             title,
-            Action::ImageEdit(EditAction::PencilShape(shape)),
+            Action::ImageEdit(EditAction::PixelShape(shape)),
             Look::Regular,
         );
         commands
@@ -608,15 +609,16 @@ pub(in crate::editor) fn setup(
             commands,
             item,
             match shape {
-                PencilShape::Round => {
-                    "Круглый отпечаток из целых пикселей. Предпросмотр показывает, какие пиксели закрасит карандаш."
+                PixelShape::Round => {
+                    "Круглый отпечаток из целых пикселей. Предпросмотр показывает область действия инструмента."
                 }
-                PencilShape::Square => {
-                    "Квадратный отпечаток без сглаживания. Закрашивает все пиксели внутри квадрата выбранного размера."
+                PixelShape::Square => {
+                    "Квадратный отпечаток без сглаживания. Действует на все пиксели внутри квадрата выбранного размера."
                 }
             },
         );
-    }
+        (item, title)
+    });
     let mut hardness_group = Entity::PLACEHOLDER;
     for (title, binding, range) in [
         ("Жёсткость", Binding::Hardness, (0.0, 1.0)),
@@ -805,16 +807,6 @@ pub(in crate::editor) fn setup(
         commands.entity(item).insert(AccessibleLabel(label.into()));
         icons::themed(commands, item, icons::Glyph::Eraser, 16.0);
         text(commands, item, font_handle, label, 12.0, TEXT);
-    }
-    for (glyph, label, tool) in [
-        (icons::Glyph::PaintBucket, "Заливка · G", PhotoTool::Fill),
-        (
-            icons::Glyph::Pipette,
-            "Пипетка · I / Alt",
-            PhotoTool::Eyedropper,
-        ),
-    ] {
-        tool_button(commands, tools, glyph, label, tool);
     }
     let paint_menu = surface(
         commands,
@@ -1048,6 +1040,7 @@ pub(in crate::editor) fn setup(
         size_title,
         hardness_group,
         pencil_shapes,
+        shape_items,
         size_shown: false,
         size_input,
         size_original: None,
@@ -1276,8 +1269,8 @@ pub(in crate::editor) fn refresh(
         .entity(ui.brush_rail)
         .insert(rail_fx::RevealTarget(editing && viewer.edit.sizeable()));
     for (entity, visible) in [
-        (ui.hardness_group, viewer.edit.tool != PhotoTool::Pencil),
-        (ui.pencil_shapes, viewer.edit.tool == PhotoTool::Pencil),
+        (ui.hardness_group, !viewer.edit.pixel_tool()),
+        (ui.pencil_shapes, viewer.edit.pixel_tool()),
     ] {
         if let Ok(mut node) = nodes.get_mut(entity) {
             node.display = if visible {
@@ -1286,6 +1279,16 @@ pub(in crate::editor) fn refresh(
                 Display::None
             };
         }
+    }
+    for (entity, title) in ui.shape_items {
+        let tool = if viewer.edit.tool == PhotoTool::Eraser {
+            "ластика"
+        } else {
+            "карандаша"
+        };
+        commands
+            .entity(entity)
+            .insert(AccessibleLabel(format!("Форма {tool} · {title}")));
     }
     if let Ok(mut group) = nodes.get_mut(ui.size_group) {
         group.display = if editing && viewer.edit.sizeable() {
@@ -1538,7 +1541,7 @@ pub(in crate::editor) fn refresh(
         viewer.brush_cursor.filter(|_| !viewer.native_brush_cursor),
         position,
         viewer.edit.resizing_brush().then_some(viewer.edit.size),
-        viewer.edit.tool == PhotoTool::Pencil,
+        viewer.edit.pixel_tool(),
     );
     let pipette = canvas.single().ok().and_then(|(node, transform)| {
         let min =

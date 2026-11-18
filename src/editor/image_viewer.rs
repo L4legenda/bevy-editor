@@ -749,6 +749,10 @@ pub(in crate::editor) fn update(
         });
     }
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
+    if viewer.edit.color_dragging {
+        viewer.gesture = None;
+        return;
+    }
     let adjusting_size = (viewer.edit.resizing_brush()
         || (!hovering_controls && !pressed_controls && !viewer.edit.mode_menu_dismissed))
         && edit::resize_brush(

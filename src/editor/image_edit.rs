@@ -17,6 +17,8 @@ pub(in crate::editor) mod picker_ui;
 pub(in crate::editor) use color::{ColorComponent, ColorTarget};
 pub(in crate::editor) use picker_ui::ColorPickerScroll;
 pub(in crate::editor) use picker_ui::{input as color_input, refresh as refresh_color_picker};
+#[path = "image_color_drop.rs"]
+pub(in crate::editor) mod color_drop;
 #[path = "image_brush_size.rs"]
 mod brush_size;
 pub(super) use brush_size::pointer as resize_brush;
@@ -35,7 +37,7 @@ pub(in crate::editor) enum EraserMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::editor) enum PencilShape {
+pub(in crate::editor) enum PixelShape {
     #[default]
     Round,
     Square,
@@ -56,7 +58,7 @@ pub(in crate::editor) enum EditAction {
     Tool(PhotoTool),
     EraserMode(EraserMode),
     DrawingTool,
-    PencilShape(PencilShape),
+    PixelShape(PixelShape),
     PaintMenu,
     EraserMenu,
     Save,
@@ -144,7 +146,8 @@ pub(in crate::editor) struct State {
     eraser_size: f32,
     pixel_eraser_size: f32,
     pub eraser_mode: EraserMode,
-    pub pencil_shape: PencilShape,
+    pub pencil_shape: PixelShape,
+    pub pixel_eraser_shape: PixelShape,
     pub tool: PhotoTool,
     pub size: f32,
     pub hardness: f32,
@@ -154,6 +157,7 @@ pub(in crate::editor) struct State {
     pub error: Option<String>,
     pub background: Option<[f32; 4]>,
     pub color_picker: Option<color::Picker>,
+    pub color_dragging: bool,
     pub swatches: Vec<[f32; 4]>,
 }
 
@@ -207,7 +211,7 @@ impl State {
                 self.tool == PhotoTool::Eraser && self.eraser_mode == mode
             }
             EditAction::DrawingTool => matches!(self.tool, PhotoTool::Brush | PhotoTool::Pencil),
-            EditAction::PencilShape(shape) => self.pencil_shape == shape,
+            EditAction::PixelShape(shape) => self.pixel_shape() == shape,
             EditAction::PaintMenu => self.paint_menu && self.tool_menu == ToolMenu::Paint,
             EditAction::EraserMenu => self.paint_menu && self.tool_menu == ToolMenu::Eraser,
             EditAction::SizeMenu => self.size_menu,
@@ -330,8 +334,14 @@ impl State {
     }
     pub fn pixel_square(&self) -> bool {
         self.pixel_tool()
-            && (self.size.round().max(1.0) <= 3.0
-                || self.tool == PhotoTool::Pencil && self.pencil_shape == PencilShape::Square)
+            && (self.size.round().max(1.0) <= 3.0 || self.pixel_shape() == PixelShape::Square)
+    }
+    pub fn pixel_shape(&self) -> PixelShape {
+        if self.tool == PhotoTool::Eraser {
+            self.pixel_eraser_shape
+        } else {
+            self.pencil_shape
+        }
     }
     pub fn snap_point(&self, point: Vec2) -> Vec2 {
         if self.pixel_tool() {
@@ -404,7 +414,7 @@ impl State {
             erase: self.tool == PhotoTool::Eraser,
             aliased: pencil,
             pressure_size: !pencil,
-            square: self.tool == PhotoTool::Pencil && self.pencil_shape == PencilShape::Square,
+            square: pencil && self.pixel_shape() == PixelShape::Square,
             ..Default::default()
         }
     }
@@ -580,7 +590,7 @@ pub(super) fn update(
                     | EditAction::Size(_)
                     | EditAction::Hardness(_)
                     | EditAction::BrushOpacity(_)
-                    | EditAction::PencilShape(_)
+                    | EditAction::PixelShape(_)
             )
         ) {
             state.size_menu = false;
@@ -740,8 +750,12 @@ pub(super) fn update(
                 state.paint_menu = false;
             }
             EditAction::DrawingTool => state.select_tool(state.drawing_tool),
-            EditAction::PencilShape(shape) => {
-                state.pencil_shape = shape;
+            EditAction::PixelShape(shape) => {
+                if state.tool == PhotoTool::Eraser {
+                    state.pixel_eraser_shape = shape;
+                } else {
+                    state.pencil_shape = shape;
+                }
                 state.gesture = None;
             }
             EditAction::PaintMenu | EditAction::EraserMenu => {

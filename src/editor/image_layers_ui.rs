@@ -97,6 +97,8 @@ struct LayerRow {
 #[derive(Component)]
 pub(in crate::editor) struct FormInput(usize);
 #[derive(Component)]
+pub(in crate::editor) struct InlineName;
+#[derive(Component)]
 pub(in crate::editor) struct LayerSearch;
 #[derive(Component)]
 pub(in crate::editor) struct CommandSearch;
@@ -534,6 +536,9 @@ fn fill(
 
 pub(in crate::editor) fn input(
     keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
     editor: Res<Editor>,
     mut viewer: ResMut<ImageViewer>,
     inputs: Query<(
@@ -542,10 +547,12 @@ pub(in crate::editor) fn input(
         Option<&FormInput>,
         Has<LayerSearch>,
         Has<CommandSearch>,
+        Has<InlineName>,
     )>,
     mut focus: ResMut<InputFocus>,
     mut actions: MessageWriter<Action>,
     mut colour_was_open: Local<bool>,
+    mut rename_confirm: Local<Option<Entity>>,
 ) {
     // The colour picker closes earlier in the schedule. Consume the same Escape
     // here too, so one key press cannot also dismiss its parent property sheet.
@@ -553,13 +560,41 @@ pub(in crate::editor) fn input(
     let colour_handled = colour_open || *colour_was_open;
     *colour_was_open = colour_open;
     if !viewer.edit.editing(editor.viewing_image) || colour_handled {
+        *rename_confirm = None;
         return;
     }
-    for (entity, input, field, filter, search) in &inputs {
-        if focus.get() != Some(entity) {
+    let mut rename = None;
+    let renaming = viewer
+        .edit
+        .layers
+        .form
+        .as_ref()
+        .is_some_and(|f| f.command == "layer.renameLayer");
+    for (entity, input, field, filter, search, inline) in &inputs {
+        if inline && !renaming {
+            continue;
+        }
+        if focus.get() != Some(entity) && !inline {
             continue;
         }
         let value = input.value().to_string();
+        if inline {
+            let unchanged = viewer
+                .edit
+                .layers
+                .form
+                .as_ref()
+                .and_then(|form| form.params["layer"].as_u64())
+                .and_then(|id| {
+                    viewer
+                        .edit
+                        .document(editor.viewing_image)?
+                        .document
+                        .layer(LayerId(id))
+                })
+                .is_some_and(|layer| layer.name == value.trim());
+            rename = Some((entity, value.trim().is_empty() || unchanged));
+        }
         if let Some(field) = field
             && let Some(form) = &mut viewer.edit.layers.form
             && let Some(field) = form.fields.get_mut(field.0)
@@ -576,6 +611,42 @@ pub(in crate::editor) fn input(
             viewer.edit.layers.search = value;
         }
     }
+    if renaming {
+        if let Some((entity, discard)) = rename {
+            let cancel = keys.just_pressed(KeyCode::Escape);
+            let outside = mouse.any_just_pressed([
+                MouseButton::Left,
+                MouseButton::Right,
+                MouseButton::Middle,
+            ]) && window.cursor_position().is_some_and(|cursor| {
+                geometry.get(entity).is_ok_and(|(node, transform)| {
+                    !node.contains_point(*transform, cursor / node.inverse_scale_factor())
+                })
+            });
+            let confirm = *rename_confirm == Some(entity) || focus.get() != Some(entity) || outside;
+            if cancel || confirm {
+                actions.write(act(if cancel || discard {
+                    LayerAction::Cancel
+                } else {
+                    LayerAction::Apply
+                }));
+                if focus.get() == Some(entity) {
+                    focus.clear();
+                }
+                *rename_confirm = None;
+            } else if keys.just_pressed(KeyCode::Enter) {
+                // Native text edits run in PostUpdate. Read them next frame so a
+                // final character and Enter in the same event batch are both kept.
+                *rename_confirm = Some(entity);
+            }
+        } else {
+            // A filtered/deleted row cannot leave an invisible form blocking tools.
+            actions.write(act(LayerAction::Cancel));
+            *rename_confirm = None;
+        }
+        return;
+    }
+    *rename_confirm = None;
     if keys.just_pressed(KeyCode::Escape)
         && (viewer.edit.layers.menu
             || viewer.edit.layers.form.is_some()
@@ -613,6 +684,8 @@ pub(in crate::editor) fn refresh(
     mut uploads: ResMut<TextureUploads>,
     thumbnail_nodes: Query<&LayerThumbnail>,
     mut nodes: Query<&mut Node>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    renames: Query<(), With<InlineName>>,
 ) {
     let state = &viewer.edit.layers;
     for (entity, mut input) in &mut filters {
@@ -732,13 +805,21 @@ pub(in crate::editor) fn refresh(
         state.blend_menu,
         editing
     );
-    let rebuild = signature != ui.signature && !state.fill_drag;
+    // Saving on an outside press must not despawn the button under that press:
+    // it still needs its release to select a different layer or open a menu.
+    let finishing_rename = !renames.is_empty()
+        && !state
+            .form
+            .as_ref()
+            .is_some_and(|f| f.command == "layer.renameLayer")
+        && mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle]);
+    let rebuild = signature != ui.signature && !state.fill_drag && !finishing_rename;
     if rebuild {
         for host in [ui.host, ui.basic, ui.details, ui.lock_controls] {
             commands.entity(host).despawn_related::<Children>();
         }
         if editing && let Some(doc) = doc {
-            panel(
+            let rename = panel(
                 &mut commands,
                 ui.host,
                 ui.basic,
@@ -751,6 +832,9 @@ pub(in crate::editor) fn refresh(
                 &mut images,
                 &mut uploads,
             );
+            if let Some(entity) = rename {
+                focus.set(entity, bevy::input_focus::FocusCause::Auto);
+            }
         }
         ui.signature = signature;
     }
@@ -797,7 +881,12 @@ pub(in crate::editor) fn refresh(
         };
         ui.popup_context = context;
         commands.entity(ui.popup).despawn_related::<Children>();
-        let show = editing && (state.menu || state.form.is_some());
+        let show = editing
+            && (state.menu
+                || state
+                    .form
+                    .as_ref()
+                    .is_some_and(|f| f.command != "layer.renameLayer"));
         commands
             .entity(ui.popup)
             .entry::<Node>()
@@ -844,7 +933,8 @@ fn panel(
     thumbs: &mut HashMap<(u64, bool, bool), (Option<photocraft_doc::Layer>, Handle<Image>)>,
     images: &mut Assets<Image>,
     uploads: &mut TextureUploads,
-) {
+) -> Option<Entity> {
+    let mut rename_input = None;
     let tree_host = host;
     let host = basic;
     if doc.editing_smart() {
@@ -1181,6 +1271,13 @@ fn panel(
             .observe(activate_row)
             .observe(select_row)
             .observe(drag_ui::press);
+        if state.form.as_ref().is_some_and(|form| {
+            form.command == "layer.renameLayer" && form.params["layer"].as_u64() == Some(layer.id.0)
+        }) {
+            // TextInput lets Enter bubble for form submission. A Button ancestor
+            // would interpret it as a row click, rebuild the input and lose edits.
+            commands.entity(select).remove::<(Button, TabIndex)>();
+        }
         ux::help(
             commands,
             select,
@@ -1225,14 +1322,47 @@ fn panel(
             },
         );
         commands.entity(label).insert(Pickable::IGNORE);
-        text(
-            commands,
-            label,
-            font,
-            &format!("{}{}", if layer.clipped { "↳ " } else { "" }, layer.name),
-            12.0,
-            TEXT,
-        );
+        if let Some(form) = state.form.as_ref().filter(|f| {
+            f.command == "layer.renameLayer" && f.params["layer"].as_u64() == Some(layer.id.0)
+        }) && let Some((index, field)) = form
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.key == "name")
+        {
+            let input = super::super::interface::input(commands, label, font, "Название слоя");
+            let mut value = EditableText::new(&field.text);
+            value.queue_edit(bevy::text::TextEdit::SelectAll);
+            commands
+                .entity(input)
+                .insert((InlineName, FormInput(index), value, BorderColor::all(FOCUS)))
+                .entry::<Node>()
+                .and_modify(|mut n| {
+                    n.height = px(22);
+                    n.padding = UiRect::axes(px(4), px(2));
+                    n.border_radius = BorderRadius::all(px(3));
+                });
+            // Text selection must not activate or begin dragging the parent row.
+            commands
+                .entity(input)
+                .observe(|mut event: On<PointerPress>| event.propagate(false))
+                .observe(|mut event: On<PointerClick>| event.propagate(false));
+            ux::help(
+                commands,
+                input,
+                "Название слоя. Enter — сохранить, Esc — отменить.",
+            );
+            rename_input = Some(input);
+        } else {
+            text(
+                commands,
+                label,
+                font,
+                &format!("{}{}", if layer.clipped { "↳ " } else { "" }, layer.name),
+                12.0,
+                TEXT,
+            );
+        }
         text(
             commands,
             label,
@@ -1395,6 +1525,7 @@ fn panel(
         text(commands, host, font, "Слои не найдены", 12.0, MUTED);
     }
     thumbs.retain(|(id, _, _), _| doc.document.layer(LayerId(*id)).is_some());
+    rename_input
 }
 // The helper name differs from the local selection node variable.
 fn select_row(

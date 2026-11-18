@@ -275,6 +275,8 @@ impl Form {
             }
             if spec.id == "layer.renameLayer" {
                 existing = json!({"name": layer.name});
+                // Inline editing remains attached to this row even if selection changes.
+                params["layer"] = json!(layer.id.0);
             }
             // A dialog is pinned to the layer it opened for; a later selection cannot redirect it.
             if !spec.params.contains("no layer: every selected")

@@ -85,6 +85,7 @@ fn pair_button(
         }
         .into(),
     ));
+    super::color_drop::attach(commands, button, target);
     solid(
         commands,
         button,
@@ -200,6 +201,7 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, tools: Entity, font: 
 
     let ui = build(commands, root, font, foreground, background, false);
     commands.insert_resource(ui);
+    super::color_drop::setup(commands, root, font);
 }
 
 pub(in crate::editor) fn setup_text(

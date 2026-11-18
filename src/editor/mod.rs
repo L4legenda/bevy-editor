@@ -1026,6 +1026,7 @@ impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         area_selection::register(app);
         app.add_plugins(ui::LayerDragFxPlugin);
+        app.add_plugins(ui::ColorDropPlugin);
         app.add_plugins(image_brush_rail_fx::BrushRailFxPlugin);
         wireframe::register(app);
         if !app.is_plugin_added::<crate::HdriPlugin>() {
@@ -1099,8 +1100,10 @@ impl Plugin for EditorPlugin {
                 (
                     ui::browser_actions,
                     ui::resize_photo_editor,
+                    ui::color_drop_input,
                     ui::photo_editor_input,
                     ui::photo_color_input,
+                    ui::photo_layers_input,
                     ui::view_images,
                     ui::browser_context_actions,
                 )
@@ -1149,7 +1152,6 @@ impl Plugin for EditorPlugin {
                     ui::refresh_photo_layer_drag
                         .after(ui::refresh_photo_layers)
                         .after(ui::image_viewer_cursor),
-                    ui::photo_layers_input.before(ui::refresh_photo_layers),
                     close_editor,
                 ),
                 (

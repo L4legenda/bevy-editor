@@ -312,6 +312,9 @@ pub(in crate::editor) fn cursor(
     viewer.native_brush_cursor = false;
     viewer.pipette_preview = None;
     let desired = active.then(|| {
+        if viewer.edit.color_dragging {
+            return CursorIcon::from(SystemCursorIcon::Default);
+        }
         let hand = !editing
             || viewer.edit.tool == PhotoTool::Hand
             || keys.pressed(KeyCode::Space)
@@ -373,24 +376,20 @@ pub(in crate::editor) fn cursor(
         };
         let tip = Tip::new(diameter, viewer.edit.pixel_square(), window.scale_factor());
         let pixel_tool = viewer.edit.pixel_tool();
-        let position = resize_center
-            .or(pointer)
-            .map(|cursor| {
-                if resize_center.is_none()
-                    && pixel_tool
-                    && let Some(dimensions) = viewer.dimensions
-                {
-                    let image = viewer.image_rect(dimensions, rect);
-                    let per_pixel = image.size() / dimensions.as_vec2();
-                    let point = (cursor - image.min) / per_pixel;
-                    image.min + viewer.edit.snap_point(point) * per_pixel
-                } else {
-                    cursor
-                }
-            });
-        if viewer.edit.tool == PhotoTool::Pencil
-            && let (Some(position), Some(dimensions)) = (position, viewer.dimensions)
-        {
+        let position = resize_center.or(pointer).map(|cursor| {
+            if resize_center.is_none()
+                && pixel_tool
+                && let Some(dimensions) = viewer.dimensions
+            {
+                let image = viewer.image_rect(dimensions, rect);
+                let per_pixel = image.size() / dimensions.as_vec2();
+                let point = (cursor - image.min) / per_pixel;
+                image.min + viewer.edit.snap_point(point) * per_pixel
+            } else {
+                cursor
+            }
+        });
+        if pixel_tool && let (Some(position), Some(dimensions)) = (position, viewer.dimensions) {
             let image = viewer.image_rect(dimensions, rect);
             let half = image.size() / dimensions.as_vec2() * viewer.edit.size * 0.5;
             if (position + half).cmple(image.min).any() || (position - half).cmpge(image.max).any()
@@ -406,8 +405,7 @@ pub(in crate::editor) fn cursor(
             &mut images,
             resize_center.is_some()
                 || viewer.pen_cursor.is_some()
-                || viewer.edit.tool == PhotoTool::Pencil
-                || (pixel_tool && tip.outline()),
+                || pixel_tool,
         );
         viewer.brush_cursor = Some(tip);
         viewer.brush_cursor_position = position;
