@@ -17,10 +17,10 @@ pub(in crate::editor) mod picker_ui;
 pub(in crate::editor) use color::{ColorComponent, ColorTarget};
 pub(in crate::editor) use picker_ui::ColorPickerScroll;
 pub(in crate::editor) use picker_ui::{input as color_input, refresh as refresh_color_picker};
-#[path = "image_color_drop.rs"]
-pub(in crate::editor) mod color_drop;
 #[path = "image_brush_size.rs"]
 mod brush_size;
+#[path = "image_color_drop.rs"]
+pub(in crate::editor) mod color_drop;
 pub(super) use brush_size::pointer as resize_brush;
 #[path = "image_layers.rs"]
 pub(in crate::editor) mod layers;
@@ -69,7 +69,7 @@ pub(in crate::editor) enum EditAction {
     DeleteLayer,
     SelectLayer(usize),
     Visible(usize),
-    Opacity(f32, bool),
+    Opacity(photocraft_doc::LayerId, f32, bool),
     Layers(layers::LayerAction),
     Size(f32),
     SizeMenu,
@@ -131,7 +131,7 @@ pub(in crate::editor) struct State {
     opening: Option<Opening>,
     saving: Option<Saving>,
     gesture: Option<(usize, Gesture)>,
-    opacity_drag: Option<usize>,
+    opacity_drag: Option<(usize, photocraft_doc::LayerId)>,
     pub size_adjust: brush_size::Adjustment,
     pub menu: bool,
     pub paint_menu: bool,
@@ -235,8 +235,8 @@ impl State {
             EditAction::Layers(layers::LayerAction::FieldChoice(index,choice)) => self.layers.form.as_ref()
                 .and_then(|f|f.fields.get(index)).is_some_and(|f| matches!(&f.kind,layers::FieldKind::Choice(values) if values.get(choice).is_some_and(|v|v.as_str().map(str::to_owned).unwrap_or_else(||v.to_string())==f.text))),
             EditAction::Layers(layers::LayerAction::Preview) => self.layers.preview_enabled,
-            EditAction::Layers(layers::LayerAction::BlendMore) => self.layers.blend_more,
-            EditAction::Layers(layers::LayerAction::SetBlend(blend)) => self.document(id).and_then(PhotoDocument::active_layer).is_some_and(|l|l.blend==blend),
+            EditAction::Layers(layers::LayerAction::Blend(layer)) => self.layers.blend_menu == Some(layer),
+            EditAction::Layers(layers::LayerAction::SetBlend(layer, blend)) => self.document(id).and_then(|doc| doc.document.layer(layer)).is_some_and(|l|l.blend==blend),
             EditAction::Layers(layers::LayerAction::ToggleLock(layer)) => self
                 .document(id)
                 .and_then(|doc| doc.document.layer(photocraft_doc::LayerId(layer)))
@@ -308,10 +308,8 @@ impl State {
             EditAction::SizeMenu => self.editing(id) && self.sizeable(),
             EditAction::Layers(layers::LayerAction::PanelSection(section)) => {
                 self.editing(id)
-                    && (matches!(
-                        section,
-                        layers::PanelSection::Search | layers::PanelSection::Layers
-                    ) || doc.is_some_and(|doc| doc.active_layer().is_some()))
+                    && (matches!(section, layers::PanelSection::Search)
+                        || doc.is_some_and(|doc| doc.active_layer().is_some()))
             }
             EditAction::Layers(action) => {
                 self.editing(id) && doc.is_some_and(|doc| layers::ux::enabled(action, doc))
@@ -611,7 +609,7 @@ pub(super) fn update(
             state.layers.form = None;
             state.layers.menu = false;
             state.layers.context_menu_y = None;
-            state.layers.blend_menu = false;
+            state.layers.blend_menu = None;
         }
         if let Some(PendingAction::CloseImageTab(id) | PendingAction::CloseImageEditor(id)) =
             editor.pending
@@ -697,7 +695,7 @@ pub(super) fn update(
                 state.layers.form = None;
                 state.layers.menu = false;
                 state.layers.context_menu_y = None;
-                state.layers.blend_menu = false;
+                state.layers.blend_menu = None;
                 if let Some(session) = state.sessions.get_mut(&id) {
                     session.editing = false;
                 }
@@ -893,16 +891,18 @@ pub(super) fn update(
                     EditAction::AddLayer => session.doc.add_layer(),
                     EditAction::DeleteLayer => session.doc.delete_layer(),
                     EditAction::Visible(index) => session.doc.visibility(index),
-                    EditAction::Opacity(value, final_value) => {
-                        if state.opacity_drag != Some(id) {
-                            session.doc.checkpoint();
-                            state.opacity_drag = Some(id);
+                    EditAction::Opacity(layer, value, final_value) => {
+                        if state.layers.blend_menu != Some(layer)
+                            || session.doc.document.layer(layer).is_none()
+                        {
+                            continue;
                         }
-                        let selected = session.doc.selected.clone();
-                        for layer in selected {
-                            if let Some(layer) = session.doc.document.layer_mut(layer) {
-                                layer.opacity = value.clamp(0.0, 1.0);
-                            }
+                        if state.opacity_drag != Some((id, layer)) {
+                            session.doc.checkpoint();
+                            state.opacity_drag = Some((id, layer));
+                        }
+                        if let Some(layer) = session.doc.document.layer_mut(layer) {
+                            layer.opacity = value.clamp(0.0, 1.0);
                         }
                         session.doc.changed();
                         if final_value {

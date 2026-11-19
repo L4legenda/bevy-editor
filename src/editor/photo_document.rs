@@ -315,15 +315,6 @@ impl PhotoDocument {
             );
         }
     }
-    pub fn rename(&mut self, name: &str) {
-        let name = name.trim();
-        if !name.is_empty() && self.active_layer().is_some_and(|l| l.name != name) {
-            let _ = self.layer_command(
-                "layer.setProps",
-                serde_json::json!({"name": name.chars().take(100).collect::<String>()}),
-            );
-        }
-    }
     pub fn paintable(&self) -> bool {
         let Some(id) = self.active_id() else {
             return false;

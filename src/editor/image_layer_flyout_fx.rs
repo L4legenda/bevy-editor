@@ -34,7 +34,7 @@ impl Plugin for LayerFlyoutFxPlugin {
         app.add_plugins(UiMaterialPlugin::<FlyoutMaterial>::default())
             .add_systems(
                 Update,
-                (animate_panel, animate_rows)
+                (animate_panel, animate_rows, super::animate_blend)
                     .after(super::refresh)
                     .after(crate::editor::ui::refresh),
             );
@@ -82,6 +82,10 @@ pub(super) fn close(
             closed: Some(closed),
         }));
     }
+    disable_interaction(commands, panel);
+}
+
+pub(super) fn disable_interaction(commands: &mut Commands, panel: Entity) {
     commands.queue(move |world: &mut World| {
         let mut pending = vec![panel];
         while let Some(entity) = pending.pop() {
@@ -89,9 +93,14 @@ pub(super) fn close(
                 pending.extend(children.iter());
             }
             if let Ok(mut entity) = world.get_entity_mut(entity) {
-                entity
-                    .insert(Pickable::IGNORE)
-                    .remove::<(TabIndex, Control, Button, bevy::ui_widgets::TextInput)>();
+                entity.insert(Pickable::IGNORE).remove::<(
+                    TabIndex,
+                    Control,
+                    Button,
+                    bevy::ui_widgets::TextInput,
+                    Scroller,
+                    LayerScroll,
+                )>();
             }
         }
     });

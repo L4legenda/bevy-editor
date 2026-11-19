@@ -21,7 +21,6 @@ pub(in crate::editor) enum LayerAction {
     FieldStep(usize, f64),
     Advanced,
     Preview,
-    BlendMore,
     PanelSection(PanelSection),
     Menu,
     ContextMenu(f32),
@@ -47,8 +46,8 @@ pub(in crate::editor) enum LayerAction {
     FilterMask(usize),
     SmartFilter(usize, usize),
     SmartFilterVisible(usize, usize),
-    Blend,
-    SetBlend(photocraft_color::BlendMode),
+    Blend(photocraft_doc::LayerId),
+    SetBlend(photocraft_doc::LayerId, photocraft_color::BlendMode),
     Fill(f32, bool),
     Lock(&'static str),
     ToggleLock(u64),
@@ -69,10 +68,7 @@ pub(in crate::editor) enum LayerAction {
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum PanelSection {
-    Layers,
     Search,
-    Settings,
-    Locks,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,10 +95,7 @@ pub(in crate::editor) struct LayerState {
     pub advanced: bool,
     pub preview_enabled: bool,
     pub preview: Option<FormPreview>,
-    pub blend_more: bool,
     pub search_open: bool,
-    pub settings_open: bool,
-    pub locks_open: bool,
     pub ui_revision: u64,
     pub menu: bool,
     pub context_menu_y: Option<f32>,
@@ -111,7 +104,7 @@ pub(in crate::editor) struct LayerState {
     pub search: String,
     pub filter: String,
     pub form: Option<Form>,
-    pub blend_menu: bool,
+    pub blend_menu: Option<photocraft_doc::LayerId>,
     pub fill_drag: bool,
     pub clipboard: Vec<photocraft_doc::Layer>,
     pub style_clipboard: Option<photocraft_engine::CopiedStyle>,
@@ -135,10 +128,7 @@ pub(in crate::editor) struct FormPreview {
 impl LayerState {
     pub fn section_open(&self, section: PanelSection) -> bool {
         match section {
-            PanelSection::Layers => !self.settings_open,
             PanelSection::Search => self.search_open,
-            PanelSection::Settings => self.settings_open,
-            PanelSection::Locks => self.locks_open,
         }
     }
     pub fn has_filter(&self) -> bool {
@@ -382,21 +372,8 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
     use LayerAction::*;
     state.gesture = None;
     // View-only disclosures keep the existing tree, inputs and scroll position alive.
-    if let PanelSection(section) = action {
-        if matches!(
-            section,
-            self::PanelSection::Layers | self::PanelSection::Settings
-        ) {
-            state.layers.settings_open = matches!(section, self::PanelSection::Settings);
-            return;
-        }
-        let open = match section {
-            self::PanelSection::Layers => return,
-            self::PanelSection::Search => &mut state.layers.search_open,
-            self::PanelSection::Settings => &mut state.layers.settings_open,
-            self::PanelSection::Locks => &mut state.layers.locks_open,
-        };
-        *open ^= true;
+    if let PanelSection(self::PanelSection::Search) = action {
+        state.layers.search_open ^= true;
         state.layers.fill_drag = false;
         return;
     }
@@ -497,7 +474,6 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
     match action {
         FieldNumber(..) | FieldStep(..) | Preview => {}
         Advanced => state.layers.advanced ^= true,
-        BlendMore => state.layers.blend_more ^= true,
         Quick(command) => {
             if state.layers.context_menu_y.take().is_some() {
                 state.layers.menu = false;
@@ -579,7 +555,7 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
                 anchor.is_some() || !state.layers.menu || state.layers.context_menu_y.is_some();
             state.layers.context_menu_y = anchor;
             state.layers.form = None;
-            state.layers.blend_menu = false;
+            state.layers.blend_menu = None;
             state.layers.category = "";
         }
         Category(category) => {
@@ -587,19 +563,20 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             state.layers.search.clear();
             state.layers.menu = true;
             state.layers.form = None;
-            state.layers.blend_menu = false;
+            state.layers.blend_menu = None;
         }
         Cancel => {
             state.layers.context_menu_y = None;
             state.layers.form = None;
             state.layers.menu = false;
-            state.layers.blend_menu = false;
+            state.layers.blend_menu = None;
         }
         Collapse(id) => {
             let expanded = doc.document.layer(LayerId(id)).is_some_and(collapsed);
             call = Some(("layer.setExpanded", json!({"layer":id,"expanded":expanded})));
         }
         Select(index, toggle, range) => {
+            state.layers.blend_menu = None;
             let ids = if range {
                 let rows = tree_rows(doc, &state.layers);
                 rows.iter()
@@ -690,14 +667,18 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
                 json!({"layers": if doc.selected.contains(&LayerId(from)) { doc.selected.iter().map(|l| l.0).collect::<Vec<_>>() } else {vec![from]}, "target":to,"position":position,"copy":copy}),
             ))
         }
-        SetBlend(blend) => {
+        SetBlend(layer, blend) if state.layers.blend_menu == Some(layer) => {
             call = Some((
                 "layer.setProps",
-                json!({"layers": doc.selected.iter().map(|l| l.0).collect::<Vec<_>>(),"blend":blend.label()}),
+                json!({"layers":[layer.0],"blend":blend.label()}),
             ));
-            state.layers.blend_menu = false;
         }
-        Blend => state.layers.blend_menu ^= true,
+        SetBlend(..) => {}
+        Blend(layer) => {
+            state.layers.blend_menu = (state.layers.blend_menu != Some(layer)
+                && doc.document.layer(layer).is_some())
+            .then_some(layer);
+        }
         ToggleLock(id) => {
             if let Some(layer) = doc.document.layer(LayerId(id)) {
                 call = Some((
@@ -783,7 +764,8 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         }
         Effects(index) => {
             doc.select(index, false, false);
-            state.layers.settings_open = true;
+            state.layers.menu = true;
+            state.layers.category = "Параметры слоя";
         }
         EffectToggle(index, effect) | EffectRemove(index, effect) => {
             if let Some(layer) = doc.layer(index) {
@@ -802,6 +784,8 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             }
         }
         EffectEdit(index, effect) => {
+            state.layers.menu = false;
+            state.layers.context_menu_y = None;
             doc.select(index, false, false);
             if let Some(layer) = doc.active_layer() {
                 let effects=layer.effects.items.iter().map(|fx|json!({"kind":photocraft_engine::layer_style::kind_of(fx),"params":effects::values_of(fx,doc.document.global_light.angle),"on":fx.enabled(),"fx":serde_json::to_value(fx).unwrap_or(Value::Null)})).collect::<Vec<_>>();
@@ -828,9 +812,6 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         }
         Command(command) => {
             if let Some(spec) = photocraft_engine::commands::find(command) {
-                if command == "layer.renameLayer" {
-                    state.layers.settings_open = false;
-                }
                 let form = Form::new(spec, doc);
                 if form.fields.is_empty() {
                     call = Some((command, form.params));
@@ -842,6 +823,8 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             }
         }
         Properties => {
+            state.layers.menu = false;
+            state.layers.context_menu_y = None;
             if let Some(layer) = doc.active_layer() {
                 if doc.mask_target
                     && doc.filter_target
@@ -870,7 +853,8 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
                     LayerContent::Text(_) => "type.edit",
                     LayerContent::Shape(_) => "shape.edit",
                     _ => {
-                        state.layers.settings_open = true;
+                        state.layers.menu = true;
+                        state.layers.category = "Параметры слоя";
                         return;
                     }
                 };

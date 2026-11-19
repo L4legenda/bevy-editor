@@ -15,8 +15,6 @@ pub(in crate::editor) fn help(
 
 pub(in crate::editor) fn action_help(action: LayerAction) -> String {
     match action {
-        LayerAction::PanelSection(PanelSection::Layers) => "Список слоёв. Верхние слои перекрывают нижние. Перетащите строку, чтобы изменить порядок.".into(),
-        LayerAction::PanelSection(PanelSection::Settings) => "Свойства выбранного слоя: название, заливка, маски, эффекты и защита от изменений.".into(),
         LayerAction::Properties => "Открыть настройки содержимого выбранного слоя: цвет, градиент, текст или коррекцию. У обычного слоя откроются его свойства.".into(),
         LayerAction::Group => "Собрать выделенные слои в папку. Если выбран один слой, создаётся пустая группа. Слои можно перетаскивать внутрь неё.".into(),
         LayerAction::Lock("all") => "Защитить слой от любых изменений. Нажмите ещё раз, чтобы продолжить редактирование.".into(),
@@ -40,8 +38,8 @@ pub(in crate::editor) fn action_help(action: LayerAction) -> String {
             "layer.layerMask.delete" => "Убрать маску и вернуть скрытые ею части рисунка. Сам рисунок не удаляется.".into(),
             _ => format!("{} · открыть настройки или выполнить действие над выбранным слоем. Изменения можно отменить через Ctrl+Z.",title(command)),
         },
-        LayerAction::SetBlend(mode) => blend_help(mode).into(),
-        LayerAction::Blend => "Как слой смешивается с нижними. «Обычный» подходит для большинства задач. В меню есть пояснения к каждому режиму.".into(),
+        LayerAction::SetBlend(_, mode) => blend_help(mode).into(),
+        LayerAction::Blend(_) => "Как слой смешивается с нижними. «Обычный» подходит для большинства задач. В меню есть пояснения к каждому режиму.".into(),
         LayerAction::Category("Эффекты") => "Добавить тень, обводку или свечение. Эффекты не меняют сам рисунок, их можно перенастроить или выключить.".into(),
         LayerAction::Category("Коррекция") => "Изменить свет и цвет отдельным слоем. Исходный рисунок сохранится; действие коррекции можно ослабить непрозрачностью.".into(),
         LayerAction::Menu => "Частые действия с выбранным слоем. Полный список редких операций доступен в дополнительных инструментах.".into(),
@@ -516,6 +514,7 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
             ("Узор…", Command("layer.newFillLayer.pattern")),
         ],
         _ => vec![
+            ("Параметры слоя…", Category("Параметры слоя")),
             ("Переименовать", Command("layer.renameLayer")),
             ("Дублировать", Quick("layer.duplicate")),
             ("Объединить с нижним", Quick("layer.mergeDown")),

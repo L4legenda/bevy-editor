@@ -1,6 +1,6 @@
 use super::*;
 use crate::editor::selection_outline::render_tests::{capture_when, frame};
-use edit::layers::{LayerAction, PanelSection, ThumbnailSize};
+use edit::layers::{LayerAction, PanelSection, ThumbnailSize, ui::BlendReveal};
 
 fn command(app: &mut App, action: LayerAction) {
     app.world_mut()
@@ -29,6 +29,15 @@ fn input_visible(app: &mut App, label: &str) -> bool {
         .iter(world)
         .find_map(|(name, node)| (name.0 == label).then_some(!node.is_empty()))
         .expect("Layer input")
+}
+
+fn blend_height(app: &mut App) -> Option<f32> {
+    let world = app.world_mut();
+    world
+        .query_filtered::<&ComputedNode, With<BlendReveal>>()
+        .iter(world)
+        .next()
+        .map(|node| node.size().y)
 }
 
 #[test]
@@ -78,54 +87,12 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
         .document(Some(id))
         .unwrap()
         .revision;
-    let original_row = {
-        let world = app.world_mut();
-        world
-            .query::<(Entity, &Control)>()
-            .iter(world)
-            .find_map(|(entity, control)| {
-                matches!(
-                    control.action,
-                    Action::ImageEdit(edit::EditAction::SelectLayer(0))
-                )
-                .then_some(entity)
-            })
-            .unwrap()
-    };
-    assert!(!input_visible(
-        &mut app,
-        "Название слоя · Enter — применить"
-    ));
     assert!(!input_visible(&mut app, "Найти слой"));
     capture_when(
         &mut app,
         &target,
         &output.join("00-compact-panel.png"),
         |_| true,
-    );
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Settings))
-    });
-    assert!(input_visible(&mut app, "Название слоя · Enter — применить"));
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Locks))
-    });
-    capture_when(
-        &mut app,
-        &target,
-        &output.join("00-grouped-settings.png"),
-        |_| true,
-    );
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Layers))
-    });
-    assert!(!input_visible(
-        &mut app,
-        "Название слоя · Enter — применить"
-    ));
-    assert!(
-        app.world().get::<ComputedNode>(original_row).is_some(),
-        "Opening sections must preserve the existing layer tree"
     );
     assert_eq!(
         app.world()
@@ -136,9 +103,144 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
             .revision,
         revision
     );
+    let layer = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(Some(id))
+        .unwrap()
+        .active_id()
+        .unwrap();
+    click(
+        &mut app,
+        window,
+        |a| matches!(a, LayerAction::Blend(id) if id == layer),
+    );
+    let opening_height = blend_height(&mut app).unwrap();
+    for _ in 0..14 {
+        frame(&mut app);
+    }
+    let expanded_height = blend_height(&mut app).unwrap();
+    assert!(opening_height > 0.0 && opening_height < expanded_height);
+    let slider_position = {
+        let world = app.world_mut();
+        let (_, node, transform) = world
+            .query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find(|(label, _, _)| label.0 == "Непрозрачность слоя")
+            .unwrap();
+        (transform.affine().translation - Vec2::X * node.size().x * 0.25)
+            * node.inverse_scale_factor()
+    };
+    use crate::editor::tests::lighting_ui_render::{mouse, move_pointer};
+    move_pointer(&mut app, window, slider_position);
+    mouse(&mut app, window, bevy::input::ButtonState::Pressed);
+    mouse(&mut app, window, bevy::input::ButtonState::Released);
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    let opacity = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(Some(id))
+        .unwrap()
+        .document
+        .layer(layer)
+        .unwrap()
+        .opacity;
+    assert!((0.15..0.35).contains(&opacity), "opacity: {opacity}");
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("00-layer-blend.png"),
+        |_| true,
+    );
+    use photocraft_color::BlendMode;
+    click(
+        &mut app,
+        window,
+        |a| matches!(a, LayerAction::SetBlend(id, BlendMode::Multiply) if id == layer),
+    );
+    let edit = &app.world().resource::<ImageViewer>().edit;
+    assert_eq!(edit.layers.blend_menu, Some(layer));
+    assert_eq!(
+        edit.document(Some(id))
+            .unwrap()
+            .document
+            .layer(layer)
+            .unwrap()
+            .blend,
+        BlendMode::Multiply
+    );
+    let (slider, value) = {
+        let world = app.world_mut();
+        let (entity, _, value) = world
+            .query::<(Entity, &AccessibleLabel, &bevy::ui_widgets::SliderValue)>()
+            .iter(world)
+            .find(|(_, label, _)| label.0 == "Непрозрачность слоя")
+            .unwrap();
+        (entity, value.0)
+    };
+    click(
+        &mut app,
+        window,
+        |a| matches!(a, LayerAction::Blend(id) if id == layer),
+    );
+    assert!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .layers
+            .blend_menu
+            .is_none()
+    );
+    let closing_height = blend_height(&mut app).unwrap();
+    assert!(closing_height > 0.0 && closing_height < expanded_height);
+    assert_eq!(
+        app.world()
+            .get::<bevy::ui_widgets::SliderValue>(slider)
+            .unwrap()
+            .0,
+        value
+    );
+    assert_eq!(app.world().get::<Pickable>(slider), Some(&Pickable::IGNORE));
+    for _ in 0..12 {
+        frame(&mut app);
+    }
+    assert!(blend_height(&mut app).is_none());
+    for _ in 0..2 {
+        app.world_mut()
+            .write_message(Action::ImageEdit(edit::EditAction::Undo));
+        frame(&mut app);
+    }
+    click_control(
+        &mut app,
+        window,
+        |a| matches!(a, Action::ImageEdit(edit::EditAction::SelectLayer(0))),
+        MouseButton::Right,
+    );
+    for _ in 0..12 {
+        frame(&mut app);
+    }
     click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Settings))
+        matches!(a, LayerAction::Category("Параметры слоя"))
     });
+    assert!(
+        app.world_mut()
+            .query::<(&Control, &ComputedNode)>()
+            .iter(app.world())
+            .any(|(control, node)| matches!(
+                control.action,
+                Action::ImageEdit(edit::EditAction::SelectLayer(0))
+            ) && !node.is_empty())
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("00-context-settings.png"),
+        |_| true,
+    );
     click(&mut app, window, |a| {
         matches!(a, LayerAction::Lock("pixels"))
     });
@@ -153,26 +255,12 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
             .locks
             .pixels
     );
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Locks))
-    });
-    {
-        let world = app.world_mut();
-        assert!(
-            world
-                .query::<&Text>()
-                .iter(world)
-                .any(|text| text.0 == "Защита слоя · 1")
-        );
-    }
+    command(&mut app, LayerAction::Cancel);
     app.world_mut()
         .write_message(Action::ImageEdit(edit::EditAction::Undo));
     for _ in 0..5 {
         frame(&mut app);
     }
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Layers))
-    });
     click(&mut app, window, |a| {
         matches!(a, LayerAction::PanelSection(PanelSection::Search))
     });
@@ -465,8 +553,9 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
         assert!(doc.mask_view.is_some_and(|view| view.filter));
         assert!(doc.paintable());
     }
+    click(&mut app, window, |a| matches!(a, LayerAction::Menu));
     click(&mut app, window, |a| {
-        matches!(a, LayerAction::PanelSection(PanelSection::Settings))
+        matches!(a, LayerAction::Category("Параметры слоя"))
     });
     click(&mut app, window, |a| matches!(a, LayerAction::Properties));
     assert_eq!(

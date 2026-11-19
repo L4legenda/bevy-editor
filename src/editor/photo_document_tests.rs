@@ -180,7 +180,11 @@ fn moving_back_to_origin_and_cancel_preserve_full_undo_and_redo_history() {
     let fixture = Fixture::new();
     let mut doc = PhotoDocument::load(&fixture.0).unwrap();
     for i in 0..HISTORY {
-        doc.rename(&format!("Название {i}"));
+        doc.layer_command(
+            "layer.renameLayer",
+            json!({"name": format!("Название {i}")}),
+        )
+        .unwrap();
     }
     let revisions = doc.undo.iter().map(|s| s.revision).collect::<Vec<_>>();
     let before = doc.composite().pixels;
@@ -458,7 +462,8 @@ fn layer_commands_and_undo_restore_pixels_order_and_saved_state() {
     doc.reorder(false);
     assert_eq!(doc.composite().pixels[..4], [30, 60, 90, 255]);
     doc.undo();
-    doc.rename("Краска");
+    doc.layer_command("layer.renameLayer", json!({"name": "Краска"}))
+        .unwrap();
     doc.duplicate_layer();
     assert_eq!(doc.document.layers.len(), 3);
     doc.delete_layer();

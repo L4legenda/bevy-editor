@@ -1,5 +1,5 @@
 use super::*;
-use edit::layers::{LayerAction as L, PanelSection};
+use edit::layers::LayerAction as L;
 
 fn editing() -> (Fixture, App) {
     let fixture = Fixture::new();
@@ -347,9 +347,8 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
             .form
             .is_none()
     );
-    click(&mut app, |a| {
-        matches!(a, L::PanelSection(PanelSection::Settings))
-    });
+    click(&mut app, |a| matches!(a, L::Menu));
+    click(&mut app, |a| matches!(a, L::Category("Параметры слоя")));
     capture_when(&mut app, &target, &output.join("01-properties.png"), |_| {
         true
     });
@@ -476,6 +475,7 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
     }
     click(&mut app, |a| matches!(a, L::Cancel));
     assert_eq!(effects(&app), 0);
+    click(&mut app, |a| matches!(a, L::Menu));
     click(&mut app, |a| matches!(a, L::Category("Эффекты")));
     click(&mut app, |a| {
         matches!(a, L::Command("layer.layerStyle.stroke"))
@@ -494,9 +494,6 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
         frame(&mut app);
     }
     assert_eq!(effects(&app), 0);
-    click(&mut app, |a| {
-        matches!(a, L::PanelSection(PanelSection::Layers))
-    });
     capture_when(
         &mut app,
         &target,

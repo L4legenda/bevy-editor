@@ -21,15 +21,9 @@ pub(in crate::editor) struct LayerUi {
     host: Entity,
     stack: Entity,
     basic: Entity,
-    details: Entity,
-    lock_controls: Entity,
     search_body: Entity,
     search_input: Entity,
-    name: Entity,
     clear_filter: Entity,
-    settings: Disclosure,
-    locks: Disclosure,
-    shown_sections: (bool, bool, bool),
     heading: Entity,
     panel: Entity,
     popup: Entity,
@@ -45,54 +39,6 @@ pub(in crate::editor) struct LayerUi {
     last_click: Option<(u64, std::time::Instant)>,
 }
 
-struct Disclosure {
-    button: Entity,
-    body: Entity,
-    chevron: Entity,
-    label: Entity,
-}
-
-fn disclosure(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    title: &str,
-    section: PanelSection,
-) -> Disclosure {
-    let button = control(
-        commands,
-        parent,
-        act(LayerAction::PanelSection(section)),
-        Look::Regular,
-        Node {
-            width: percent(100),
-            height: px(27),
-            padding: UiRect::horizontal(px(4)),
-            ..row(5.0)
-        },
-    );
-    commands
-        .entity(button)
-        .insert(AccessibleLabel(title.into()));
-    let chevron = icons::themed(commands, button, icons::Glyph::ChevronRight, 12.0);
-    let label = text(commands, button, font, title, 12.0, TEXT);
-    let body = node(
-        commands,
-        parent,
-        Node {
-            display: Display::None,
-            width: percent(100),
-            padding: UiRect::new(px(8), px(0), px(2), px(6)),
-            ..column(5.0)
-        },
-    );
-    Disclosure {
-        button,
-        body,
-        chevron,
-        label,
-    }
-}
 #[derive(Component)]
 struct LayerRow {
     id: u64,
@@ -108,6 +54,64 @@ pub(in crate::editor) struct LayerSearch;
 pub(in crate::editor) struct CommandSearch;
 #[derive(Component)]
 pub(in crate::editor) struct LayerScroll;
+#[derive(Clone, Copy, Default)]
+struct BlendFrame {
+    progress: f32,
+    height: f32,
+    scroll: Vec2,
+}
+
+#[derive(Component)]
+pub(in crate::editor) struct BlendReveal {
+    layer: LayerId,
+    body: Entity,
+    choices: Entity,
+    opening: bool,
+    frame: BlendFrame,
+}
+
+fn blend_height(frame: BlendFrame) -> Val {
+    let p = frame.progress;
+    px(frame.height * (p * p * (3.0 - 2.0 * p)))
+}
+
+pub(super) fn animate_blend(
+    mut commands: Commands,
+    time: Res<Time>,
+    geometry: Query<&ComputedNode>,
+    mut menus: Query<(Entity, &mut BlendReveal, &mut Node)>,
+    mut transforms: Query<&mut UiTransform>,
+) {
+    for (entity, mut reveal, mut node) in &mut menus {
+        if let Ok(body) = geometry.get(reveal.body)
+            && !body.is_empty()
+        {
+            reveal.frame.height = body.size().y * body.inverse_scale_factor();
+        }
+        if reveal.frame.height == 0.0 {
+            continue;
+        }
+        let duration = if reveal.opening { 0.20 } else { -0.16 };
+        reveal.frame.progress =
+            (reveal.frame.progress + time.delta_secs() / duration).clamp(0.0, 1.0);
+        if !reveal.opening && reveal.frame.progress == 0.0 {
+            commands.entity(entity).despawn();
+        } else {
+            let height = blend_height(reveal.frame);
+            if node.height != height {
+                node.height = height;
+            }
+            if !reveal.opening
+                && let Ok(mut body) = transforms.get_mut(reveal.body)
+            {
+                body.set_if_neq(UiTransform::from_translation(Val2::px(
+                    0.0,
+                    -9.0 * (1.0 - reveal.frame.progress).powi(2),
+                )));
+            }
+        }
+    }
+}
 #[derive(Component)]
 struct FillReadout(Entity);
 #[derive(Component)]
@@ -194,34 +198,7 @@ pub(in crate::editor) fn setup(
     root: Entity,
     font: &Handle<Font>,
     heading: Entity,
-    name: Entity,
-    opacity: Entity,
 ) {
-    let tabs = node(
-        commands,
-        container,
-        Node {
-            width: percent(100),
-            ..row(4.0)
-        },
-    );
-    for (label, section) in [
-        ("Слои", PanelSection::Layers),
-        ("Свойства", PanelSection::Settings),
-    ] {
-        let tab = compact(
-            commands,
-            tabs,
-            font,
-            label,
-            LayerAction::PanelSection(section),
-        );
-        commands.entity(tab).entry::<Node>().and_modify(|mut n| {
-            n.flex_grow = 1.0;
-            n.justify_content = JustifyContent::Center;
-            n.height = px(31);
-        });
-    }
     let search_body = node(
         commands,
         container,
@@ -265,7 +242,6 @@ pub(in crate::editor) fn setup(
             ..column(4.0)
         },
     );
-    commands.entity(opacity).insert(ChildOf(container));
     let stack = node(
         commands,
         container,
@@ -353,55 +329,6 @@ pub(in crate::editor) fn setup(
         });
         ux::help(commands, e, ux::action_help(action));
     }
-    let settings = disclosure(
-        commands,
-        container,
-        font,
-        "Параметры слоя",
-        PanelSection::Settings,
-    );
-    commands
-        .entity(settings.button)
-        .remove::<(Control, Button, TabIndex)>()
-        .entry::<Node>()
-        .and_modify(|mut n| n.display = Display::None);
-    commands
-        .entity(settings.body)
-        .entry::<Node>()
-        .and_modify(|mut n| {
-            n.padding = UiRect::ZERO;
-            n.flex_grow = 1.0;
-            n.min_height = px(0);
-            n.overflow = Overflow::scroll_y();
-        });
-    commands
-        .entity(settings.body)
-        .insert((Scroller, LayerScroll));
-    text(commands, settings.body, font, "Название", 11.0, MUTED);
-    commands.entity(name).insert(ChildOf(settings.body));
-    let details = node(
-        commands,
-        settings.body,
-        Node {
-            width: percent(100),
-            ..column(4.0)
-        },
-    );
-    let locks = disclosure(
-        commands,
-        settings.body,
-        font,
-        "Защита от случайных изменений",
-        PanelSection::Locks,
-    );
-    let lock_controls = node(
-        commands,
-        locks.body,
-        Node {
-            width: percent(100),
-            ..column(4.0)
-        },
-    );
     let popup = node(
         commands,
         root,
@@ -424,15 +351,9 @@ pub(in crate::editor) fn setup(
         host,
         stack,
         basic,
-        details,
-        lock_controls,
         search_body,
         search_input: filter,
-        name,
         clear_filter,
-        settings,
-        locks,
-        shown_sections: (false, false, false),
         heading,
         panel,
         popup,
@@ -684,7 +605,7 @@ pub(in crate::editor) fn input(
     if keys.just_pressed(KeyCode::Escape)
         && (viewer.edit.layers.menu
             || viewer.edit.layers.form.is_some()
-            || viewer.edit.layers.blend_menu)
+            || viewer.edit.layers.blend_menu.is_some())
     {
         actions.write(act(LayerAction::Cancel));
         focus.clear();
@@ -720,10 +641,11 @@ pub(in crate::editor) fn refresh(
     mut nodes: Query<&mut Node>,
     mouse: Res<ButtonInput<MouseButton>>,
     renames: Query<(), With<InlineName>>,
-    (window, geometry, time): (
+    (window, geometry, time, blend_reveals): (
         Single<&Window, With<PrimaryWindow>>,
         Query<(&ComputedNode, &UiGlobalTransform)>,
         Res<Time>,
+        Query<(Entity, &BlendReveal)>,
     ),
 ) {
     let state = &viewer.edit.layers;
@@ -745,21 +667,9 @@ pub(in crate::editor) fn refresh(
         }));
     }
     let editing = viewer.edit.editing(editor.viewing_image);
-    let selected = doc.and_then(PhotoDocument::active_layer);
     for (entity, show) in [
-        (
-            ui.search_body,
-            editing && state.search_open && !state.settings_open,
-        ),
-        (ui.stack, editing && !state.settings_open),
-        (
-            ui.settings.body,
-            editing && selected.is_some() && state.settings_open,
-        ),
-        (
-            ui.locks.body,
-            editing && selected.is_some() && state.locks_open,
-        ),
+        (ui.search_body, editing && state.search_open),
+        (ui.stack, editing),
         (ui.clear_filter, state.has_filter()),
     ] {
         if let Ok(mut node) = nodes.get_mut(entity) {
@@ -769,56 +679,8 @@ pub(in crate::editor) fn refresh(
             }
         }
     }
-    if (!state.search_open && focus.get() == Some(ui.search_input))
-        || (!state.settings_open && focus.get() == Some(ui.name))
-    {
+    if !state.search_open && focus.get() == Some(ui.search_input) {
         focus.clear();
-    }
-    let sections = (state.search_open, state.settings_open, state.locks_open);
-    if sections != ui.shown_sections {
-        for (entity, open) in [
-            (ui.settings.chevron, state.settings_open),
-            (ui.locks.chevron, state.locks_open),
-        ] {
-            icons::set_glyph(
-                &mut commands,
-                entity,
-                if open {
-                    icons::Glyph::ChevronDown
-                } else {
-                    icons::Glyph::ChevronRight
-                },
-            );
-        }
-        ui.shown_sections = sections;
-    }
-    let lock_count = selected.map_or(0, |layer| {
-        [
-            layer.locks.all,
-            layer.locks.transparency,
-            layer.locks.pixels,
-            layer.locks.position,
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count()
-    });
-    if let Ok(mut title) = titles.get_mut(ui.locks.label) {
-        title.set_if_neq(Text(if lock_count == 0 {
-            "Защита слоя".into()
-        } else {
-            format!("Защита слоя · {lock_count}")
-        }));
-    }
-    if let Ok(mut title) = titles.get_mut(ui.settings.label) {
-        title.set_if_neq(Text(
-            selected
-                .filter(|layer| layer.fill_opacity != 1.0)
-                .map_or_else(
-                    || "Параметры слоя".into(),
-                    |layer| format!("Параметры · заливка {:.0}%", layer.fill_opacity * 100.0),
-                ),
-        ));
     }
     let thumbnail_revision = doc
         .filter(|_| editing)
@@ -829,7 +691,7 @@ pub(in crate::editor) fn refresh(
         ui.thumbnails.clear();
     }
     let signature = format!(
-        "{:?}:{}:{:?}:{}:{:?}:{}:{}",
+        "{:?}:{}:{:?}:{}:{:?}:{:?}:{}",
         editor.viewing_image,
         doc.map(panel_signature).unwrap_or_default(),
         doc.map(|d| (
@@ -854,7 +716,27 @@ pub(in crate::editor) fn refresh(
         && mouse.any_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle]);
     let rebuild = signature != ui.signature && !state.fill_drag && !finishing_rename;
     if rebuild {
-        for host in [ui.host, ui.basic, ui.details, ui.lock_controls] {
+        let same_document =
+            ui.thumbnail_revision.map(|(id, _, _)| id) == thumbnail_revision.map(|(id, _, _)| id);
+        let mut closing_menus = HashMap::new();
+        let blend_frames = blend_reveals
+            .iter()
+            .filter(|_| same_document && editing)
+            .filter_map(|(entity, menu)| {
+                if state.blend_menu != Some(menu.layer) && menu.frame.progress > 0.0 {
+                    // Keep the laid-out controls and their styling on screen through exit.
+                    commands.entity(entity).remove::<ChildOf>();
+                    closing_menus.insert(menu.layer, entity);
+                    return None;
+                }
+                let mut frame = menu.frame;
+                frame.scroll = scroll_positions
+                    .get(menu.choices)
+                    .map_or(Vec2::ZERO, |position| position.0);
+                Some((menu.layer, frame))
+            })
+            .collect();
+        for host in [ui.host, ui.basic] {
             commands.entity(host).despawn_related::<Children>();
         }
         if editing && let Some(doc) = doc {
@@ -862,11 +744,11 @@ pub(in crate::editor) fn refresh(
                 &mut commands,
                 ui.host,
                 ui.basic,
-                ui.details,
-                ui.lock_controls,
                 &interface.font,
                 doc,
                 state,
+                &blend_frames,
+                &mut closing_menus,
                 &mut ui.thumbnails,
                 &mut images,
                 &mut uploads,
@@ -874,6 +756,9 @@ pub(in crate::editor) fn refresh(
             if let Some(entity) = rename {
                 focus.set(entity, bevy::input_focus::FocusCause::Auto);
             }
+        }
+        for entity in closing_menus.into_values() {
+            commands.entity(entity).despawn();
         }
         ui.signature = signature;
     }
@@ -901,7 +786,7 @@ pub(in crate::editor) fn refresh(
         "{}:{}:{}:{:?}",
         editing, state.ui_revision, state.menu, viewer.edit.error
     );
-    if popup_signature != ui.popup_signature {
+    if popup_signature != ui.popup_signature && !state.fill_drag {
         let context = format!(
             "{:?}:{:?}:{}",
             editor.viewing_image,
@@ -1032,21 +917,157 @@ pub(in crate::editor) fn refresh(
                 &interface.font,
                 state,
                 ui.flyout.is_some(),
+                doc,
             );
         }
         ui.search_signature = search_signature;
     }
 }
 
+fn layer_properties(
+    commands: &mut Commands,
+    host: Entity,
+    font: &Handle<Font>,
+    doc: &PhotoDocument,
+    state: &LayerState,
+) {
+    let Some(layer) = doc.active_layer() else {
+        return;
+    };
+    if doc.mask_target {
+        let properties = node(
+            commands,
+            host,
+            Node {
+                width: percent(100),
+                flex_wrap: FlexWrap::Wrap,
+                ..row(3.0)
+            },
+        );
+        compact(
+            commands,
+            properties,
+            font,
+            "Маска",
+            LayerAction::MaskPreview(false),
+        );
+        compact(
+            commands,
+            properties,
+            font,
+            "Наложение",
+            LayerAction::MaskPreview(true),
+        );
+    }
+    let locks = node(
+        commands,
+        host,
+        Node {
+            width: percent(100),
+            flex_wrap: FlexWrap::Wrap,
+            ..row(3.0)
+        },
+    );
+    for (key, title, on) in [
+        ("all", "Всё", layer.locks.all),
+        ("transparency", "Прозрачность", layer.locks.transparency),
+        ("pixels", "Пиксели", layer.locks.pixels),
+        ("position", "Положение", layer.locks.position),
+    ] {
+        compact(
+            commands,
+            locks,
+            font,
+            &format!("{} {title}", if on { "●" } else { "○" }),
+            LayerAction::Lock(key),
+        );
+    }
+    let fill_header = node(
+        commands,
+        host,
+        Node {
+            width: percent(100),
+            justify_content: JustifyContent::SpaceBetween,
+            ..row(3.0)
+        },
+    );
+    text(commands, fill_header, font, "Заливка", 11.0, MUTED);
+    let fill_readout = text(
+        commands,
+        fill_header,
+        font,
+        &format!("{:.0}%", layer.fill_opacity * 100.0),
+        11.0,
+        TEXT,
+    );
+    let slider = commands
+        .spawn((
+            Slider {
+                track_click: TrackClick::Snap,
+                ..default()
+            },
+            SliderRange::new(0.0, 1.0),
+            SliderValue(layer.fill_opacity),
+            Node {
+                width: percent(100),
+                height: px(18),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            BackgroundColor(Color::NONE),
+            ChildOf(host),
+        ))
+        .observe(fill)
+        .id();
+    commands.entity(slider).insert(FillReadout(fill_readout));
+    ux::help(commands, slider, ux::field_help("fillOpacity"));
+    let track = surface(
+        commands,
+        slider,
+        Node {
+            position_type: PositionType::Absolute,
+            left: px(5),
+            right: px(5),
+            top: px(7),
+            height: px(4),
+            border_radius: BorderRadius::MAX,
+            ..default()
+        },
+        EDGE,
+    );
+    commands.entity(track).insert(Pickable::IGNORE);
+    let thumb = surface(
+        commands,
+        slider,
+        Node {
+            position_type: PositionType::Absolute,
+            left: percent(layer.fill_opacity * 94.0),
+            width: px(14),
+            height: px(14),
+            top: px(2),
+            border_radius: BorderRadius::MAX,
+            border: UiRect::all(px(2)),
+            ..default()
+        },
+        WELL,
+    );
+    commands.entity(thumb).insert((
+        bevy::ui_widgets::SliderThumb,
+        Pickable::IGNORE,
+        BorderColor::all(FOCUS),
+    ));
+    properties_ui::build(commands, host, font, doc, state);
+}
+
 fn panel(
     commands: &mut Commands,
     host: Entity,
     basic: Entity,
-    details: Entity,
-    lock_controls: Entity,
     font: &Handle<Font>,
     doc: &PhotoDocument,
     state: &LayerState,
+    blend_frames: &HashMap<LayerId, BlendFrame>,
+    closing_menus: &mut HashMap<LayerId, Entity>,
     thumbs: &mut HashMap<(u64, bool, bool), (Option<photocraft_doc::Layer>, Handle<Image>)>,
     images: &mut Assets<Image>,
     uploads: &mut TextureUploads,
@@ -1070,198 +1091,6 @@ fn panel(
             "← Готово · вернуться к изображению",
             LayerAction::Command("layer.smartObjects.saveContents"),
         );
-    }
-    if let Some(layer) = doc.active_layer() {
-        text(
-            commands,
-            host,
-            font,
-            "Смешивание с нижними слоями",
-            10.0,
-            MUTED,
-        );
-        let properties = node(
-            commands,
-            host,
-            Node {
-                width: percent(100),
-                flex_wrap: FlexWrap::Wrap,
-                ..row(3.0)
-            },
-        );
-        dropdown(
-            commands,
-            properties,
-            font,
-            ux::blend(layer.blend),
-            LayerAction::Blend,
-        );
-        if doc.mask_target {
-            compact(
-                commands,
-                properties,
-                font,
-                "Маска",
-                LayerAction::MaskPreview(false),
-            );
-            compact(
-                commands,
-                properties,
-                font,
-                "Наложение",
-                LayerAction::MaskPreview(true),
-            );
-        }
-        let locks = node(
-            commands,
-            lock_controls,
-            Node {
-                width: percent(100),
-                flex_wrap: FlexWrap::Wrap,
-                ..row(3.0)
-            },
-        );
-        for (key, title, on) in [
-            ("all", "Всё", layer.locks.all),
-            ("transparency", "Прозрачность", layer.locks.transparency),
-            ("pixels", "Пиксели", layer.locks.pixels),
-            ("position", "Положение", layer.locks.position),
-        ] {
-            compact(
-                commands,
-                locks,
-                font,
-                &format!("{} {title}", if on { "●" } else { "○" }),
-                LayerAction::Lock(key),
-            );
-        }
-        let fill_header = node(
-            commands,
-            details,
-            Node {
-                width: percent(100),
-                justify_content: JustifyContent::SpaceBetween,
-                ..row(3.0)
-            },
-        );
-        text(commands, fill_header, font, "Заливка", 11.0, MUTED);
-        let fill_readout = text(
-            commands,
-            fill_header,
-            font,
-            &format!("{:.0}%", layer.fill_opacity * 100.0),
-            11.0,
-            TEXT,
-        );
-        let slider = commands
-            .spawn((
-                Slider {
-                    track_click: TrackClick::Snap,
-                    ..default()
-                },
-                SliderRange::new(0.0, 1.0),
-                SliderValue(layer.fill_opacity),
-                Node {
-                    width: percent(100),
-                    height: px(18),
-                    flex_shrink: 0.0,
-                    ..default()
-                },
-                BackgroundColor(Color::NONE),
-                ChildOf(details),
-            ))
-            .observe(fill)
-            .id();
-        commands.entity(slider).insert(FillReadout(fill_readout));
-        ux::help(commands, slider, ux::field_help("fillOpacity"));
-        let track = surface(
-            commands,
-            slider,
-            Node {
-                position_type: PositionType::Absolute,
-                left: px(5),
-                right: px(5),
-                top: px(7),
-                height: px(4),
-                border_radius: BorderRadius::MAX,
-                ..default()
-            },
-            EDGE,
-        );
-        commands.entity(track).insert(Pickable::IGNORE);
-        let thumb = surface(
-            commands,
-            slider,
-            Node {
-                position_type: PositionType::Absolute,
-                left: percent(layer.fill_opacity * 94.0),
-                width: px(14),
-                height: px(14),
-                top: px(2),
-                border_radius: BorderRadius::MAX,
-                border: UiRect::all(px(2)),
-                ..default()
-            },
-            WELL,
-        );
-        commands.entity(thumb).insert((
-            bevy::ui_widgets::SliderThumb,
-            Pickable::IGNORE,
-            BorderColor::all(FOCUS),
-        ));
-        properties_ui::build(commands, details, font, doc, state);
-        if state.blend_menu {
-            let choices = scroll_node(
-                commands,
-                host,
-                Node {
-                    width: percent(100),
-                    max_height: px(180),
-                    overflow: Overflow::scroll_y(),
-                    ..column(2.0)
-                },
-            );
-            if layer.is_group() {
-                compact(
-                    commands,
-                    choices,
-                    font,
-                    ux::blend(photocraft_color::BlendMode::PassThrough),
-                    LayerAction::SetBlend(photocraft_color::BlendMode::PassThrough),
-                );
-            }
-            for mode in photocraft_color::BlendMode::layer_modes().filter(|m| {
-                state.blend_more
-                    || matches!(
-                        m,
-                        photocraft_color::BlendMode::Normal
-                            | photocraft_color::BlendMode::Multiply
-                            | photocraft_color::BlendMode::Screen
-                            | photocraft_color::BlendMode::Overlay
-                            | photocraft_color::BlendMode::SoftLight
-                            | photocraft_color::BlendMode::Color
-                    )
-            }) {
-                compact(
-                    commands,
-                    choices,
-                    font,
-                    ux::blend(mode),
-                    LayerAction::SetBlend(mode),
-                );
-            }
-            compact(
-                commands,
-                choices,
-                font,
-                if state.blend_more {
-                    "Только основные режимы"
-                } else {
-                    "Все режимы смешивания…"
-                },
-                LayerAction::BlendMore,
-            );
-        }
     }
     let host = tree_host;
     let rows = tree_rows(doc, state);
@@ -1569,6 +1398,32 @@ fn panel(
                 LayerAction::Effects(index),
             );
         }
+        let blend = icons::button(
+            commands,
+            row_entity,
+            icons::Glyph::LayerBlend,
+            &format!("Наложение: {} · {}", layer.name, ux::blend(layer.blend)),
+            act(LayerAction::Blend(layer.id)),
+            Look::Tool,
+        );
+        commands.entity(blend).entry::<Node>().and_modify(|mut n| {
+            n.width = px(28);
+            n.height = px(28);
+            n.flex_shrink = 0.0;
+            n.padding = UiRect::ZERO;
+        });
+        let expanded = state.blend_menu == Some(layer.id);
+        let frame = blend_frames.get(&layer.id).copied().unwrap_or_default();
+        if let Some(menu) = closing_menus.remove(&layer.id) {
+            commands
+                .entity(menu)
+                .insert(ChildOf(host))
+                .entry::<BlendReveal>()
+                .and_modify(|mut reveal| reveal.opening = false);
+            flyout_fx::disable_interaction(commands, menu);
+        } else if expanded {
+            blend_settings(commands, host, font, layer, frame);
+        }
         let lock = icons::button(
             commands,
             row_entity,
@@ -1828,7 +1683,14 @@ fn command_results(
     font: &Handle<Font>,
     state: &LayerState,
     flyout: bool,
+    doc: Option<&PhotoDocument>,
 ) {
+    if state.category == "Параметры слоя" {
+        if let Some(doc) = doc {
+            layer_properties(commands, scroll, font, doc, state);
+        }
+        return;
+    }
     if state.category == "Вид панели" && state.search.is_empty() {
         panel_settings(commands, scroll, font, state);
         return;
@@ -2144,6 +2006,85 @@ fn label_color(label: photocraft_doc::LabelColor) -> Color {
     Color::srgb(rgb[0], rgb[1], rgb[2])
 }
 
+fn blend_settings(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    layer: &photocraft_doc::Layer,
+    frame: BlendFrame,
+) {
+    use photocraft_color::BlendMode;
+    let reveal = node(
+        commands,
+        parent,
+        Node {
+            width: percent(100),
+            height: blend_height(frame),
+            flex_shrink: 0.0,
+            overflow: Overflow::clip(),
+            ..column(0.0)
+        },
+    );
+    commands.entity(reveal).insert(Pickable::IGNORE);
+    let menu = surface(
+        commands,
+        reveal,
+        Node {
+            width: percent(100),
+            flex_shrink: 0.0,
+            padding: UiRect::all(px(8)),
+            border_radius: BorderRadius::all(px(5)),
+            ..column(4.0)
+        },
+        CHROME,
+    );
+    super::super::interface::slider(
+        commands,
+        menu,
+        font,
+        "Непрозрачность слоя",
+        super::super::interface::Binding::LayerOpacity(layer.id),
+        (0.0, 1.0),
+    );
+    let choices = scroll_node(
+        commands,
+        menu,
+        Node {
+            width: percent(100),
+            max_height: px(188),
+            overflow: Overflow::scroll_y(),
+            ..column(2.0)
+        },
+    );
+    let modes = layer
+        .is_group()
+        .then_some(BlendMode::PassThrough)
+        .into_iter()
+        .chain(BlendMode::layer_modes());
+    commands
+        .entity(choices)
+        .insert(ScrollPosition(frame.scroll));
+    for mode in modes {
+        let choice = compact(
+            commands,
+            choices,
+            font,
+            ux::blend(mode),
+            LayerAction::SetBlend(layer.id, mode),
+        );
+        commands.entity(choice).entry::<Node>().and_modify(|mut n| {
+            n.width = percent(100);
+            n.flex_shrink = 0.0;
+        });
+    }
+    commands.entity(reveal).insert(BlendReveal {
+        layer: layer.id,
+        body: menu,
+        choices,
+        opening: true,
+        frame,
+    });
+}
 fn dropdown(
     commands: &mut Commands,
     parent: Entity,

@@ -7,11 +7,11 @@ use bevy::ui_widgets::{
 };
 
 #[derive(Clone, Copy, Component)]
-enum Binding {
+pub(super) enum Binding {
     Size,
     Hardness,
     BrushOpacity,
-    LayerOpacity,
+    LayerOpacity(photocraft_doc::LayerId),
 }
 #[derive(Component)]
 pub(in crate::editor) struct PhotoSlider {
@@ -33,7 +33,6 @@ pub(in crate::editor) struct EditUi {
     paint_menu: Entity,
     panel: Entity,
     eraser_modes: Entity,
-    name: Entity,
     status: Entity,
     size_group: Entity,
     brush_rail: Entity,
@@ -53,7 +52,7 @@ pub(in crate::editor) struct EditUi {
     cursor: super::super::tool_cursor::Overlay,
 }
 
-fn slider(
+pub(super) fn slider(
     commands: &mut Commands,
     parent: Entity,
     font_handle: &Handle<Font>,
@@ -118,7 +117,7 @@ fn slider_track(
         },
         WELL,
     );
-    if matches!(binding, Binding::LayerOpacity) {
+    if matches!(binding, Binding::LayerOpacity(_)) {
         layers::ux::help(
             commands,
             slider,
@@ -128,7 +127,7 @@ fn slider_track(
     commands.entity(track).insert(Pickable::IGNORE);
     if matches!(
         binding,
-        Binding::Size | Binding::Hardness | Binding::BrushOpacity | Binding::LayerOpacity
+        Binding::Size | Binding::Hardness | Binding::BrushOpacity | Binding::LayerOpacity(_)
     ) {
         commands
             .entity(track)
@@ -384,7 +383,7 @@ fn slider_change(
             }),
             Binding::Hardness => EditAction::Hardness(event.value),
             Binding::BrushOpacity => EditAction::BrushOpacity(event.value),
-            Binding::LayerOpacity => EditAction::Opacity(event.value, event.is_final),
+            Binding::LayerOpacity(layer) => EditAction::Opacity(layer, event.value, event.is_final),
         };
         actions.write(Action::ImageEdit(action));
     }
@@ -889,7 +888,7 @@ pub(in crate::editor) fn setup(
         body,
         Node {
             display: Display::None,
-            width: px(248),
+            width: px(300),
             min_width: px(0),
             min_height: px(0),
             flex_shrink: 0.0,
@@ -976,28 +975,6 @@ pub(in crate::editor) fn setup(
             n.height = px(25);
             n.padding = UiRect::ZERO;
         });
-    let name = input(
-        commands,
-        panel,
-        font_handle,
-        "Название слоя · Enter — применить",
-    );
-    let layer_opacity = node(
-        commands,
-        panel,
-        Node {
-            width: percent(100),
-            ..column(3.0)
-        },
-    );
-    slider(
-        commands,
-        layer_opacity,
-        font_handle,
-        "Непрозрачность слоя",
-        Binding::LayerOpacity,
-        (0.0, 1.0),
-    );
     let layers = node(
         commands,
         panel,
@@ -1008,16 +985,7 @@ pub(in crate::editor) fn setup(
             ..column(3.0)
         },
     );
-    layers::ui::setup(
-        commands,
-        layers,
-        panel_root,
-        root,
-        font_handle,
-        layer_title,
-        name,
-        layer_opacity,
-    );
+    layers::ui::setup(commands, layers, panel_root, root, font_handle, layer_title);
     let cursor = super::super::tool_cursor::Overlay::setup(commands, canvas, font_handle);
     commands.insert_resource(EditUi {
         mode_button,
@@ -1031,7 +999,6 @@ pub(in crate::editor) fn setup(
         paint_menu,
         panel: panel_root,
         eraser_modes,
-        name,
         status,
         size_group,
         brush_rail,
@@ -1228,16 +1195,6 @@ pub(in crate::editor) fn color_pointer(
             viewer.edit.paint_menu_dismissed = true;
         }
     }
-    if keys.just_pressed(KeyCode::Enter) {
-        if focus.get() == Some(ui.name)
-            && let Ok(input) = inputs.get(ui.name)
-            && let Some(id) = editor.viewing_image
-            && let Some(session) = viewer.edit.sessions.get_mut(&id)
-        {
-            session.doc.rename(&input.value().to_string());
-            focus.clear();
-        }
-    }
 }
 
 pub(in crate::editor) fn refresh(
@@ -1431,15 +1388,7 @@ pub(in crate::editor) fn refresh(
             }
         })));
     }
-    if let Some(doc) = doc
-        && let Some(active) = doc.active_layer()
-    {
-        if focus.get() != Some(ui.name)
-            && let Ok(mut input) = inputs.get_mut(ui.name)
-            && input.value().to_string() != active.name
-        {
-            input.editor_mut().set_text(&active.name);
-        }
+    if let Some(doc) = doc {
         for (entity, slider, value, range, control, computed) in &sliders {
             let (number, label) = match slider.binding {
                 Binding::Size => (
@@ -1458,8 +1407,11 @@ pub(in crate::editor) fn refresh(
                     viewer.edit.opacity,
                     format!("{:.0}%", viewer.edit.opacity * 100.0),
                 ),
-                Binding::LayerOpacity => {
-                    (active.opacity, format!("{:.0}%", active.opacity * 100.0))
+                Binding::LayerOpacity(id) => {
+                    let Some(layer) = doc.document.layer(id) else {
+                        continue;
+                    };
+                    (layer.opacity, format!("{:.0}%", layer.opacity * 100.0))
                 }
             };
             let rail_position = if matches!(control.orientation, SliderOrientation::Vertical)

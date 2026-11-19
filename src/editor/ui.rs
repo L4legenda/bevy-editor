@@ -2400,6 +2400,7 @@ pub(super) fn refresh(
             Action::ImageEdit(ImageEditAction::SelectLayer(_))
                 | Action::ImageEdit(ImageEditAction::Layers(
                     image_viewer::edit::layers::LayerAction::ToggleLock(_)
+                        | image_viewer::edit::layers::LayerAction::Blend(_)
                 ))
         );
         // Menus block activation without making the selected file/object look deselected.

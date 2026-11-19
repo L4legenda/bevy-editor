@@ -385,7 +385,6 @@ pub(in crate::editor) fn input(
         || editor.pending.is_some()
         || editor.browser_popup
         || editor.hdri_library_open
-        || viewer.edit.layers.settings_open
         || viewer.edit.layers.menu
         || viewer.edit.layers.form.is_some()
         || viewer.edit.color_picker.is_some()
