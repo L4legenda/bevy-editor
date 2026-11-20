@@ -332,6 +332,9 @@ pub(super) fn seams(
         for edge in &uv.atlas.seams {
             gizmos.line(world(edge.0), world(edge.1), Color::srgb(1., 0.24, 0.12));
         }
+        for edge in &geometry.uv_seams {
+            gizmos.line(world(edge.0), world(edge.1), Color::srgb(1., 0.62, 0.18));
+        }
     }
     if !uv.selected.is_empty() && uv.selected.len() < uv.atlas.count {
         let mut edges = BTreeSet::new();

@@ -23,6 +23,7 @@ fn fixture() -> (Glb, Object) {
     let source = Glb::parse(path, bytes).unwrap();
     let geometry = Geometry {
         loose_edges: default(),
+        uv_seams: default(),
         positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y],
         faces: vec![Face {
             corners: (0..3).map(Corner::new).collect(),
@@ -37,6 +38,7 @@ fn fixture() -> (Glb, Object) {
         geometry: geometry.into(),
         transform: Transform::from_xyz(1., 2., 3.),
         materials: vec![MaterialSlot {
+            authored: None,
             paint: None,
             material: default(),
             source: json!({"material":0,"extras":{"keep":true}}),
@@ -45,6 +47,54 @@ fn fixture() -> (Glb, Object) {
     };
     (source, object)
 }
+
+#[test]
+fn model_glb_assigns_translucent_material_to_only_selected_faces_and_keeps_it_on_save() {
+    use crate::editor::{
+        model_document::{MaterialDraft, Mode},
+        model_mesh::Element,
+    };
+    let (source, mut object) = fixture();
+    object.geometry.positions.push(Vec3::X + Vec3::Y);
+    object.geometry.faces.push(Face {
+        corners: [1, 3, 2].into_iter().map(Corner::new).collect(),
+        material: 0,
+        smooth: false,
+    });
+    let mut doc = Document::new(source, vec![object]);
+    doc.mode = Mode::Edit;
+    doc.selection.kind = Element::Face;
+    doc.selection.faces.insert(1);
+    let draft = MaterialDraft {
+        name: "Стекло".into(),
+        color: bevy::color::Srgba::hex("#9CCFE080").unwrap(),
+        roughness: 0.2,
+        metallic: 0.0,
+    };
+    let mut assets = Assets::<StandardMaterial>::default();
+    let glass = draft.slot(&mut assets);
+    assert_eq!(assets.get(&glass.material).unwrap().alpha_mode, AlphaMode::Blend);
+    doc.assign_material(glass, &Handle::default()).unwrap();
+    assert_eq!(doc.objects[0].geometry.faces[0].material, 0);
+    assert_eq!(doc.objects[0].geometry.faces[1].material, 1);
+    doc.undo();
+    assert_eq!(doc.objects[0].geometry.faces[1].material, 0);
+    doc.redo();
+    assert_eq!(doc.objects[0].geometry.faces[1].material, 1);
+    doc.save().unwrap();
+    doc.save().unwrap();
+    let loaded = Glb::load(&doc.source.path).unwrap();
+    let asset = bevy::gltf::gltf::Gltf::from_slice(loaded.data()).unwrap();
+    assert_eq!(asset.materials().count(), 2);
+    let indices: Vec<_> = asset.nodes().next().unwrap().mesh().unwrap().primitives()
+        .map(|primitive| primitive.material().index()).collect();
+    assert_eq!(indices, [Some(0), Some(1)]);
+    let glass = asset.materials().nth(1).unwrap();
+    assert_eq!(glass.name(), Some("Стекло"));
+    assert_eq!(glass.alpha_mode(), bevy::gltf::gltf::material::AlphaMode::Blend);
+    assert!((glass.pbr_metallic_roughness().base_color_factor()[3] - 128.0 / 255.0).abs() < 0.00001);
+}
+
 #[test]
 fn model_glb_paint_round_trip_keeps_layers_and_flattened_standard_material() {
     use crate::editor::model_paint_data::{Surface, Stack, Layer, LayerKind, solid};
@@ -352,8 +402,47 @@ fn import_geometry(source: &Glb) -> Result<Geometry, String> {
                 .then(|| &topology["primitives"][primitive.index()]),
         )?;
     }
+    if topology["version"].as_u64() == Some(1) {
+        geometry.restore_uv_seams(&topology["uv_seams"])?;
+    }
     geometry.validate()?;
     Ok(geometry)
+}
+
+#[test]
+fn model_glb_manual_uv_seams_survive_loop_cut_undo_and_reopen() {
+    use crate::editor::{model_document::Mode, model_mesh::{Edge, Element}};
+
+    let (source, mut object) = fixture();
+    object.geometry = Geometry::default().into();
+    crate::editor::model_document::from_mesh(
+        &Mesh::from(Cuboid::from_size(Vec3::ONE)), &mut object.geometry, 0,
+    ).unwrap();
+    let mut doc = Document::new(source, vec![object]);
+    doc.mode = Mode::Edit;
+    doc.selection.kind = Element::Edge;
+    let marked = *doc.active().unwrap().geometry.edges().keys().next().unwrap();
+    doc.selection.edges.insert(marked);
+    doc.operate(Operation::MarkUvSeam).unwrap();
+    assert_eq!(doc.active().unwrap().geometry.uv_seams, [marked].into());
+    doc.operate(Operation::ClearUvSeam).unwrap();
+    assert!(doc.active().unwrap().geometry.uv_seams.is_empty());
+    doc.undo();
+    doc.operate(Operation::LoopCut).unwrap();
+    let mesh = &doc.active().unwrap().geometry;
+    assert_eq!(mesh.uv_seams.len(), 2);
+    let expected = mesh.uv_seam_positions();
+    doc.save().unwrap();
+    let saved = Glb::load(&doc.source.path).unwrap();
+    let imported = import_geometry(&saved).unwrap();
+    assert_eq!(imported.uv_seams.len(), 2);
+    for [a, b] in expected {
+        let edge = Edge::new(
+            imported.positions.iter().position(|p| p.to_array() == a).unwrap(),
+            imported.positions.iter().position(|p| p.to_array() == b).unwrap(),
+        );
+        assert!(imported.uv_seams.contains(&edge));
+    }
 }
 
 #[test]

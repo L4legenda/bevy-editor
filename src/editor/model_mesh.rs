@@ -2,6 +2,12 @@
 use bevy::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+#[path = "model_edge_tools.rs"]
+mod edge_tools;
+#[path = "model_edge_bevel.rs"]
+mod bevel;
+pub(super) use bevel::{BevelOptions, Intersection, WidthType};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Edge(pub usize, pub usize);
 impl Edge {
@@ -59,6 +65,7 @@ pub(super) struct Geometry {
     pub positions: Vec<Vec3>,
     pub faces: Vec<Face>,
     pub loose_edges: BTreeSet<Edge>,
+    pub uv_seams: BTreeSet<Edge>,
 }
 
 #[derive(Default, Clone)]
@@ -99,6 +106,22 @@ impl Selection {
             Element::Vertex => self.vertices.extend(0..mesh.positions.len()),
             Element::Edge => self.edges.extend(mesh.edges().keys().copied()),
             Element::Face => self.faces.extend(0..mesh.faces.len()),
+        }
+    }
+    pub fn select_face_elements(&mut self, mesh: &Geometry, faces: BTreeSet<usize>) {
+        self.clear();
+        match self.kind {
+            Element::Vertex => self.vertices.extend(
+                faces
+                    .iter()
+                    .flat_map(|&i| mesh.faces[i].corners.iter().map(|corner| corner.vertex)),
+            ),
+            Element::Edge => self.edges.extend(
+                faces
+                    .iter()
+                    .flat_map(|&i| mesh.faces[i].edges().map(|(a, b)| Edge::new(a, b))),
+            ),
+            Element::Face => self.faces = faces,
         }
     }
     pub fn selected_vertices(&self, mesh: &Geometry) -> BTreeSet<usize> {
@@ -313,6 +336,51 @@ impl Geometry {
         }
         result
     }
+    pub fn prune_uv_seams(&mut self) {
+        if !self.uv_seams.is_empty() {
+            let adjacency = self.edges();
+            self.uv_seams
+                .retain(|edge| adjacency.get(edge).is_some_and(|faces| !faces.is_empty()));
+        }
+    }
+
+    pub fn uv_seam_positions(&self) -> Vec<[[f32; 3]; 2]> {
+        self.uv_seams
+            .iter()
+            .map(|edge| [edge.0, edge.1].map(|v| self.positions[v].to_array()))
+            .collect()
+    }
+
+    pub fn restore_uv_seams(&mut self, seams: &serde_json::Value) -> Result<(), String> {
+        if seams.is_null() {
+            return Ok(());
+        }
+        let error = "Некорректные UV-швы в топологии GLB";
+        let seams: Vec<[[f32; 3]; 2]> =
+            serde_json::from_value(seams.clone()).map_err(|_| error)?;
+        let key = |position: [f32; 3]| position.map(|v| if v == 0.0 { 0 } else { v.to_bits() });
+        let vertices: HashMap<_, _> = self.positions.iter().enumerate()
+            .map(|(i, p)| (key(p.to_array()), i)).collect();
+        let adjacency = self.edges();
+        let mut marked = BTreeSet::new();
+        for [a, b] in seams {
+            let edge = Edge::new(*vertices.get(&key(a)).ok_or(error)?, *vertices.get(&key(b)).ok_or(error)?);
+            if adjacency.get(&edge).is_none_or(Vec::is_empty) {
+                return Err(error.into());
+            }
+            marked.insert(edge);
+        }
+        self.uv_seams = marked;
+        Ok(())
+    }
+
+    fn split_uv_seams(&mut self, points: &BTreeMap<Edge, usize>) {
+        for (&edge, &vertex) in points {
+            if self.uv_seams.remove(&edge) {
+                self.uv_seams.extend([Edge::new(edge.0, vertex), Edge::new(vertex, edge.1)]);
+            }
+        }
+    }
     pub fn line_positions(&self) -> Vec<[f32; 3]> {
         self.loose_edges
             .iter()
@@ -450,6 +518,12 @@ impl Geometry {
             self.faces.push(face);
         }
         self.select_faces(selection, start..self.faces.len());
+        let seams: Vec<_> = self
+            .uv_seams
+            .iter()
+            .filter_map(|e| Some(Edge::new(*vertices.get(&e.0)?, *vertices.get(&e.1)?)))
+            .collect();
+        self.uv_seams.extend(seams);
         Ok(())
     }
     pub fn extrude(&mut self, selection: &mut Selection, distance: f32) -> Result<(), String> {
@@ -787,6 +861,7 @@ impl Geometry {
             }
         }
         self.faces = result;
+        self.split_uv_seams(&mid);
         self.select_faces(selection, chosen);
         Ok(())
     }
@@ -832,6 +907,9 @@ impl Geometry {
         };
         let mut changed = false;
         while let Some(edge) = edges.pop() {
+            if quads_only && self.uv_seams.contains(&edge) {
+                continue;
+            }
             let Some(faces) = adjacency.get(&edge).filter(|v| v.len() == 2) else {
                 continue;
             };
@@ -1001,11 +1079,17 @@ impl Geometry {
             .iter()
             .map(|e| Edge::new(remap[&e.0], remap[&e.1]))
             .collect();
+        self.uv_seams = self
+            .uv_seams
+            .iter()
+            .filter_map(|e| Some(Edge::new(*remap.get(&e.0)?, *remap.get(&e.1)?)))
+            .collect();
         for f in &mut self.faces {
             for c in &mut f.corners {
                 c.vertex = remap[&c.vertex];
             }
         }
+        self.prune_uv_seams();
         remap
     }
     pub fn merge(
@@ -1070,6 +1154,9 @@ impl Geometry {
             })
             .filter(|e| e.0 != e.1)
             .collect();
+        self.uv_seams = self.uv_seams.iter().map(|e| {
+            Edge::new(*remap.get(&e.0).unwrap_or(&e.0), *remap.get(&e.1).unwrap_or(&e.1))
+        }).filter(|e| e.0 != e.1).collect();
         for f in &mut self.faces {
             for c in &mut f.corners {
                 if let Some(&v) = remap.get(&c.vertex) {
@@ -1327,9 +1414,10 @@ impl Geometry {
         }
         self.faces = result;
         self.discard_normals();
+        self.split_uv_seams(&intersections);
         Ok(())
     }
-    pub fn loop_cut(&mut self, edge: Edge) -> Result<(), String> {
+    pub fn loop_cut(&mut self, edge: Edge) -> Result<BTreeSet<Edge>, String> {
         let adjacency = self.edges();
         let mut queue = vec![edge];
         let mut split = BTreeMap::new();
@@ -1367,11 +1455,13 @@ impl Geometry {
             points.insert(e, v);
         }
         let mut result = Vec::new();
+        let mut loop_edges = BTreeSet::new();
         for (i, f) in self.faces.iter().enumerate() {
             if let Some(&j) = split.get(&i) {
                 let c: Vec<_> = (0..4).map(|k| f.corners[(j + k) % 4].clone()).collect();
                 let a = c[0].between(&c[1], points[&Edge::new(c[0].vertex, c[1].vertex)], 0.5);
                 let b = c[2].between(&c[3], points[&Edge::new(c[2].vertex, c[3].vertex)], 0.5);
+                loop_edges.insert(Edge::new(a.vertex, b.vertex));
                 for corners in [
                     vec![c[0].clone(), a.clone(), b.clone(), c[3].clone()],
                     vec![a, c[1].clone(), c[2].clone(), b],
@@ -1398,7 +1488,8 @@ impl Geometry {
             }
         }
         self.faces = result;
-        Ok(())
+        self.split_uv_seams(&points);
+        Ok(loop_edges)
     }
     pub fn bevel_vertices(&mut self, selection: &mut Selection, width: f32) -> Result<(), String> {
         let chosen = selection.selected_vertices(self);

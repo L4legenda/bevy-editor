@@ -103,6 +103,15 @@ impl Bvh {
         direction: Vec3,
         object: Option<usize>,
     ) -> Option<(usize, usize, f32)> {
+        self.cast_where(origin, direction, |t| object.is_none_or(|id| id == t.object))
+    }
+
+    pub fn cast_where(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        accepts: impl Fn(&Triangle) -> bool,
+    ) -> Option<(usize, usize, f32)> {
         if self.nodes.is_empty() {
             return None;
         }
@@ -123,7 +132,7 @@ impl Bvh {
             } else {
                 for &index in &self.order[node.start..node.end] {
                     let t = &self.triangles[index];
-                    if object.is_some_and(|id| id != t.object) {
+                    if !accepts(t) {
                         continue;
                     }
                     if let Some(distance) =

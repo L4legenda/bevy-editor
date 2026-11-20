@@ -11,6 +11,74 @@ pub(super) struct Input {
     pub request: Request,
     pub corners: Vec<(usize, [usize; 3])>,
 }
+impl Input {
+    pub fn cut_manual_seams(&mut self, seams: &BTreeSet<Edge>) {
+        if seams.is_empty() {
+            return;
+        }
+        let request = &mut self.request;
+        let mut adjacency = BTreeMap::<Edge, Vec<usize>>::new();
+        for (i, &[a, b, c]) in request.triangles.iter().enumerate() {
+            for edge in [Edge::new(a, b), Edge::new(b, c), Edge::new(c, a)] {
+                adjacency.entry(edge).or_default().push(i);
+            }
+        }
+        let corner = |face: usize, vertex| {
+            request.triangles[face].iter().position(|&v| v == vertex).unwrap()
+        };
+        let mut parents: Vec<_> = (0..request.triangles.len() * 3).collect();
+        for (&edge, faces) in &adjacency {
+            let [a, b] = faces.as_slice() else { continue };
+            if seams.contains(&edge) {
+                continue;
+            }
+            for vertex in [edge.0, edge.1] {
+                let a = root(&mut parents, a * 3 + corner(*a, vertex));
+                let b = root(&mut parents, b * 3 + corner(*b, vertex));
+                parents[a.max(b)] = a.min(b);
+            }
+        }
+        let mut ids = vec![usize::MAX; parents.len()];
+        let mut positions = Vec::new();
+        let mut triangles = Vec::with_capacity(request.triangles.len());
+        for (i, face) in request.triangles.iter().enumerate() {
+            triangles.push(std::array::from_fn(|c| {
+                let id = &mut ids[root(&mut parents, i * 3 + c)];
+                if *id == usize::MAX {
+                    *id = positions.len();
+                    positions.push(request.positions[face[c]]);
+                }
+                *id
+            }));
+        }
+        // With isolated marks on a closed vertex fan, both endpoints can still
+        // be connected around the other side. Open one corner in that case.
+        for &edge in seams {
+            let Some([a, b]) = adjacency.get(&edge).map(Vec::as_slice) else {
+                continue;
+            };
+            let ca = [corner(*a, edge.0), corner(*a, edge.1)];
+            let cb = [corner(*b, edge.0), corner(*b, edge.1)];
+            if triangles[*a][ca[0]] == triangles[*b][cb[0]]
+                && triangles[*a][ca[1]] == triangles[*b][cb[1]]
+            {
+                let point = positions[triangles[*b][cb[0]]];
+                triangles[*b][cb[0]] = positions.len();
+                positions.push(point);
+            }
+        }
+        request.positions = positions;
+        request.triangles = triangles;
+    }
+}
+
+fn root(parents: &mut [usize], mut i: usize) -> usize {
+    while parents[i] != i {
+        parents[i] = parents[parents[i]];
+        i = parents[i];
+    }
+    i
+}
 pub(super) fn input(
     mesh: &Geometry,
     threshold: f32,
@@ -85,6 +153,7 @@ pub(super) fn apply(
         positions: mesh.positions.clone(),
         faces: Vec::new(),
         loose_edges: mesh.loose_edges.clone(),
+        uv_seams: mesh.uv_seams.clone(),
     };
     for (fi, face) in mesh.faces.iter().enumerate() {
         if split.contains(&fi) {
@@ -298,6 +367,7 @@ mod tests {
     fn quad() -> Geometry {
         Geometry {
             loose_edges: default(),
+            uv_seams: default(),
             positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
             faces: vec![Face {
                 corners: (0..4)

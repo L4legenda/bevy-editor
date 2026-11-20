@@ -423,6 +423,7 @@ pub(super) fn create(
         geometry: primitive.geometry(parameters)?.into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            authored: None,
             paint: None,
             material: default(),
             source: serde_json::json!({"material": 0}),

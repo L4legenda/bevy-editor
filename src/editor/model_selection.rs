@@ -300,7 +300,7 @@ pub(in crate::editor) fn sync(
     if overlay.materials.is_none() {
         overlay.materials = Some([
             materials.add(FaceMaterial {
-                color: Vec4::new(0.22, 0.075, 0.40, 0.96),
+                color: Vec4::new(0.22, 0.075, 0.40, 0.768),
                 style: Vec4::new(window.scale_factor(), 0., 0., 0.),
                 xray: false,
             }),

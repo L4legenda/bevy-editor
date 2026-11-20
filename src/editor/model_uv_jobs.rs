@@ -65,6 +65,9 @@ pub(super) fn start(
         }
         _ => return,
     }
+    if matches!(action, UvAction::Preview | UvAction::Unwrap) {
+        input.cut_manual_seams(&object.geometry.uv_seams);
+    }
     let progress = Arc::new(backend::Progress::default());
     let worker_progress = progress.clone();
     let request = input.request;

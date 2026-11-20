@@ -311,6 +311,7 @@ fn actions(
     controls: Query<(Entity, &Control)>,
     mut editing: ResMut<editing::State>,
     mut previews: ResMut<crate::editor::thumbnails::Thumbnails>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut grid_assets: (
         ResMut<Assets<Mesh>>,
@@ -326,6 +327,7 @@ fn actions(
         &mut editing,
         &server,
         &mut previews,
+        &mut materials,
         keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
     );
     let mut retry = false;
@@ -846,6 +848,8 @@ fn refresh(
             } else if let Some(gesture) = &editing.gesture {
                 if gesture.is_extruding() {
                     "Двигайте курсор, чтобы задать расстояние · Ctrl — привязка к шагу".into()
+                } else if gesture.is_beveling() {
+                    "A — размер · M — тип · Колесо/S — сегменты · P — профиль · C — ограничение · V — вершины/рёбра · Enter — применить · Esc — отменить".into()
                 } else {
                     format!(
                         "{:?} {} {} · X/Y/Z — ось · число — значение · Ctrl — привязка · Enter — применить · Esc — отмена",

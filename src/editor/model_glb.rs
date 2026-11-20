@@ -276,6 +276,19 @@ impl Glb {
                     .materials
                     .get(slot)
                     .map_or_else(|| json!({}), |slot| slot.source.clone());
+                if let Some(definition) = object.materials.get(slot).and_then(|m| m.authored.as_deref()) {
+                    if root["materials"].is_null() {
+                        root["materials"] = json!([]);
+                    }
+                    let materials = root["materials"].as_array_mut()
+                        .ok_or("Некорректная таблица материалов GLB")?;
+                    let index = materials.iter().position(|material| material == definition)
+                        .unwrap_or_else(|| {
+                            materials.push(definition.clone());
+                            materials.len() - 1
+                        });
+                    primitive["material"] = json!(index);
+                }
                 if let Some(surface) = object.materials.get(slot).and_then(|m| m.paint.as_deref()) {
                     paint_io::encode(&mut root, &mut bin, &mut primitive, surface)?;
                 }
@@ -303,9 +316,13 @@ impl Glb {
                 continue;
             }
             let mesh = root["meshes"].as_array().unwrap().len();
+            let mut saved_topology = json!({"version":1,"primitives":topology});
+            if !object.geometry.uv_seams.is_empty() {
+                saved_topology["uv_seams"] = json!(object.geometry.uv_seam_positions());
+            }
             root["meshes"].as_array_mut().unwrap().push(json!({
                 "name":object.name,"primitives":primitives,
-                "extras":{"bevy_editor_topology":{"version":1,"primitives":topology}}
+                "extras":{"bevy_editor_topology":saved_topology}
             }));
             root["nodes"][node]["mesh"] = json!(mesh);
         }

@@ -12,7 +12,12 @@ pub(in crate::editor) struct EditButton(pub(in crate::editor) EditAction);
 pub(in crate::editor) enum Field {
     Transform(usize),
     Amount,
+    SlidePercent,
     Name,
+    MaterialName,
+    MaterialColor,
+    MaterialRoughness,
+    MaterialMetallic,
 }
 #[derive(Component)]
 pub(in crate::editor) struct Group(bool);
@@ -21,6 +26,8 @@ struct Draft {
     entity: Entity,
     field: Field,
     before: Snapshot,
+    slide_percent: f32,
+    material: document::MaterialDraft,
     text: String,
     error: Option<String>,
 }
@@ -28,9 +35,12 @@ struct Draft {
 pub(in crate::editor) struct Ui {
     toolbar: Entity,
     panel: Entity,
+    bevel_panel: Entity,
     menu: Entity,
     add: Entity,
     stats: Entity,
+    materials: Entity,
+    material_stamp: Option<(usize, Vec<(usize, usize, bevy::asset::AssetId<StandardMaterial>)>)>,
     list: Option<Entity>,
     stamp: Option<(usize, u64)>,
     bound: Option<usize>,
@@ -121,8 +131,12 @@ fn entry(
         ))
         .id();
     let number = match field {
-        Field::Name => None,
+        Field::Name | Field::MaterialName | Field::MaterialColor => None,
         Field::Amount => Some(crate::editor::ui::Number::decimal(0.0001, 1.0e6, 0.01, 4)),
+        Field::SlidePercent => Some(crate::editor::ui::Number::decimal(0.1, 99.0, 1.0, 1)),
+        Field::MaterialRoughness | Field::MaterialMetallic => {
+            Some(crate::editor::ui::Number::decimal(0.0, 1.0, 0.01, 2))
+        }
         Field::Transform(index) => Some(match index / 3 {
             0 => crate::editor::ui::Number::decimal(-1.0e6, 1.0e6, 0.01, 4),
             1 => crate::editor::ui::Number::decimal(-1.0e6, 1.0e6, 0.5, 4),
@@ -276,6 +290,55 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         "Сетка",
         EditAction::Wireframe,
     );
+    let bevel_panel = node(
+        &mut commands,
+        interface.inspector,
+        Node {
+            display: Display::None,
+            width: percent(100),
+            ..column(6.0)
+        },
+    );
+    text(&mut commands, bevel_panel, &interface.font, "ФАСКА", 11.0, MUTED);
+    let decisions = node(&mut commands, bevel_panel, row(4.0));
+    control(&mut commands, decisions, &interface.font, "Применить", EditAction::Bevel(BevelControl::Confirm));
+    control(&mut commands, decisions, &interface.font, "Отменить", EditAction::Cancel);
+    let parameters = node(&mut commands, bevel_panel, Node {
+        flex_wrap: FlexWrap::Wrap,
+        row_gap: px(4),
+        ..row(4.0)
+    });
+    for (choice, label) in [
+        (BevelControl::Affect, "Рёбра или вершины"),
+        (BevelControl::WidthType, "Тип размера"),
+        (BevelControl::Amount, "Размер"),
+        (BevelControl::Segments, "Сегменты"),
+        (BevelControl::Profile, "Профиль"),
+        (BevelControl::CustomProfile, "Пользовательский профиль"),
+        (BevelControl::Clamp, "Ограничить пересечения"),
+        (BevelControl::LoopSlide, "Скольжение вдоль рёбер"),
+        (BevelControl::OuterMiter, "Внешний стык"),
+        (BevelControl::InnerMiter, "Внутренний стык"),
+        (BevelControl::Intersection, "Пересечения"),
+        (BevelControl::Spread, "Разнос стыка"),
+        (BevelControl::Harden, "Сохранить плоские грани"),
+        (BevelControl::PreserveSeams, "Перенести UV-швы"),
+        (BevelControl::PreserveSharp, "Перенести резкие рёбра"),
+        (BevelControl::Material, "Материал новых граней"),
+    ] {
+        control(&mut commands, parameters, &interface.font, label, EditAction::Bevel(choice));
+    }
+    for point in 0..3 {
+        for (axis, label) in ["X", "Y"].into_iter().enumerate() {
+            control(
+                &mut commands,
+                parameters,
+                &interface.font,
+                label,
+                EditAction::Bevel(BevelControl::CustomCoordinate { point, axis }),
+            );
+        }
+    }
     let panel = node(
         &mut commands,
         interface.inspector,
@@ -363,6 +426,42 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     ] {
         control(&mut commands, settings, &interface.font, label, a);
     }
+    text(&mut commands, panel, &interface.font, "ЦЕНТР ТРАНСФОРМАЦИИ", 11.0, MUTED);
+    let pivots = node(
+        &mut commands,
+        panel,
+        Node {
+            flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3),
+            ..row(3.0)
+        },
+    );
+    for (label, mode) in [
+        ("Средняя точка", Pivot::Median),
+        ("Центр границ", Pivot::Bounds),
+        ("Начало объекта", Pivot::ObjectOrigin),
+        ("Начало мира", Pivot::WorldOrigin),
+    ] {
+        control(&mut commands, pivots, &interface.font, label, EditAction::Pivot(mode));
+    }
+    text(&mut commands, panel, &interface.font, "ПРИВЯЗКА", 11.0, MUTED);
+    let snap_targets = node(
+        &mut commands,
+        panel,
+        Node {
+            flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3),
+            ..row(3.0)
+        },
+    );
+    for (label, target) in [
+        ("Шаг", SnapTarget::Step),
+        ("Вершина", SnapTarget::Vertex),
+        ("Ребро", SnapTarget::Edge),
+        ("Поверхность", SnapTarget::Surface),
+    ] {
+        control(&mut commands, snap_targets, &interface.font, label, EditAction::SnapTarget(target));
+    }
     let edit = node(&mut commands, panel, column(6.0));
     commands.entity(edit).insert(Group(true));
     entry(
@@ -372,6 +471,13 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         Field::Amount,
         "Шаг операции",
     );
+    entry(
+        &mut commands,
+        edit,
+        &interface.font,
+        Field::SlidePercent,
+        "Скольжение · %",
+    );
     for (title, buttons) in [
         (
             "ГЕОМЕТРИЯ",
@@ -380,7 +486,16 @@ pub(in crate::editor::ui::model_viewer) fn setup(
                 ("Inset · I", Operation::Inset),
                 ("Подразделить", Operation::Subdivide),
                 ("Loop cut · Ctrl+R", Operation::LoopCut),
-                ("Фаска вершин", Operation::BevelVertices),
+                (
+                    "Скольжение · сторона 1",
+                    Operation::SlideEdges { reverse: false },
+                ),
+                (
+                    "Скольжение · сторона 2",
+                    Operation::SlideEdges { reverse: true },
+                ),
+                ("Фаска рёбер · Ctrl+B", Operation::BevelEdges),
+                ("Фаска вершин · Ctrl+Shift+B", Operation::BevelVertices),
                 ("Треугольники", Operation::Triangulate),
                 ("В четырёхугольники · Alt+J", Operation::Quads),
                 ("Растворить рёбра", Operation::Dissolve),
@@ -396,6 +511,8 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             vec![
                 ("Пересчитать нормали", Operation::RecalculateNormals),
                 ("Развернуть нормали", Operation::FlipNormals),
+                ("Отметить UV-шов", Operation::MarkUvSeam),
+                ("Убрать UV-шов", Operation::ClearUvSeam),
                 ("UV по граням куба", Operation::ProjectUv(3)),
                 ("UV сферой", Operation::SphericalUv),
             ],
@@ -417,14 +534,40 @@ pub(in crate::editor::ui::model_viewer) fn setup(
                 group,
                 &interface.font,
                 label,
-                if op == Operation::Extrude {
-                    EditAction::ExtrudeTool
-                } else {
-                    EditAction::Operate(op)
+                match op {
+                    Operation::Extrude => EditAction::ExtrudeTool,
+                    Operation::BevelEdges => EditAction::BeginBevel { vertices: false },
+                    Operation::BevelVertices => EditAction::BeginBevel { vertices: true },
+                    _ => EditAction::Operate(op),
                 },
             );
         }
     }
+    text(&mut commands, edit, &interface.font, "МАТЕРИАЛЫ ГРАНЕЙ", 11.0, MUTED);
+    let materials = node(
+        &mut commands,
+        edit,
+        Node {
+            flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3),
+            ..row(3.0)
+        },
+    );
+    for (field, label) in [
+        (Field::MaterialName, "Имя"),
+        (Field::MaterialColor, "Цвет · HEX/RGBA"),
+        (Field::MaterialRoughness, "Шероховатость"),
+        (Field::MaterialMetallic, "Металличность"),
+    ] {
+        entry(&mut commands, edit, &interface.font, field, label);
+    }
+    control(
+        &mut commands,
+        edit,
+        &interface.font,
+        "Создать и назначить",
+        EditAction::CreateMaterial,
+    );
     let select = node(
         &mut commands,
         panel,
@@ -439,6 +582,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Снять", EditAction::Deselect),
         ("Инверсия", EditAction::Invert),
         ("Связанные · Ctrl+L", EditAction::Linked),
+        ("Выбрать петлю", EditAction::SelectEdgeLoop),
         ("Расширить", EditAction::Grow),
         ("Сузить", EditAction::Shrink),
         ("Рамка · B", EditAction::BoxSelect),
@@ -509,9 +653,12 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     commands.insert_resource(Ui {
         toolbar,
         panel,
+        bevel_panel,
         menu,
         add,
         stats,
+        materials,
+        material_stamp: None,
         list: None,
         stamp: None,
         bound: None,
@@ -523,9 +670,19 @@ fn value(doc: &Document, field: Field) -> String {
     match field {
         Field::Name => doc.active().map_or(String::new(), |o| o.name.clone()),
         Field::Amount => format!("{:.4}", doc.amount),
+        Field::SlidePercent => format!("{:.1}", doc.slide_percent),
+        Field::MaterialName => doc.material_draft.name.clone(),
+        Field::MaterialColor => {
+            let color = doc.material_draft.color;
+            let [r, g, b, a] = [color.red, color.green, color.blue, color.alpha]
+                .map(|v| (v * 255.0).round() as u8);
+            format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+        }
+        Field::MaterialRoughness => format!("{:.2}", doc.material_draft.roughness),
+        Field::MaterialMetallic => format!("{:.2}", doc.material_draft.metallic),
         Field::Transform(index) => {
             let v = if doc.mode == Mode::Edit {
-                doc.pivot().map_or(0.0, |v| v[index % 3])
+                doc.selection_center().map_or(0.0, |v| v[index % 3])
             } else {
                 doc.active().map_or(0.0, |o| match index / 3 {
                     0 => o.transform.translation[index % 3],
@@ -557,6 +714,8 @@ pub(in crate::editor) fn fields(
         if let Some(doc) = state.documents.get_mut(&draft.index) {
             if cancel {
                 doc.restore(draft.before);
+                doc.slide_percent = draft.slide_percent;
+                doc.material_draft = draft.material;
                 if let Ok((_, _, mut text)) = inputs.get_mut(draft.entity) {
                     text.editor_mut().set_text(&value(doc, draft.field));
                 }
@@ -568,12 +727,19 @@ pub(in crate::editor) fn fields(
                         draft.text = typed.clone();
                         doc.objects = draft.before.objects.clone();
                         let result = (|| {
-                            if draft.field == Field::Name {
+                            if matches!(draft.field, Field::Name | Field::MaterialName) {
                                 let name = typed.trim();
                                 if name.is_empty() || name.len() > 256 {
                                     return Err("Имя должно содержать от 1 до 256 символов".into());
                                 }
-                                doc.active_mut().ok_or("Нет активного объекта")?.name = name.into();
+                                if draft.field == Field::MaterialName {
+                                    doc.material_draft.name = name.into();
+                                } else {
+                                    doc.active_mut().ok_or("Нет активного объекта")?.name = name.into();
+                                }
+                            } else if draft.field == Field::MaterialColor {
+                                doc.material_draft.color = bevy::color::Srgba::hex(typed.trim())
+                                    .map_err(|_| "Введите цвет в формате #RRGGBB или #RRGGBBAA")?;
                             } else {
                                 let number = typed
                                     .trim()
@@ -588,6 +754,22 @@ pub(in crate::editor) fn fields(
                                             return Err("Шаг должен быть больше нуля".into());
                                         }
                                         doc.amount = number;
+                                    }
+                                    Field::SlidePercent => {
+                                        if !(0.1..=99.0).contains(&number) {
+                                            return Err("Скольжение задаётся от 0,1 до 99%".into());
+                                        }
+                                        doc.slide_percent = number;
+                                    }
+                                    Field::MaterialRoughness | Field::MaterialMetallic => {
+                                        if !(0.0..=1.0).contains(&number) {
+                                            return Err("Введите значение от 0 до 1".into());
+                                        }
+                                        if draft.field == Field::MaterialRoughness {
+                                            doc.material_draft.roughness = number;
+                                        } else {
+                                            doc.material_draft.metallic = number;
+                                        }
                                     }
                                     Field::Transform(index) => {
                                         if doc.mode == Mode::Object {
@@ -619,7 +801,7 @@ pub(in crate::editor) fn fields(
                                             }
                                         } else {
                                             let pivot =
-                                                doc.pivot().ok_or("Нет выделенных вершин")?;
+                                                doc.selection_center().ok_or("Нет выделенных вершин")?;
                                             let mut delta = Vec3::ZERO;
                                             delta[index % 3] = number - pivot[index % 3];
                                             doc.transform(
@@ -665,6 +847,8 @@ pub(in crate::editor) fn fields(
                                 entity,
                                 field: *field,
                                 before: doc.snapshot(),
+                                slide_percent: doc.slide_percent,
+                                material: doc.material_draft.clone(),
                                 text: expected,
                                 error: None,
                             });
@@ -683,7 +867,7 @@ pub(in crate::editor) fn fields(
         state.status.clear();
     }
     for (&index, doc) in &state.documents {
-        if doc.dirty() || state.drafts.contains(&index) {
+        if state.document_dirty(index, doc) || state.drafts.contains(&index) {
             editor.dirty_models.insert(index);
         } else {
             editor.dirty_models.remove(&index);
@@ -710,11 +894,13 @@ pub(in crate::editor) fn refresh(
     let index = editor.viewing_model;
     let doc = index.and_then(|i| state.documents.get(&i));
     let editing = doc.is_some_and(|d| d.mode == Mode::Edit);
+    let beveling = state.gesture.as_ref().is_some_and(input::Gesture::is_beveling);
     for (entity, show) in [
         (
             ui.panel,
-            showing && !doc.is_some_and(|d| matches!(d.mode, Mode::Uv | Mode::Paint)),
+            showing && !beveling && !doc.is_some_and(|d| matches!(d.mode, Mode::Uv | Mode::Paint)),
         ),
+        (ui.bevel_panel, showing && beveling),
         (ui.toolbar, showing),
         (ui.menu, showing && state.menu),
         (ui.add, showing && state.add_menu),
@@ -726,6 +912,11 @@ pub(in crate::editor) fn refresh(
     for (entity, control, children) in &controls {
         let selected = state.active(control.0, index);
         let available = state.available(control.0, index) && editor.pending.is_none();
+        if matches!(control.0, EditAction::Bevel(BevelControl::CustomCoordinate { .. }))
+            && let Ok(mut node) = nodes.get_mut(entity)
+        {
+            node.display = if available { Display::Flex } else { Display::None };
+        }
         if available {
             commands.entity(entity).try_remove::<InteractionDisabled>();
         } else {
@@ -752,6 +943,10 @@ pub(in crate::editor) fn refresh(
                         "Объект"
                     }
                     .into();
+                } else if let EditAction::Bevel(choice) = control.0
+                    && let Some(label) = state.gesture.as_ref().and_then(|g| g.bevel_control_label(choice))
+                {
+                    text.0 = label;
                 }
                 color.0 = if !available {
                     DISABLED_TEXT
@@ -822,6 +1017,46 @@ pub(in crate::editor) fn refresh(
         }
     }
     // These panes are deliberately independent of the scene inspector's controls.
+
+    let material_stamp = doc.zip(index).filter(|_| showing && editing).map(|(doc, index)| {
+        let choices = doc.objects.iter().flat_map(|object| {
+            object.materials.iter().enumerate().map(move |(slot, material)| {
+                (object.id, slot, material.material.id())
+            })
+        }).collect();
+        (index, choices)
+    });
+    if ui.material_stamp != material_stamp {
+        commands.entity(ui.materials).despawn_children();
+        if let Some((_, choices)) = &material_stamp {
+            let doc = doc.unwrap();
+            let mut listed = Vec::new();
+            for &(id, slot, _) in choices {
+                let object = doc.objects.iter().find(|object| object.id == id).unwrap();
+                let material = &object.materials[slot];
+                if listed.contains(&material) {
+                    continue;
+                }
+                listed.push(material);
+                let definition = material.authored.as_deref().or_else(|| {
+                    let index = material.source["material"].as_u64()?;
+                    doc.source.json["materials"].get(index as usize)
+                });
+                let name = definition.and_then(|definition| definition["name"].as_str())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{} · {}", object.name, slot + 1));
+                control(
+                    &mut commands,
+                    ui.materials,
+                    &interface.font,
+                    &name,
+                    EditAction::AssignMaterial { object: id, slot },
+                );
+            }
+        }
+        ui.material_stamp = material_stamp;
+    }
 
     let stamp = doc.zip(index).map(|(doc, index)| (index, doc.ui_revision));
     if ui.stamp != stamp || ui.list.is_some_and(|e| !entities.contains(e)) || ui.list.is_none() {

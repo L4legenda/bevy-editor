@@ -488,8 +488,12 @@ fn initial(
     let material = object
         .materials
         .get(slot)
-        .and_then(|m| m.source["material"].as_u64())
-        .and_then(|i| doc.source.json["materials"].get(i as usize))
+        .and_then(|slot| {
+            slot.authored.as_deref().or_else(|| {
+                let index = slot.source["material"].as_u64()? as usize;
+                doc.source.json["materials"].get(index)
+            })
+        })
         .cloned()
         .unwrap_or_else(|| serde_json::json!({"doubleSided":true}));
     Surface {
@@ -1259,6 +1263,7 @@ mod tests {
             geometry: mesh.into(),
             transform: Transform::IDENTITY,
             materials: vec![MaterialSlot {
+                authored: None,
                 material: default(),
                 source: serde_json::json!({"material":0}),
                 paint: None,

@@ -1,7 +1,7 @@
 //! Model documents, kept alive across tabs and isolated from scene instances.
 use super::*;
 use crate::editor::{
-    model_document::{self as document, Document, MaterialSlot, Mode, Object, Operation, Snapshot},
+    model_document::{self as document, Document, MaterialSlot, Mode, Object, Operation, Pivot, Snapshot},
     model_mesh::{Edge, Element, Geometry, Selection as MeshSelection},
 };
 use bevy::{
@@ -13,6 +13,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
+
+#[path = "model_edit_snap.rs"]
+mod snapping;
+use snapping::SnapTarget;
+use input::BevelControl;
 
 #[path = "model_area.rs"]
 pub(super) mod area;
@@ -40,10 +45,16 @@ pub(in crate::editor) enum EditAction {
     Operate(Operation),
     ExtrudeTool,
     BeginExtrude,
+    BeginBevel { vertices: bool },
+    AdjustBevel,
+    Bevel(BevelControl),
     SelectAll,
     Deselect,
     Invert,
     Linked,
+    SelectEdgeLoop,
+    CreateMaterial,
+    AssignMaterial { object: usize, slot: usize },
     Grow,
     Shrink,
     SelectObject(usize),
@@ -57,6 +68,8 @@ pub(in crate::editor) enum EditAction {
     Wireframe,
     Local,
     Snap,
+    SnapTarget(SnapTarget),
+    Pivot(Pivot),
     Proportional,
     Connected,
     AddMenu,
@@ -100,6 +113,7 @@ pub(in crate::editor) struct State {
     render_objects: HashMap<usize, RenderedObject>,
     default_material: Handle<StandardMaterial>,
     pub gesture: Option<input::Gesture>,
+    last_bevel: HashMap<usize, input::LastBevel>,
     pub hover: Option<crate::editor::viewport::TransformHandle>,
     bvh: input::Bvh,
     pub(super) bvh_stamp: Option<(usize, u64)>,
@@ -110,6 +124,7 @@ pub(in crate::editor) struct State {
     pub wireframe: bool,
     pub local: bool,
     pub snap: bool,
+    snap_target: SnapTarget,
     pub proportional: bool,
     pub connected: bool,
     pub influence: f32,
@@ -134,6 +149,7 @@ impl Default for State {
             render_objects: HashMap::new(),
             default_material: default(),
             gesture: None,
+            last_bevel: HashMap::new(),
             hover: None,
             bvh: default(),
             bvh_stamp: None,
@@ -144,6 +160,7 @@ impl Default for State {
             wireframe: false,
             local: false,
             snap: false,
+            snap_target: SnapTarget::Step,
             proportional: false,
             connected: false,
             influence: 1.0,
@@ -162,6 +179,13 @@ impl Default for State {
     }
 }
 impl State {
+    fn document_dirty(&self, index: usize, doc: &Document) -> bool {
+        self.gesture.as_ref()
+            .filter(|gesture| gesture.model == index)
+            .and_then(input::Gesture::committed_bevel_state)
+            .map_or_else(|| doc.dirty(), |state| doc.paint_pending || state.objects != doc.saved)
+    }
+
     pub(in crate::editor) fn saving_model(&self, index: usize) -> bool {
         self.saving
             .as_ref()
@@ -218,6 +242,8 @@ impl State {
     pub fn active(&self, action: EditAction, index: Option<usize>) -> bool {
         let doc = index.and_then(|i| self.documents.get(&i));
         match action {
+            EditAction::Bevel(control) => self.gesture.as_ref()
+                .is_some_and(|gesture| gesture.bevel_control_active(control)),
             EditAction::Mode(mode) => self.mode(index) == mode,
             EditAction::Element(kind) => doc.is_some_and(|d| d.selection.kind == kind),
             EditAction::Tool(tool) => !self.extrude_tool && self.tool == tool,
@@ -227,6 +253,8 @@ impl State {
             EditAction::Wireframe => self.wireframe,
             EditAction::Local => self.local,
             EditAction::Snap => self.snap,
+            EditAction::SnapTarget(target) => self.snap_target == target,
+            EditAction::Pivot(mode) => doc.is_some_and(|d| d.pivot_mode == mode),
             EditAction::Proportional => self.proportional,
             EditAction::Connected => self.connected,
             EditAction::BoxSelect => self.box_armed,
@@ -235,6 +263,13 @@ impl State {
         }
     }
     pub fn available(&self, action: EditAction, index: Option<usize>) -> bool {
+        if let Some(gesture) = self.gesture.as_ref().filter(|g| g.is_beveling()) {
+            return match action {
+                EditAction::Cancel => true,
+                EditAction::Bevel(control) => gesture.bevel_control_available(control),
+                _ => false,
+            };
+        }
         if action == EditAction::Wireframe {
             // Topology can also be viewed for GLTFs protected from editing.
             return index.is_some();
@@ -267,10 +302,32 @@ impl State {
             return false;
         }
         match action {
+            EditAction::Bevel(_) => false,
+            EditAction::BeginBevel { .. } => {
+                self.gesture.is_none() && doc.mode == Mode::Edit && doc.selection_center().is_some()
+            }
+            EditAction::AdjustBevel => index.and_then(|index| self.last_bevel.get(&index))
+                .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision),
             EditAction::Undo => !doc.undo.is_empty() && self.gesture.is_none(),
             EditAction::Redo => !doc.redo.is_empty() && self.gesture.is_none(),
             EditAction::Save => doc.dirty() || doc.paint_busy,
             EditAction::Element(_) => doc.mode == Mode::Edit,
+            EditAction::CreateMaterial | EditAction::AssignMaterial { .. } => {
+                doc.can_assign_material() && self.gesture.is_none() && !doc.paint_busy
+            }
+            EditAction::Pivot(_) | EditAction::SnapTarget(_) => {
+                matches!(doc.mode, Mode::Object | Mode::Edit) && self.gesture.is_none()
+            }
+            EditAction::SelectEdgeLoop
+            | EditAction::Operate(
+                Operation::SlideEdges { .. } | Operation::BevelEdges
+                | Operation::MarkUvSeam | Operation::ClearUvSeam,
+            ) => {
+                doc.mode == Mode::Edit
+                    && doc.selection.kind == Element::Edge
+                    && !doc.selection.edges.is_empty()
+                    && self.gesture.is_none()
+            }
             EditAction::Knife => doc.mode == Mode::Edit,
             EditAction::ExtrudeTool => {
                 self.gesture.is_none()
@@ -304,8 +361,15 @@ impl State {
     pub(super) fn clear_gesture(&mut self, _doc_index: Option<usize>, cancel: bool) {
         if let Some(gesture) = self.gesture.take() {
             if let Some(doc) = self.documents.get_mut(&gesture.model) {
-                if cancel {
-                    doc.restore(gesture.base);
+                if cancel || gesture.is_beveling() {
+                    let model = gesture.model;
+                    doc.restore(gesture.cancel_snapshot());
+                    if let Some(last) = self.last_bevel.get_mut(&model)
+                        && last.matches(doc)
+                    {
+                        last.revision = doc.revision;
+                    }
+                    self.status.clear();
                 } else if doc.validate().is_ok() {
                     doc.checkpoint(gesture.base);
                 } else {
@@ -486,10 +550,15 @@ pub(super) fn initialize(
                         ctx.default.clone()
                     };
                     slots.push(MaterialSlot {
+                        authored: None,
                         paint: ctx.source.paint_surface(&ctx.json["meshes"][mesh.index()]["primitives"][i])?,
                         material,
                         source: ctx.json["meshes"][mesh.index()]["primitives"][i].clone(),
                     });
+                }
+                let topology = &ctx.json["meshes"][mesh.index()]["extras"]["bevy_editor_topology"];
+                if topology["version"].as_u64() == Some(1) {
+                    geometry.restore_uv_seams(&topology["uv_seams"])?;
                 }
                 geometry.validate()?;
                 objects.push(Object {
@@ -712,6 +781,7 @@ pub(super) fn process_actions(
     state: &mut State,
     server: &AssetServer,
     previews: &mut crate::editor::thumbnails::Thumbnails,
+    materials: &mut Assets<StandardMaterial>,
     shift: bool,
 ) {
     if let Some((index, objects, result)) = state.saving.as_mut().and_then(|job| {
@@ -756,6 +826,16 @@ pub(super) fn process_actions(
         }
     }
     for &action in actions {
+        if state.gesture.as_ref().is_some_and(|gesture| {
+            gesture.is_beveling() && match action {
+                Action::CloseModelTab(index) => gesture.model == index,
+                Action::ViewModel(index) => gesture.model != index,
+                Action::ModelView(ModelViewAction::Close | ModelViewAction::Retry) => true,
+                _ => false,
+            }
+        }) {
+            state.clear_gesture(None, true);
+        }
         if let Some(
             crate::editor::PendingAction::CloseModelTab(index)
             | crate::editor::PendingAction::CloseModelEditor(index),
@@ -803,6 +883,11 @@ pub(super) fn process_actions(
         let Some(index) = editor.viewing_model else {
             continue;
         };
+        if state.gesture.as_ref().is_some_and(input::Gesture::is_beveling)
+            && !matches!(action, EditAction::Cancel | EditAction::Bevel(_))
+        {
+            continue;
+        }
         if state.mode(Some(index)) == Mode::Uv && !state.available(action, Some(index)) {
             continue;
         }
@@ -813,6 +898,13 @@ pub(super) fn process_actions(
             continue;
         }
         match action {
+            EditAction::Bevel(control) => {
+                if let Some(gesture) = state.gesture.as_mut().filter(|g| g.model == index) {
+                    let slots = state.documents[&index].active()
+                        .map_or(0, |o| o.materials.len());
+                    gesture.set_bevel_control(control, slots);
+                }
+            }
             EditAction::Menu => {
                 state.clear_gesture(Some(index), false);
                 state.menu = !state.menu;
@@ -856,12 +948,33 @@ pub(super) fn process_actions(
                     state.status = "Выделите вершины, рёбра или грани для экструдирования".into();
                 }
             }
+            EditAction::BeginBevel { .. } | EditAction::AdjustBevel => {
+                if !state.available(action, Some(index)) {
+                    state.status = "Выделите геометрию или завершите предыдущую операцию".into();
+                    continue;
+                }
+                let doc = &state.documents[&index];
+                state.gesture = match action {
+                    EditAction::BeginBevel { vertices } => input::Gesture::bevel(doc, index, vertices),
+                    _ => input::Gesture::adjust_bevel(doc, index, &state.last_bevel[&index]),
+                };
+                if state.gesture.is_some() {
+                    state.box_start = None;
+                    state.box_armed = false;
+                    state.knife = false;
+                    state.knife_start = None;
+                    state.menu = false;
+                    state.add_menu = false;
+                    state.extrude_tool = false;
+                    viewer.gesture = None;
+                }
+            }
             EditAction::Begin(tool) => {
                 state.box_start = None;
                 state.box_auto = false;
                 if let Some(doc) = state.documents.get(&index) {
-                    if doc.pivot().is_some() {
-                        state.gesture = Some(input::Gesture::new(tool, doc.snapshot(), index));
+                    if let Some(pivot) = doc.pivot() {
+                        state.gesture = Some(input::Gesture::new(tool, doc.snapshot(), index, pivot));
                         viewer.gesture = None;
                     }
                 }
@@ -877,6 +990,15 @@ pub(super) fn process_actions(
             EditAction::Wireframe => state.wireframe = !state.wireframe,
             EditAction::Local => state.local = !state.local,
             EditAction::Snap => state.snap = !state.snap,
+            EditAction::SnapTarget(target) if state.available(action, Some(index)) => {
+                state.snap_target = target;
+                state.snap = true;
+            }
+            EditAction::Pivot(mode) if state.available(action, Some(index)) => {
+                let doc = state.documents.get_mut(&index).unwrap();
+                doc.pivot_mode = mode;
+                doc.ui_revision += 1;
+            }
             EditAction::Proportional => state.proportional = !state.proportional,
             EditAction::Connected => state.connected = !state.connected,
             EditAction::BoxSelect => {
@@ -946,6 +1068,26 @@ pub(super) fn process_actions(
                         EditAction::Undo => doc.undo(),
                         EditAction::Redo => doc.redo(),
                         EditAction::SelectObject(id) => doc.select_object(id, shift),
+                        EditAction::SelectEdgeLoop => {
+                            let mesh = &doc.active().ok_or("Выберите объект")?.geometry;
+                            doc.selection.edges = mesh.edge_loops(&doc.selection.edges);
+                            doc.ui_revision += 1;
+                        }
+                        EditAction::CreateMaterial => {
+                            if !doc.can_assign_material() || doc.paint_busy {
+                                return Err("Выделите грани для назначения материала".into());
+                            }
+                            let material = doc.material_draft.slot(materials);
+                            doc.assign_material(material, &state.default_material)?;
+                        }
+                        EditAction::AssignMaterial { object, slot } => {
+                            let material = doc.objects.iter()
+                                .find(|o| o.id == object)
+                                .and_then(|o| o.materials.get(slot))
+                                .cloned()
+                                .ok_or("Материал не найден")?;
+                            doc.assign_material(material, &state.default_material)?;
+                        }
                         EditAction::SelectAll
                         | EditAction::Deselect
                         | EditAction::Invert
@@ -1081,10 +1223,11 @@ pub(super) fn process_actions(
     state
         .drafts
         .retain(|index| editor.model_tabs.contains(index));
+    state.last_bevel.retain(|index, _| editor.model_tabs.contains(index));
     editor.dirty_models = state
         .documents
         .iter()
-        .filter(|(_, doc)| doc.dirty())
+        .filter(|&(&index, doc)| state.document_dirty(index, doc))
         .map(|(&i, _)| i)
         .chain(state.drafts.iter().copied())
         .collect();
@@ -1192,13 +1335,15 @@ pub(in crate::editor) fn shortcuts(
             Some(EditAction::Operate(Operation::LoopCut))
         } else if keys.just_pressed(KeyCode::KeyT) {
             Some(EditAction::Operate(Operation::Triangulate))
-        } else if keys.just_pressed(KeyCode::KeyB) {
-            Some(EditAction::Operate(Operation::BevelVertices))
+        } else if keys.just_pressed(KeyCode::KeyB) && mode == Mode::Edit {
+            Some(EditAction::BeginBevel { vertices: shift })
         } else if keys.just_pressed(KeyCode::KeyJ) {
             Some(EditAction::Operate(Operation::Join))
         } else {
             None
         }
+    } else if keys.just_pressed(KeyCode::F9) && mode == Mode::Edit {
+        Some(EditAction::AdjustBevel)
     } else if keys.just_pressed(KeyCode::Tab) {
         Some(if shift {
             EditAction::Snap

@@ -12,10 +12,14 @@ use bevy::{
 #[path = "model_pick.rs"]
 mod picking;
 pub(in crate::editor) use picking::Bvh;
+#[path = "model_bevel_input.rs"]
+mod bevel;
+pub(super) use bevel::{BevelControl, LastBevel};
 
 pub(in crate::editor) struct Gesture {
     pub model: usize,
     pub base: Snapshot,
+    pivot: Vec3,
     pub tool: Tool,
     pub axis: Option<usize>,
     pub plane: Option<usize>,
@@ -23,7 +27,10 @@ pub(in crate::editor) struct Gesture {
     pub typed: String,
     pub start: Option<Vec2>,
     pub drag: bool,
+    snap_geometry: Option<snapping::GeometryTargets>,
+    snap_point: Option<Vec3>,
     extrusion: Option<Extrusion>,
+    bevel: Option<bevel::Preview>,
 }
 struct Extrusion {
     pivot: Vec3,
@@ -33,10 +40,11 @@ struct Extrusion {
     distance: f32,
 }
 impl Gesture {
-    pub fn new(tool: Tool, base: Snapshot, model: usize) -> Self {
+    pub fn new(tool: Tool, base: Snapshot, model: usize, pivot: Vec3) -> Self {
         Self {
             model,
             base,
+            pivot,
             tool,
             axis: None,
             plane: None,
@@ -44,12 +52,15 @@ impl Gesture {
             typed: String::new(),
             start: None,
             drag: false,
+            snap_geometry: None,
+            snap_point: None,
             extrusion: None,
+            bevel: None,
         }
     }
     pub(super) fn extrude(doc: &Document, model: usize) -> Option<Self> {
         let (pivot, direction) = extrusion_axis(doc)?;
-        let mut gesture = Self::new(Tool::Move, doc.snapshot(), model);
+        let mut gesture = Self::new(Tool::Move, doc.snapshot(), model, pivot);
         gesture.extrusion = Some(Extrusion {
             pivot,
             direction,
@@ -61,6 +72,18 @@ impl Gesture {
     }
     pub(in crate::editor) fn is_extruding(&self) -> bool {
         self.extrusion.is_some()
+    }
+
+    pub(in crate::editor) fn is_beveling(&self) -> bool {
+        self.bevel.is_some()
+    }
+
+    pub(super) fn cancel_snapshot(mut self) -> Snapshot {
+        self.bevel.take().and_then(|preview| preview.previous).unwrap_or(self.base)
+    }
+
+    pub(super) fn committed_bevel_state(&self) -> Option<&Snapshot> {
+        self.bevel.as_ref().map(|preview| preview.previous.as_ref().unwrap_or(&self.base))
     }
 }
 
@@ -158,7 +181,7 @@ fn extrusion_axis(doc: &Document) -> Option<(Vec3, Vec3)> {
     let object = doc.active()?;
     let normal = object.geometry.extrusion_direction(&doc.selection)?;
     Some((
-        doc.pivot()?,
+        doc.selection_center()?,
         object.transform.to_matrix().transform_vector3(normal),
     ))
 }
@@ -276,6 +299,9 @@ pub(in crate::editor) fn input(
             && !editor.browser_popup
             && !editor.hdri_library_open
     }) else {
+        if state.gesture.as_ref().is_some_and(Gesture::is_beveling) {
+            state.clear_gesture(None, true);
+        }
         text.clear();
         return;
     };
@@ -294,7 +320,9 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
+    let beveling = state.gesture.as_ref().is_some_and(Gesture::is_beveling);
+    let cursor = window.cursor_position().or_else(|| beveling.then_some(rect.min - Vec2::ONE));
+    let Some(cursor) = cursor else {
         if mouse.just_released(MouseButton::Left)
             && state
                 .gesture
@@ -307,17 +335,18 @@ pub(in crate::editor) fn input(
         return;
     };
     let extruding = state.gesture.as_ref().is_some_and(Gesture::is_extruding);
-    if !extruding
+    let over_navigation = orientation
+        .as_ref()
+        .is_some_and(|gizmo| gizmo.blocks_input());
+    if !extruding && !beveling
         && state.box_start.is_none()
-        && orientation
-            .as_ref()
-            .is_some_and(|gizmo| gizmo.blocks_input())
+        && over_navigation
     {
         state.hover = None;
         text.clear();
         return;
     }
-    if !extruding
+    if !extruding && !beveling
         && (drawer.resizing || (state.box_start.is_none() && drawer.covers(cursor, &window)))
     {
         state.hover = None;
@@ -330,7 +359,7 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     }
-    if focus.get().is_some_and(|e| inputs.contains(e)) {
+    if !beveling && focus.get().is_some_and(|e| inputs.contains(e)) {
         if mouse.just_pressed(MouseButton::Left)
             && rect.contains(cursor)
             && state.input_error.is_none()
@@ -345,13 +374,14 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     }
-    if state.gesture.is_none()
-        && state.box_start.is_none()
-        && buttons.iter().any(|(node, transform)| {
+    let over_button = || {
+        buttons.iter().any(|(node, transform)| {
             let p = cursor * window.scale_factor();
             let center = transform.affine().translation;
             node.size().min_element() > 0.0 && (p - center).abs().cmple(node.size() * 0.5).all()
         })
+    };
+    if state.gesture.is_none() && state.box_start.is_none() && over_button()
     {
         text.clear();
         return;
@@ -388,7 +418,47 @@ pub(in crate::editor) fn input(
         KeyCode::SuperRight,
     ]);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
-    if extruding && let Some(mut gesture) = state.gesture.take() {
+    if beveling && let Some(mut gesture) = state.gesture.take() {
+        let wheel = if scroll.unit == bevy::input::mouse::MouseScrollUnit::Pixel {
+            scroll.delta.y / 24.0
+        } else {
+            scroll.delta.y
+        };
+        let outcome = bevel::update(
+            &mut gesture, &mut doc, &viewer, rect, cursor, &keys, &mouse, wheel, text.read(),
+            rect.contains(cursor)
+                && !over_navigation
+                && !drawer.resizing
+                && !drawer.covers(cursor, &window)
+                && !over_button(),
+        );
+        match outcome {
+            bevel::Outcome::Preview(status) => {
+                state.status = status;
+                state.gesture = Some(gesture);
+            }
+            bevel::Outcome::Confirm(last) => {
+                state.last_bevel.insert(index, last);
+                state.status.clear();
+            }
+            bevel::Outcome::Noop { removed_last } => {
+                if removed_last {
+                    state.last_bevel.remove(&index);
+                }
+                state.status.clear();
+            }
+            bevel::Outcome::Cancel => {
+                doc.restore(gesture.cancel_snapshot());
+                if let Some(last) = state.last_bevel.get_mut(&index)
+                    && last.matches(&doc)
+                {
+                    last.revision = doc.revision;
+                }
+                state.status.clear();
+            }
+        }
+        viewer.gesture = None;
+    } else if extruding && let Some(mut gesture) = state.gesture.take() {
         let initial = gesture.start.is_none();
         if keys.just_pressed(KeyCode::Escape) || mouse.just_pressed(MouseButton::Right) {
             doc.restore(gesture.base);
@@ -464,7 +534,7 @@ pub(in crate::editor) fn input(
                 _ => {}
             }
         }
-        let pivot = snapshot_pivot(&gesture.base, doc.mode).unwrap_or(viewer.center);
+        let pivot = gesture.pivot;
         let delta = (cursor - start) * if shift { 0.1 } else { 1.0 };
         let pose = view_pose(&viewer);
         let depth = (pivot - pose.translation).dot(*pose.forward());
@@ -474,11 +544,14 @@ pub(in crate::editor) fn input(
         let numeric_error = (!gesture.typed.is_empty() && typed.is_none())
             || (gesture.tool == Tool::Scale && typed.is_some_and(|v| v.abs() < 0.0001));
         let direction = gesture.axis.map(|a| axis(&doc, a, state.local));
+        gesture.snap_point = None;
         let matrix = match gesture.tool {
             Tool::Move | Tool::Universal => {
+                let step_snap = snapped && state.snap_target == SnapTarget::Step;
+                let plane = gesture.plane.map(|a| axis(&doc, a, state.local));
                 let mut movement =
                     (*pose.right() * delta.x - *pose.up() * delta.y) * world_per_pixel;
-                if let Some(normal) = gesture.plane.map(|a| axis(&doc, a, state.local)) {
+                if let Some(normal) = plane {
                     movement = plane_point(&viewer, rect, start, pivot, normal)
                         .zip(plane_point(&viewer, rect, cursor, pivot, normal))
                         .map_or(Vec3::ZERO, |(a, b)| b - a);
@@ -498,13 +571,13 @@ pub(in crate::editor) fn input(
                     };
                     if let Some(value) = typed {
                         amount = value;
-                    } else if snapped {
+                    } else if step_snap {
                         amount = (amount / 0.25).round() * 0.25;
                     }
                     movement = direction * amount;
                 } else if let Some(amount) = typed {
                     movement = *pose.right() * amount;
-                } else if snapped {
+                } else if step_snap {
                     let frame = if state.local {
                         doc.active()
                             .map_or(Quat::IDENTITY, |o| o.transform.rotation)
@@ -512,6 +585,29 @@ pub(in crate::editor) fn input(
                         Quat::IDENTITY
                     };
                     movement = frame * ((frame.inverse() * movement / 0.25).round() * 0.25);
+                }
+                if snapped && !step_snap && gesture.typed.is_empty() {
+                    let targets = gesture.snap_geometry.get_or_insert_with(|| {
+                        snapping::GeometryTargets::new(&gesture.base, doc.mode)
+                    });
+                    if let Some(target) = targets.at(
+                        &gesture.base,
+                        doc.mode,
+                        state.snap_target,
+                        &viewer,
+                        rect,
+                        cursor,
+                    ) {
+                        let offset = target - pivot;
+                        movement = if let Some(axis) = direction {
+                            axis * offset.dot(axis)
+                        } else if let Some(normal) = plane {
+                            offset - normal * offset.dot(normal)
+                        } else {
+                            offset
+                        };
+                        gesture.snap_point = Some(target);
+                    }
                 }
                 Mat4::from_translation(movement)
             }
@@ -727,13 +823,13 @@ pub(in crate::editor) fn input(
                     let hit = frame
                         .as_ref()
                         .and_then(|frame| frame.hit(&viewer, rect, state.tool, cursor));
-                    if let Some(handle) = hit {
+                    if let (Some(handle), Some(frame)) = (hit, frame) {
                         let tool = match handle {
                             TransformHandle::Axis { tool, .. } => tool,
                             TransformHandle::ViewRotation => Tool::Rotate,
                             _ => Tool::Move,
                         };
-                        let mut gesture = Gesture::new(tool, doc.snapshot(), index);
+                        let mut gesture = Gesture::new(tool, doc.snapshot(), index, frame.pivot);
                         gesture.handle = Some(handle);
                         if let TransformHandle::Axis { axis, .. } = handle {
                             gesture.axis = Some(axis);
@@ -764,7 +860,7 @@ pub(in crate::editor) fn input(
             }
         }
     }
-    if doc.dirty() {
+    if state.document_dirty(index, &doc) || state.drafts.contains(&index) {
         editor.dirty_models.insert(index);
     } else {
         editor.dirty_models.remove(&index);
@@ -772,40 +868,6 @@ pub(in crate::editor) fn input(
     state.documents.insert(index, doc);
 }
 
-// Only selection and geometry are needed to compute the immutable gesture pivot.
-fn snapshot_pivot(base: &Snapshot, mode: Mode) -> Option<Vec3> {
-    if mode == Mode::Edit {
-        let o = base.objects.iter().find(|o| Some(o.id) == base.active)?;
-        let selected = base.selection.selected_vertices(&o.geometry);
-        if selected.is_empty() {
-            return None;
-        }
-        Some(
-            selected
-                .iter()
-                .map(|&v| o.transform.transform_point(o.geometry.positions[v]))
-                .sum::<Vec3>()
-                / selected.len() as f32,
-        )
-    } else {
-        let objects: Vec<_> = base
-            .objects
-            .iter()
-            .filter(|o| base.selected.contains(&o.id) && !o.hidden)
-            .collect();
-        if objects.is_empty() {
-            None
-        } else {
-            Some(
-                objects
-                    .iter()
-                    .map(|o| o.transform.translation)
-                    .sum::<Vec3>()
-                    / objects.len() as f32,
-            )
-        }
-    }
-}
 fn world_per_pixel(viewer: &Viewer, rect: Rect) -> f32 {
     viewer.distance * 2.0 * (FOV * 0.5).tan() / rect.height()
 }
@@ -910,7 +972,12 @@ pub(in crate::editor) fn draw(
                     .transform
                     .transform_point(object.geometry.positions[e.1]);
                 if !selected {
-                    line!(a, b, gray);
+                    let color = if object.geometry.uv_seams.contains(e) {
+                        Color::srgb(1.0, 0.22, 0.12)
+                    } else {
+                        gray
+                    };
+                    line!(a, b, color);
                 }
             }
             if doc.selection.kind == Element::Vertex {
@@ -989,7 +1056,7 @@ pub(in crate::editor) fn draw(
         }
     }
     if !state.extrude_tool
-        && !state.gesture.as_ref().is_some_and(Gesture::is_extruding)
+        && !state.gesture.as_ref().is_some_and(|g| g.is_extruding() || g.is_beveling())
         && let Some(mut frame) = handles::Frame::new(doc, &viewer, rect, state.local)
     {
         if state.local
@@ -1037,6 +1104,13 @@ pub(in crate::editor) fn draw(
             }
         }
     }
+    if let Some(point) = state.gesture.as_ref().and_then(|gesture| gesture.snap_point) {
+        let depth = (point - pose.translation).dot(*pose.forward());
+        let radius = view_height(&viewer, depth) / rect.height() * 7.0;
+        for axis in [*pose.right(), *pose.up()] {
+            overlay.line(point - axis * radius, point + axis * radius, Color::srgb(0.4, 1.0, 0.83));
+        }
+    }
     if let Some(cursor) = window.cursor_position() {
         if let Some(start) = state.knife_start {
             overlay.line(
@@ -1045,5 +1119,8 @@ pub(in crate::editor) fn draw(
                 orange,
             );
         }
+    }
+    if let Some(gesture) = state.gesture.as_ref() {
+        bevel::draw_guide(gesture, &viewer, rect, &mut overlay);
     }
 }

@@ -1,5 +1,5 @@
 //! Editable model state and transactions. Scene documents never share these meshes.
-use super::model_mesh::{Corner, Edge, Face, Geometry, Selection};
+use super::model_mesh::{BevelOptions, Corner, Edge, Element, Face, Geometry, Selection};
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
@@ -20,11 +20,64 @@ pub(super) struct MaterialSlot {
     pub material: Handle<StandardMaterial>,
     pub source: serde_json::Value,
     pub paint: Option<Arc<super::model_paint_data::Surface>>,
+    pub authored: Option<Arc<serde_json::Value>>,
 }
 impl PartialEq for MaterialSlot {
-    fn eq(&self, other:&Self)->bool {
-        self.material==other.material && self.source==other.source && match(&self.paint,&other.paint){
-            (None,None)=>true,(Some(a),Some(b))=>Arc::ptr_eq(a,b)||a.same(b),_=>false
+    fn eq(&self, other: &Self) -> bool {
+        self.material == other.material
+            && self.source == other.source
+            && self.authored == other.authored
+            && match (&self.paint, &other.paint) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same(b),
+                _ => false,
+            }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct MaterialDraft {
+    pub name: String,
+    pub color: bevy::color::Srgba,
+    pub roughness: f32,
+    pub metallic: f32,
+}
+
+impl Default for MaterialDraft {
+    fn default() -> Self {
+        Self {
+            name: "Материал".into(),
+            color: bevy::color::Srgba::WHITE,
+            roughness: 0.5,
+            metallic: 0.0,
+        }
+    }
+}
+
+impl MaterialDraft {
+    pub fn slot(&self, materials: &mut Assets<StandardMaterial>) -> MaterialSlot {
+        let color = Color::from(self.color);
+        let transparent = self.color.alpha < 1.0;
+        let material = materials.add(StandardMaterial {
+            base_color: color,
+            perceptual_roughness: self.roughness,
+            metallic: self.metallic,
+            alpha_mode: if transparent { AlphaMode::Blend } else { AlphaMode::Opaque },
+            ..default()
+        });
+        MaterialSlot {
+            material,
+            source: serde_json::json!({}),
+            paint: None,
+            authored: Some(Arc::new(serde_json::json!({
+                "name": self.name,
+                "alphaMode": if transparent { "BLEND" } else { "OPAQUE" },
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": color.to_linear().to_f32_array(),
+                    "metallicFactor": self.metallic,
+                    "roughnessFactor": self.roughness
+                }
+            }))),
         }
     }
 }
@@ -88,6 +141,15 @@ pub(in crate::editor) enum Mode {
     Paint,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum Pivot {
+    #[default]
+    Median,
+    Bounds,
+    ObjectOrigin,
+    WorldOrigin,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum Operation {
     Extrude,
@@ -109,7 +171,11 @@ pub(in crate::editor) enum Operation {
     ShadeFlat,
     Mirror(usize),
     LoopCut,
+    SlideEdges { reverse: bool },
     BevelVertices,
+    BevelEdges,
+    MarkUvSeam,
+    ClearUvSeam,
     ProjectUv(usize),
     SphericalUv,
     Separate,
@@ -127,11 +193,14 @@ pub(super) struct Document {
     pub selected: BTreeSet<usize>,
     pub selection: Selection,
     pub mode: Mode,
+    pub pivot_mode: Pivot,
     pub undo: Vec<Snapshot>,
     pub redo: Vec<Snapshot>,
     pub revision: u64,
     pub ui_revision: u64,
     pub amount: f32,
+    pub slide_percent: f32,
+    pub material_draft: MaterialDraft,
     pub paint_busy: bool,
     pub paint_pending: bool,
 }
@@ -148,11 +217,14 @@ impl Document {
             selected,
             selection: Selection::default(),
             mode: Mode::Object,
+            pivot_mode: Pivot::Median,
             undo: Vec::new(),
             redo: Vec::new(),
             revision: 0,
             ui_revision: 0,
             amount: 0.1,
+            slide_percent: 10.0,
+            material_draft: MaterialDraft::default(),
             paint_busy: false,
             paint_pending: false,
         }
@@ -195,6 +267,46 @@ impl Document {
         self.redo.clear();
         self.revision += 1;
         self.ui_revision += 1;
+    }
+    pub fn can_assign_material(&self) -> bool {
+        self.mode == Mode::Edit && self.selection.kind == Element::Face
+            && !self.selection.faces.is_empty()
+            && self.active().is_some_and(|o| !o.hidden)
+    }
+
+    pub fn assign_material(
+        &mut self,
+        material: MaterialSlot,
+        fallback: &Handle<StandardMaterial>,
+    ) -> Result<(), String> {
+        if !self.can_assign_material() {
+            return Err("Выделите грани для назначения материала".into());
+        }
+        let faces = self.selection.selected_faces(&self.active().unwrap().geometry);
+        if faces.is_empty() {
+            return Err("Выделите грани для назначения материала".into());
+        }
+        let before = self.snapshot();
+        let object = self.active_mut().unwrap();
+        if object.materials.is_empty() {
+            object.materials.push(MaterialSlot {
+                material: fallback.clone(),
+                source: serde_json::json!({}),
+                paint: None,
+                authored: None,
+            });
+        }
+        let slot = object.materials.iter().position(|slot| *slot == material)
+            .unwrap_or_else(|| {
+                let slot = object.materials.len();
+                object.materials.push(material);
+                slot
+            });
+        for face in faces {
+            object.geometry.faces[face].material = slot;
+        }
+        self.checkpoint(before);
+        Ok(())
     }
     pub fn undo(&mut self) {
         if let Some(previous) = self.undo.pop() {
@@ -243,38 +355,60 @@ impl Document {
         self.selection.clear();
         self.ui_revision += 1;
     }
+    pub fn selection_center(&self) -> Option<Vec3> {
+        self.pivot_at(Pivot::Median)
+    }
+
     pub fn pivot(&self) -> Option<Vec3> {
+        self.pivot_at(self.pivot_mode)
+    }
+
+    fn pivot_at(&self, mode: Pivot) -> Option<Vec3> {
+        let origin = self
+            .active()
+            .filter(|o| !o.hidden)
+            .map(|o| o.transform.translation);
         if self.mode == Mode::Edit {
-            let o = self.active()?;
+            let o = self.active().filter(|o| !o.hidden)?;
             let selected = self.selection.selected_vertices(&o.geometry);
-            if selected.is_empty() {
-                return None;
-            }
-            Some(
+            Self::pivot_from_points(
+                mode,
+                origin,
                 selected
                     .iter()
-                    .map(|&v| o.transform.transform_point(o.geometry.positions[v]))
-                    .sum::<Vec3>()
-                    / selected.len() as f32,
+                    .map(|&v| o.transform.transform_point(o.geometry.positions[v])),
             )
         } else {
-            let objects: Vec<_> = self
-                .objects
-                .iter()
-                .filter(|o| self.selected.contains(&o.id))
-                .collect();
-            if objects.is_empty() {
-                None
-            } else {
-                Some(
-                    objects
-                        .iter()
-                        .map(|o| o.transform.translation)
-                        .sum::<Vec3>()
-                        / objects.len() as f32,
-                )
-            }
+            Self::pivot_from_points(
+                mode,
+                origin.filter(|_| self.active.is_some_and(|id| self.selected.contains(&id))),
+                self.objects
+                    .iter()
+                    .filter(|o| self.selected.contains(&o.id) && !o.hidden)
+                    .map(|o| o.transform.translation),
+            )
         }
+    }
+
+    fn pivot_from_points(
+        mode: Pivot,
+        origin: Option<Vec3>,
+        mut points: impl Iterator<Item = Vec3>,
+    ) -> Option<Vec3> {
+        let first = points.next()?;
+        Some(match mode {
+            Pivot::WorldOrigin => Vec3::ZERO,
+            Pivot::ObjectOrigin => origin.unwrap_or(first),
+            Pivot::Bounds => {
+                let (min, max) =
+                    points.fold((first, first), |(min, max), p| (min.min(p), max.max(p)));
+                (min + max) * 0.5
+            }
+            Pivot::Median => {
+                let (sum, count) = points.fold((first, 1), |(sum, count), p| (sum + p, count + 1));
+                sum / count as f32
+            }
+        })
     }
     pub fn validate(&self) -> Result<(), String> {
         let mut count = 0;
@@ -344,7 +478,11 @@ impl Document {
     pub fn operate(&mut self, operation: Operation) -> Result<(), String> {
         let before = self.snapshot();
         let result = self.apply(operation).and_then(|_| {
-            if !matches!(operation, Operation::ProjectUv(_) | Operation::SphericalUv) {
+            if !matches!(
+                operation,
+                Operation::ProjectUv(_) | Operation::SphericalUv
+                    | Operation::MarkUvSeam | Operation::ClearUvSeam
+            ) {
                 for object in &mut self.objects {
                     if before
                         .objects
@@ -352,6 +490,7 @@ impl Document {
                         .find(|old| old.id == object.id)
                         .is_some_and(|old| old.geometry != object.geometry)
                     {
+                        object.geometry.prune_uv_seams();
                         object.geometry.discard_normals();
                     }
                 }
@@ -368,6 +507,59 @@ impl Document {
                 Err(error)
             }
         }
+    }
+
+    /// Build each preview from the original mesh, leaving the undo stack alone.
+    pub fn preview_bevel(
+        &mut self,
+        base: &Snapshot,
+        vertices: bool,
+        options: BevelOptions,
+    ) -> Result<(), String> {
+        if options.amount == 0.0 {
+            self.restore(base.clone());
+            return Ok(());
+        }
+        let mut preview = base.clone();
+        let object = preview
+            .objects
+            .iter_mut()
+            .find(|o| Some(o.id) == base.active && !o.hidden)
+            .ok_or("Выберите объект для фаски")?;
+        if options.material.is_some_and(|index| index >= object.materials.len()) {
+            return Err("Выберите существующий материал для фаски".into());
+        }
+        let faces = if vertices {
+            let selected = preview.selection.selected_vertices(&object.geometry);
+            object.geometry.bevel_vertices_with(&selected, options)?
+        } else {
+            let geometry = &object.geometry;
+            let edges = match preview.selection.kind {
+                Element::Edge => preview.selection.edges.clone(),
+                Element::Face => preview.selection.selected_faces(geometry)
+                    .into_iter()
+                    .flat_map(|i| geometry.faces[i].edges().map(|(a, b)| Edge::new(a, b)))
+                    .collect(),
+                Element::Vertex => geometry.edges().into_keys()
+                    .filter(|edge| preview.selection.vertices.contains(&edge.0)
+                        && preview.selection.vertices.contains(&edge.1))
+                    .collect(),
+            };
+            object.geometry.bevel_edges_with(&edges, options)?
+        };
+        if !faces.is_empty() {
+            preview.selection.select_face_elements(&object.geometry, faces);
+        }
+        object.geometry.prune_uv_seams();
+        if !(options.harden_normals || options.preserve_sharp) {
+            object.geometry.discard_normals();
+        }
+        object.geometry.validate()?;
+        if preview.objects.iter().map(|o| o.geometry.positions.len()).sum::<usize>() > 250_000 {
+            return Err("Фаска превысит лимит модели в 250 000 вершин".into());
+        }
+        self.restore(preview);
+        Ok(())
     }
     fn apply(&mut self, operation: Operation) -> Result<(), String> {
         if self.mode == Mode::Object {
@@ -461,10 +653,40 @@ impl Document {
                             .map(|(a, b)| super::model_mesh::Edge::new(a, b))
                     })
                     .ok_or("Выберите ребро для разреза петли")?;
-                mesh.loop_cut(edge)?;
-                self.selection.all(mesh);
+                let edges = mesh.loop_cut(edge)?;
+                self.selection.clear();
+                self.selection.kind = Element::Edge;
+                self.selection.edges = edges;
+            }
+            Operation::SlideEdges { reverse } => {
+                if self.selection.kind != Element::Edge {
+                    return Err("Переключитесь на выбор рёбер".into());
+                }
+                let fraction = self.slide_percent / 100.0;
+                mesh.slide_edges(
+                    &self.selection.edges,
+                    if reverse { -fraction } else { fraction },
+                )?;
             }
             Operation::BevelVertices => mesh.bevel_vertices(&mut self.selection, amount)?,
+            Operation::BevelEdges => {
+                if self.selection.kind != Element::Edge {
+                    return Err("Переключитесь на выбор рёбер".into());
+                }
+                let faces = mesh.bevel_edges(&self.selection.edges, amount)?;
+                self.selection.select_face_elements(mesh, faces);
+            }
+            Operation::MarkUvSeam | Operation::ClearUvSeam => {
+                if self.selection.kind != Element::Edge || self.selection.edges.is_empty() {
+                    return Err("Выделите рёбра для разметки UV-швов".into());
+                }
+                if operation == Operation::MarkUvSeam {
+                    mesh.uv_seams.extend(self.selection.edges.iter().copied());
+                    mesh.prune_uv_seams();
+                } else {
+                    mesh.uv_seams.retain(|edge| !self.selection.edges.contains(edge));
+                }
+            }
             Operation::ProjectUv(axis) => mesh.project_uv(&self.selection, axis, false),
             Operation::SphericalUv => mesh.project_uv(&self.selection, 0, true),
             _ => return Err("Операция доступна в режиме «Объект»".into()),
@@ -540,6 +762,9 @@ impl Document {
                     self.objects[index].materials.extend(o.materials);
                     self.objects[index].geometry.loose_edges.extend(
                         o.geometry.loose_edges.iter().map(|e| Edge::new(e.0 + offset, e.1 + offset))
+                    );
+                    self.objects[index].geometry.uv_seams.extend(
+                        o.geometry.uv_seams.iter().map(|e| Edge::new(e.0 + offset, e.1 + offset))
                     );
                 }
                 self.objects

@@ -1,4 +1,5 @@
 use super::*;
+use super::bevel::Miter;
 
 pub(in crate::editor) fn cube() -> Geometry {
     let positions = vec![
@@ -84,6 +85,332 @@ fn model_mesh_subdivision_and_loop_cut_share_neighbor_vertices() {
     assert_eq!(mesh.faces.len(), 10);
     closed(&mesh);
 }
+
+#[test]
+fn edge_loop_and_slide_follow_consistent_rails_on_a_cut_cube() {
+    let mut mesh = cube();
+    let cut = mesh.loop_cut(Edge::new(0, 1)).unwrap();
+    assert_eq!(cut.len(), 4);
+    assert_eq!(mesh.edge_loops(&[*cut.first().unwrap()].into()), cut);
+    let before = mesh.positions.clone();
+    let selected: BTreeSet<_> = cut.iter().flat_map(|e| [e.0, e.1]).collect();
+    mesh.slide_edges(&cut, 0.25).unwrap();
+    let delta = mesh.positions[*selected.first().unwrap()] - before[*selected.first().unwrap()];
+    assert_eq!(delta.x.abs(), 0.25);
+    for (i, (&position, old)) in mesh.positions.iter().zip(before).enumerate() {
+        assert_eq!(position - old, if selected.contains(&i) { delta } else { Vec3::ZERO });
+    }
+    closed(&mesh);
+}
+
+#[test]
+fn transform_pivot_can_differ_from_the_selected_vertices_center() {
+    use crate::editor::model_document::{Document, Mode, Object, Pivot, glb::Glb};
+
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/legacy/assets/models/block.glb");
+    let mut doc = Document::new(
+        Glb::load(&asset).unwrap(),
+        vec![Object {
+            id: 0,
+            source_node: None,
+            name: "Куб".into(),
+            geometry: cube().into(),
+            transform: Transform::from_xyz(10.0, 0.0, 0.0),
+            materials: Vec::new(),
+            hidden: false,
+        }],
+    );
+    doc.mode = Mode::Edit;
+    doc.selection.vertices = [0, 1, 2].into();
+    let center = Vec3::new(10.0 + 1.0 / 3.0, -1.0 / 3.0, -1.0);
+    assert!(doc.pivot().unwrap().abs_diff_eq(center, 0.00001));
+    doc.pivot_mode = Pivot::Bounds;
+    assert_eq!(doc.pivot(), Some(Vec3::new(10.0, 0.0, -1.0)));
+    doc.pivot_mode = Pivot::ObjectOrigin;
+    assert_eq!(doc.pivot(), Some(Vec3::X * 10.0));
+    doc.pivot_mode = Pivot::WorldOrigin;
+    assert_eq!(doc.pivot(), Some(Vec3::ZERO));
+    assert!(doc.selection_center().unwrap().abs_diff_eq(center, 0.00001));
+    doc.selection.clear();
+    assert_eq!(doc.pivot(), None);
+}
+
+#[test]
+fn edge_bevel_bridges_a_single_edge_and_caps_corners_of_complete_selection() {
+    let mut mesh = cube();
+    mesh.faces[4].material = 7;
+    let selected = [Edge::new(0, 1)].into();
+    let bevel = mesh.bevel_edges(&selected, 0.25).unwrap();
+    assert_eq!(bevel.len(), 1);
+    assert_eq!(mesh.faces[4].material, 7);
+    let strip = &mesh.faces[*bevel.first().unwrap()];
+    assert_eq!(strip.corners.len(), 4);
+    assert!((mesh.positions[strip.corners[0].vertex].y + 0.75).abs() < 0.00001);
+    closed(&mesh);
+
+    let mut mesh = cube();
+    let selected = mesh.edges().into_keys().collect();
+    let bevel = mesh.bevel_edges(&selected, 0.25).unwrap();
+    assert_eq!(bevel.len(), 12 + 8);
+    assert_eq!(mesh.positions.len(), 24);
+    closed(&mesh);
+}
+
+#[test]
+fn edge_bevel_width_modes_and_profile_build_closed_meshes() {
+    let edge = Edge::new(0, 1);
+    let selected = [edge].into();
+    for (mode, amount) in [
+        (WidthType::Offset, 0.25),
+        (WidthType::Absolute, 0.25),
+        (WidthType::Percent, 12.5),
+        (WidthType::Width, 0.25 * std::f32::consts::SQRT_2),
+        (WidthType::Depth, 0.25 / std::f32::consts::SQRT_2),
+    ] {
+        let mut mesh = cube();
+        let bevel = mesh.bevel_edges_with(&selected, BevelOptions {
+            amount, width_type: mode, ..default()
+        }).unwrap();
+        let corner = &mesh.faces[*bevel.first().unwrap()].corners[0];
+        assert!((mesh.positions[corner.vertex].y + 0.75).abs() < 0.00001, "{mode:?}");
+        closed(&mesh);
+    }
+    let mut rounded = cube();
+    let mut flat = rounded.clone();
+    let base = BevelOptions { amount: 0.25, segments: 4, ..default() };
+    let rounded_faces = rounded.bevel_edges_with(&selected, base).unwrap();
+    let flat_faces = flat.bevel_edges_with(&selected, BevelOptions { profile: 0.25, ..base }).unwrap();
+    assert_eq!(rounded_faces.len(), 6);
+    assert_eq!(flat_faces.len(), 4);
+    assert_ne!(rounded.positions, flat.positions);
+    closed(&rounded);
+    closed(&flat);
+    let mut cube = cube();
+    let all = cube.edges().into_keys().collect();
+    cube.bevel_edges_with(&all, base).unwrap();
+    closed(&cube);
+}
+
+#[test]
+fn edge_bevel_samples_custom_profile_and_solves_shared_rail_offsets() {
+    let mut mesh = cube();
+    let options = BevelOptions {
+        amount: 0.25,
+        segments: 4,
+        custom_profile: Some([
+            Vec2::new(0.75, 0.08),
+            Vec2::new(0.5, 0.18),
+            Vec2::new(0.25, 0.3),
+        ]),
+        ..default()
+    };
+    let bevel = mesh.bevel_edges_with(&[Edge::new(0, 1)].into(), options).unwrap();
+    let strip = &mesh.faces[bevel.first().copied().unwrap() + 1];
+    let midpoint = mesh.positions[strip.corners[2].vertex];
+    let displacement = midpoint - Vec3::splat(-1.0);
+    let steps = Vec2::new(displacement.y, displacement.z);
+    let expected = Vec2::new(0.5, 0.18) * options.amount;
+    assert!(steps.abs_diff_eq(expected, 0.00001) || steps.yx().abs_diff_eq(expected, 0.00001));
+    closed(&mesh);
+
+    let mut slid = cube();
+    for p in &mut slid.positions {
+        p.x += 0.4 * (p.z + 1.0);
+    }
+    let mut even = slid.clone();
+    let selected = [Edge::new(0, 1), Edge::new(0, 3)].into();
+    slid.bevel_edges_with(&selected, BevelOptions { amount: 0.25, ..default() }).unwrap();
+    even.bevel_edges_with(&selected, BevelOptions {
+        amount: 0.25, loop_slide: false, ..default()
+    }).unwrap();
+    assert_ne!(even.positions, slid.positions);
+    closed(&slid);
+    closed(&even);
+}
+
+#[test]
+fn edge_bevel_builds_inner_arcs_and_outer_patches_and_arcs() {
+    let options = BevelOptions { amount: 0.1, segments: 3, ..default() };
+    let mut sharp = cube();
+    let mut arc = sharp.clone();
+    let selected = [Edge::new(0, 1), Edge::new(0, 3)].into();
+    sharp.bevel_edges_with(&selected, options).unwrap();
+    arc.bevel_edges_with(&selected, BevelOptions { inner_miter: Miter::Arc, ..options }).unwrap();
+    assert_eq!(arc.faces[0].corners.len(), sharp.faces[0].corners.len() + 3);
+    closed(&arc);
+
+    let outline = [(0., 0.), (2., 0.), (2., 1.), (1., 1.), (1., 2.), (0., 2.)];
+    let positions = [0., 1.].into_iter().flat_map(|z| {
+        outline.into_iter().map(move |(x, y)| Vec3::new(x, y, z))
+    }).collect();
+    let face = |vertices: Vec<usize>| Face {
+        corners: vertices.into_iter().map(Corner::new).collect(),
+        material: 0,
+        smooth: false,
+    };
+    let mut faces = vec![face((0..6).rev().collect()), face((6..12).collect())];
+    for a in 0..6 {
+        let b = (a + 1) % 6;
+        faces.push(face(vec![a, b, b + 6, a + 6]));
+    }
+    let shape = Geometry { positions, faces, ..default() };
+    closed(&shape);
+    let selected = [Edge::new(8, 9), Edge::new(9, 10)].into();
+    let mut results = Vec::new();
+    for miter in [Miter::Sharp, Miter::Patch, Miter::Arc] {
+        let mut mesh = shape.clone();
+        mesh.bevel_edges_with(&selected, BevelOptions { outer_miter: miter, ..options }).unwrap();
+        closed(&mesh);
+        results.push(mesh.faces[1].corners.len());
+    }
+    assert_eq!(results, [6, 8, 9]);
+}
+
+#[test]
+fn edge_bevel_grid_and_cutoff_use_different_closed_junctions() {
+    let mut grid = cube();
+    let mut cutoff = grid.clone();
+    let selected = grid.edges().into_keys().collect();
+    let options = BevelOptions { amount: 0.2, segments: 3, ..default() };
+    grid.bevel_edges_with(&selected, options).unwrap();
+    cutoff.bevel_edges_with(&selected, BevelOptions {
+        intersection: Intersection::Cutoff,
+        ..options
+    }).unwrap();
+    let cap_start = 6 + 12 * 3;
+    assert_eq!(grid.faces[cap_start..].iter().filter(|f| f.corners.len() == 4).count(), 8 * 9);
+    assert_eq!(cutoff.faces[cap_start..].iter().filter(|f| f.corners.len() == 6).count(), 8 * 3);
+    assert_eq!(cutoff.faces[cap_start..].iter().filter(|f| f.corners.len() == 3).count(), 8);
+    closed(&grid);
+    closed(&cutoff);
+}
+
+#[test]
+fn edge_bevel_rounds_an_interior_edge_on_an_open_mesh() {
+    let mut mesh = cube();
+    mesh.faces = [mesh.faces[0].clone(), mesh.faces[2].clone()].into();
+    mesh.compact();
+    let affected = mesh.bevel_edges_with(&[Edge::new(0, 1)].into(), BevelOptions {
+        amount: 0.25,
+        segments: 3,
+        ..default()
+    }).unwrap();
+    assert_eq!(affected.len(), 3);
+    let adjacency = mesh.edges();
+    assert!(adjacency.values().all(|faces| (1..=2).contains(&faces.len())));
+    assert_eq!(adjacency.values().filter(|faces| faces.len() == 1).count(), 12);
+    mesh.validate().unwrap();
+}
+
+#[test]
+fn edge_bevel_reaches_the_far_side_of_a_cube() {
+    let selected = [Edge::new(0, 1)].into();
+    for segments in [1, 3] {
+        let mut mesh = cube();
+        let affected = mesh.bevel_edges_with(&selected, BevelOptions {
+            amount: 3.0,
+            segments,
+            ..default()
+        }).unwrap();
+        let vertices: Vec<_> = affected.iter()
+            .flat_map(|&i| mesh.faces[i].corners.iter().map(|c| mesh.positions[c.vertex]))
+            .collect();
+        assert!(vertices.iter().all(|p| p.y <= 1.0 && p.z <= 1.0));
+        assert!(vertices.iter().any(|p| p.y == 1.0));
+        assert!(vertices.iter().any(|p| p.z == 1.0));
+        assert_eq!(mesh.faces.len(), if segments == 1 { 5 } else { 9 });
+        closed(&mesh);
+    }
+}
+
+#[test]
+fn edge_bevel_stops_where_two_bevels_meet() {
+    let mut mesh = cube();
+    let selected = [Edge::new(0, 1), Edge::new(2, 3)].into();
+    let affected = mesh.bevel_edges_with(&selected, BevelOptions {
+        amount: 3.0,
+        ..default()
+    }).unwrap();
+    let endpoints: Vec<_> = affected.iter()
+        .flat_map(|&i| mesh.faces[i].corners.iter().map(|c| mesh.positions[c.vertex]))
+        .filter(|p| p.z == -1.0)
+        .collect();
+    assert!(!endpoints.is_empty());
+    assert!(endpoints.iter().all(|p| p.y.abs() < 0.000001));
+    assert_eq!(mesh.faces.len(), 7);
+    closed(&mesh);
+}
+
+#[test]
+fn vertex_bevel_builds_profile_caps_and_handles_an_open_boundary() {
+    let mut mesh = cube();
+    mesh.uv_seams.insert(Edge::new(0, 1));
+    let affected = mesh.bevel_vertices_with(&[0].into(), BevelOptions {
+        amount: 12.5,
+        width_type: WidthType::Percent,
+        segments: 3,
+        preserve_uv_seams: true,
+        material: Some(1),
+        ..default()
+    }).unwrap();
+    assert_eq!(affected.len(), 10);
+    assert!(affected.iter().all(|&fi| mesh.faces[fi].material == 1));
+    assert_eq!(mesh.uv_seams.len(), 1);
+    assert!(mesh.positions.iter().any(|point| point.abs_diff_eq(
+        Vec3::new(-0.75, -1.0, -1.0), 0.00001
+    )));
+    closed(&mesh);
+
+    let mut plane = cube();
+    plane.faces.truncate(1);
+    plane.compact();
+    let affected = plane.bevel_vertices_with(&[0].into(), BevelOptions {
+        amount: 0.2,
+        segments: 4,
+        ..default()
+    }).unwrap();
+    assert_eq!(affected, [0].into());
+    assert_eq!(plane.faces[0].corners.len(), 8);
+    assert_eq!(plane.triangles(&plane.faces[0]).len(), 6);
+    plane.validate().unwrap();
+}
+
+#[test]
+fn edge_bevel_applies_material_and_preserves_seams_and_split_normals() {
+    let mut mesh = cube();
+    let edge = Edge::new(0, 1);
+    mesh.uv_seams.insert(edge);
+    for fi in [0, 2] {
+        let normal = mesh.normal(&mesh.faces[fi]).normalize();
+        for corner in &mut mesh.faces[fi].corners {
+            corner.source_normal = Some(normal);
+        }
+    }
+    let affected = mesh.bevel_edges_with(&[edge].into(), BevelOptions {
+        amount: 0.2,
+        segments: 3,
+        preserve_uv_seams: true,
+        preserve_sharp: true,
+        harden_normals: true,
+        material: Some(3),
+        ..default()
+    }).unwrap();
+    assert!(affected.iter().all(|&fi| mesh.faces[fi].material == 3));
+    assert_eq!(mesh.uv_seams.len(), 2);
+    for fi in [0, 2] {
+        let face = &mesh.faces[fi];
+        let normal = mesh.normal(face).normalize();
+        assert!(face.corners.iter().all(|corner| corner.source_normal == Some(normal)));
+        let (a, b) = face.edges().find(|&(a, b)| mesh.uv_seams.contains(&Edge::new(a, b))).unwrap();
+        let strip = affected.iter().map(|&j| &mesh.faces[j])
+            .find(|f| f.edges().any(|pair| pair == (b, a))).unwrap();
+        let strip_normal = strip.corners.iter().find(|c| c.vertex == a).unwrap().source_normal.unwrap();
+        assert!(strip_normal.dot(normal) < 0.999);
+    }
+    closed(&mesh);
+}
+
 #[test]
 fn model_mesh_triangles_quads_and_concave_ngons_render_without_missing_faces() {
     let mut mesh = cube();
@@ -202,6 +529,7 @@ fn split_quad() -> Geometry {
     Geometry {
         positions,
         loose_edges: default(),
+        uv_seams: default(),
         faces: [[0, 1, 2], [0, 2, 3]]
             .into_iter()
             .map(|vertices| Face {

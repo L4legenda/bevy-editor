@@ -132,6 +132,35 @@ fn uv_partuv_real_worker_preserves_cube_corners() {
 }
 
 #[test]
+fn model_uv_manual_seam_separates_coplanar_faces_in_the_native_unwrap() {
+    use crate::editor::model_mesh::{Corner, Edge, Face};
+
+    let mut mesh = Geometry {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+        faces: [[0, 1, 2], [0, 2, 3]]
+            .map(|vertices| Face {
+                corners: vertices.into_iter().map(Corner::new).collect(),
+                material: 0,
+                smooth: false,
+            })
+            .to_vec(),
+        ..default()
+    };
+    mesh.uv_seams.insert(Edge::new(0, 2));
+    let mut input = topology::input(&mesh, 1.25, 1024, 4).unwrap();
+    input.cut_manual_seams(&mesh.uv_seams);
+    input.request.options.guide_seams = true;
+    assert_eq!(input.request.positions.len(), 6);
+    let result = backend::run(input.request.clone(), Arc::new(backend::Progress::default())).unwrap();
+    let unwrapped = topology::apply(&mesh, &input.corners, &result).unwrap();
+    assert_eq!(unwrapped.positions, mesh.positions);
+    assert_eq!(unwrapped.uv_seams, mesh.uv_seams);
+    let atlas = topology::Atlas::new(&unwrapped);
+    assert_eq!(atlas.count, 2);
+    assert!(atlas.seams.contains(&Edge::new(0, 2)));
+}
+
+#[test]
 #[ignore = "requires GPU; tests bundled native UV, split view, background job, selection, undo and GLB save"]
 fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
     use crate::editor::{

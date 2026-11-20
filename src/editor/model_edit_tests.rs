@@ -120,6 +120,179 @@ fn copy_directory(source: &Path, destination: &Path) {
 }
 
 #[test]
+#[ignore = "requires GPU; uses the real Ctrl+B, wheel, cancellation, F9 and undo input paths"]
+fn gpu_bevel_shortcut_previews_segments_and_adjusts_one_undo_step() {
+    use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+    let (mut app, window, target) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    send(&mut app, EditAction::Element(Element::Edge));
+    let (original, original_selection, original_history) = {
+        let mut state = app.world_mut().resource_mut::<State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        let edge = *doc.active().unwrap().geometry.edges().keys().next().unwrap();
+        doc.selection.edges = [edge].into();
+        (doc.objects.clone(), doc.selection.clone(), doc.undo.len())
+    };
+    let rect = canvas_rect(&mut app);
+    let center = rect.center();
+    move_pointer(&mut app, window, center);
+    let begin = |app: &mut App| {
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            app.world_mut().write_message(KeyboardInput {
+                key_code: KeyCode::ControlLeft,
+                logical_key: Key::Control,
+                state,
+                text: None,
+                repeat: false,
+                window,
+            });
+            warm(app, 2);
+            if state == ButtonState::Pressed {
+                key(app, window, KeyCode::KeyB, Key::Character("b".into()));
+            }
+        }
+        assert!(app.world().resource::<State>().gesture.as_ref().is_some_and(input::Gesture::is_beveling));
+    };
+    let type_width = |app: &mut App, digit, code| {
+        key(app, window, KeyCode::Digit0, Key::Character("0".into()));
+        key(app, window, KeyCode::Period, Key::Character(".".into()));
+        key(app, window, code, Key::Character(digit));
+    };
+    let roll = |app: &mut App| {
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: 0.0,
+            y: 2.0,
+            window,
+            phase: bevy::input::touch::TouchPhase::Moved,
+        });
+        warm(app, 3);
+    };
+    let modifier = |app: &mut App, key_code, logical_key, state| {
+        app.world_mut().write_message(KeyboardInput {
+            key_code, logical_key, state, text: None, repeat: false, window,
+        });
+        warm(app, 2);
+    };
+    let displayed_width = |app: &App| -> f32 {
+        app.world().resource::<State>().gesture.as_ref().unwrap()
+            .bevel_control_label(BevelControl::Amount).unwrap()
+            .split_whitespace().last().unwrap().parse().unwrap()
+    };
+    let assert_beveled_edges_selected = |app: &App| {
+        let doc = &app.world().resource::<State>().documents[&0];
+        let mesh = &doc.active().unwrap().geometry;
+        let expected: BTreeSet<_> = mesh.faces[original[0].geometry.faces.len()..]
+            .iter()
+            .flat_map(|face| face.edges().map(|(a, b)| Edge::new(a, b)))
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(doc.selection.kind, Element::Edge);
+        assert_eq!(doc.selection.edges, expected);
+        assert!(doc.selection.faces.is_empty());
+    };
+    begin(&mut app);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+    let direction = {
+        let state = app.world().resource::<State>();
+        let viewer = app.world().resource::<Viewer>();
+        let pivot = state.documents[&0].selection_center().unwrap();
+        let delta = center - input::project(viewer, rect, pivot).unwrap_or(center);
+        if delta.length() < 8.0 {
+            Vec2::new(1.0, -1.0).normalize()
+        } else {
+            delta.normalize()
+        }
+    };
+    move_pointer(&mut app, window, center + direction * 16.0);
+    warm(&mut app, 3);
+    assert_ne!(app.world().resource::<State>().documents[&0].objects, original);
+    let width = displayed_width(&app);
+    modifier(&mut app, KeyCode::ShiftLeft, Key::Shift, ButtonState::Pressed);
+    move_pointer(&mut app, window, center + direction * 32.0);
+    let fine_width = displayed_width(&app);
+    assert!((fine_width - width * 1.1).abs() <= 0.0002);
+    modifier(&mut app, KeyCode::ShiftLeft, Key::Shift, ButtonState::Released);
+    modifier(&mut app, KeyCode::ControlLeft, Key::Control, ButtonState::Pressed);
+    let step = app.world().resource::<State>().documents[&0].amount;
+    assert!((displayed_width(&app) - (fine_width / step).round() * step).abs() <= 0.0002);
+    modifier(&mut app, KeyCode::ControlLeft, Key::Control, ButtonState::Released);
+    type_width(&mut app, "1".into(), KeyCode::Digit1);
+    roll(&mut app);
+    assert_beveled_edges_selected(&app);
+    let guide_image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/model-edit-qa/bevel-guide.png");
+    std::fs::create_dir_all(guide_image.parent().unwrap()).unwrap();
+    capture_when(&mut app, &target, &guide_image, |_| true);
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_ne!(doc.objects, original);
+        assert_eq!(doc.undo.len(), original_history);
+        assert_eq!(doc.active().unwrap().geometry.faces.len(), 11);
+    }
+    assert!(!app.world().resource::<Editor>().dirty_models.contains(&0));
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_eq!(doc.objects, original);
+        assert_eq!(doc.selection, original_selection);
+    }
+    begin(&mut app);
+    type_width(&mut app, "1".into(), KeyCode::Digit1);
+    roll(&mut app);
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    assert_beveled_edges_selected(&app);
+    let committed = app.world().resource::<State>().documents[&0].objects.clone();
+    assert_eq!(app.world().resource::<State>().documents[&0].undo.len(), original_history + 1);
+    key(&mut app, window, KeyCode::F9, Key::F9);
+    assert!(app.world().resource::<State>().gesture.as_ref().is_some_and(input::Gesture::is_beveling));
+    type_width(&mut app, "2".into(), KeyCode::Digit2);
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    assert_beveled_edges_selected(&app);
+    assert_ne!(app.world().resource::<State>().documents[&0].objects, committed);
+    assert_eq!(app.world().resource::<State>().documents[&0].undo.len(), original_history + 1);
+    send(&mut app, EditAction::Undo);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+
+    send(&mut app, EditAction::Element(Element::Vertex));
+    app.world_mut().resource_mut::<State>().documents.get_mut(&0).unwrap().selection.vertices =
+        [0].into();
+    for (code, logical_key) in [(KeyCode::ControlLeft, Key::Control), (KeyCode::ShiftLeft, Key::Shift)] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: code, logical_key, state: ButtonState::Pressed,
+            text: None, repeat: false, window,
+        });
+    }
+    warm(&mut app, 2);
+    key(&mut app, window, KeyCode::KeyB, Key::Character("b".into()));
+    for (code, logical_key) in [(KeyCode::ControlLeft, Key::Control), (KeyCode::ShiftLeft, Key::Shift)] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: code, logical_key, state: ButtonState::Released,
+            text: None, repeat: false, window,
+        });
+    }
+    warm(&mut app, 2);
+    assert_eq!(app.world().resource::<State>().gesture.as_ref().unwrap()
+        .bevel_control_label(BevelControl::Affect).as_deref(), Some("Вершины"));
+    let custom_y = BevelControl::CustomCoordinate { point: 1, axis: 1 };
+    send(&mut app, EditAction::Bevel(BevelControl::CustomProfile));
+    type_width(&mut app, "1".into(), KeyCode::Digit1);
+    roll(&mut app);
+    let rounded = app.world().resource::<State>().documents[&0].objects.clone();
+    send(&mut app, EditAction::Bevel(custom_y));
+    type_width(&mut app, "2".into(), KeyCode::Digit2);
+    assert_ne!(app.world().resource::<State>().documents[&0].objects, rounded);
+    send(&mut app, EditAction::Bevel(BevelControl::Confirm));
+    let state = app.world().resource::<State>();
+    assert!(state.gesture.is_none());
+    assert_eq!(state.documents[&0].selection.kind, Element::Vertex);
+    assert!(!state.documents[&0].selection.vertices.is_empty());
+    assert_eq!(state.documents[&0].undo.len(), original_history + 1);
+}
+
+#[test]
 #[ignore = "requires GPU; compares unassigned GLTF materials in scenes and editable model tabs"]
 fn gpu_unassigned_model_material_matches_scene_instead_of_pink_placeholder() {
     let directory = std::env::temp_dir().join(format!(
@@ -179,6 +352,157 @@ fn gpu_unassigned_model_material_matches_scene_instead_of_pink_placeholder() {
             .count()
             < 30
     });
+}
+
+#[test]
+#[ignore = "requires GPU; creates a window asset, unwraps it and loads the saved GLB into a scene"]
+fn gpu_model_window_workflow_saves_beveled_frame_with_glass_and_uv_seam() {
+    fn edit_document(app: &mut App, edit: impl FnOnce(&mut Document)) {
+        let mut state = app.world_mut().resource_mut::<State>();
+        edit(state.documents.get_mut(&0).unwrap());
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "bevy-window-model-{}", bevy::asset::uuid::Uuid::new_v4()
+    ));
+    let mut project = EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    copy_directory(&project.asset_root, &directory);
+    project.asset_root = directory.clone();
+    let path = directory.join("models/block.glb");
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    send(&mut app, EditAction::SelectAll);
+    send(&mut app, EditAction::Operate(Operation::Delete));
+
+    let wood = bevy::color::Srgba::hex("#865328").unwrap();
+    let glass = bevy::color::Srgba::hex("#89D0EA80").unwrap();
+    let mut first_beam = None;
+    for (name, position, size) in [
+        ("Верх", Vec3::new(0.0, 2.0, 0.0), Vec3::new(2.0, 0.16, 0.14)),
+        ("Низ", Vec3::new(0.0, 0.16, 0.0), Vec3::new(2.0, 0.16, 0.14)),
+        ("Слева", Vec3::new(-0.92, 1.08, 0.0), Vec3::new(0.16, 1.84, 0.14)),
+        ("Справа", Vec3::new(0.92, 1.08, 0.0), Vec3::new(0.16, 1.84, 0.14)),
+        ("Стекло", Vec3::new(0.0, 1.08, 0.0), Vec3::new(1.84, 1.84, 0.02)),
+    ] {
+        let pane = name == "Стекло";
+        send(&mut app, EditAction::Add(if pane { 2 } else { 0 }));
+        edit_document(&mut app, |doc| {
+            let object = doc.active_mut().unwrap();
+            object.name = name.into();
+            if !pane {
+                first_beam.get_or_insert(object.id);
+            }
+            let positions = &object.geometry.positions;
+            let (min, max) = positions.iter().fold((positions[0], positions[0]), |(min, max), &p| {
+                (min.min(p), max.max(p))
+            });
+            object.transform = Transform::from_translation(position);
+            object.transform.scale = if pane {
+                object.transform.rotation = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+                Vec3::new(size.x / (max.x - min.x), 1.0, size.y / (max.z - min.z))
+            } else {
+                size / (max - min)
+            };
+            doc.material_draft = document::MaterialDraft {
+                color: if pane { glass } else { wood },
+                name: if pane { "Стекло" } else { "Дерево" }.into(),
+                roughness: if pane { 0.1 } else { 0.65 },
+                metallic: 0.0,
+            };
+            doc.amount = 0.04;
+        });
+        send(&mut app, EditAction::Mode(Mode::Edit));
+        if !pane {
+            send(&mut app, EditAction::Element(Element::Edge));
+            send(&mut app, EditAction::SelectAll);
+            send(&mut app, EditAction::BeginBevel { vertices: false });
+            for (code, digit) in [
+                (KeyCode::Digit0, "0"),
+                (KeyCode::Period, "."),
+                (KeyCode::Digit0, "0"),
+                (KeyCode::Digit4, "4"),
+            ] {
+                key(&mut app, window, code, Key::Character(digit.into()));
+            }
+            send(&mut app, EditAction::Bevel(BevelControl::Segments));
+            key(&mut app, window, KeyCode::Digit2, Key::Character("2".into()));
+            send(&mut app, EditAction::Bevel(BevelControl::Confirm));
+            edit_document(&mut app, |doc| {
+                assert_eq!(doc.active().unwrap().geometry.faces.len(), 86);
+            });
+        }
+        send(&mut app, EditAction::Element(Element::Face));
+        send(&mut app, EditAction::SelectAll);
+        send(&mut app, EditAction::CreateMaterial);
+        send(&mut app, EditAction::Mode(Mode::Object));
+    }
+    send(&mut app, EditAction::SelectObject(first_beam.unwrap()));
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    send(&mut app, EditAction::Element(Element::Edge));
+    edit_document(&mut app, |doc| {
+        let edges = doc.active().unwrap().geometry.edges();
+        doc.selection.edges = [*edges.keys().next().unwrap()].into();
+    });
+    send(&mut app, EditAction::Operate(Operation::MarkUvSeam));
+    send(&mut app, EditAction::Mode(Mode::Uv));
+    let revision = app.world().resource::<State>().documents[&0].revision;
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Uv(uv::UvAction::Unwrap)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        frame(&mut app);
+        if app.world().resource::<State>().documents[&0].revision != revision {
+            break;
+        }
+    }
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_ne!(doc.revision, revision, "The unwrap must apply a real worker result");
+        assert_eq!(doc.active().unwrap().geometry.uv_seams.len(), 1);
+        let mesh = &doc.active().unwrap().geometry;
+        let atlas = crate::editor::model_uv_mesh::Atlas::new(mesh);
+        assert!(mesh.uv_seams.iter().all(|edge| atlas.seams.contains(edge)));
+        assert_eq!(doc.objects.len(), 5);
+        assert!(doc.objects.iter().filter(|o| o.name != "Стекло").all(|o| o.geometry.faces.len() >= 86));
+    }
+    send(&mut app, EditAction::Save);
+    for _ in 0..240 {
+        frame(&mut app);
+        if !app.world().resource::<State>().documents[&0].dirty() {
+            break;
+        }
+    }
+    assert!(!app.world().resource::<State>().documents[&0].dirty());
+    let saved = document::glb::Glb::load(&path).unwrap();
+    let gltf = bevy::gltf::gltf::Gltf::from_slice(saved.data()).unwrap();
+    assert_eq!(gltf.default_scene().unwrap().nodes().filter(|node| node.mesh().is_some()).count(), 5);
+    assert!(gltf.materials().any(|m| m.name() == Some("Стекло")
+        && m.alpha_mode() == bevy::gltf::gltf::material::AlphaMode::Blend));
+    app.world_mut().write_message(Action::Open(0));
+    warm(&mut app, 12);
+    app.world_mut().write_message(Action::Add(0));
+    let mut loaded_in_scene = false;
+    for _ in 0..180 {
+        frame(&mut app);
+        let world = app.world_mut();
+        let handles: Vec<_> = world.query::<(&MeshMaterial3d<StandardMaterial>, Option<&RenderLayers>, &InheritedVisibility)>()
+            .iter(world)
+            .filter(|(_, layers, visibility)| visibility.get() && layers.is_none_or(|layers| layers.intersects(&RenderLayers::layer(0))))
+            .map(|(material, _, _)| material.0.clone())
+            .collect();
+        let materials = world.resource::<Assets<StandardMaterial>>();
+        loaded_in_scene = handles.iter().any(|handle| {
+            materials.get(handle).is_some_and(|m| {
+                m.alpha_mode == AlphaMode::Blend
+                    && (m.base_color.alpha() - glass.alpha).abs() < 0.001
+            })
+        });
+        if loaded_in_scene {
+            break;
+        }
+    }
+    assert!(loaded_in_scene, "The scene must render the saved glass material");
 }
 
 fn scene_workspace_interactions(app: &mut App, window: Entity) {
@@ -1267,10 +1591,7 @@ fn gpu_model_selection_feedback_identifies_faces_edges_and_vertices() {
         BTreeSet::from([top])
     );
     let face_image = capture_when(&mut app, &target, &output.join("02-face.png"), |_| true);
-    let nebula = |pixel: &image::Rgba<u8>| {
-        let [r, g, b, _] = pixel.0.map(u16::from);
-        b + 8 > r && b > g + 15
-    };
+    let violet_tint = |pixel: image::Rgba<u8>| i16::from(pixel[2]) - i16::from(pixel[1]);
     let stellar = |pixel: &image::Rgba<u8>| {
         let [r, g, b, _] = pixel.0.map(u16::from);
         r > 205 && g > 200 && b > 145 && r > g + 4 && g > b + 12
@@ -1278,13 +1599,16 @@ fn gpu_model_selection_feedback_identifies_faces_edges_and_vertices() {
     let sample = |image: &image::RgbaImage, p: Vec2| {
         *image.get_pixel(p.x.round() as u32, p.y.round() as u32)
     };
+    let has_fill = |image: &image::RgbaImage, p| {
+        violet_tint(sample(image, p)) - violet_tint(sample(&before, p)) > 15
+    };
     assert!(
         samples
             .iter()
-            .filter(|&&p| nebula(&sample(&face_image, p)) && !nebula(&sample(&before, p)))
+            .filter(|&&p| has_fill(&face_image, p))
             .count()
             >= 2,
-        "The selected face must have an amethyst interior, independently of the GLTF material"
+        "The translucent fill must give the selected face a visible violet tint"
     );
     warm(&mut app, 120);
     let flowing = capture_when(&mut app, &target, &output.join("02-face-flow.png"), |_| {
@@ -1343,7 +1667,7 @@ fn gpu_model_selection_feedback_identifies_faces_edges_and_vertices() {
     assert!(
         samples
             .iter()
-            .all(|&p| !nebula(&sample(&converted_face, p)) || nebula(&sample(&before, p))),
+            .all(|&p| !has_fill(&converted_face, p)),
         "Vertex mode must remove the selected face fill after conversion"
     );
     send(&mut app, EditAction::Deselect);

@@ -45,6 +45,7 @@ fn model(path: &Path) -> ResultModel {
             .into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            authored: None,
             paint: None,
             material: default(),
             source: serde_json::json!({"material":0}),
