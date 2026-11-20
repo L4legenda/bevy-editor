@@ -1853,6 +1853,7 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
         geometry: primitive.geometry(&primitive.defaults()).unwrap().into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            authored: None,
             material: default(),
             source: serde_json::json!({"material": 0}),
             paint: None,
