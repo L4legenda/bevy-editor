@@ -446,6 +446,38 @@ fn model_glb_manual_uv_seams_survive_loop_cut_undo_and_reopen() {
 }
 
 #[test]
+fn model_glb_round_trips_knife_and_multiple_loop_cuts() {
+    use crate::editor::model_mesh::{Edge, KnifeSegment, LoopCut, LoopCutOptions};
+    let (mut source, mut object) = fixture();
+    object.geometry = Geometry {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+        faces: vec![Face { corners: (0..4).map(Corner::new).collect(), material: 0, smooth: false }],
+        uv_seams: [Edge::new(0,1)].into(),
+        ..default()
+    }.into();
+    let geometry = &mut object.geometry;
+    let new_loops = LoopCut::find(geometry, Edge::new(0,1)).unwrap()
+        .apply(geometry, LoopCutOptions { count: 3, ..default() }).unwrap();
+    let new_knife = geometry.apply_knife(&[KnifeSegment {
+        face: 0, ends: [Vec3::new(0.0,0.5,0.0), Vec3::new(0.25,0.5,0.0)],
+    }]).unwrap();
+    let expected = geometry.edges().keys().map(|e| [geometry.positions[e.0],geometry.positions[e.1]])
+        .collect::<Vec<_>>();
+    let face_count = geometry.faces.len();
+    assert_eq!(new_loops.len(), 3);
+    assert_eq!(new_knife.len(), 1);
+    source.save(&[object], &[]).unwrap();
+    let imported = import_geometry(&Glb::load(&source.path).unwrap()).unwrap();
+    assert_eq!(imported.faces.len(), face_count);
+    assert_eq!(imported.uv_seams.len(), 4);
+    let adjacency = imported.edges();
+    for [a,b] in expected {
+        let point = |p: Vec3| imported.positions.iter().position(|&at| at==p).unwrap();
+        assert!(adjacency.contains_key(&Edge::new(point(a),point(b))));
+    }
+}
+
+#[test]
 fn model_glb_reconstructs_quads_from_the_previously_edited_cube_regression() {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/model-edit/warped-cube.glb");

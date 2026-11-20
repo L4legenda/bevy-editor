@@ -15,6 +15,11 @@ pub(in crate::editor) use picking::Bvh;
 #[path = "model_bevel_input.rs"]
 mod bevel;
 pub(super) use bevel::{BevelControl, LastBevel};
+#[path = "model_loop_cut_input.rs"]
+mod loop_cut;
+pub(super) use loop_cut::{LastLoopCut, LoopCutControl};
+#[path = "model_knife_input.rs"]
+mod knife;
 
 pub(in crate::editor) struct Gesture {
     pub model: usize,
@@ -31,6 +36,8 @@ pub(in crate::editor) struct Gesture {
     snap_point: Option<Vec3>,
     extrusion: Option<Extrusion>,
     bevel: Option<bevel::Preview>,
+    loop_cut: Option<loop_cut::Preview>,
+    knife: Option<knife::Preview>,
 }
 struct Extrusion {
     pivot: Vec3,
@@ -56,6 +63,8 @@ impl Gesture {
             snap_point: None,
             extrusion: None,
             bevel: None,
+            loop_cut: None,
+            knife: None,
         }
     }
     pub(super) fn extrude(doc: &Document, model: usize) -> Option<Self> {
@@ -76,6 +85,18 @@ impl Gesture {
 
     pub(in crate::editor) fn is_beveling(&self) -> bool {
         self.bevel.is_some()
+    }
+
+    pub(in crate::editor) fn is_loop_cutting(&self) -> bool {
+        self.loop_cut.is_some()
+    }
+
+    pub(super) fn is_preview_tool(&self) -> bool {
+        self.is_beveling() || self.is_loop_cutting() || self.is_knifing()
+    }
+
+    pub(in crate::editor) fn is_knifing(&self) -> bool {
+        self.knife.is_some()
     }
 
     pub(super) fn cancel_snapshot(mut self) -> Snapshot {
@@ -299,7 +320,7 @@ pub(in crate::editor) fn input(
             && !editor.browser_popup
             && !editor.hdri_library_open
     }) else {
-        if state.gesture.as_ref().is_some_and(Gesture::is_beveling) {
+        if state.gesture.as_ref().is_some_and(Gesture::is_preview_tool) {
             state.clear_gesture(None, true);
         }
         text.clear();
@@ -321,7 +342,10 @@ pub(in crate::editor) fn input(
         return;
     };
     let beveling = state.gesture.as_ref().is_some_and(Gesture::is_beveling);
-    let cursor = window.cursor_position().or_else(|| beveling.then_some(rect.min - Vec2::ONE));
+    let loop_cutting = state.gesture.as_ref().is_some_and(Gesture::is_loop_cutting);
+    let knifing = state.gesture.as_ref().is_some_and(Gesture::is_knifing);
+    let previewing = beveling || loop_cutting || knifing;
+    let cursor = window.cursor_position().or_else(|| previewing.then_some(rect.min - Vec2::ONE));
     let Some(cursor) = cursor else {
         if mouse.just_released(MouseButton::Left)
             && state
@@ -338,7 +362,7 @@ pub(in crate::editor) fn input(
     let over_navigation = orientation
         .as_ref()
         .is_some_and(|gizmo| gizmo.blocks_input());
-    if !extruding && !beveling
+    if !extruding && !previewing
         && state.box_start.is_none()
         && over_navigation
     {
@@ -346,7 +370,7 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     }
-    if !extruding && !beveling
+    if !extruding && !previewing
         && (drawer.resizing || (state.box_start.is_none() && drawer.covers(cursor, &window)))
     {
         state.hover = None;
@@ -359,7 +383,7 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     }
-    if !beveling && focus.get().is_some_and(|e| inputs.contains(e)) {
+    if !previewing && focus.get().is_some_and(|e| inputs.contains(e)) {
         if mouse.just_pressed(MouseButton::Left)
             && rect.contains(cursor)
             && state.input_error.is_none()
@@ -393,7 +417,7 @@ pub(in crate::editor) fn input(
         text.clear();
         return;
     };
-    if state.gesture.is_none() && state.bvh_stamp != Some((index, doc.revision)) {
+    if (state.gesture.is_none() || loop_cutting || knifing) && state.bvh_stamp != Some((index, doc.revision)) {
         state.bvh = Bvh::build(&doc);
         state.bvh_stamp = Some((index, doc.revision));
     }
@@ -418,7 +442,41 @@ pub(in crate::editor) fn input(
         KeyCode::SuperRight,
     ]);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
-    if beveling && let Some(mut gesture) = state.gesture.take() {
+    let canvas_input = || rect.contains(cursor) && !over_navigation && !drawer.resizing
+        && !drawer.covers(cursor, &window) && !over_button();
+    if knifing && let Some(mut gesture) = state.gesture.take() {
+        match knife::update(
+            &mut gesture, &mut doc, &state.bvh, &viewer, rect, cursor, canvas_input(),
+            &mouse, &keys, text.read(),
+        ) {
+            knife::Outcome::Preview(status) => {
+                state.status = status;
+                state.gesture = Some(gesture);
+            }
+            knife::Outcome::Commit | knife::Outcome::Cancel => state.status.clear(),
+        }
+        viewer.gesture = None;
+    } else if loop_cutting && let Some(mut gesture) = state.gesture.take() {
+        let canvas_input = canvas_input();
+        let wheel = if !canvas_input { 0.0 }
+            else if scroll.unit == bevy::input::mouse::MouseScrollUnit::Pixel { scroll.delta.y / 24.0 }
+            else { scroll.delta.y };
+        match loop_cut::update(
+            &mut gesture, &mut doc, &state.bvh, &viewer, rect, cursor, canvas_input,
+            &mouse, &keys, wheel, text.read(),
+        ) {
+            loop_cut::Outcome::Preview(status) => {
+                state.status = status;
+                state.gesture = Some(gesture);
+            }
+            loop_cut::Outcome::Confirm(last) => {
+                state.last_loop_cut.insert(index, last);
+                state.status.clear();
+            }
+            loop_cut::Outcome::Cancel => state.status.clear(),
+        }
+        viewer.gesture = None;
+    } else if beveling && let Some(mut gesture) = state.gesture.take() {
         let wheel = if scroll.unit == bevy::input::mouse::MouseScrollUnit::Pixel {
             scroll.delta.y / 24.0
         } else {
@@ -426,11 +484,7 @@ pub(in crate::editor) fn input(
         };
         let outcome = bevel::update(
             &mut gesture, &mut doc, &viewer, rect, cursor, &keys, &mouse, wheel, text.read(),
-            rect.contains(cursor)
-                && !over_navigation
-                && !drawer.resizing
-                && !drawer.covers(cursor, &window)
-                && !over_button(),
+            canvas_input(),
         );
         match outcome {
             bevel::Outcome::Preview(status) => {
@@ -767,8 +821,8 @@ pub(in crate::editor) fn input(
             if state.box_armed {
                 state.box_start = Some(cursor);
                 state.box_auto = false;
-            } else if state.knife {
-                if let Some(start) = state.knife_start.take() {
+            } else if state.bisect {
+                if let Some(start) = state.bisect_start.take() {
                     if start.distance(cursor) > 3.0 {
                         let (o, a) = ray(&viewer, rect, start);
                         let (other, b) = ray(&viewer, rect, cursor);
@@ -803,9 +857,9 @@ pub(in crate::editor) fn input(
                             }
                         }
                     }
-                    state.knife = false;
+                    state.bisect = false;
                 } else {
-                    state.knife_start = Some(cursor);
+                    state.bisect_start = Some(cursor);
                 }
             } else {
                 let extrusion = state.extrude_tool
@@ -1056,7 +1110,7 @@ pub(in crate::editor) fn draw(
         }
     }
     if !state.extrude_tool
-        && !state.gesture.as_ref().is_some_and(|g| g.is_extruding() || g.is_beveling())
+        && !state.gesture.as_ref().is_some_and(|g| g.is_extruding() || g.is_preview_tool())
         && let Some(mut frame) = handles::Frame::new(doc, &viewer, rect, state.local)
     {
         if state.local
@@ -1112,7 +1166,7 @@ pub(in crate::editor) fn draw(
         }
     }
     if let Some(cursor) = window.cursor_position() {
-        if let Some(start) = state.knife_start {
+        if let Some(start) = state.bisect_start {
             overlay.line(
                 on_plane(&viewer, rect, start),
                 on_plane(&viewer, rect, cursor),
@@ -1122,5 +1176,7 @@ pub(in crate::editor) fn draw(
     }
     if let Some(gesture) = state.gesture.as_ref() {
         bevel::draw_guide(gesture, &viewer, rect, &mut overlay);
+        loop_cut::draw(gesture, &mut depth);
+        knife::draw(gesture, &viewer, rect, &mut depth, &mut overlay);
     }
 }

@@ -23,6 +23,10 @@ pub(in crate::editor) struct Bvh {
     nodes: Vec<Node>,
 }
 impl Bvh {
+    pub(super) fn triangles(&self) -> &[Triangle] {
+        &self.triangles
+    }
+
     pub fn build(doc: &Document) -> Self {
         Self::from_objects(&doc.objects)
     }

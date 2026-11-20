@@ -103,6 +103,7 @@ tokio = { version = "1", optional = true, features = ["rt", "net", "io-util", "i
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio"] }
 uuid = { version = "1", optional = true, features = ["v4"] }
 base64 = { version = "0.22", optional = true }
+spade = "2.15.1"
 
 [build-dependencies]
 bevy-uv-build = { path = "native/uv-build" }

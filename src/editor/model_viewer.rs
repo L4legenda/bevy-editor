@@ -396,8 +396,8 @@ fn actions(
         editing.add_menu = false;
         editing.box_start = None;
         editing.box_armed = false;
-        editing.knife = false;
-        editing.knife_start = None;
+        editing.bisect = false;
+        editing.bisect_start = None;
         editing.bvh_stamp = None;
     }
     if editor.viewing_model == viewer.model && !retry {
@@ -694,7 +694,7 @@ fn navigate(
         || editing.menu
         || editing.add_menu
         || editing.box_armed
-        || editing.knife
+        || editing.bisect
         || editor.sidebar.resizing()
         || runtime.4.resizing
         || window
@@ -850,6 +850,10 @@ fn refresh(
                     "Двигайте курсор, чтобы задать расстояние · Ctrl — привязка к шагу".into()
                 } else if gesture.is_beveling() {
                     "A — размер · M — тип · Колесо/S — сегменты · P — профиль · C — ограничение · V — вершины/рёбра · Enter — применить · Esc — отменить".into()
+                } else if gesture.is_knifing() {
+                    "ЛКМ — точки · ПКМ — новый путь · Enter — применить · Esc — отменить · C — насквозь · V — X-Ray · A — угол · S — измерения".into()
+                } else if gesture.is_loop_cutting() {
+                    "ЛКМ — выбрать / применить · Колесо — число разрезов · ПКМ — центр · E/F — расстояние и сторона · C — границы · U — UV · S/P — сглаживание · Esc — отмена".into()
                 } else {
                     format!(
                         "{:?} {} {} · X/Y/Z — ось · число — значение · Ctrl — привязка · Enter — применить · Esc — отмена",
@@ -858,8 +862,8 @@ fn refresh(
                         gesture.typed
                     )
                 }
-            } else if editing.knife {
-                "Нож: отметьте две точки в 3D-виде · Esc — отмена".into()
+            } else if editing.bisect {
+                "Сечение плоскостью · Отметьте две точки в 3D-виде · Esc — отмена".into()
             } else if editing.box_armed || editing.box_start.is_some() {
                 "Рамка: протяните ЛКМ · Shift — добавить · Ctrl — исключить · Esc — отмена".into()
             } else if editing.extrude_tool {

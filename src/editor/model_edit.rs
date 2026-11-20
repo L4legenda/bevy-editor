@@ -17,7 +17,7 @@ use std::{
 #[path = "model_edit_snap.rs"]
 mod snapping;
 use snapping::SnapTarget;
-use input::BevelControl;
+use input::{BevelControl, LoopCutControl};
 
 #[path = "model_area.rs"]
 pub(super) mod area;
@@ -46,6 +46,9 @@ pub(in crate::editor) enum EditAction {
     ExtrudeTool,
     BeginExtrude,
     BeginBevel { vertices: bool },
+    BeginLoopCut,
+    AdjustLoopCut,
+    LoopCut(LoopCutControl),
     AdjustBevel,
     Bevel(BevelControl),
     SelectAll,
@@ -78,7 +81,8 @@ pub(in crate::editor) enum EditAction {
     Reveal,
     Focus,
     BoxSelect,
-    Knife,
+    Bisect,
+    BeginKnife { only_selected: bool },
 }
 
 /// Shared header controls act on the currently opened model document.
@@ -114,6 +118,7 @@ pub(in crate::editor) struct State {
     default_material: Handle<StandardMaterial>,
     pub gesture: Option<input::Gesture>,
     last_bevel: HashMap<usize, input::LastBevel>,
+    last_loop_cut: HashMap<usize, input::LastLoopCut>,
     pub hover: Option<crate::editor::viewport::TransformHandle>,
     bvh: input::Bvh,
     pub(super) bvh_stamp: Option<(usize, u64)>,
@@ -133,8 +138,8 @@ pub(in crate::editor) struct State {
     pub box_start: Option<Vec2>,
     pub box_auto: bool,
     pub box_armed: bool,
-    pub knife_start: Option<Vec2>,
-    pub knife: bool,
+    pub bisect_start: Option<Vec2>,
+    pub bisect: bool,
     saving: Option<Saving>,
     pub status: String,
     drafts: BTreeSet<usize>,
@@ -150,6 +155,7 @@ impl Default for State {
             default_material: default(),
             gesture: None,
             last_bevel: HashMap::new(),
+            last_loop_cut: HashMap::new(),
             hover: None,
             bvh: default(),
             bvh_stamp: None,
@@ -169,8 +175,8 @@ impl Default for State {
             box_start: None,
             box_auto: false,
             box_armed: false,
-            knife_start: None,
-            knife: false,
+            bisect_start: None,
+            bisect: false,
             saving: None,
             status: String::new(),
             drafts: default(),
@@ -244,6 +250,8 @@ impl State {
         match action {
             EditAction::Bevel(control) => self.gesture.as_ref()
                 .is_some_and(|gesture| gesture.bevel_control_active(control)),
+            EditAction::LoopCut(control) => self.gesture.as_ref()
+                .is_some_and(|gesture| gesture.loop_control_active(control)),
             EditAction::Mode(mode) => self.mode(index) == mode,
             EditAction::Element(kind) => doc.is_some_and(|d| d.selection.kind == kind),
             EditAction::Tool(tool) => !self.extrude_tool && self.tool == tool,
@@ -258,7 +266,8 @@ impl State {
             EditAction::Proportional => self.proportional,
             EditAction::Connected => self.connected,
             EditAction::BoxSelect => self.box_armed,
-            EditAction::Knife => self.knife,
+            EditAction::Bisect => self.bisect,
+            EditAction::BeginKnife { .. } => self.gesture.as_ref().is_some_and(input::Gesture::is_knifing),
             _ => false,
         }
     }
@@ -267,6 +276,13 @@ impl State {
             return match action {
                 EditAction::Cancel => true,
                 EditAction::Bevel(control) => gesture.bevel_control_available(control),
+                _ => false,
+            };
+        }
+        if let Some(gesture) = self.gesture.as_ref().filter(|g| g.is_preview_tool()) {
+            return match action {
+                EditAction::Cancel => true,
+                EditAction::LoopCut(control) => gesture.loop_control_available(control),
                 _ => false,
             };
         }
@@ -302,7 +318,12 @@ impl State {
             return false;
         }
         match action {
-            EditAction::Bevel(_) => false,
+            EditAction::Bevel(_) | EditAction::LoopCut(_) => false,
+            EditAction::BeginLoopCut => doc.mode == Mode::Edit && self.gesture.is_none()
+                && doc.active().is_some_and(|object| !object.hidden),
+            EditAction::AdjustLoopCut => index.and_then(|index| self.last_loop_cut.get(&index))
+                .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision)
+                && self.gesture.is_none(),
             EditAction::BeginBevel { .. } => {
                 self.gesture.is_none() && doc.mode == Mode::Edit && doc.selection_center().is_some()
             }
@@ -328,7 +349,9 @@ impl State {
                     && !doc.selection.edges.is_empty()
                     && self.gesture.is_none()
             }
-            EditAction::Knife => doc.mode == Mode::Edit,
+            EditAction::Bisect => doc.mode == Mode::Edit,
+            EditAction::BeginKnife { .. } => doc.mode == Mode::Edit && self.gesture.is_none()
+                && doc.active().is_some_and(|object| !object.hidden),
             EditAction::ExtrudeTool => {
                 self.gesture.is_none()
                     && doc.mode == Mode::Edit
@@ -360,6 +383,10 @@ impl State {
     }
     pub(super) fn clear_gesture(&mut self, _doc_index: Option<usize>, cancel: bool) {
         if let Some(gesture) = self.gesture.take() {
+            if gesture.is_loop_cutting() || gesture.is_knifing() {
+                self.status.clear();
+                return;
+            }
             if let Some(doc) = self.documents.get_mut(&gesture.model) {
                 if cancel || gesture.is_beveling() {
                     let model = gesture.model;
@@ -827,7 +854,7 @@ pub(super) fn process_actions(
     }
     for &action in actions {
         if state.gesture.as_ref().is_some_and(|gesture| {
-            gesture.is_beveling() && match action {
+            gesture.is_preview_tool() && match action {
                 Action::CloseModelTab(index) => gesture.model == index,
                 Action::ViewModel(index) => gesture.model != index,
                 Action::ModelView(ModelViewAction::Close | ModelViewAction::Retry) => true,
@@ -883,8 +910,8 @@ pub(super) fn process_actions(
         let Some(index) = editor.viewing_model else {
             continue;
         };
-        if state.gesture.as_ref().is_some_and(input::Gesture::is_beveling)
-            && !matches!(action, EditAction::Cancel | EditAction::Bevel(_))
+        if state.gesture.as_ref().is_some_and(input::Gesture::is_preview_tool)
+            && !matches!(action, EditAction::Cancel | EditAction::Bevel(_) | EditAction::LoopCut(_))
         {
             continue;
         }
@@ -898,6 +925,11 @@ pub(super) fn process_actions(
             continue;
         }
         match action {
+            EditAction::LoopCut(control) => {
+                if let Some(gesture) = state.gesture.as_mut().filter(|g| g.model == index) {
+                    gesture.set_loop_control(control);
+                }
+            }
             EditAction::Bevel(control) => {
                 if let Some(gesture) = state.gesture.as_mut().filter(|g| g.model == index) {
                     let slots = state.documents[&index].active()
@@ -925,8 +957,8 @@ pub(super) fn process_actions(
                 state.add_menu = false;
                 state.box_start = None;
                 state.box_armed = false;
-                state.knife = false;
-                state.knife_start = None;
+                state.bisect = false;
+                state.bisect_start = None;
                 state.extrude_tool = false;
             }
             EditAction::ExtrudeTool => {
@@ -934,8 +966,8 @@ pub(super) fn process_actions(
                     state.extrude_tool = !state.extrude_tool;
                     state.box_start = None;
                     state.box_armed = false;
-                    state.knife = false;
-                    state.knife_start = None;
+                    state.bisect = false;
+                    state.bisect_start = None;
                 }
             }
             EditAction::BeginExtrude => {
@@ -961,13 +993,47 @@ pub(super) fn process_actions(
                 if state.gesture.is_some() {
                     state.box_start = None;
                     state.box_armed = false;
-                    state.knife = false;
-                    state.knife_start = None;
+                    state.bisect = false;
+                    state.bisect_start = None;
                     state.menu = false;
                     state.add_menu = false;
                     state.extrude_tool = false;
                     viewer.gesture = None;
                 }
+            }
+            EditAction::BeginLoopCut | EditAction::AdjustLoopCut => {
+                if !state.available(action, Some(index)) {
+                    continue;
+                }
+                let doc = &state.documents[&index];
+                state.gesture = if action == EditAction::BeginLoopCut {
+                    input::Gesture::loop_cut(doc, index)
+                } else {
+                    input::Gesture::adjust_loop_cut(doc, index, &state.last_loop_cut[&index])
+                };
+                state.box_start = None;
+                state.box_armed = false;
+                state.bisect = false;
+                state.bisect_start = None;
+                state.menu = false;
+                state.add_menu = false;
+                state.extrude_tool = false;
+                viewer.gesture = None;
+            }
+            EditAction::BeginKnife { only_selected } => {
+                if !state.available(action, Some(index)) {
+                    continue;
+                }
+                let doc = &state.documents[&index];
+                state.gesture = input::Gesture::knife(doc, index, only_selected);
+                state.box_start = None;
+                state.box_armed = false;
+                state.bisect = false;
+                state.bisect_start = None;
+                state.menu = false;
+                state.add_menu = false;
+                state.extrude_tool = false;
+                viewer.gesture = None;
             }
             EditAction::Begin(tool) => {
                 state.box_start = None;
@@ -1003,12 +1069,12 @@ pub(super) fn process_actions(
             EditAction::Connected => state.connected = !state.connected,
             EditAction::BoxSelect => {
                 state.box_armed = true;
-                state.knife = false;
+                state.bisect = false;
             }
-            EditAction::Knife => {
+            EditAction::Bisect => {
                 state.extrude_tool = false;
-                state.knife = state.mode(Some(index)) == Mode::Edit;
-                state.knife_start = None;
+                state.bisect = state.mode(Some(index)) == Mode::Edit;
+                state.bisect_start = None;
                 state.box_armed = false;
             }
             EditAction::Focus => {
@@ -1040,8 +1106,8 @@ pub(super) fn process_actions(
                             state.box_start = None;
                             doc.set_mode(mode);
                             state.menu = false;
-                            state.knife = false;
-                            state.knife_start = None;
+                            state.bisect = false;
+                            state.bisect_start = None;
                             viewer.gesture = None;
                         }
                         EditAction::ToggleMode => {
@@ -1052,8 +1118,8 @@ pub(super) fn process_actions(
                             } else {
                                 Mode::Object
                             });
-                            state.knife = false;
-                            state.knife_start = None;
+                            state.bisect = false;
+                            state.bisect_start = None;
                             viewer.gesture = None;
                         }
                         EditAction::Element(kind) => {
@@ -1224,6 +1290,7 @@ pub(super) fn process_actions(
         .drafts
         .retain(|index| editor.model_tabs.contains(index));
     state.last_bevel.retain(|index, _| editor.model_tabs.contains(index));
+    state.last_loop_cut.retain(|index, _| editor.model_tabs.contains(index));
     editor.dirty_models = state
         .documents
         .iter()
@@ -1332,7 +1399,7 @@ pub(in crate::editor) fn shortcuts(
         } else if keys.just_pressed(KeyCode::KeyL) {
             Some(EditAction::Linked)
         } else if keys.just_pressed(KeyCode::KeyR) {
-            Some(EditAction::Operate(Operation::LoopCut))
+            Some(EditAction::BeginLoopCut)
         } else if keys.just_pressed(KeyCode::KeyT) {
             Some(EditAction::Operate(Operation::Triangulate))
         } else if keys.just_pressed(KeyCode::KeyB) && mode == Mode::Edit {
@@ -1343,7 +1410,9 @@ pub(in crate::editor) fn shortcuts(
             None
         }
     } else if keys.just_pressed(KeyCode::F9) && mode == Mode::Edit {
-        Some(EditAction::AdjustBevel)
+        let loop_cut = state.zip(index)
+            .is_some_and(|(state, index)| state.available(EditAction::AdjustLoopCut, Some(index)));
+        Some(if loop_cut { EditAction::AdjustLoopCut } else { EditAction::AdjustBevel })
     } else if keys.just_pressed(KeyCode::Tab) {
         Some(if shift {
             EditAction::Snap
@@ -1399,7 +1468,7 @@ pub(in crate::editor) fn shortcuts(
     } else if keys.just_pressed(KeyCode::KeyB) {
         Some(EditAction::BoxSelect)
     } else if keys.just_pressed(KeyCode::KeyK) {
-        Some(EditAction::Knife)
+        Some(EditAction::BeginKnife { only_selected: shift })
     } else if keys.just_pressed(KeyCode::KeyO) {
         Some(if alt {
             EditAction::Connected

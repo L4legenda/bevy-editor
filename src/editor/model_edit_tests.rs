@@ -24,6 +24,161 @@ fn warm(app: &mut App, count: usize) {
     }
 }
 
+#[test]
+#[ignore = "requires GPU; exercises the real Loop Cut and Knife input paths"]
+fn gpu_cut_tools_preview_cancel_and_commit_once() {
+    let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    {
+        let mut viewer = app.world_mut().resource_mut::<Viewer>();
+        viewer.yaw = 0.0;
+        viewer.pitch = 0.0;
+    }
+    warm(&mut app, 3);
+    let rect = canvas_rect(&mut app);
+    let (original, undo_len, front_face, front_center_y, rails, line) = {
+        let world = app.world();
+        let state = world.resource::<State>();
+        let viewer = world.resource::<Viewer>();
+        let doc = &state.documents[&0];
+        let object = doc.active().unwrap();
+        let mesh = &object.geometry;
+        let (fi, face) = mesh.faces.iter().enumerate().max_by(|(_,a),(_,b)| {
+            mesh.normal(a).normalize_or_zero().z.total_cmp(&mesh.normal(b).normalize_or_zero().z)
+        }).unwrap();
+        let show = |v| input::project(viewer, rect, object.transform.transform_point(v)).unwrap();
+        let rails: Vec<_> = face.edges().take(2).map(|(a,b)| {
+            let midpoint = (mesh.positions[a] + mesh.positions[b]) * 0.5;
+            (show(midpoint), midpoint)
+        }).collect();
+        let screens: Vec<_> = face.corners.iter().map(|corner| show(mesh.positions[corner.vertex])).collect();
+        let center: Vec2 = screens.iter().copied().sum::<Vec2>() / screens.len() as f32;
+        let half = screens.iter().map(|p| (p.x-center.x).abs()).fold(0.0,f32::max);
+        let line = [-1.0, 1.0].map(|side| center+Vec2::new(side*(half+12.0), 7.0));
+        (doc.objects.clone(), doc.undo.len(), fi, mesh.center(face).y, rails, line)
+    };
+    let modifier = |app: &mut App, key_code, logical_key, state| {
+        app.world_mut().write_message(KeyboardInput {
+            key_code, logical_key, state, text: None, repeat: false, window,
+        });
+        warm(app, 2);
+    };
+    let click = |app: &mut App| {
+        mouse(app, window, ButtonState::Pressed);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 2);
+    };
+
+    let begin_loop = |app: &mut App, rail| {
+        move_pointer(app, window, rail);
+        modifier(app, KeyCode::ControlLeft, Key::Control, ButtonState::Pressed);
+        key(app, window, KeyCode::KeyR, Key::Character("r".into()));
+        modifier(app, KeyCode::ControlLeft, Key::Control, ButtonState::Released);
+        assert!(app.world().resource::<State>().gesture.as_ref().unwrap().is_loop_cutting());
+    };
+    for select_strip in [false,true] {
+        begin_loop(&mut app, rails[0].0);
+        if select_strip { click(&mut app); }
+        key(&mut app, window, KeyCode::Escape, Key::Escape);
+        let state = app.world().resource::<State>();
+        assert!(state.gesture.is_none());
+        assert_eq!(state.documents[&0].objects, original);
+        assert_eq!(state.documents[&0].undo.len(), undo_len);
+    }
+    let mut centered_cuts = Vec::new();
+    for &(rail, midpoint) in &rails {
+        begin_loop(&mut app, rail);
+        click(&mut app);
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            app.world_mut().write_message(bevy::input::mouse::MouseButtonInput {
+                button: MouseButton::Right, state, window,
+            });
+            warm(&mut app, 2);
+        }
+        {
+            let state = app.world().resource::<State>();
+            let doc = &state.documents[&0];
+            let mesh = &doc.active().unwrap().geometry;
+            assert!(state.gesture.is_none());
+            assert!(mesh.positions.contains(&midpoint));
+            assert_eq!(doc.undo.len(), undo_len + 1);
+            centered_cuts.push(doc.objects.clone());
+        }
+        send(&mut app, EditAction::Undo);
+    }
+    assert_ne!(centered_cuts[0], centered_cuts[1]);
+    begin_loop(&mut app, rails[0].0);
+    click(&mut app);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+    key(&mut app, window, KeyCode::Digit2, Key::Character("2".into()));
+    key(&mut app, window, KeyCode::Digit5, Key::Character("5".into()));
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    let cut = app.world().resource::<State>().documents[&0].objects.clone();
+    assert_ne!(cut, original);
+    key(&mut app, window, KeyCode::F9, Key::F9);
+    assert!(app.world().resource::<State>().gesture.as_ref().unwrap().is_loop_cutting());
+    click_control(&mut app, window, |action| matches!(
+        action, Action::ModelView(ModelViewAction::Edit(EditAction::LoopCut(LoopCutControl::Position)))
+    ));
+    key(&mut app, window, KeyCode::Digit7, Key::Character("7".into()));
+    key(&mut app, window, KeyCode::Digit5, Key::Character("5".into()));
+    click_control(&mut app, window, |action| matches!(
+        action, Action::ModelView(ModelViewAction::Edit(EditAction::LoopCut(LoopCutControl::Confirm)))
+    ));
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_ne!(doc.objects, cut);
+        assert_eq!(doc.undo.len(), undo_len + 1);
+        assert_eq!(doc.selection.edges.len(), 4);
+    }
+    send(&mut app, EditAction::Undo);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+
+    let begin_knife = |app: &mut App| {
+        modifier(app, KeyCode::ShiftLeft, Key::Shift, ButtonState::Pressed);
+        key(app, window, KeyCode::KeyK, Key::Character("k".into()));
+        assert!(app.world().resource::<State>().gesture.as_ref().unwrap().is_knifing());
+        for at in line {
+            move_pointer(app, window, at);
+            click(app);
+        }
+        modifier(app, KeyCode::ShiftLeft, Key::Shift, ButtonState::Released);
+        assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+    };
+    {
+        let mut state = app.world_mut().resource_mut::<State>();
+        let selection = &mut state.documents.get_mut(&0).unwrap().selection;
+        selection.clear();
+        selection.kind = Element::Face;
+        selection.faces.insert(front_face);
+    }
+    begin_knife(&mut app);
+    modifier(&mut app, KeyCode::ControlLeft, Key::Control, ButtonState::Pressed);
+    key(&mut app, window, KeyCode::KeyZ, Key::Character("z".into()));
+    modifier(&mut app, KeyCode::ControlLeft, Key::Control, ButtonState::Released);
+    key(&mut app, window, KeyCode::Enter, Key::Enter);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    assert!(app.world().resource::<State>().gesture.is_none());
+    begin_knife(&mut app);
+    key(&mut app, window, KeyCode::Space, Key::Space);
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_ne!(doc.objects, original);
+        assert_eq!(doc.undo.len(), undo_len + 1);
+        let mesh = &doc.active().unwrap().geometry;
+        assert_eq!(mesh.faces.len(), 7);
+        assert!(!doc.selection.edges.is_empty());
+        for edge in &doc.selection.edges {
+            assert!([edge.0,edge.1].into_iter().all(|v| (mesh.positions[v].y-front_center_y).abs() < 1.0e-5));
+        }
+    }
+    send(&mut app, EditAction::Undo);
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+}
+
 fn send(app: &mut App, action: EditAction) {
     app.world_mut()
         .write_message(Action::ModelView(ModelViewAction::Edit(action)));

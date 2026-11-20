@@ -36,6 +36,7 @@ pub(in crate::editor) struct Ui {
     toolbar: Entity,
     panel: Entity,
     bevel_panel: Entity,
+    loop_cut_panel: Entity,
     menu: Entity,
     add: Entity,
     stats: Entity,
@@ -339,6 +340,36 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             );
         }
     }
+    let loop_cut_panel = node(
+        &mut commands,
+        interface.inspector,
+        Node {
+            display: Display::None,
+            width: percent(100),
+            ..column(6.0)
+        },
+    );
+    text(&mut commands, loop_cut_panel, &interface.font, "РАЗРЕЗ ПЕТЛИ", 11.0, MUTED);
+    let decisions = node(&mut commands, loop_cut_panel, row(4.0));
+    control(&mut commands, decisions, &interface.font, "Применить", EditAction::LoopCut(LoopCutControl::Confirm));
+    control(&mut commands, decisions, &interface.font, "Отменить", EditAction::Cancel);
+    let parameters = node(&mut commands, loop_cut_panel, Node {
+        flex_wrap: FlexWrap::Wrap,
+        row_gap: px(4),
+        ..row(4.0)
+    });
+    for (choice, label) in [
+        (LoopCutControl::Count, "Разрезы"),
+        (LoopCutControl::Position, "Положение"),
+        (LoopCutControl::Even, "Равное расстояние"),
+        (LoopCutControl::Flip, "Другая сторона"),
+        (LoopCutControl::Clamp, "Ограничить полосой"),
+        (LoopCutControl::CorrectUv, "Корректировать UV"),
+        (LoopCutControl::Smoothness, "Сглаживание"),
+        (LoopCutControl::Falloff, "Профиль"),
+    ] {
+        control(&mut commands, parameters, &interface.font, label, EditAction::LoopCut(choice));
+    }
     let panel = node(
         &mut commands,
         interface.inspector,
@@ -536,6 +567,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
                 label,
                 match op {
                     Operation::Extrude => EditAction::ExtrudeTool,
+                    Operation::LoopCut => EditAction::BeginLoopCut,
                     Operation::BevelEdges => EditAction::BeginBevel { vertices: false },
                     Operation::BevelVertices => EditAction::BeginBevel { vertices: true },
                     _ => EditAction::Operate(op),
@@ -586,7 +618,8 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Расширить", EditAction::Grow),
         ("Сузить", EditAction::Shrink),
         ("Рамка · B", EditAction::BoxSelect),
-        ("Нож · K", EditAction::Knife),
+        ("Нож · K", EditAction::BeginKnife { only_selected: false }),
+        ("Сечение плоскостью", EditAction::Bisect),
     ] {
         control(&mut commands, select, &interface.font, label, a);
     }
@@ -654,6 +687,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         toolbar,
         panel,
         bevel_panel,
+        loop_cut_panel,
         menu,
         add,
         stats,
@@ -895,12 +929,14 @@ pub(in crate::editor) fn refresh(
     let doc = index.and_then(|i| state.documents.get(&i));
     let editing = doc.is_some_and(|d| d.mode == Mode::Edit);
     let beveling = state.gesture.as_ref().is_some_and(input::Gesture::is_beveling);
+    let loop_cutting = state.gesture.as_ref().is_some_and(input::Gesture::is_loop_cutting);
     for (entity, show) in [
         (
             ui.panel,
-            showing && !beveling && !doc.is_some_and(|d| matches!(d.mode, Mode::Uv | Mode::Paint)),
+            showing && !beveling && !loop_cutting && !doc.is_some_and(|d| matches!(d.mode, Mode::Uv | Mode::Paint)),
         ),
         (ui.bevel_panel, showing && beveling),
+        (ui.loop_cut_panel, showing && loop_cutting),
         (ui.toolbar, showing),
         (ui.menu, showing && state.menu),
         (ui.add, showing && state.add_menu),
@@ -945,6 +981,10 @@ pub(in crate::editor) fn refresh(
                     .into();
                 } else if let EditAction::Bevel(choice) = control.0
                     && let Some(label) = state.gesture.as_ref().and_then(|g| g.bevel_control_label(choice))
+                {
+                    text.0 = label;
+                } else if let EditAction::LoopCut(choice) = control.0
+                    && let Some(label) = state.gesture.as_ref().and_then(|g| g.loop_control_label(choice))
                 {
                     text.0 = label;
                 }

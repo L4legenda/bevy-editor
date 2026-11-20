@@ -48,6 +48,152 @@ fn closed(mesh: &Geometry) {
         "Operation introduced a hole or a non-manifold edge"
     );
 }
+
+#[test]
+fn loop_cut_preview_matches_asymmetric_and_multiple_cuts() {
+    for (count, position) in [(1, 0.25), (1, 0.75), (3, 0.5)] {
+        let mut mesh = cube();
+        mesh.uv_seams.insert(Edge::new(0, 1));
+        let cut = LoopCut::find(&mesh, Edge::new(0, 1)).unwrap();
+        let options = LoopCutOptions { count, position, ..default() };
+        let preview = cut.preview(&mesh, options);
+        let original = mesh.positions.len();
+        let selected = cut.apply(&mut mesh, options).unwrap();
+        assert_eq!(selected.len(), 4 * count);
+        assert_eq!(mesh.positions.len(), original + 4 * count);
+        assert_eq!(mesh.uv_seams.len(), count + 1);
+        for [a,b] in preview {
+            assert!(selected.iter().any(|edge| {
+                let [x,y] = [mesh.positions[edge.0], mesh.positions[edge.1]];
+                (a == x && b == y) || (a == y && b == x)
+            }));
+        }
+        if count == 1 {
+            assert!(mesh.positions[original..].iter().all(|p| p.x == -1.0 + 2.0 * position));
+        }
+        closed(&mesh);
+    }
+}
+
+#[test]
+fn loop_cut_even_is_measured_from_the_selected_side_and_can_correct_uvs() {
+    let mut original = cube();
+    original.positions[1].x = 2.0;
+    original.positions[5].x = 2.0;
+    original.faces[0].material = 3;
+    let cut = LoopCut::find(&original, Edge::new(0,1)).unwrap();
+    let options = LoopCutOptions { position: 0.5, even: true, ..default() };
+    let mut left = original.clone();
+    let mut right = original.clone();
+    let mut uncorrected = original.clone();
+    cut.apply(&mut left, options).unwrap();
+    cut.apply(&mut right, LoopCutOptions { flipped: true, ..options }).unwrap();
+    cut.apply(&mut uncorrected, LoopCutOptions { correct_uv: false, ..options }).unwrap();
+    assert!(left.positions[8..].iter().all(|p| (p.x-0.5).abs() < 1.0e-6));
+    assert!(right.positions[8..].iter().any(|p|(p.x+0.5).abs() < 1.0e-6));
+    assert_eq!(left.positions, uncorrected.positions);
+    assert_ne!(left.faces, uncorrected.faces);
+    let top = left.positions.iter().position(|point| *point == Vec3::new(0.5, 1.0, -1.0)).unwrap();
+    let uv_at_top = |mesh: &Geometry| {
+        mesh.faces.iter().filter(|face| face.material == 3)
+            .flat_map(|face| &face.corners).find(|corner| corner.vertex == top).unwrap().uv
+    };
+    let checker = |uv: Vec2| ((uv.x * 4.0).floor() as i32 + (uv.y * 4.0).floor() as i32) % 2;
+    assert_eq!(uv_at_top(&left), Vec2::new(1.0, 0.75));
+    assert_eq!(checker(uv_at_top(&left)), checker(Vec2::new(1.0, 0.75)));
+    assert_ne!(checker(uv_at_top(&left)), checker(uv_at_top(&uncorrected)));
+    closed(&left);
+    closed(&right);
+}
+
+#[test]
+fn loop_cut_ends_at_a_triangle_without_detaching_the_boundary() {
+    let mut mesh = cube();
+    mesh.faces.truncate(1);
+    mesh.positions.push(Vec3::new(0.0, 2.0, -1.0));
+    mesh.faces.push(Face {
+        corners: [2,3,8].into_iter().map(Corner::new).collect(),
+        material: 1, smooth: false,
+    });
+    mesh.compact();
+    let cut = LoopCut::find(&mesh, Edge::new(0,1)).unwrap();
+    let edges = cut.apply(&mut mesh, LoopCutOptions {count:3,..default()}).unwrap();
+    assert_eq!(edges.len(),3);
+    assert_eq!(mesh.faces.len(),5);
+    assert_eq!(mesh.faces.iter().find(|f|f.material==1).unwrap().corners.len(),6);
+    mesh.validate().unwrap();
+}
+
+#[test]
+fn knife_reuses_a_cut_point_between_adjacent_faces() {
+    let mut mesh = cube();
+    let common = Vec3::new(0.0,-1.0,-1.0);
+    let cuts = mesh.apply_knife(&[
+        KnifeSegment { face: 0, ends: [Vec3::new(0.0,1.0,-1.0), common] },
+        KnifeSegment { face: 2, ends: [common,Vec3::new(0.0,-1.0,1.0)] },
+    ]).unwrap();
+    assert_eq!(cuts.len(),2);
+    let shared = mesh.positions.iter().position(|p| *p==common).unwrap();
+    assert!(cuts.iter().all(|edge|edge.0==shared || edge.1==shared));
+    closed(&mesh);
+}
+
+#[test]
+fn knife_keeps_the_outline_of_a_concave_face() {
+    let point = |x,y| Vec3::new(x,y,0.0);
+    let mut mesh = Geometry {
+        positions: [(-2.0,-1.0),(2.0,-1.0),(2.0,1.0),(1.0,1.0),(1.0,0.0),(-1.0,0.0),(-1.0,1.0),(-2.0,1.0)]
+            .map(|(x,y)| point(x,y)).into(),
+        faces: vec![Face { corners: (0..8).map(Corner::new).collect(), material: 4, smooth: false }],
+        ..default()
+    };
+    let area = mesh.normal(&mesh.faces[0]).z;
+    let cuts = mesh.apply_knife(&[
+        KnifeSegment { face: 0, ends: [point(-2.0,0.5),point(-1.0,0.5)] },
+        KnifeSegment { face: 0, ends: [point(1.0,0.5),point(2.0,0.5)] },
+    ]).unwrap();
+    assert_eq!(cuts.len(),2);
+    assert_eq!(mesh.faces.len(),3);
+    assert!(mesh.faces.iter().all(|face| face.material == 4));
+    assert_eq!(mesh.faces.iter().map(|face| mesh.normal(face).z).sum::<f32>(), area);
+}
+
+#[test]
+fn knife_subdivides_only_the_target_face_and_keeps_boundary_watertight() {
+    let mut mesh = cube();
+    mesh.faces[0].material = 5;
+    mesh.uv_seams.insert(Edge::new(0, 3));
+    let cuts = mesh.apply_knife(&[KnifeSegment {
+        face: 0, ends: [Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0)],
+    }]).unwrap();
+    assert_eq!(cuts.len(), 1);
+    assert_eq!(mesh.faces.len(), 7);
+    assert_eq!(mesh.faces.iter().filter(|face| face.material == 5).count(), 2);
+    assert_eq!(mesh.uv_seams.len(), 2);
+    closed(&mesh);
+}
+
+#[test]
+fn knife_resolves_crossing_paths_and_closed_internal_contours() {
+    let mut mesh = cube();
+    let point = |x,y| Vec3::new(x,y,-1.0);
+    let cuts = mesh.apply_knife(&[
+        KnifeSegment { face: 0, ends: [point(-0.6,0.0),point(0.6,0.0)] },
+        KnifeSegment { face: 0, ends: [point(0.0,-0.6),point(0.0,0.6)] },
+    ]).unwrap();
+    assert_eq!(cuts.len(), 4);
+    assert_eq!(cuts.iter().filter(|edge| {
+        [edge.0,edge.1].iter().any(|&v|mesh.positions[v].abs_diff_eq(point(0.0,0.0),1.0e-5))
+    }).count(),4);
+    closed(&mesh);
+
+    let mut mesh = cube();
+    let path = [point(-0.5,-0.5),point(0.5,-0.5),point(0.5,0.5),point(-0.5,0.5)];
+    let segments: Vec<_> = path.iter().zip(path.iter().cycle().skip(1))
+        .map(|(&a,&b)| KnifeSegment { face: 0, ends: [a,b] }).collect();
+    assert_eq!(mesh.apply_knife(&segments).unwrap().len(),4);
+    closed(&mesh);
+}
 fn face(index: usize) -> Selection {
     Selection {
         kind: Element::Face,

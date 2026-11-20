@@ -7,6 +7,12 @@ mod edge_tools;
 #[path = "model_edge_bevel.rs"]
 mod bevel;
 pub(super) use bevel::{BevelOptions, Intersection, WidthType};
+#[path = "model_loop_cut.rs"]
+mod loop_cut;
+pub(super) use loop_cut::{LoopCut, LoopCutOptions};
+#[path = "model_knife.rs"]
+mod knife;
+pub(super) use knife::KnifeSegment;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Edge(pub usize, pub usize);
@@ -1418,78 +1424,7 @@ impl Geometry {
         Ok(())
     }
     pub fn loop_cut(&mut self, edge: Edge) -> Result<BTreeSet<Edge>, String> {
-        let adjacency = self.edges();
-        let mut queue = vec![edge];
-        let mut split = BTreeMap::new();
-        let mut cut_edges = BTreeSet::new();
-        while let Some(edge) = queue.pop() {
-            cut_edges.insert(edge);
-            if let Some(faces) = adjacency.get(&edge) {
-                for &i in faces {
-                    let f = &self.faces[i];
-                    if f.corners.len() != 4 || split.contains_key(&i) {
-                        continue;
-                    }
-                    let j = f
-                        .edges()
-                        .position(|(a, b)| Edge::new(a, b) == edge)
-                        .unwrap();
-                    let opposite =
-                        Edge::new(f.corners[(j + 2) % 4].vertex, f.corners[(j + 3) % 4].vertex);
-                    split.insert(i, j);
-                    queue.push(opposite);
-                }
-            }
-        }
-        if split.is_empty() {
-            return Err(
-                "Разрез петли проходит по четырёхугольным граням; Alt+J объединяет треугольники"
-                    .into(),
-            );
-        }
-        let mut points = BTreeMap::new();
-        for e in cut_edges {
-            let v = self.positions.len();
-            self.positions
-                .push((self.positions[e.0] + self.positions[e.1]) * 0.5);
-            points.insert(e, v);
-        }
-        let mut result = Vec::new();
-        let mut loop_edges = BTreeSet::new();
-        for (i, f) in self.faces.iter().enumerate() {
-            if let Some(&j) = split.get(&i) {
-                let c: Vec<_> = (0..4).map(|k| f.corners[(j + k) % 4].clone()).collect();
-                let a = c[0].between(&c[1], points[&Edge::new(c[0].vertex, c[1].vertex)], 0.5);
-                let b = c[2].between(&c[3], points[&Edge::new(c[2].vertex, c[3].vertex)], 0.5);
-                loop_edges.insert(Edge::new(a.vertex, b.vertex));
-                for corners in [
-                    vec![c[0].clone(), a.clone(), b.clone(), c[3].clone()],
-                    vec![a, c[1].clone(), c[2].clone(), b],
-                ] {
-                    result.push(Face {
-                        corners,
-                        material: f.material,
-                        smooth: f.smooth,
-                    });
-                }
-            } else {
-                let mut corners = Vec::new();
-                for (a, b) in f.corners.iter().zip(f.corners.iter().cycle().skip(1)) {
-                    corners.push(a.clone());
-                    if let Some(&v) = points.get(&Edge::new(a.vertex, b.vertex)) {
-                        corners.push(a.between(b, v, 0.5));
-                    }
-                }
-                result.push(Face {
-                    corners,
-                    material: f.material,
-                    smooth: f.smooth,
-                });
-            }
-        }
-        self.faces = result;
-        self.split_uv_seams(&points);
-        Ok(loop_edges)
+        LoopCut::find(self, edge)?.apply(self, LoopCutOptions::default())
     }
     pub fn bevel_vertices(&mut self, selection: &mut Selection, width: f32) -> Result<(), String> {
         let chosen = selection.selected_vertices(self);
