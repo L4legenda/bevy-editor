@@ -1,5 +1,6 @@
 //! File-card drag gestures and their overlay. Filesystem writes stay in actions.
 use super::*;
+use crate::editor::ui::image_viewer::{self, CanvasControl, ImageCanvas};
 use crate::editor::ui::narrative::NarrativeUi;
 use bevy::ui::CalculatedClip;
 use std::path::Path;
@@ -18,6 +19,7 @@ pub(crate) enum DropTarget {
     Scene(Vec2),
     GenerationSource,
     Dialogue { document: usize, local: Vec2 },
+    ModelReference { document: usize, point: Vec2 },
 }
 
 #[derive(Clone, Copy)]
@@ -220,7 +222,11 @@ pub(crate) fn pointer(
     lighting: Option<Res<LightingUi>>,
     viewer: Option<Res<ImageViewer>>,
     narrative: Option<Res<NarrativeUi>>,
-    canvas: Query<(&ComputedNode, &UiGlobalTransform, Option<&CalculatedClip>)>,
+    (canvas, image_canvas, image_controls): (
+        Query<(&ComputedNode, &UiGlobalTransform, Option<&CalculatedClip>)>,
+        Query<Entity, With<ImageCanvas>>,
+        Query<(&ComputedNode, &UiGlobalTransform), With<CanvasControl>>,
+    ),
 ) {
     drag.cancelled_this_frame = false;
     if mouse.just_pressed(MouseButton::Left)
@@ -328,6 +334,29 @@ pub(crate) fn pointer(
                 })
             })
             .or_else(|| {
+                let document = editor.viewing_image?;
+                let viewer = viewer.as_ref()?;
+                if motion.covers(cursor, &window)
+                    || image_viewer::over_controls(&image_controls, cursor)
+                {
+                    return None;
+                }
+                let (node, transform, clip) = canvas.get(image_canvas.single().ok()?).ok()?;
+                if !hit(node, transform, clip, physical)
+                    || browser
+                        .model_asset(&editor.project.catalog, payload.entry)
+                        .is_none()
+                {
+                    return None;
+                }
+                let canvas = Rect::from_center_size(
+                    transform.translation * node.inverse_scale_factor(),
+                    node.size() * node.inverse_scale_factor(),
+                );
+                let point = viewer.reference_point(document, canvas, cursor)?;
+                Some(DropTarget::ModelReference { document, point })
+            })
+            .or_else(|| {
                 (can_place(payload.entry, &browser, &editor)
                     && scene_target_contains(&editor, &window, &motion, cursor))
                 .then_some(DropTarget::Scene(cursor))
@@ -341,6 +370,14 @@ pub(crate) fn pointer(
                 }
                 DropTarget::Scene(position) => {
                     actions.write(Action::DropAsset(payload.entry, position));
+                }
+                DropTarget::ModelReference { document, point } => {
+                    actions.write(Action::DropModelReference {
+                        entry: payload.entry,
+                        scan_revision: payload.scan_revision,
+                        document,
+                        point,
+                    });
                 }
                 DropTarget::Dialogue { document, local } => {
                     if let Entry::File(file) = payload.entry {
@@ -443,6 +480,7 @@ pub(crate) fn visuals(
             BLUE,
         ),
         Some(DropTarget::Dialogue { .. }) => ("Создать ноду диалога".into(), BLUE),
+        Some(DropTarget::ModelReference { .. }) => ("Добавить слой-референс".into(), BLUE),
         Some(DropTarget::GenerationSource) => {
             ("Использовать в 3D генерации · Esc — отмена".into(), GREEN)
         }

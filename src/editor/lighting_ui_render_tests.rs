@@ -65,27 +65,35 @@ pub(in crate::editor) fn fixture() -> (App, Entity, Handle<Image>) {
 }
 
 pub(in crate::editor) fn fixture_project(project: EditorProject) -> (App, Entity, Handle<Image>) {
+    fixture_project_with_pipeline_compilation(project, true)
+}
+
+pub(in crate::editor) fn fixture_project_with_pipeline_compilation(
+    project: EditorProject,
+    synchronous_pipeline_compilation: bool,
+) -> (App, Entity, Handle<Image>) {
     let mut app = App::new();
+    let mut plugins = DefaultPlugins
+        .set(AssetPlugin {
+            file_path: project.asset_root.to_string_lossy().into_owned(),
+            ..default()
+        })
+        .set(WindowPlugin {
+            primary_window: None,
+            exit_condition: ExitCondition::DontExit,
+            close_when_requested: false,
+            ..default()
+        })
+        .set(RenderPlugin {
+            synchronous_pipeline_compilation,
+            ..default()
+        })
+        .disable::<WinitPlugin>();
+    if synchronous_pipeline_compilation {
+        plugins = plugins.disable::<PipelinedRenderingPlugin>();
+    }
     app.add_plugins(AssetRedirectPlugin::new(&project.asset_root).unwrap())
-        .add_plugins(
-            DefaultPlugins
-                .set(AssetPlugin {
-                    file_path: project.asset_root.to_string_lossy().into_owned(),
-                    ..default()
-                })
-                .set(WindowPlugin {
-                    primary_window: None,
-                    exit_condition: ExitCondition::DontExit,
-                    close_when_requested: false,
-                    ..default()
-                })
-                .set(RenderPlugin {
-                    synchronous_pipeline_compilation: true,
-                    ..default()
-                })
-                .disable::<WinitPlugin>()
-                .disable::<PipelinedRenderingPlugin>(),
-        )
+        .add_plugins(plugins)
         .add_plugins(EditorPlugin::new(project).unwrap())
         .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
             1.0 / 60.0,

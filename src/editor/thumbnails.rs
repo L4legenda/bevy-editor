@@ -34,7 +34,7 @@ use super::{
 #[path = "asset_loading_tests.rs"]
 mod asset_loading_tests;
 #[path = "thumbnail_framing.rs"]
-mod framing;
+pub(super) mod framing;
 #[cfg(test)]
 #[path = "thumbnail_lifecycle_tests.rs"]
 mod lifecycle_tests;
@@ -45,7 +45,7 @@ mod performance;
 #[path = "thumbnail_render_tests.rs"]
 mod render_tests;
 #[path = "preview_scene.rs"]
-mod scene;
+pub(super) mod scene;
 
 // Render above the card's logical size so edges stay crisp on Retina displays.
 const WIDTH: u32 = 384;

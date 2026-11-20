@@ -18,7 +18,7 @@ use crate::{
 };
 
 #[derive(Component)]
-pub(super) struct CatalogModel;
+pub(in crate::editor) struct CatalogModel;
 
 #[derive(Clone, Component, PartialEq)]
 pub(in crate::editor) struct SceneSnapshot {
@@ -235,10 +235,11 @@ pub(super) fn spawn_native(
     (root, spatial)
 }
 
-pub(super) fn prepare(
+pub(in crate::editor) fn prepare(
     ready: On<WorldInstanceReady>,
     snapshots: Query<&SceneSnapshot>,
     catalog_models: Query<(), With<CatalogModel>>,
+    layers: Query<&RenderLayers>,
     children: Query<&Children>,
     names: Query<&Name>,
     parents: Query<&ChildOf>,
@@ -252,14 +253,19 @@ pub(super) fn prepare(
     mut transforms: ParamSet<(TransformHelper, Query<&mut Transform>)>,
     mut commands: Commands,
 ) {
+    let is_catalog_model = catalog_models.contains(ready.entity);
+    let layer = layers
+        .get(ready.entity)
+        .ok()
+        .filter(|_| is_catalog_model)
+        .cloned()
+        .unwrap_or_else(|| RenderLayers::layer(super::LAYER));
     for entity in std::iter::once(ready.entity).chain(children.iter_descendants(ready.entity)) {
-        commands
-            .entity(entity)
-            .insert(RenderLayers::layer(super::LAYER));
+        commands.entity(entity).insert(layer.clone());
         if let Ok(mut camera) = cameras.get_mut(entity) {
             camera.is_active = false;
         }
-        if catalog_models.contains(ready.entity) {
+        if is_catalog_model {
             commands
                 .entity(entity)
                 .remove::<(PointLight, SpotLight, DirectionalLight, RectLight)>();

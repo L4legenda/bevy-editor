@@ -1200,7 +1200,10 @@ pub(in crate::editor) fn color_pointer(
 pub(in crate::editor) fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
-    viewer: Res<ImageViewer>,
+    (viewer, references): (
+        Res<ImageViewer>,
+        Res<crate::editor::image_reference::ReferenceRender>,
+    ),
     window: Single<&Window, With<PrimaryWindow>>,
     mut ui: ResMut<EditUi>,
     mut focus: ResMut<InputFocus>,
@@ -1381,6 +1384,8 @@ pub(in crate::editor) fn refresh(
         text.set_if_neq(Text(viewer.edit.error.clone().unwrap_or_else(|| {
             if viewer.edit.busy() {
                 "Подождите…".into()
+            } else if references.pending_for(editor.viewing_image) {
+                "Рендер слоя-референса…".into()
             } else if doc.is_some_and(PhotoDocument::dirty) {
                 "Есть несохранённые изменения".into()
             } else {

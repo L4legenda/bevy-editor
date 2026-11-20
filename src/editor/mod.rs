@@ -11,6 +11,7 @@ mod generation_model;
 mod hdri_catalog;
 mod image_brush_rail_fx;
 mod image_previews;
+mod image_reference;
 mod image_texture;
 mod lighting;
 mod lighting_gizmos;
@@ -183,6 +184,12 @@ enum Action {
     ImageEdit(ui::ImageEditAction),
     MoveAsset(browser::Entry, usize),
     DropAsset(browser::Entry, Vec2),
+    DropModelReference {
+        entry: browser::Entry,
+        scan_revision: u64,
+        document: usize,
+        point: Vec2,
+    },
     BrowserInstanceScene,
     Undo,
     Redo,
@@ -1078,6 +1085,7 @@ impl Plugin for EditorPlugin {
         .init_resource::<asset_placement::PlacementPreview>()
         .init_resource::<image_previews::ImagePreviews>()
         .init_resource::<ui::ImageViewer>()
+        .init_resource::<image_reference::ReferenceRender>()
         .init_resource::<ui::BrowserContext>()
         .init_gizmo_group::<viewport::TransformGizmos>()
         .init_gizmo_group::<selection_outline::SelectionGizmos>()
@@ -1114,6 +1122,7 @@ impl Plugin for EditorPlugin {
                     ui::photo_color_input,
                     ui::photo_layers_input,
                     ui::view_images,
+                    image_reference::update,
                     ui::browser_context_actions,
                 )
                     .chain(),
@@ -1193,8 +1202,10 @@ impl Plugin for EditorPlugin {
                 .after(bevy::transform::TransformSystems::Propagate)
                 .after(bevy::camera::visibility::VisibilitySystems::CalculateBounds),
         );
-        app.sub_app_mut(bevy::render::RenderApp)
-            .add_systems(bevy::render::ExtractSchedule, thumbnails::track_frame);
+        app.sub_app_mut(bevy::render::RenderApp).add_systems(
+            bevy::render::ExtractSchedule,
+            (thumbnails::track_frame, image_reference::track_frame),
+        );
     }
 }
 
@@ -1661,6 +1672,7 @@ fn handle_actions(
                 | Action::MoveAsset(_, _)
                 | Action::HdriLibrary(_)
                 | Action::DropAsset(_, _)
+                | Action::DropModelReference { .. }
                 | Action::BrowserInstanceScene
                 | Action::Browse(_)
                 | Action::BrowseBack

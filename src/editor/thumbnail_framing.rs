@@ -10,7 +10,7 @@ const FRAME_MARGIN: f32 = 1.15;
 
 /// Find world bounds while the job is still hidden. Editable roots and their
 /// descendants take precedence; geometry outside them remains the fallback.
-pub(super) fn bounds(
+pub(in crate::editor) fn bounds(
     root: Entity,
     subjects: &Query<(), With<scene::Subject>>,
     children: &Query<&Children>,
@@ -54,7 +54,7 @@ pub(super) fn bounds(
 
 /// Preserve the supplied target-to-camera direction and move the camera just
 /// far enough to contain every world-AABB corner, with fifteen percent margin.
-pub(super) fn fit(bounds: BoxBounds, direction: Vec3, aspect: f32) -> (Transform, Projection) {
+pub(in crate::editor) fn fit(bounds: BoxBounds, direction: Vec3, aspect: f32) -> (Transform, Projection) {
     let center = Vec3::from(bounds.center);
     let center = if center.is_finite() {
         center

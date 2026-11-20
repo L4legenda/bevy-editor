@@ -282,6 +282,20 @@ impl PhotoDocument {
     pub fn add_layer(&mut self) {
         let _ = self.layer_command("layer.new.layer", serde_json::json!({}));
     }
+    pub(super) fn add_reference(&mut self, name: String, surface: Surface) -> Result<(), String> {
+        if self.document.layer_count() >= MAX_LAYERS {
+            return Err("достигнут предел в 4096 слоёв".into());
+        }
+        let index = self.document.walk().len();
+        let mut reference = Layer::new(name, LayerContent::Raster(surface));
+        reference.locks.pixels = true;
+        self.checkpoint();
+        // A reference must be visible even if the selected layer is in a hidden group.
+        self.document.layers.push(reference);
+        self.select(index, false, false);
+        self.changed();
+        Ok(())
+    }
     #[cfg(test)]
     pub fn duplicate_layer(&mut self) {
         let _ = self.layer_command("layer.duplicate", serde_json::json!({}));

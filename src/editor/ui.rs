@@ -52,7 +52,7 @@ mod drawer;
 #[path = "icons.rs"]
 pub(crate) mod icons;
 #[path = "image_viewer.rs"]
-mod image_viewer;
+pub(super) mod image_viewer;
 #[path = "model_viewer.rs"]
 pub(in crate::editor) mod model_viewer;
 pub(super) use model_viewer::editing::State as ModelEditingState;

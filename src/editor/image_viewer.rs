@@ -117,6 +117,26 @@ pub(in crate::editor) struct ImageViewer {
 }
 
 impl ImageViewer {
+    pub(in crate::editor) fn reference_point(
+        &self,
+        document: usize,
+        canvas: Rect,
+        cursor: Vec2,
+    ) -> Option<Vec2> {
+        if self.tab != Some(document)
+            || !self.edit.editing(Some(document))
+            || self.panel.blocks_canvas()
+            || self.edit.layers.menu
+            || self.edit.layers.form.is_some()
+        {
+            return None;
+        }
+        let dimensions = self.dimensions?;
+        let image = self.image_rect(dimensions, canvas);
+        let relative = ((cursor - image.min) / image.size()).clamp(Vec2::ZERO, Vec2::ONE);
+        Some(relative * dimensions.as_vec2())
+    }
+
     pub(super) fn resizing_panel(&self) -> bool {
         self.panel.capturing()
     }
@@ -542,7 +562,7 @@ fn canvas_rect(
         )
 }
 
-fn over_controls(
+pub(in crate::editor) fn over_controls(
     controls: &Query<(&ComputedNode, &UiGlobalTransform), With<CanvasControl>>,
     point: Vec2,
 ) -> bool {

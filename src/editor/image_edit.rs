@@ -257,6 +257,38 @@ impl State {
     pub fn document(&self, id: Option<usize>) -> Option<&PhotoDocument> {
         Some(&self.sessions.get(&id?)?.doc)
     }
+    pub(in crate::editor) fn insert_reference(
+        &mut self,
+        id: usize,
+        document: photocraft_doc::DocId,
+        size: UVec2,
+        name: String,
+        surface: &Surface,
+    ) -> Result<bool, String> {
+        if self.file_busy(id)
+            || self.gesture.as_ref().is_some_and(|(tab, _)| *tab == id)
+            || self.opacity_drag.is_some_and(|(tab, _)| tab == id)
+            || self
+                .selection
+                .transform
+                .as_ref()
+                .is_some_and(|t| t.id == id)
+            || self.layers.preview.is_some()
+            || self.layers.fill_drag
+        {
+            return Ok(false);
+        }
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Err("документ закрыт".into());
+        };
+        let current = session.doc.size();
+        if document != session.doc.document.id || size != UVec2::new(current.width, current.height)
+        {
+            return Err("холст изменился во время рендера".into());
+        }
+        session.doc.add_reference(name, surface.clone())?;
+        Ok(true)
+    }
     pub fn available(&self, action: EditAction, id: Option<usize>) -> bool {
         if self.busy() {
             return false;

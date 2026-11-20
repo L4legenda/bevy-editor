@@ -1816,3 +1816,218 @@ fn gpu_photo_cursor_is_visible_on_light_dark_and_grey_and_tracks_zoom() {
     assert!(app.world().resource::<ImageViewer>().brush_cursor.is_none());
     println!("Painting cursor captures: {}", output.display());
 }
+
+#[test]
+#[ignore = "requires GPU adapter; drags GLB and FBX onto the PhotoCraft canvas"]
+fn gpu_model_cards_add_transparent_reference_layers_and_save() {
+    use crate::editor::{
+        image_reference::ReferenceCamera,
+        model_document::{MaterialSlot, Object, glb::Glb},
+        model_primitives::Primitive,
+        selection_outline::render_tests::{capture_when, frame},
+        ui::drawer::{AssetDrag, DropTarget, FileCard},
+    };
+    use bevy::input::ButtonState;
+    use lighting_ui_render::{mouse, move_pointer};
+
+    #[derive(Resource)]
+    struct SimulateEmptyCapture(bool);
+
+    let fixture = Fixture::new();
+    let models = fixture.0.join("models");
+    std::fs::create_dir(&models).unwrap();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for directory in ["scenes", "levels"] {
+        let destination = fixture.0.join(directory);
+        std::fs::create_dir(&destination).unwrap();
+        for file in std::fs::read_dir(fixtures.join("legacy/assets").join(directory)).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), destination.join(file.file_name())).unwrap();
+        }
+    }
+    let primitive = Primitive::Cube;
+    let cube = Object {
+        id: 0,
+        source_node: None,
+        name: "Куб".into(),
+        geometry: primitive.geometry(&primitive.defaults()).unwrap().into(),
+        transform: Transform::IDENTITY,
+        materials: vec![MaterialSlot {
+            material: default(),
+            source: serde_json::json!({"material": 0}),
+            paint: None,
+        }],
+        hidden: false,
+    };
+    std::fs::write(models.join("cube.glb"), Glb::new_asset(&[cube]).unwrap()).unwrap();
+    std::fs::copy(
+        fixtures.join("fbx/embedded/props_embedded.fbx"),
+        models.join("props.fbx"),
+    )
+    .unwrap();
+    let source = fixture.0.join("canvas.png");
+    image::RgbaImage::new(600, 480).save(&source).unwrap();
+    let (mut app, window, output) =
+        lighting_ui_render::fixture_project_with_pipeline_compilation(fixture.project(), false);
+    app.insert_resource(SimulateEmptyCapture(true)).add_systems(
+        PostUpdate,
+        |simulate: Res<SimulateEmptyCapture>,
+         mut cameras: Query<&mut Camera, With<ReferenceCamera>>| {
+            if simulate.0 {
+                for mut camera in &mut cameras {
+                    camera.is_active = false;
+                }
+            }
+        },
+    );
+    let image = file(&app, "canvas.png");
+    app.world_mut().write_message(Action::ViewImage(image));
+    frame(&mut app);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    let tab = app.world().resource::<Editor>().viewing_image.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        frame(&mut app);
+        if app
+            .world()
+            .resource::<ImageViewer>()
+            .edit
+            .editing(Some(tab))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PhotoCraft did not open"
+        );
+    }
+    let folder = app
+        .world()
+        .resource::<Browser>()
+        .folders
+        .iter()
+        .position(|folder| folder.path == std::path::Path::new("models"))
+        .unwrap();
+    app.world_mut().write_message(Action::OpenBrowser);
+    app.world_mut().write_message(Action::Browse(folder));
+    for _ in 0..28 {
+        frame(&mut app);
+    }
+
+    for (index, name) in ["cube.glb", "props.fbx"].into_iter().enumerate() {
+        app.world_mut().resource_mut::<SimulateEmptyCapture>().0 = index == 0;
+        let model = app
+            .world()
+            .resource::<Editor>()
+            .project
+            .catalog
+            .iter()
+            .position(|item| item.asset == format!("models/{name}"))
+            .unwrap();
+        let card = {
+            let world = app.world_mut();
+            world
+                .query::<(&FileCard, &ComputedNode, &UiGlobalTransform)>()
+                .iter(world)
+                .find_map(|(card, node, transform)| {
+                    (card.0 == browser::Entry::Model(model) && !node.is_empty())
+                        .then_some(transform.translation * node.inverse_scale_factor())
+                })
+                .unwrap()
+        };
+        let drop_point = {
+            let world = app.world_mut();
+            let (node, transform) = world
+                .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+                .single(world)
+                .unwrap();
+            let canvas_center = transform.translation * node.inverse_scale_factor();
+            canvas_center + Vec2::new(index as f32 * 280.0 - 140.0, -75.0)
+        };
+        move_pointer(&mut app, window, card);
+        mouse(&mut app, window, ButtonState::Pressed);
+        move_pointer(&mut app, window, drop_point);
+        assert!(
+            matches!(app.world().resource::<AssetDrag>().target, Some(DropTarget::ModelReference { document, .. }) if document == tab)
+        );
+        mouse(&mut app, window, ButtonState::Released);
+
+        let started = std::time::Instant::now();
+        loop {
+            frame(&mut app);
+            let state = &app.world().resource::<ImageViewer>().edit;
+            assert!(state.error.is_none(), "{:?}", state.error);
+            let doc = state.document(Some(tab)).unwrap();
+            if doc.document.layers.len() == index + 2 {
+                let layer = doc.active_layer().unwrap();
+                assert_eq!(layer.name, format!("Референс · {name}"));
+                assert!(layer.locks.pixels && doc.movable());
+                let photocraft_doc::LayerContent::Raster(surface) = &layer.content else {
+                    panic!("Expected a raster reference");
+                };
+                let bounds = surface.content_bounds();
+                let mut pixels = vec![[0; 4]; bounds.width() as usize * bounds.height() as usize];
+                surface.read_rgba8_into(bounds, &mut pixels);
+                assert!(
+                    pixels.iter().any(|p| p[3] == 0),
+                    "The silhouette must have no backdrop"
+                );
+                let pixels = doc.preview().pixels;
+                assert!(pixels.chunks_exact(4).any(|p| p[3] == 0));
+                assert!(
+                    pixels
+                        .chunks_exact(4)
+                        .any(|p| p[3] == 255 && p[..3] != [0, 0, 0])
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(40),
+                "{}",
+                app.world().resource::<Editor>().status
+            );
+        }
+    }
+    assert!(app.world().resource::<Editor>().edits.models.is_empty());
+    for (action, count) in [(edit::EditAction::Undo, 2), (edit::EditAction::Redo, 3)] {
+        app.world_mut().write_message(Action::ImageEdit(action));
+        frame(&mut app);
+        let doc = app
+            .world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap();
+        assert_eq!(doc.document.layers.len(), count);
+    }
+    app.world_mut().write_message(Action::Drawer);
+    for _ in 0..25 {
+        frame(&mut app);
+    }
+    capture_when(
+        &mut app,
+        &output,
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/model-reference.png"),
+        |_| true,
+    );
+
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    frame(&mut app);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while app.world().resource::<ImageViewer>().edit.file_busy(tab) {
+        frame(&mut app);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Reference layers did not save"
+        );
+    }
+    let reloaded = crate::editor::photo_document::PhotoDocument::load(&source).unwrap();
+    assert_eq!(reloaded.document.layers.len(), 3);
+    assert!(
+        reloaded.document.layers[1..]
+            .iter()
+            .all(|layer| layer.locks.pixels)
+    );
+}
