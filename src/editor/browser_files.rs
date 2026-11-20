@@ -1,4 +1,4 @@
-//! Filesystem operations for importing images and creating asset folders.
+//! Filesystem operations for importing files and creating asset folders.
 use std::{
     collections::HashSet,
     fs, io,
@@ -6,6 +6,7 @@ use std::{
 };
 
 use super::browser::is_image;
+use crate::data::ModelFormat;
 
 pub(super) fn directory(root: &Path, relative: &Path) -> io::Result<PathBuf> {
     if relative
@@ -185,6 +186,7 @@ pub(super) fn create_image(
 #[derive(Default)]
 pub(super) struct ImportReport {
     pub imported: Vec<PathBuf>,
+    pub(super) textures_copied: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
 }
@@ -192,10 +194,13 @@ pub(super) struct ImportReport {
 impl ImportReport {
     pub fn status(&self) -> String {
         let mut status = if self.imported.is_empty() {
-            "Не добавлено новых изображений".into()
+            "Не добавлено новых файлов".into()
         } else {
-            format!("Добавлено изображений: {}", self.imported.len())
+            format!("Добавлено файлов: {}", self.imported.len())
         };
+        if self.textures_copied > 0 {
+            status.push_str(&format!(" · Текстур FBX: {}", self.textures_copied));
+        }
         if self.skipped != 0 {
             status.push_str(&format!(" · Уже в папке: {}", self.skipped));
         }
@@ -209,7 +214,7 @@ impl ImportReport {
     }
 }
 
-pub(super) fn import_images(root: &Path, parent: &Path, sources: Vec<PathBuf>) -> ImportReport {
+pub(super) fn import_files(root: &Path, parent: &Path, sources: Vec<PathBuf>) -> ImportReport {
     let mut report = ImportReport::default();
     let target = match directory(root, parent) {
         Ok(target) => target,
@@ -221,28 +226,141 @@ pub(super) fn import_images(root: &Path, parent: &Path, sources: Vec<PathBuf>) -
         }
     };
     let mut seen = HashSet::new();
+    let mut fbx_files = Vec::new();
     for source in sources {
         let label = source.file_name().unwrap_or_default().to_string_lossy();
-        match import_image(&source, &target, &mut seen) {
-            Ok(Some(name)) => report.imported.push(parent.join(name)),
+        match import_file(&source, &target, &mut seen) {
+            Ok(Some(name)) => {
+                report.imported.push(parent.join(&name));
+                if name.to_str().and_then(ModelFormat::from_path) == Some(ModelFormat::Fbx) {
+                    fbx_files.push((source, name));
+                }
+            }
             Ok(None) => report.skipped += 1,
             Err(error) => report.errors.push(format!("{label}: {error}")),
+        }
+    }
+    // Copy explicitly dropped files first. Shared textures and explicitly dropped
+    // textures can then reuse the same destination without producing numbered copies.
+    for (source, name) in fbx_files {
+        if let Err(error) = import_fbx_textures(&source, &target, &name, &mut report) {
+            report
+                .errors
+                .push(format!("{} · текстуры FBX: {error}", name.display()));
         }
     }
     report
 }
 
-fn import_image(
+fn import_fbx_textures(
+    source: &Path,
+    target: &Path,
+    name: &Path,
+    report: &mut ImportReport,
+) -> io::Result<()> {
+    let source = source.canonicalize()?;
+    let folder = source
+        .parent()
+        .ok_or_else(|| io::Error::other("Нет папки модели"))?;
+    let filename = source.strip_prefix(folder).map_err(io::Error::other)?;
+    let textures = crate::runtime::fbx::external_texture_paths(folder, filename, name)?;
+    for (relative, destination) in textures {
+        let Some(destination) = destination.filter(|_| is_image(&relative)) else {
+            continue;
+        };
+        match copy_texture(folder, &relative, target, &destination) {
+            Ok(true) => report.textures_copied += 1,
+            Ok(false) => {}
+            Err(error) => report.errors.push(format!(
+                "{} · {}: {error}",
+                name.display(),
+                relative.display()
+            )),
+        }
+    }
+    Ok(())
+}
+
+fn copy_texture(
+    folder: &Path,
+    relative: &Path,
+    target: &Path,
+    destination: &Path,
+) -> io::Result<bool> {
+    let source = folder.join(relative).canonicalize()?;
+    if !source.starts_with(folder) || !source.is_file() {
+        return Err(io::Error::other("Текстура находится вне папки модели"));
+    }
+    let mut directory = target.to_path_buf();
+    // A pre-existing symlink must never turn a nested texture reference into
+    // a write outside the selected project folder.
+    for component in destination.parent().into_iter().flat_map(Path::components) {
+        directory.push(component);
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    && fs::symlink_metadata(&directory)?.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let path = target.join(destination);
+    let mut input = fs::File::open(source)?;
+    match copy_new(&mut input, &path) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && fs::symlink_metadata(&path)?.is_file() =>
+        {
+            use sha2::{Digest, Sha256};
+            let digest = |file: &mut fs::File| -> io::Result<_> {
+                let mut sha = Sha256::new();
+                io::copy(file, &mut sha)?;
+                Ok(sha.finalize())
+            };
+            let mut previous = fs::File::open(path)?;
+            if previous.metadata()?.len() == input.metadata()?.len()
+                && digest(&mut previous)? == digest(&mut input)?
+            {
+                return Ok(false);
+            }
+            Err(io::Error::other(
+                "В проекте уже есть другая текстура с этим именем",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn copy_new(input: &mut fs::File, destination: &Path) -> io::Result<()> {
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    if let Err(error) = io::copy(input, &mut output).and_then(|_| output.flush()) {
+        drop(output);
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn import_file(
     source: &Path,
     target: &Path,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
-    if !is_image(source) {
-        return Err("Поддерживаются PNG, JPEG, WebP, BMP, TGA, GIF, ICO и SVG".into());
+    let model = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(ModelFormat::from_path)
+        .is_some();
+    if !is_image(source) && !model {
+        return Err("Поддерживаются GLB, FBX, PNG, JPEG, WebP, BMP, TGA, GIF, ICO и SVG".into());
     }
     let source = source.canonicalize().map_err(|error| error.to_string())?;
     if !source.is_file() {
-        return Err("Перетащите файл изображения".into());
+        return Err("Перетащите обычный файл".into());
     }
     if !seen.insert(source.clone()) || source.parent() == Some(target) {
         return Ok(None);
@@ -257,7 +375,7 @@ fn import_image(
     let stem = Path::new(name)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("image");
+        .unwrap_or("asset");
     let ext = source
         .extension()
         .and_then(|ext| ext.to_str())
@@ -270,22 +388,11 @@ fn import_image(
             format!("{stem} ({suffix}).{ext}")
         };
         let destination = target.join(&name);
-        let mut output = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-        {
-            Ok(output) => output,
+        match copy_new(&mut input, &destination) {
+            Ok(()) => return Ok(Some(PathBuf::from(name))),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.to_string()),
-        };
-        // Only remove the file exclusively created by this import on a failed copy.
-        if let Err(error) = io::copy(&mut input, &mut output).and_then(|_| output.flush()) {
-            drop(output);
-            let _ = fs::remove_file(&destination);
-            return Err(error.to_string());
         }
-        return Ok(Some(PathBuf::from(name)));
     }
     Err("Не удалось подобрать свободное имя файла".into())
 }

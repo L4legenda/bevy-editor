@@ -849,7 +849,7 @@ fn scroll_to_label(app: &mut App, wanted: &str) {
     scroll_to_entity(app, entity);
 }
 
-fn scroll_to_entity(app: &mut App, entity: Entity) {
+pub(in crate::editor) fn scroll_to_entity(app: &mut App, entity: Entity) {
     let world = app.world_mut();
     let center = world
         .get::<UiGlobalTransform>(entity)

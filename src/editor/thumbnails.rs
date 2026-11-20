@@ -10,7 +10,6 @@ use bevy::{
     camera::{
         ClearColorConfig, Exposure, Hdr, RenderTarget, primitives::Aabb, visibility::RenderLayers,
     },
-    gltf::GltfLoaderSettings,
     light::{CascadeShadowConfigBuilder, EnvironmentMapLight},
     pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceTransmission},
     prelude::*,
@@ -26,7 +25,9 @@ use bevy::{
 use super::{
     Editor,
     browser::{Browser, Entry},
-    load_error, viewport,
+    load_error,
+    model_source::ModelSource,
+    viewport,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -105,7 +106,7 @@ struct PreviewView {
 
 struct Job {
     target: Target,
-    asset: Handle<Gltf>,
+    asset: Option<ModelSource>,
     // Roots retain only this job's assets until its captured image is ready.
     root: Entity,
     instances: Vec<Entity>,
@@ -212,7 +213,7 @@ impl Thumbnails {
                         .get(index)
                         .is_some_and(|model| changed.contains(&key(&model.asset)))
             }
-            // A GLB can occur in multiple scene documents, including closed ones.
+            // A model can occur in multiple scene documents, including closed ones.
             Target::Scene(_) => !changed.is_empty(),
         };
         if self.job.as_ref().is_some_and(|job| invalid(job.target)) {
@@ -405,7 +406,7 @@ fn asset_version(editor: &Editor, path: &str) -> Option<(u64, std::time::SystemT
     Some((metadata.len(), metadata.modified().ok()?))
 }
 
-/// A saved/reloaded GLB invalidates both its catalog card and dependent scenes.
+/// A saved/reloaded model invalidates both its catalog card and dependent scenes.
 pub(super) fn watch_assets(
     mut gltfs: MessageReader<AssetEvent<Gltf>>,
     mut worlds: MessageReader<AssetEvent<WorldAsset>>,
@@ -551,18 +552,7 @@ pub(super) fn update(
                     previews.remember_asset(&editor, &path);
                 }
             }
-            let asset = if path.is_empty() {
-                Handle::default()
-            } else {
-                assets
-                    .load_builder()
-                    .with_settings(|settings: &mut GltfLoaderSettings| {
-                        settings.load_cameras = false;
-                        settings.load_lights = true;
-                        settings.load_animations = false;
-                    })
-                    .load(path.clone())
-            };
+            let asset = (!path.is_empty()).then(|| ModelSource::load(&assets, path, true));
             let root = commands
                 .spawn((
                     Transform::IDENTITY,
@@ -593,7 +583,17 @@ pub(super) fn update(
         previews.stop(job, &mut commands);
         return;
     }
-    let error = load_error(&assets, &job.asset)
+    let world = if job.instances.is_empty() {
+        job.asset
+            .as_ref()
+            .map_or(Ok(None), |source| source.world(&assets, &gltfs))
+    } else {
+        Ok(None)
+    };
+    let error = world
+        .as_ref()
+        .err()
+        .cloned()
         .or_else(|| {
             job.models
                 .iter()
@@ -633,16 +633,8 @@ pub(super) fn update(
                 job.instances.push(root);
                 job.models.push(crate::runtime::load_model(&assets, model));
             }
-        } else if assets.is_loaded_with_dependencies(job.asset.id())
-            && let Some(gltf) = gltfs.get(&job.asset)
-        {
-            let Some(world) = gltf.default_scene.as_ref().or_else(|| gltf.scenes.first()) else {
-                warn!("Thumbnail for {:?}: GLB has no scene", job.target);
-                previews.fail(job.target);
-                previews.stop(job, &mut commands);
-                return;
-            };
-            let mut instance = commands.spawn((WorldAssetRoot(world.clone()), ChildOf(job.root)));
+        } else if let Ok(Some(world)) = world {
+            let mut instance = commands.spawn((WorldAssetRoot(world), ChildOf(job.root)));
             if matches!(job.target, Target::Model(_)) {
                 instance.insert(scene::CatalogModel);
             }
@@ -973,7 +965,7 @@ mod tests {
         let camera = world.spawn_empty().id();
         previews.job = Some(Job {
             target: Target::Scene(0),
-            asset: Handle::default(),
+            asset: None,
             root,
             instances: Vec::new(),
             models: Vec::new(),

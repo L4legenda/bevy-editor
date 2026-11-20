@@ -1,5 +1,6 @@
 //! The asset browser is an overlay: sliding it never changes the scene camera.
 use super::*;
+use crate::data::ModelFormat;
 use crate::editor::{browser::Entry, image_previews::ImagePreviews, thumbnails::Thumbnails};
 
 #[path = "drawer_resize.rs"]
@@ -13,6 +14,7 @@ pub(crate) use drag::{
 };
 
 const DURATION: f32 = 0.24;
+const FILE_DROP_HINT: &str = "Перетащите модели и изображения сюда · ПКМ — создать папку";
 const CARD: f32 = 180.0;
 const CARD_BORDER: f32 = 1.0;
 const PREVIEW_WIDTH: f32 = CARD - CARD_BORDER * 2.0;
@@ -438,7 +440,7 @@ pub(super) fn setup(
         commands,
         detail_cell,
         font_handle,
-        "Перетащите изображения сюда · ПКМ — создать папку",
+        FILE_DROP_HINT,
         11.0,
         MUTED,
     );
@@ -991,6 +993,7 @@ pub(crate) fn refresh(
             }
             Entry::Model(index) => {
                 let item = &editor.project.catalog[index];
+                let format = ModelFormat::from_path(&item.asset).map_or("3D", ModelFormat::label);
                 let filename = item.asset.rsplit('/').next().unwrap_or(&item.asset);
                 let card = asset_card(&mut commands, interface.grid, Action::ViewModel(index));
                 commands.entity(card).insert((
@@ -1022,7 +1025,7 @@ pub(crate) fn refresh(
                     card,
                     &interface.font,
                     filename,
-                    &format!("GLB · {}", item.label),
+                    &format!("{format} · {}", item.label),
                     BLUE,
                 );
             }
@@ -1228,7 +1231,7 @@ pub(crate) fn refresh(
             empty,
             &interface.font,
             if browser.search.is_empty() {
-                "Перетащите изображения сюда · ПКМ — создать папку"
+                FILE_DROP_HINT
             } else {
                 "Попробуйте другое название или расширение файла"
             },
@@ -1313,10 +1316,14 @@ pub(crate) fn update_files(
     let detail = selected
         .map(|entry| match entry {
             Entry::Folder(index) => format!("Папка · {}", browser.folders[index].path.display()),
-            Entry::Model(index) => format!(
-                "{} · GLB · {} · Перетащите на сцену, чтобы добавить",
-                editor.project.catalog[index].asset, editor.project.catalog[index].label
-            ),
+            Entry::Model(index) => {
+                let item = &editor.project.catalog[index];
+                let format = ModelFormat::from_path(&item.asset).map_or("3D", ModelFormat::label);
+                format!(
+                    "{} · {format} · {} · Перетащите на сцену, чтобы добавить",
+                    item.asset, item.label
+                )
+            }
             Entry::Scene { file, room } => format!(
                 "{} · Сцена «{}» · Нажмите, чтобы открыть во вкладке",
                 browser.files[file].path.display(),
@@ -1344,7 +1351,7 @@ pub(crate) fn update_files(
                 )
             }
         })
-        .unwrap_or_else(|| "Перетащите изображения сюда · ПКМ — создать папку".into());
+        .unwrap_or_else(|| FILE_DROP_HINT.into());
     for (entity, mut text, image_info) in &mut labels {
         let value = if entity == interface.detail {
             Some(detail.clone())

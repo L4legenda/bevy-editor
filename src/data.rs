@@ -8,13 +8,48 @@ use std::{
 };
 
 pub(crate) fn relative_path(path: &str, extension: &str) -> bool {
-    let relative = Path::new(path);
+    relative_asset_path(path)
+        && Path::new(path)
+            .extension()
+            .is_some_and(|value| value == extension)
+}
+
+fn relative_asset_path(path: &str) -> bool {
     !path.is_empty()
-        && !path.contains(['#', '\\', ':'])
-        && relative
+        && !path.contains(['#', '\\', ':', '\0'])
+        && Path::new(path)
             .components()
             .all(|part| matches!(part, PathComponent::Normal(_)))
-        && relative.extension().is_some_and(|value| value == extension)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelFormat {
+    Glb,
+    Fbx,
+}
+
+impl ModelFormat {
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        if !relative_asset_path(path) {
+            return None;
+        }
+        let extension = Path::new(path).extension()?.to_str()?;
+        if extension == "glb" {
+            Some(Self::Glb)
+        } else if extension.eq_ignore_ascii_case("fbx") {
+            Some(Self::Fbx)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Glb => "GLB",
+            Self::Fbx => "FBX",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -307,7 +342,7 @@ impl<K: Ord> LevelEdits<K> {
         let mut ids = HashSet::new();
         let mut asset_exists = BTreeMap::new();
         for model in &self.models {
-            if !relative_path(&model.asset, "glb")
+            if ModelFormat::from_path(&model.asset).is_none()
                 || !*asset_exists.entry(&model.asset).or_insert_with(|| {
                     redirects
                         .resolve(&model.asset)

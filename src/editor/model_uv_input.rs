@@ -46,12 +46,14 @@ pub(super) fn handle(
             }
         }
         uv.pan = None;
+        uv.brush_at = None;
         return;
     }
     if focus.get().is_some_and(|e| inputs.contains(e)) {
         return;
     }
     let Some(cursor) = window.cursor_position() else {
+        uv.brush_at = None;
         return;
     };
     let Ok((computed, transform)) = canvas.single() else {
@@ -74,6 +76,9 @@ pub(super) fn handle(
         KeyCode::SuperRight,
     ]);
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    if !mouse.pressed(MouseButton::Left) {
+        uv.brush_at = None;
+    }
     if mouse.just_released(MouseButton::Left) {
         if let Some(drag) = uv.drag.take() {
             if drag.changed {
@@ -139,7 +144,11 @@ pub(super) fn handle(
             } else if !uv.selected.contains(&id) {
                 uv.selected = BTreeSet::from([id]);
             }
-            if !uv.comparing && uv.job.is_none() && uv.selected.contains(&id) {
+            if !uv.comparing
+                && uv.job.is_none()
+                && uv.proposal.is_none()
+                && uv.selected.contains(&id)
+            {
                 uv.drag = Some(Drag {
                     start: at,
                     snapshot: doc.snapshot(),
@@ -168,9 +177,14 @@ pub(super) fn handle(
             return;
         }
     }
-    // A model click selects the corresponding UV island without entering mesh editing.
+    let pressed = mouse.just_pressed(MouseButton::Left);
+    if !(pressed || (uv.brush_at.is_some() && mouse.pressed(MouseButton::Left))) {
+        return;
+    }
     if !over
-        && mouse.just_pressed(MouseButton::Left)
+        && !editor.browser_popup
+        && !editor.hdri_library_open
+        && !drawer.resizing
         && !alt
         && !keys.pressed(KeyCode::Space)
         && !drawer.covers(cursor, &window)
@@ -185,9 +199,22 @@ pub(super) fn handle(
                     uv.bvh = Bvh::build(doc);
                     uv.bvh_stamp = Some((index, doc.revision));
                 }
+                if uv.tool == Tool::Brush && uv.job.is_none() && uv.proposal.is_none() {
+                    if let Some(object) = doc.active() {
+                        paint(
+                            &mut uv, doc, object, &viewer, bounds, cursor, shift, pressed,
+                        );
+                    }
+                    return;
+                }
                 let (origin, direction) = model_input::ray(&viewer, bounds, cursor);
                 if let Some((id, face, _)) = uv.bvh.cast(origin, direction, None) {
-                    if doc.active != Some(id) {
+                    if uv.tool == Tool::Wand && uv.job.is_none() && uv.proposal.is_none() {
+                        if doc.active != Some(id) {
+                            doc.select_object(id, false);
+                        }
+                        jobs::start(&mut uv, index, doc, UvAction::Suggest, Some(face));
+                    } else if doc.active != Some(id) {
                         doc.select_object(id, false);
                         uv.stamp = None;
                         uv.selected.clear();
@@ -200,5 +227,70 @@ pub(super) fn handle(
                 }
             }
         }
+    }
+    uv.brush_at = None;
+}
+
+// Sample a screen-space brush through the same BVH used for picking. Rays stop at
+// the first visible face, so a stroke on a cheek does not paint the back of the head.
+fn paint(
+    uv: &mut UvState,
+    doc: &Document,
+    object: &Object,
+    viewer: &Viewer,
+    bounds: Rect,
+    cursor: Vec2,
+    erase: bool,
+    pressed: bool,
+) {
+    let previous = if pressed {
+        cursor
+    } else {
+        uv.brush_at.unwrap_or(cursor)
+    };
+    if !pressed && uv.brush_at == Some(cursor) {
+        return;
+    }
+    uv.brush_at = Some(cursor);
+    let steps = ((cursor - previous).length() / 6.).ceil().clamp(1., 64.) as usize;
+    let mut hit = BTreeSet::new();
+    for step in 1..=steps {
+        let center = previous.lerp(cursor, step as f32 / steps as f32);
+        for y in -3i32..=3 {
+            for x in -3i32..=3 {
+                if x * x + y * y > 9 {
+                    continue;
+                }
+                let point = center + Vec2::new(x as f32, y as f32) * 4.;
+                if !bounds.contains(point) {
+                    continue;
+                }
+                let (origin, dir) = model_input::ray(viewer, bounds, point);
+                if let Some((id, fi, _)) = uv.bvh.cast(origin, dir, None)
+                    && id == object.id
+                {
+                    hit.insert(fi);
+                }
+            }
+        }
+    }
+    let mask = uv
+        .masks
+        .entry((doc.source.path.clone(), object.id))
+        .or_default();
+    let mut changed = false;
+    for fi in hit {
+        let f = &object.geometry.faces[fi];
+        for tri in object.geometry.triangles(f) {
+            let key = face_key(tri.map(|i| f.corners[i].vertex));
+            changed |= if erase {
+                mask.remove(&key)
+            } else {
+                mask.insert(key)
+            };
+        }
+    }
+    if changed {
+        uv.overlay_revision += 1;
     }
 }

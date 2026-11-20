@@ -13,7 +13,7 @@ fn previews() -> Thumbnails {
 fn job(target: Target, root: Entity, camera: Entity) -> Job {
     Job {
         target,
-        asset: Handle::default(),
+        asset: None,
         root,
         instances: Vec::new(),
         models: Vec::new(),

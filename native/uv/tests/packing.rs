@@ -117,3 +117,55 @@ fn small_island_far_from_origin_keeps_its_shape() {
         "resolution":2048,"padding":8,"threshold":1.25});
     packing::check(&request, &run(&request));
 }
+
+#[test]
+fn both_layout_engines_use_material_boundaries_and_respect_protected_patches() {
+    let mut request = json!({
+        "positions":[[0,0,0],[1,0,0],[1,1,0],[0,1,0]],
+        "triangles":[[0,1,2],[0,2,3]], "resolution":256, "padding":4,"threshold":1.25
+    });
+    for method in ["unwrap", "preview"] {
+        request["options"] = json!({"method":method,"guide_seams":true,"materials":[0,1]});
+        let split = run(&request);
+        assert_eq!(split["charts"], 2, "{method} material seam");
+        request["options"]["protected"] = json!([0, 1]);
+        let joined = run(&request);
+        assert_eq!(joined["charts"], 1, "{method} protected region");
+        assert_eq!(joined["uv"][0][0], joined["uv"][1][0]);
+        assert_eq!(joined["uv"][0][2], joined["uv"][1][1]);
+    }
+}
+
+#[test]
+fn dawand_matches_the_published_network_on_a_closed_asymmetric_torus() {
+    // These face IDs come from the published PyTorch checkpoint on the same mesh.
+    let mut vertices = Vec::new();
+    let mut faces = Vec::new();
+    let vertex = |i: usize, j: usize| i % 13 * 9 + j % 9;
+    for i in 0..13 {
+        let a = i as f64 * std::f64::consts::TAU / 13.;
+        let r = 0.42 * (1. + 0.12 * (2. * a + 0.3).sin());
+        for j in 0..9 {
+            let b = j as f64 * std::f64::consts::TAU / 9.;
+            let radius = 1. + r * b.cos();
+            vertices.push([radius * a.cos(), radius * a.sin(), r * b.sin()]);
+            let [v, w, x, y] = [
+                vertex(i, j),
+                vertex(i + 1, j),
+                vertex(i, j + 1),
+                vertex(i + 1, j + 1),
+            ];
+            faces.extend([[v, w, x], [x, w, y]]);
+        }
+    }
+    let mut request = json!({"positions":vertices,"triangles":faces,"resolution":256,"padding":4,
+        "threshold":1.25, "options":{"method":"suggest","seed":150}});
+    assert_eq!(
+        run(&request)["suggestion"],
+        json!([
+            97, 99, 114, 115, 116, 117, 131, 132, 133, 134, 147, 148, 149, 150
+        ])
+    );
+    request["options"]["seed"] = json!(38);
+    assert_eq!(run(&request)["suggestion"], json!([38]));
+}

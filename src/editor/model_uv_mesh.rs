@@ -47,12 +47,17 @@ pub(super) fn input(
             resolution,
             padding,
             existing_uv: None,
+            options: Default::default(),
         },
         corners,
     })
 }
-pub(super) fn apply(mesh: &Geometry, input: &Input, output: &Output) -> Result<Geometry, String> {
-    if input.corners.len() != output.uv.len() {
+pub(super) fn apply(
+    mesh: &Geometry,
+    corners: &[(usize, [usize; 3])],
+    output: &Output,
+) -> Result<Geometry, String> {
+    if corners.len() != output.uv.len() {
         return Err("Неполный результат развёртки".into());
     }
     let mut assigned: Vec<Vec<Option<Vec2>>> = mesh
@@ -62,9 +67,7 @@ pub(super) fn apply(mesh: &Geometry, input: &Input, output: &Output) -> Result<G
         .collect();
     let mut split = BTreeSet::new();
     let mut triangles_by_face = vec![Vec::new(); mesh.faces.len()];
-    for (triangle_index, ((fi, corners), values)) in
-        input.corners.iter().zip(&output.uv).enumerate()
-    {
+    for (triangle_index, ((fi, corners), values)) in corners.iter().zip(&output.uv).enumerate() {
         triangles_by_face[*fi].push(triangle_index);
         for (ci, uv) in corners.iter().zip(values) {
             let uv = Vec2::from_array(*uv);
@@ -86,7 +89,7 @@ pub(super) fn apply(mesh: &Geometry, input: &Input, output: &Output) -> Result<G
     for (fi, face) in mesh.faces.iter().enumerate() {
         if split.contains(&fi) {
             for &triangle in &triangles_by_face[fi] {
-                let corners = &input.corners[triangle].1;
+                let corners = &corners[triangle].1;
                 let values = &output.uv[triangle];
                 result.faces.push(Face {
                     corners: corners
@@ -121,6 +124,8 @@ pub(super) struct Atlas {
     pub area: f32,
     pub outside: usize,
     pub seams: Vec<Edge>,
+    pub distortion: Vec<Vec<f32>>,
+    pub angular_p95: Option<f32>,
 }
 impl Atlas {
     pub fn new(mesh: &Geometry) -> Self {
@@ -182,6 +187,35 @@ impl Atlas {
         atlas.count = ids.len();
         atlas
     }
+    pub fn measure_stretch(&mut self, mesh: &Geometry) {
+        let mut weighted = Vec::new();
+        self.distortion = mesh
+            .faces
+            .iter()
+            .map(|f| {
+                mesh.triangles(f)
+                    .into_iter()
+                    .map(|tri| {
+                        let (ratio, area) = angular_stretch(
+                            tri.map(|i| mesh.positions[f.corners[i].vertex]),
+                            tri.map(|i| f.corners[i].uv),
+                        );
+                        if area > 0. {
+                            weighted.push((ratio, area));
+                        }
+                        ratio
+                    })
+                    .collect()
+            })
+            .collect();
+        weighted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let target = 0.95 * weighted.iter().map(|p| p.1).sum::<f64>();
+        let mut sum = 0.;
+        self.angular_p95 = weighted.into_iter().find_map(|(ratio, area)| {
+            sum += area;
+            (sum >= target).then_some(ratio)
+        });
+    }
     pub fn hit(&self, mesh: &Geometry, p: Vec2) -> Option<usize> {
         for (fi, f) in mesh.faces.iter().enumerate().rev() {
             for t in mesh.triangles(f) {
@@ -235,6 +269,28 @@ impl Atlas {
     }
 }
 
+// Ratio of singular values of the per-triangle surface-to-UV Jacobian.
+fn angular_stretch(p: [Vec3; 3], uv: [Vec2; 3]) -> (f32, f64) {
+    let [a, b, c] = p.map(|v| v.as_dvec3());
+    let u = b - a;
+    let v = c - a;
+    let twice_area = u.cross(v).length();
+    if twice_area <= 0. {
+        return (f32::INFINITY, 0.);
+    }
+    let [a, b, c] = uv.map(|v| v.as_dvec2());
+    let len = u.length();
+    let j0 = (b - a) / len;
+    let j1 = ((c - a) - j0 * (v.dot(u) / len)) * (len / twice_area);
+    let det = j0.perp_dot(j1).abs();
+    if det <= 0. {
+        return (f32::INFINITY, twice_area * 0.5);
+    }
+    let trace = j0.length_squared() + j1.length_squared();
+    let high = (trace + ((trace - 2. * det) * (trace + 2. * det)).max(0.).sqrt()) * 0.5;
+    ((high / det).max(1.) as f32, twice_area * 0.5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +315,40 @@ mod tests {
         }
     }
     #[test]
+    fn uv_angular_heatmap_uses_singular_ratio_and_surface_area_percentiles() {
+        let triangle = [Vec3::ZERO, Vec3::X, Vec3::Y];
+        for tex in [
+            [Vec2::ZERO, Vec2::Y * 4., -Vec2::X * 4.],
+            [Vec2::ZERO, -Vec2::X, Vec2::Y],
+        ] {
+            assert_eq!(angular_stretch(triangle, tex), (1., 0.5));
+        }
+        assert_eq!(
+            angular_stretch(triangle, [Vec2::ZERO, Vec2::X * 2., Vec2::Y]),
+            (2., 0.5)
+        );
+        assert!(angular_stretch(triangle, [Vec2::ZERO; 3]).0.is_infinite());
+        let mut mesh = quad();
+        for c in &mut mesh.faces[0].corners {
+            c.uv = mesh.positions[c.vertex].truncate();
+        }
+        mesh.positions
+            .extend([Vec3::ZERO, Vec3::X * 0.05, Vec3::Y * 0.05]);
+        mesh.faces.push(Face {
+            corners: (4..7).map(Corner::new).collect(),
+            material: 0,
+            smooth: false,
+        });
+        let mut atlas = Atlas::new(&mesh);
+        atlas.measure_stretch(&mesh);
+        assert_eq!(atlas.angular_p95, Some(1.));
+        assert!(atlas.distortion[1][0].is_infinite());
+        mesh.positions[5] = Vec3::X;
+        mesh.positions[6] = Vec3::Y;
+        atlas.measure_stretch(&mesh);
+        assert!(atlas.angular_p95.unwrap().is_infinite());
+    }
+    #[test]
     fn uv_mapping_keeps_geometry_materials_normals_and_quads_when_continuous() {
         let mesh = quad();
         let input = input(&mesh, 1.25, 2048, 8).unwrap();
@@ -269,8 +359,9 @@ mod tests {
             .collect();
         let out = apply(
             &mesh,
-            &input,
+            &input.corners,
             &Output {
+                suggestion: vec![],
                 uv,
                 charts: 1,
                 utilization: 0.8,
@@ -298,8 +389,9 @@ mod tests {
         uv[1] = [[0.1, 0.1], [0.4, 0.1], [0.2, 0.4]];
         let out = apply(
             &mesh,
-            &input,
+            &input.corners,
             &Output {
+                suggestion: vec![],
                 uv,
                 charts: 2,
                 utilization: 0.5,
@@ -322,8 +414,9 @@ mod tests {
         assert!(
             apply(
                 &mesh,
-                &input,
+                &input.corners,
                 &Output {
+                    suggestion: vec![],
                     uv: vec![],
                     charts: 0,
                     utilization: 0.

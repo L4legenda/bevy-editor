@@ -139,6 +139,9 @@ impl Plugin for GameLevelPlugin {
         if !app.is_plugin_added::<crate::HdriPlugin>() {
             app.add_plugins(crate::HdriPlugin);
         }
+        if !app.is_plugin_added::<super::FbxPlugin>() {
+            app.add_plugins(super::FbxPlugin);
+        }
         app.insert_resource(self.0.clone())
             .init_resource::<GameLevelStatus>()
             .add_systems(Startup, setup_level)

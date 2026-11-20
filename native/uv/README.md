@@ -4,9 +4,12 @@ The editor embeds a CPU-only Rust + C++ worker. End users need no Python, pip, u
 
 ## Architecture
 
+- Material changes, folds of at least 60 degrees and painted borders guide chart formation. Contiguous protected faces take precedence over materials and folds.
 - Rust prepares nonmanifold edge fans and builds deterministic connectivity-constrained Ward clusters from normals and normalized centroids.
 - A C ABI calls the vendored PartUV Geometric pipeline directly: ABF, five iterations, the existing distortion threshold and CPU overlap checks.
-- xatlas packs the real island contours without recomputing the unwrap. Local opt-in extensions keep caller-defined islands intact, include collapsed connectors in their masks, and disable independent X/Y texel snapping. The adapter applies a rotation/reflection and one common uniform scale to preserve shape and relative texel density. Tiny islands with a degenerate hull axis retain their original axes. Several orientation/placement candidates are compared; grid search is capped at 16,384 candidates per island before retaining a valid placement or using random search. Rectangular fallback remains available on validation failure.
+- xatlas packs the real island contours without recomputing the unwrap. Local opt-in extensions keep caller-defined islands intact, include collapsed connectors in their masks, and disable independent X/Y texel snapping. The adapter applies a rotation/reflection and one common uniform scale to preserve shape and relative texel density. Tiny islands with a degenerate hull axis retain their original axes. Automatic unwrap returns its first successful placement. Explicit repacking compares additional orientation and placement candidates. Grid search is capped at 16,384 candidates per island before retaining a valid placement or using random search. Rectangular fallback remains available on validation failure.
+- The fast preview uses xatlas charting on the original triangles, with the same guidance. The editor stages the resulting layout for acceptance or dismissal.
+- DA Wand runs the published MeshCNN checkpoint locally in Eigen. It computes dihedral angles, anchor-edge indicators and 16 heat-kernel features on the connected neighborhood of the selected face (up to 8,000 triangles). The classifier supplies per-face probabilities. A flood fill retains the seed and adjacent predictions at or above 0.5.
 - Per-corner output is mapped to the input triangle order. Changed coverage, non-finite UVs and coordinates outside the square are rejected.
 
 The isolated native process lets cancellation terminate all native threads and keeps native failures out of the editor process. The editor retains document validation, stale-result protection, undo/redo, comparison, selection, checker, seams, transforms, repacking and GLB save.
@@ -33,7 +36,7 @@ C++ sources and headers are vendored. `vendor/dependencies.json` pins the source
 bevy-uv-native INPUT.json OUTPUT.json
 ```
 
-Input contains `positions`, `triangles`, `threshold`, `resolution`, `padding` and optional per-triangle/corner `existing_uv`. Supplying `existing_uv` packs existing islands; omitting it performs automatic unwrapping. Output contains per-corner `uv`, `charts` and `utilization`. Progress lines start with `BEVY_UV:` followed by JSON with `phase` and `fraction`; other output is logged. The result file is written via a temporary file.
+Input contains `positions`, `triangles`, `threshold`, `resolution`, `padding` and optional per-triangle/corner `existing_uv`. Supplying `existing_uv` repacks its contours. With no options, the worker unwraps through PartUV. Set `options.method` to `preview` for fast xatlas or `suggest` with a zero-based triangle `seed` for DA Wand. Unwrap and preview accept `guide_seams`, per-triangle `materials`, and a list of `protected` triangle indices inside `options`. Layout replies contain per-corner `uv`, `charts` and `utilization`. A DA Wand reply contains the original triangle indices in `suggestion`. Progress lines start with `BEVY_UV:` followed by JSON with `phase` and `fraction`; other output is logged. The result file is written via a temporary file.
 
 The editor extracts the embedded bytes into `%LOCALAPPDATA%/BevyEditor/uv-runtime/native-<content hash>` and verifies cached bytes before use. Per-job JSON and logs are stored below the same runtime directory. No paths to the benchmark folder or an installed Python environment are used.
 

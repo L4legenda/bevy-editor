@@ -201,6 +201,52 @@ fn gpu_game_level_loads_unsaved_models_camera_and_lights() {
 }
 
 #[test]
+#[ignore = "requires GPU; verifies a FBX instance in the standalone game renderer"]
+fn gpu_fbx_game_level_spawns_and_renders_a_document_model() {
+    let (_, mut level) = native_level();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fbx");
+    let id = 17;
+    let mut pose: crate::Pose = Transform::IDENTITY.into();
+    pose.position[0] = 0.25;
+    level.edits.models = vec![crate::PlacedModel {
+        id,
+        asset: "embedded/props_embedded.fbx".into(),
+        pose,
+        bounds: None,
+    }];
+    level.edits.model_names.clear();
+    level.edits.lighting = Some(SceneLighting::editor_default());
+    level.edits.lights.push(crate::LightPreset::Sun.create(900));
+    let camera = crate::CameraPlacement {
+        lens: 45.0,
+        pose: Transform::from_xyz(4.0, 2.8, 5.0)
+            .looking_at(Vec3::new(0.9, 0.55, 0.0), Vec3::Y)
+            .into(),
+    };
+    level.edits.cameras.insert(level.camera.clone(), camera);
+    level.validate(&root).unwrap();
+    let (mut app, target) = headless(&root, level);
+    wait_ready(&mut app);
+    let world = app.world_mut();
+    let (entity, model, transform) = world
+        .query::<(Entity, &GameModel, &Transform)>()
+        .single(world)
+        .unwrap();
+    assert_eq!(model.0, id);
+    assert_eq!(transform.translation, Vec3::from(pose.position));
+    let mut children = world.query::<&Children>();
+    assert_eq!(
+        children
+            .query(world)
+            .iter_descendants(entity)
+            .filter(|&child| world.get::<Mesh3d>(child).is_some())
+            .count(),
+        3
+    );
+    capture(&mut app, &target, "fbx-level.png");
+}
+
+#[test]
 #[ignore = "requires GPU; validates legacy GLB node transforms and removals"]
 fn gpu_game_level_applies_imported_world_edits_and_removals() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/assets");

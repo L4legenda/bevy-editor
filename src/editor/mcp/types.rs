@@ -51,7 +51,7 @@ pub(super) struct TransformArgs {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(super) struct AddModelArgs {
-    /// Exact project-relative GLB asset path returned by list_assets.
+    /// Exact project-relative model path returned by list_assets (GLB or FBX).
     pub asset: String,
     /// Defaults to the origin, no rotation and unit scale.
     pub transform: Option<TransformPatch>,

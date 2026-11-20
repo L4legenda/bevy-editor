@@ -1,4 +1,4 @@
-//! A snapshot of the project's folders, files, and placeable GLB assets.
+//! A snapshot of the project's folders, files, and placeable models.
 //!
 //! Folder IDs and catalog indices stay stable while navigating. Filesystem
 //! symlinks are deliberately omitted, so browsing cannot leave the asset root.
@@ -12,7 +12,7 @@ use std::{
 use bevy::prelude::Resource;
 
 use crate::{
-    data::relative_path,
+    data::{ModelFormat, relative_path},
     project::{CatalogItem, EditorProject},
 };
 
@@ -100,10 +100,10 @@ impl Browser {
                 .replace(std::path::MAIN_SEPARATOR, "/"),
             Entry::Folder(_) | Entry::Image(_) => return None,
         };
-        relative_path(&asset, "glb").then_some(asset)
+        ModelFormat::from_path(&asset).map(|_| asset)
     }
 
-    /// Discover GLBs before allocating thumbnail textures. Existing catalog
+    /// Discover models before allocating thumbnail textures. Existing catalog
     /// entries retain their indices and all host-provided placement settings.
     /// Both the source GLB and the saved JSON open their configured scene.
     pub fn new(project: &mut EditorProject) -> Self {
@@ -243,7 +243,7 @@ impl Browser {
                         if links.is_none() && (hidden || !discover[folder]) {
                             continue;
                         }
-                        if links.is_none() && relative_path(&asset, "glb") {
+                        if links.is_none() && ModelFormat::from_path(&asset).is_some() {
                             let index = project.catalog.len();
                             project.catalog.push(CatalogItem {
                                 label: Path::new(&name)

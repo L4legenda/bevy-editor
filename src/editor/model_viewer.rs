@@ -2,11 +2,12 @@
 use super::*;
 use bevy::{
     camera::{ClearColorConfig, RenderTarget, primitives::Aabb, visibility::RenderLayers},
-    gltf::{Gltf, GltfLoaderSettings},
+    gltf::Gltf,
     light::RectLight,
     render::render_resource::{Extent3d, TextureFormat},
     world_serialization::WorldInstanceReady,
 };
+use crate::editor::model_source::ModelSource;
 
 const LAYER: usize = 8;
 const FOV: f32 = crate::editor::viewport::EDITOR_FOV;
@@ -58,7 +59,7 @@ struct Viewer {
     model: Option<usize>,
     stage: Option<Entity>,
     root: Option<Entity>,
-    source: Option<Handle<Gltf>>,
+    source: Option<ModelSource>,
     started: Option<std::time::Instant>,
     error: Option<String>,
     fitted: bool,
@@ -448,17 +449,7 @@ fn actions(
     if retry {
         server.reload(model.asset.clone());
     }
-    viewer.source = Some(
-        server
-            .load_builder()
-            .with_settings(|settings: &mut GltfLoaderSettings| {
-                settings.load_cameras = false;
-                settings.load_lights = false;
-                settings.load_animations = false;
-                settings.load_meshes = bevy::asset::RenderAssetUsages::default();
-            })
-            .load(model.asset.clone()),
-    );
+    viewer.source = Some(ModelSource::load(&server, &model.asset, false));
     viewer.started = Some(std::time::Instant::now());
     let stage = commands
         .spawn((Transform::IDENTITY, Visibility::Inherited))
@@ -550,35 +541,30 @@ fn load(
     if viewer.error.is_some() || viewer.root.is_some() {
         return;
     }
-    if let Some(error) = crate::editor::load_error(&server, source) {
-        viewer.error = Some(error);
-        return;
-    }
-    if !server.is_loaded_with_dependencies(source.id()) {
-        if viewer
-            .started
-            .is_some_and(|start| start.elapsed().as_secs() > 30)
-        {
-            viewer.error =
-                Some("Загрузка занимает слишком много времени. Нажмите F5 для обновления.".into());
+    let world = match source.world(&server, &assets) {
+        Ok(Some(world)) => world,
+        Ok(None) => {
+            if viewer
+                .started
+                .is_some_and(|start| start.elapsed().as_secs() > 30)
+            {
+                viewer.error = Some(
+                    "Загрузка занимает слишком много времени. Нажмите F5 для обновления.".into(),
+                );
+            }
+            return;
         }
-        return;
-    }
-    let Some(asset) = assets.get(source) else {
+        Err(error) => {
+            viewer.error = Some(error);
+            return;
+        }
+    };
+    let Some(stage) = viewer.stage else {
         return;
     };
-    let Some(world) = asset
-        .default_scene
-        .as_ref()
-        .or_else(|| asset.scenes.first())
-    else {
-        viewer.error = Some("В GLB нет доступной геометрии.".into());
-        return;
-    };
-    let stage = viewer.stage.unwrap();
     viewer.root = Some(
         commands
-            .spawn((WorldAssetRoot(world.clone()), ChildOf(stage)))
+            .spawn((WorldAssetRoot(world), ChildOf(stage)))
             .observe(prepare)
             .id(),
     );
@@ -848,7 +834,9 @@ fn refresh(
                 });
         }
         if let Ok(mut hint) = labels.get_mut(ui.hint) {
-            hint.0 = if editing.mode(editor.viewing_model)
+            hint.0 = if matches!(viewer.source, Some(ModelSource::Fbx(_))) {
+                "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · СКМ — панорама".into()
+            } else if editing.mode(editor.viewing_model)
                 == crate::editor::model_document::Mode::Paint
             {
                 "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · СКМ — панорама · Tab — объект".into()

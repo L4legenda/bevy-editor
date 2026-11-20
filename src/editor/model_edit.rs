@@ -337,7 +337,17 @@ pub(super) fn initialize(
     if state.documents.contains_key(&index) || state.errors.contains_key(&index) {
         return;
     }
-    let Some(asset) = viewer.source.as_ref().and_then(|source| gltfs.get(source)) else {
+    let Some(source) = viewer.source.as_ref() else {
+        return;
+    };
+    let ModelSource::Glb(handle) = source else {
+        state.errors.insert(
+            index,
+            "FBX · просмотр модели. Правка сетки и UV доступна для GLB.".into(),
+        );
+        return;
+    };
+    let Some(asset) = gltfs.get(handle) else {
         return;
     };
     // Handle::default() is Bevy's pink diagnostic material. Reuse the GLTF

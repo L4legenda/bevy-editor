@@ -13,6 +13,7 @@ using UV = std::array<float, 2>;
 using Tri = std::array<uint32_t, 3>;
 using FaceUV = std::array<std::array<double, 2>, 3>;
 using Progress = void (*)(int);
+Json suggest_island(const Json &, Progress);
 struct Chart {
   std::vector<int> ids;
   std::vector<UV> uv;
@@ -44,7 +45,7 @@ static double area(const Eigen::Vector2d &a, const Eigen::Vector2d &b,
   return std::abs(d.x() * e.y() - d.y() * e.x());
 }
 static Packing pack(const std::vector<UV> &uv, const std::vector<Tri> &faces,
-                    int resolution, int padding, Progress progress) {
+                    int resolution, int padding, bool refine, Progress progress) {
   if (progress)
     progress(80);
   Union u((int)faces.size());
@@ -243,7 +244,7 @@ static Packing pack(const std::vector<UV> &uv, const std::vector<Tri> &faces,
   }
   // Search an additional placement for ordinary game assets. Always retain the
   // better valid atlas, so the extra search cannot degrade the default result.
-  if (charts.size() <= 256 && faces.size() <= 100000) {
+  if (refine && charts.size() <= 256 && faces.size() <= 100000) {
     if (progress)
       progress(87);
     for (int orientation : {1, 2, 3}) {
@@ -259,40 +260,63 @@ static Packing pack(const std::vector<UV> &uv, const std::vector<Tri> &faces,
 }
 using Point = std::array<double, 3>;
 using TriangleKey = std::array<Point, 3>;
-static Json process(const Json &request, Progress progress) {
-  auto vertices = request.at("positions").get<std::vector<Point>>();
+static Json repack(const Json &request, Progress progress) {
   auto faces = request.at("triangles").get<std::vector<Tri>>();
   std::vector<UV> uv;
   std::vector<Tri> uvfaces;
-  if (request.contains("existing_uv")) {
-    auto existing = request.at("existing_uv").get<std::vector<FaceUV>>();
-    if (existing.size() != faces.size())
-      throw std::runtime_error("Incomplete existing UV");
-    using Key = std::tuple<uint32_t, float, float>;
-    std::map<Key, uint32_t> unique;
-    for (size_t i = 0; i < faces.size(); ++i)
-      for (int c = 0; c < 3; ++c)
-        unique[{faces[i][c], float(existing[i][c][0]),
-                float(existing[i][c][1])}] = 0;
-    for (auto &kv : unique) {
-      kv.second = (uint32_t)uv.size();
-      uv.push_back({std::get<1>(kv.first), std::get<2>(kv.first)});
-    }
-    for (size_t i = 0; i < faces.size(); ++i) {
-      Tri f;
-      for (int c = 0; c < 3; ++c)
-        f[c] = unique.at(
-            {faces[i][c], float(existing[i][c][0]), float(existing[i][c][1])});
-      uvfaces.push_back(f);
-    }
-    for (auto &p : uv)
-      if (!std::isfinite(p[0]) || !std::isfinite(p[1]))
-        throw std::runtime_error("Non-finite source UV");
-    auto packed = pack(uv, uvfaces, request.at("resolution"),
-                       request.at("padding"), progress);
-    return Json{{"uv", packed.uv},
-                {"charts", packed.charts},
-                {"utilization", packed.utilization}};
+  auto existing = request.at("existing_uv").get<std::vector<FaceUV>>();
+  if (existing.size() != faces.size())
+    throw std::runtime_error("Incomplete existing UV");
+  using Key = std::tuple<uint32_t, float, float>;
+  std::map<Key, uint32_t> unique;
+  for (size_t i = 0; i < faces.size(); ++i)
+    for (int c = 0; c < 3; ++c)
+      unique[{faces[i][c], float(existing[i][c][0]),
+              float(existing[i][c][1])}] = 0;
+  for (auto &kv : unique) {
+    kv.second = (uint32_t)uv.size();
+    uv.push_back({std::get<1>(kv.first), std::get<2>(kv.first)});
+  }
+  for (size_t i = 0; i < faces.size(); ++i) {
+    Tri f;
+    for (int c = 0; c < 3; ++c)
+      f[c] = unique.at(
+          {faces[i][c], float(existing[i][c][0]), float(existing[i][c][1])});
+    uvfaces.push_back(f);
+  }
+  for (auto &p : uv)
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1]))
+      throw std::runtime_error("Non-finite source UV");
+  auto packed = pack(uv, uvfaces, request.at("resolution"),
+                     request.at("padding"), true, progress);
+  return Json{{"uv", packed.uv},
+              {"charts", packed.charts},
+              {"utilization", packed.utilization}};
+}
+// Keep the editor triangle/corner order while assigning each independently
+// solved region its own UV indices. Packing all regions together preserves
+// texel density.
+static void unwrap_part(const Json &part, double threshold,
+                        bool balance_density, std::vector<UV> &uv,
+                        std::vector<Tri> &output_faces) {
+  auto vertices = part.at("positions").get<std::vector<Point>>();
+  auto faces = part.at("triangles").get<std::vector<Tri>>();
+  auto ids = part.at("ids").get<std::vector<size_t>>();
+  uint32_t offset = static_cast<uint32_t>(uv.size());
+  if (faces.size() == 1) {
+    auto position = [&](int k) {
+      return Eigen::Map<const Eigen::Vector3d>(vertices[faces[0][k]].data());
+    };
+    Eigen::Vector3d u = position(1) - position(0),
+                    v = position(2) - position(0);
+    if (u.norm() == 0 || u.cross(v).norm() == 0)
+      throw std::runtime_error("Degenerate source triangle");
+    uv.push_back({0, 0});
+    uv.push_back({float(u.norm()), 0});
+    uv.push_back(
+        {float(u.dot(v) / u.norm()), float(u.cross(v).norm() / u.norm())});
+    output_faces[ids.at(0)] = {offset, offset + 1, offset + 2};
+    return;
   }
   Eigen::MatrixXd V(vertices.size(), 3);
   Eigen::MatrixXi F(faces.size(), 3);
@@ -303,25 +327,35 @@ static Json process(const Json &request, Progress progress) {
     for (int c = 0; c < 3; ++c)
       F(i, c) = faces[i][c];
   std::vector<NodeRecord> nodes;
-  for (auto &v : request.at("tree"))
+  for (auto &v : part.at("tree"))
     nodes.push_back({v[0].get<int>(), v[1].get<int>(), v[2].get<int>()});
   std::vector<UVParts> parts;
-  auto result = pipeline(V, F, nodes, "", request.at("threshold").get<double>(),
-                         false, parts)
-                    .to_components();
+  auto result =
+      pipeline(V, F, nodes, "", threshold, false, parts).to_components();
   if (result.F.rows() != (int)faces.size() ||
       result.UV.rows() != result.V.rows())
     throw std::runtime_error("PartUV changed mesh coverage");
-  for (int i = 0; i < result.UV.rows(); ++i)
-    uv.push_back({float(result.UV(i, 0)), float(result.UV(i, 1))});
-  for (int i = 0; i < result.F.rows(); ++i)
-    uvfaces.push_back({uint32_t(result.F(i, 0)), uint32_t(result.F(i, 1)),
-                       uint32_t(result.F(i, 2))});
-  for (auto &p : uv)
-    if (!std::isfinite(p[0]) || !std::isfinite(p[1]))
+  double scale = 1.;
+  if (balance_density) {
+    double surface = 0., flat = 0.;
+    for (int i = 0; i < result.F.rows(); ++i) {
+      auto a = result.F(i, 0), b = result.F(i, 1), c = result.F(i, 2);
+      Eigen::Vector3d u = result.V.row(b) - result.V.row(a),
+                      v = result.V.row(c) - result.V.row(a);
+      Eigen::Vector2d x = result.UV.row(b) - result.UV.row(a),
+                      y = result.UV.row(c) - result.UV.row(a);
+      surface += u.cross(v).norm();
+      flat += std::abs(x.x() * y.y() - x.y() * y.x());
+    }
+    if (flat > 0.)
+      scale = std::sqrt(surface / flat);
+  }
+  for (int i = 0; i < result.UV.rows(); ++i) {
+    UV coord{float(scale * result.UV(i, 0)), float(scale * result.UV(i, 1))};
+    if (!std::isfinite(coord[0]) || !std::isfinite(coord[1]))
       throw std::runtime_error("Non-finite PartUV result");
-  auto packed = pack(uv, uvfaces, request.at("resolution"),
-                     request.at("padding"), progress);
+    uv.push_back(coord);
+  }
   std::map<TriangleKey, std::deque<size_t>> original;
   for (size_t i = 0; i < faces.size(); ++i) {
     TriangleKey key = {vertices[faces[i][0]], vertices[faces[i][1]],
@@ -329,12 +363,12 @@ static Json process(const Json &request, Progress progress) {
     std::sort(key.begin(), key.end());
     original[key].push_back(i);
   }
-  std::vector<FaceUV> ordered(faces.size());
-  for (size_t i = 0; i < uvfaces.size(); ++i) {
+
+  for (size_t i = 0; i < faces.size(); ++i) {
     TriangleKey points;
     for (int c = 0; c < 3; ++c)
       for (int k = 0; k < 3; ++k)
-        points[c][k] = result.V(uvfaces[i][c], k);
+        points[c][k] = result.V(result.F(i, c), k);
     auto key = points;
     std::sort(key.begin(), key.end());
     auto found = original.find(key);
@@ -352,13 +386,71 @@ static Json process(const Json &request, Progress progress) {
         }
       if (match < 0)
         throw std::runtime_error("PartUV changed corner");
-      ordered[fi][c] = packed.uv[i][match];
+      output_faces[ids[fi]][c] = offset + result.F(i, match);
     }
   }
   for (auto &kv : original)
     if (!kv.second.empty())
       throw std::runtime_error("PartUV omitted triangles");
+}
+static Json preview(const Json &request, Progress progress) {
+  auto vertices =
+      request.at("positions").get<std::vector<std::array<float, 3>>>();
+  auto faces = request.at("triangles").get<std::vector<Tri>>();
+  auto regions = request.at("groups").get<std::vector<uint32_t>>();
+  std::unique_ptr<xatlas::Atlas, decltype(&xatlas::Destroy)> atlas(
+      xatlas::Create(), xatlas::Destroy);
+  xatlas::MeshDecl mesh;
+  mesh.vertexPositionData = vertices.data();
+  mesh.vertexCount = static_cast<uint32_t>(vertices.size());
+  mesh.vertexPositionStride = sizeof(vertices.front());
+  mesh.indexData = faces.data();
+  mesh.indexCount = static_cast<uint32_t>(faces.size() * 3);
+  mesh.indexFormat = xatlas::IndexFormat::UInt32;
+  mesh.faceMaterialData = regions.data();
+  if (xatlas::AddMesh(atlas.get(), mesh) != xatlas::AddMeshError::Success)
+    throw std::runtime_error("xatlas rejected surface");
+  xatlas::ComputeCharts(atlas.get());
+  if (progress)
+    progress(80);
+  xatlas::PackOptions settings;
+  settings.resolution = request.at("resolution");
+  settings.padding = request.at("padding");
+  settings.preserveChartShape = true;
+  xatlas::PackCharts(atlas.get(), settings);
+  if (atlas->meshCount != 1 || atlas->atlasCount != 1 ||
+      atlas->meshes[0].indexCount != mesh.indexCount)
+    throw std::runtime_error("Incomplete xatlas preview");
+  const auto &out = atlas->meshes[0];
+  double side = std::max(atlas->width, atlas->height);
+  std::vector<FaceUV> ordered(faces.size());
+  for (size_t i = 0; i < faces.size(); ++i)
+    for (size_t c = 0; c < 3; ++c) {
+      const auto &v = out.vertexArray[out.indexArray[i * 3 + c]];
+      if (v.xref != faces[i][c] || v.atlasIndex != 0)
+        throw std::runtime_error("xatlas changed source corners");
+      ordered[i][c] = {v.uv[0] / side, v.uv[1] / side};
+    }
   return Json{{"uv", ordered},
+              {"charts", atlas->chartCount},
+              {"utilization", atlas->utilization[0] * atlas->width *
+                                  atlas->height / (side * side)}};
+}
+static Json process(const Json &request, Progress progress) {
+  if (request.contains("existing_uv"))
+    return repack(request, progress);
+  if (request.at("method") == "preview")
+    return preview(request, progress);
+  if (request.at("method") == "suggest")
+    return suggest_island(request, progress);
+  std::vector<UV> uv;
+  std::vector<Tri> faces(request.at("count").get<size_t>());
+  const auto &parts = request.at("parts");
+  for (const auto &part : parts)
+    unwrap_part(part, request.at("threshold"), parts.size() > 1, uv, faces);
+  auto packed = pack(uv, faces, request.at("resolution"), request.at("padding"),
+                     false, progress);
+  return Json{{"uv", packed.uv},
               {"charts", packed.charts},
               {"utilization", packed.utilization}};
 }

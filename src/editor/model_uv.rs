@@ -3,7 +3,11 @@ use super::*;
 use crate::editor::{model_uv_backend as backend, model_uv_mesh as topology};
 use bevy::tasks::{IoTaskPool, Task, block_on, poll_once};
 use bevy::window::RequestRedraw;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+#[path = "model_uv_jobs.rs"]
+mod jobs;
 
 #[path = "model_uv_input.rs"]
 mod input;
@@ -15,6 +19,13 @@ mod view;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum UvAction {
     Unwrap,
+    Preview,
+    Accept,
+    Dismiss,
+    Brush,
+    ClearMask,
+    Suggest,
+    Heatmap,
     Pack,
     Cancel,
     Fit,
@@ -31,10 +42,13 @@ pub(in crate::editor) enum UvAction {
     Quality(usize),
 }
 struct Job {
+    source: PathBuf,
+    action: UvAction,
     index: usize,
     object: usize,
     original: document::MeshData,
-    input: topology::Input,
+    corners: Vec<(usize, [usize; 3])>,
+    settings: (u32, u32),
     progress: Arc<backend::Progress>,
     task: Task<Result<backend::Output, String>>,
 }
@@ -49,6 +63,30 @@ struct Comparison {
     before: document::MeshData,
     after: document::MeshData,
 }
+type FaceMask = BTreeSet<[usize; 3]>;
+fn face_key(mut vertices: [usize; 3]) -> [usize; 3] {
+    vertices.sort_unstable();
+    vertices
+}
+enum Proposed {
+    Layout(document::MeshData),
+    Island(FaceMask),
+}
+struct Proposal {
+    source: PathBuf,
+    index: usize,
+    object: usize,
+    original: document::MeshData,
+    result: Proposed,
+    settings: (u32, u32),
+}
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Tool {
+    #[default]
+    Select,
+    Brush,
+    Wand,
+}
 struct Drag {
     start: Vec2,
     snapshot: Snapshot,
@@ -60,11 +98,19 @@ struct Drag {
 #[derive(Resource)]
 pub(in crate::editor) struct UvState {
     job: Option<Job>,
+    proposal: Option<Proposal>,
+    layout_settings: Option<(u32, u32)>,
+    masks: BTreeMap<(PathBuf, usize), FaceMask>,
+    tool: Tool,
+    overlay_revision: u64,
+    brush_at: Option<Vec2>,
+    heatmap: bool,
     before: Option<Comparison>,
     comparing: bool,
     selected: BTreeSet<usize>,
     atlas: topology::Atlas,
     stamp: Option<(usize, usize, u64, bool)>,
+    view_object: Option<(usize, usize)>,
     center: Vec2,
     zoom: f32,
     pan: Option<Vec2>,
@@ -87,11 +133,19 @@ impl Default for UvState {
     fn default() -> Self {
         Self {
             job: None,
+            proposal: None,
+            layout_settings: None,
+            masks: default(),
+            tool: Tool::Select,
+            overlay_revision: 0,
+            brush_at: None,
+            heatmap: false,
             before: None,
             comparing: false,
             selected: default(),
             atlas: default(),
             stamp: None,
+            view_object: None,
             center: Vec2::splat(0.5),
             zoom: 1.,
             pan: None,
@@ -114,6 +168,18 @@ impl Default for UvState {
 }
 impl UvState {
     pub(super) fn display_geometry(&self, index: usize, object: &Object) -> document::MeshData {
+        if let Some(p) = &self.proposal
+            && p.index == index
+            && p.object == object.id
+            && p.original == object.geometry
+            && let Proposed::Layout(layout) = &p.result
+        {
+            return if self.comparing {
+                p.original.clone()
+            } else {
+                layout.clone()
+            };
+        }
         self.before
             .as_ref()
             .filter(|b| {
@@ -125,6 +191,15 @@ impl UvState {
             .map_or_else(|| object.geometry.clone(), |b| b.before.clone())
     }
     fn comparison_available(&self, index: Option<usize>, state: &State) -> bool {
+        if let Some(p) = &self.proposal {
+            return matches!(p.result, Proposed::Layout(_))
+                && Some(p.index) == index
+                && state
+                    .documents
+                    .get(&p.index)
+                    .and_then(Document::active)
+                    .is_some_and(|o| o.id == p.object && o.geometry == p.original);
+        }
         self.before.as_ref().is_some_and(|b| {
             Some(b.index) == index
                 && state
@@ -135,28 +210,45 @@ impl UvState {
         })
     }
     fn available(&self, action: UvAction, index: Option<usize>, state: &State) -> bool {
-        let doc = index.and_then(|i| state.documents.get(&i));
+        let doc = index
+            .and_then(|i| state.documents.get(&i))
+            .filter(|d| d.mode == Mode::Uv);
         let surface = doc
             .and_then(|d| d.active())
             .is_some_and(|o| !o.hidden && !o.geometry.faces.is_empty());
+        let free =
+            surface && self.job.is_none() && self.proposal.is_none() && state.saving.is_none();
         match action {
-            UvAction::Cancel => self.job.is_some(),
-            UvAction::Unwrap => surface && self.job.is_none() && state.saving.is_none(),
-            UvAction::Pack => {
-                surface && self.atlas.area > 1e-9 && self.job.is_none() && state.saving.is_none()
+            UvAction::Accept | UvAction::Dismiss => self.proposal.is_some() && self.job.is_none(),
+            UvAction::Brush | UvAction::Suggest => free && !self.comparing,
+            UvAction::ClearMask => {
+                free && doc
+                    .and_then(|d| {
+                        d.active()
+                            .and_then(|o| self.masks.get(&(d.source.path.clone(), o.id)))
+                    })
+                    .is_some_and(|m| !m.is_empty())
             }
+            UvAction::Cancel => {
+                self.job.is_some() || self.proposal.is_some() || self.tool != Tool::Select
+            }
+            UvAction::Unwrap | UvAction::Preview => free,
+            UvAction::Pack => free && !self.comparing && self.atlas.area > 1e-9,
             UvAction::Compare => self.job.is_none() && self.comparison_available(index, state),
             UvAction::Resolution | UvAction::Padding | UvAction::Quality(_) => {
                 surface && self.job.is_none()
             }
             UvAction::Rotate | UvAction::ScaleUp | UvAction::ScaleDown => {
-                surface && !self.selected.is_empty() && !self.comparing && self.job.is_none()
+                free && !self.selected.is_empty() && !self.comparing
             }
             _ => surface,
         }
     }
     fn active(&self, action: UvAction) -> bool {
         match action {
+            UvAction::Brush => self.tool == Tool::Brush,
+            UvAction::Suggest => self.tool == Tool::Wand,
+            UvAction::Heatmap => self.heatmap,
             UvAction::Checker => self.checker,
             UvAction::Seams => self.seams,
             UvAction::Compare => self.comparing,
@@ -174,20 +266,23 @@ impl UvState {
         if self.stamp == Some(stamp) {
             return;
         }
-        if self
-            .stamp
-            .is_none_or(|old| old.0 != index || old.1 != object.id)
-        {
+        if self.view_object != Some((index, object.id)) {
+            self.view_object = Some((index, object.id));
+            self.brush_at = None;
             self.selected.clear();
             self.center = Vec2::splat(0.5);
             self.zoom = 1.;
         }
-        self.atlas = topology::Atlas::new(&self.display_geometry(index, object));
+        let geometry = self.display_geometry(index, object);
+        self.atlas = topology::Atlas::new(&geometry);
+        if self.heatmap {
+            self.atlas.measure_stretch(&geometry);
+        }
         self.selected.retain(|i| *i < self.atlas.count);
         self.stamp = Some(stamp);
     }
     fn transform(&mut self, index: usize, state: &mut State, angle: f32, scale: f32) {
-        if self.comparing || self.job.is_some() {
+        if self.comparing || self.job.is_some() || self.proposal.is_some() {
             return;
         }
         let Some(doc) = state.documents.get_mut(&index) else {
@@ -232,6 +327,10 @@ impl Plugin for UvPlugin {
             .add_systems(Update, view::materials.after(xray::sync))
             .add_systems(
                 Update,
+                view::overlay.after(super::render).after(input::handle),
+            )
+            .add_systems(
+                Update,
                 (ui::refresh, view::refresh)
                     .chain()
                     .after(controls::refresh),
@@ -263,58 +362,48 @@ fn actions(
         }
         uv.error.clear();
         match action {
-            UvAction::Unwrap | UvAction::Pack => {
+            UvAction::Unwrap | UvAction::Preview | UvAction::Pack => {
                 state.clear_gesture(Some(index), false);
-                let Some(object) = state.documents.get(&index).and_then(|d| d.active()) else {
-                    continue;
+                if let Some(doc) = state.documents.get(&index) {
+                    jobs::start(&mut uv, index, doc, action, None);
+                }
+                state.rendered = None;
+            }
+            UvAction::Accept => jobs::accept(&mut uv, &mut state, index),
+            UvAction::Dismiss | UvAction::Cancel => {
+                uv.job.take();
+                uv.proposal = None;
+                uv.tool = Tool::Select;
+                uv.brush_at = None;
+                uv.comparing = false;
+                uv.stamp = None;
+                uv.overlay_revision += 1;
+                state.rendered = None;
+                uv.status.clear();
+                uv.progress = 0.;
+            }
+            UvAction::Suggest | UvAction::Brush => {
+                let tool = if action == UvAction::Suggest {
+                    Tool::Wand
+                } else {
+                    Tool::Brush
                 };
-                let request = topology::input(
-                    &object.geometry,
-                    [1.1, 1.25, 1.5][uv.quality],
-                    uv.resolution,
-                    uv.padding,
-                );
-                match request {
-                    Ok(mut input) => {
-                        if action == UvAction::Pack {
-                            input.request.existing_uv = Some(
-                                input
-                                    .corners
-                                    .iter()
-                                    .map(|(fi, corners)| {
-                                        corners.map(|ci| {
-                                            object.geometry.faces[*fi].corners[ci].uv.to_array()
-                                        })
-                                    })
-                                    .collect(),
-                            );
-                        }
-                        let progress = Arc::new(backend::Progress::default());
-                        let worker_progress = progress.clone();
-                        let request = input.request.clone();
-                        uv.job = Some(Job {
-                            index,
-                            object: object.id,
-                            original: object.geometry.clone(),
-                            input,
-                            progress,
-                            task: IoTaskPool::get()
-                                .spawn(async move { backend::run(request, worker_progress) }),
-                        });
-                        uv.elapsed = 0.;
-                        uv.progress = 0.;
-                        uv.status = "Подготовка PartUV Geometric…".into();
-                        uv.comparing = false;
-                        uv.drag = None;
-                        state.rendered = None;
-                    }
-                    Err(error) => uv.error = error,
+                uv.tool = if uv.tool == tool { Tool::Select } else { tool };
+                uv.overlay_revision += 1;
+                uv.brush_at = None;
+            }
+            UvAction::ClearMask => {
+                if let Some(doc) = state.documents.get(&index)
+                    && let Some(id) = doc.active
+                {
+                    uv.masks.remove(&(doc.source.path.clone(), id));
+                    uv.overlay_revision += 1;
                 }
             }
-            UvAction::Cancel => {
-                uv.job.take();
-                uv.status = "Развёртка отменена · модель не изменена".into();
-                uv.progress = 0.;
+            UvAction::Heatmap => {
+                uv.heatmap = !uv.heatmap;
+                uv.overlay_revision += 1;
+                uv.stamp = None;
             }
             UvAction::Fit => {
                 uv.center = Vec2::splat(0.5);
@@ -357,8 +446,18 @@ fn apply_job(
     index: usize,
     id: usize,
     original: &document::MeshData,
-    input: &topology::Input,
+    corners: &[(usize, [usize; 3])],
     output: &backend::Output,
+) -> Result<(document::MeshData, document::MeshData), String> {
+    let after = topology::apply(original, corners, output)?.into();
+    commit_layout(state, index, id, original, after)
+}
+fn commit_layout(
+    state: &mut State,
+    index: usize,
+    id: usize,
+    original: &document::MeshData,
+    after: document::MeshData,
 ) -> Result<(document::MeshData, document::MeshData), String> {
     let doc = state
         .documents
@@ -372,9 +471,7 @@ fn apply_job(
     if &object.geometry != original {
         return Err("Модель изменилась во время расчёта. Запустите развёртку снова.".into());
     }
-    let geometry = topology::apply(original, input, output)?;
     let snapshot = doc.snapshot();
-    let after: document::MeshData = geometry.into();
     doc.objects
         .iter_mut()
         .find(|o| o.id == id)
@@ -391,50 +488,7 @@ fn poll(
     time: Res<Time>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    if uv
-        .job
-        .as_ref()
-        .is_some_and(|job| !state.documents.contains_key(&job.index))
-    {
-        uv.job.take();
-    }
-    let ready = uv
-        .job
-        .as_mut()
-        .and_then(|job| block_on(poll_once(&mut job.task)));
-    if let Some(result) = ready {
-        let job = uv.job.take().unwrap();
-        match result.and_then(|output| {
-            apply_job(
-                &mut state,
-                job.index,
-                job.object,
-                &job.original,
-                &job.input,
-                &output,
-            )
-        }) {
-            Ok((before, after)) => {
-                uv.before = Some(Comparison {
-                    index: job.index,
-                    object: job.object,
-                    before,
-                    after,
-                });
-                uv.comparing = false;
-                uv.stamp = None;
-                uv.status = "Развёртка готова · Ctrl+Z — отменить · Ctrl+S — сохранить".into();
-                uv.progress = 1.;
-                uv.reveal = 1.;
-                uv.error.clear();
-            }
-            Err(error) => {
-                uv.error = error;
-                uv.status.clear();
-                uv.progress = 0.;
-            }
-        }
-    }
+    jobs::poll_job(&mut uv, &mut state, &editor);
     let showing = editor
         .viewing_model
         .and_then(|i| state.documents.get(&i))
@@ -445,6 +499,10 @@ fn poll(
         uv.comparing = false;
         uv.stamp = None;
         state.rendered = None;
+    }
+    if !showing {
+        uv.tool = Tool::Select;
+        uv.brush_at = None;
     }
     let dt = time.delta_secs().min(0.1);
     let target = if showing { 1. } else { 0. };
@@ -468,9 +526,10 @@ fn poll(
         redraw.write(RequestRedraw);
     }
     uv.reveal = (uv.reveal - dt * 0.8).max(0.);
-    if let Some((index, doc)) = editor
-        .viewing_model
-        .and_then(|i| state.documents.get(&i).map(|d| (i, d)))
+    if showing
+        && let Some((index, doc)) = editor
+            .viewing_model
+            .and_then(|i| state.documents.get(&i).map(|d| (i, d)))
     {
         uv.rebuild(index, doc);
     }

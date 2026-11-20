@@ -25,6 +25,7 @@ fn document_fixture() -> Document {
 }
 fn output(input: &topology::Input) -> backend::Output {
     backend::Output {
+        suggestion: vec![],
         uv: input
             .corners
             .iter()
@@ -45,11 +46,11 @@ fn uv_job_is_one_undoable_transaction_and_rejects_stale_geometry() {
     state.documents.insert(0, document_fixture());
     let original = state.documents[&0].active().unwrap().geometry.clone();
     let input = topology::input(&original, 1.25, 2048, 8).unwrap();
-    apply_job(&mut state, 0, 0, &original, &input, &output(&input)).unwrap();
+    apply_job(&mut state, 0, 0, &original, &input.corners, &output(&input)).unwrap();
     let after = state.documents[&0].active().unwrap().geometry.clone();
     assert_eq!(original.positions, after.positions);
     assert_eq!(state.documents[&0].undo.len(), 1);
-    assert!(apply_job(&mut state, 0, 0, &original, &input, &output(&input)).is_err());
+    assert!(apply_job(&mut state, 0, 0, &original, &input.corners, &output(&input)).is_err());
     assert_eq!(state.documents[&0].undo.len(), 1);
     state.documents.get_mut(&0).unwrap().undo();
     assert_eq!(state.documents[&0].active().unwrap().geometry, original);
@@ -64,7 +65,17 @@ fn uv_invalid_results_do_not_change_materials_geometry_or_history() {
     let input = topology::input(&original[0].geometry, 1.25, 2048, 8).unwrap();
     let mut bad = output(&input);
     bad.uv[0][0][0] = f32::NAN;
-    assert!(apply_job(&mut state, 0, 0, &original[0].geometry, &input, &bad).is_err());
+    assert!(
+        apply_job(
+            &mut state,
+            0,
+            0,
+            &original[0].geometry,
+            &input.corners,
+            &bad
+        )
+        .is_err()
+    );
     assert_eq!(state.documents[&0].objects, original);
     assert!(state.documents[&0].undo.is_empty());
 }
@@ -74,7 +85,7 @@ fn uv_before_after_is_view_only_and_does_not_overwrite_newer_edits() {
     state.documents.insert(0, document_fixture());
     let before = state.documents[&0].active().unwrap().geometry.clone();
     let input = topology::input(&before, 1.25, 2048, 8).unwrap();
-    let (_, after) = apply_job(&mut state, 0, 0, &before, &input, &output(&input)).unwrap();
+    let (_, after) = apply_job(&mut state, 0, 0, &before, &input.corners, &output(&input)).unwrap();
     let mut uv = UvState::default();
     uv.before = Some(Comparison {
         index: 0,
@@ -115,7 +126,7 @@ fn uv_partuv_real_worker_preserves_cube_corners() {
     .unwrap();
     assert_eq!(result.uv.len(), input.corners.len());
     assert!(result.charts > 0);
-    let mapped = topology::apply(&mesh, &input, &result).unwrap();
+    let mapped = topology::apply(&mesh, &input.corners, &result).unwrap();
     assert_eq!(mapped.positions, mesh.positions);
     assert!(topology::Atlas::new(&mapped).area > 0.1);
 }
@@ -126,7 +137,7 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
     use crate::editor::{
         Editor,
         selection_outline::render_tests::{capture_when, frame},
-        tests::lighting_ui_render::{fixture_project, mouse, move_pointer},
+        tests::lighting_ui_render::{fixture_project, mouse, move_pointer, scroll_to_entity},
     };
     use bevy::input::ButtonState;
     fn warm(app: &mut App, n: usize) {
@@ -135,17 +146,25 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
         }
     }
     fn click(app: &mut App, window: Entity, test: impl Fn(Action) -> bool) {
-        let point = {
+        let control = {
             let world = app.world_mut();
             world
-                .query::<(&Control, &ComputedNode, &UiGlobalTransform)>()
+                .query::<(Entity, &Control, &ComputedNode)>()
                 .iter(world)
-                .find_map(|(c, n, t)| {
-                    (!n.is_empty() && test(c.action))
-                        .then_some(t.affine().translation * n.inverse_scale_factor())
-                })
+                .find_map(|(e, c, n)| (!n.is_empty() && test(c.action)).then_some(e))
                 .expect("UV control must be visible")
         };
+        scroll_to_entity(app, control);
+        let world = app.world();
+        let point = world
+            .get::<UiGlobalTransform>(control)
+            .unwrap()
+            .affine()
+            .translation
+            * world
+                .get::<ComputedNode>(control)
+                .unwrap()
+                .inverse_scale_factor();
         move_pointer(app, window, point);
         mouse(app, window, ButtonState::Pressed);
         mouse(app, window, ButtonState::Released);
@@ -296,6 +315,138 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
         );
         return;
     }
+    fn uv_click(app: &mut App, window: Entity, action: UvAction) {
+        click(
+            app,
+            window,
+            |a| matches!(a, Action::ModelView(ModelViewAction::Uv(value)) if value == action),
+        );
+    }
+    fn wait_for_proposal(app: &mut App) {
+        let start = std::time::Instant::now();
+        loop {
+            frame(app);
+            let uv = app.world().resource::<UvState>();
+            assert!(uv.error.is_empty(), "{}", uv.error);
+            if uv.proposal.is_some() {
+                break;
+            }
+            assert!(
+                start.elapsed().as_secs() < 60,
+                "Missing proposal: {}",
+                uv.status
+            );
+        }
+        warm(app, 3);
+    }
+    // Both preview decisions must leave the on-disk asset untouched. Accept gets one undo step.
+    for apply in [false, true] {
+        uv_click(&mut app, window, UvAction::Preview);
+        wait_for_proposal(&mut app);
+        let uv = app.world().resource::<UvState>();
+        assert!(matches!(
+            uv.proposal.as_ref().unwrap().result,
+            Proposed::Layout(_)
+        ));
+        assert_eq!(
+            app.world().resource::<State>().documents[&0].objects,
+            original
+        );
+        assert!(
+            app.world().resource::<State>().documents[&0]
+                .undo
+                .is_empty()
+        );
+        if apply {
+            uv_click(&mut app, window, UvAction::Accept);
+            assert_eq!(app.world().resource::<State>().documents[&0].undo.len(), 1);
+            app.world_mut()
+                .write_message(Action::ModelView(ModelViewAction::Edit(EditAction::Undo)));
+            warm(&mut app, 4);
+        } else {
+            uv_click(&mut app, window, UvAction::Compare);
+            assert!(app.world().resource::<UvState>().comparing);
+            uv_click(&mut app, window, UvAction::Dismiss);
+        }
+        assert!(app.world().resource::<UvState>().proposal.is_none());
+        assert_eq!(
+            app.world().resource::<State>().documents[&0].objects,
+            original
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    }
+    let model_point = {
+        let world = app.world_mut();
+        let (n, t) = world
+            .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<Canvas>>()
+            .single(world)
+            .unwrap();
+        let bounds = Rect::from_center_size(
+            t.affine().translation * n.inverse_scale_factor(),
+            n.size() * n.inverse_scale_factor(),
+        );
+        let doc = &world.resource::<State>().documents[&0];
+        let bvh = input::Bvh::build(doc);
+        let viewer = world.resource::<Viewer>();
+        (0..101)
+            .flat_map(|x| (0..101).map(move |y| (x, y)))
+            .map(|(x, y)| bounds.min + bounds.size() * Vec2::new(x as f32 / 100., y as f32 / 100.))
+            .filter(|&point| {
+                let (origin, dir) = super::super::input::ray(viewer, bounds, point);
+                bvh.cast(origin, dir, None)
+                    .is_some_and(|(object, _, _)| Some(object) == doc.active)
+            })
+            .min_by_key(|p| p.distance_squared(bounds.center()) as i32)
+            .expect("Pickable model surface")
+    };
+    let stroke = |app: &mut App| {
+        move_pointer(app, window, model_point);
+        mouse(app, window, ButtonState::Pressed);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 3);
+    };
+    uv_click(&mut app, window, UvAction::Brush);
+    assert!(app.world().resource::<UvState>().tool == Tool::Brush);
+    stroke(&mut app);
+    assert!(
+        app.world()
+            .resource::<UvState>()
+            .masks
+            .values()
+            .any(|m| !m.is_empty())
+    );
+    uv_click(&mut app, window, UvAction::ClearMask);
+    assert!(app.world().resource::<UvState>().masks.is_empty());
+    uv_click(&mut app, window, UvAction::Suggest);
+    stroke(&mut app);
+    wait_for_proposal(&mut app);
+    assert!(
+        matches!(&app.world().resource::<UvState>().proposal.as_ref().unwrap().result, Proposed::Island(faces) if !faces.is_empty())
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &out.join("06-dawand-proposal.png"),
+        |_| true,
+    );
+    uv_click(&mut app, window, UvAction::Accept);
+    assert!(
+        app.world()
+            .resource::<UvState>()
+            .masks
+            .values()
+            .any(|m| !m.is_empty())
+    );
+    assert!(
+        app.world().resource::<State>().documents[&0]
+            .undo
+            .is_empty()
+    );
+    uv_click(&mut app, window, UvAction::ClearMask);
+    uv_click(&mut app, window, UvAction::Heatmap);
+    let uv = app.world().resource::<UvState>();
+    assert!(uv.heatmap && uv.atlas.angular_p95.is_some());
+    uv_click(&mut app, window, UvAction::Heatmap);
     click(&mut app, window, |a| {
         matches!(a, Action::ModelView(ModelViewAction::Uv(UvAction::Unwrap)))
     });
@@ -329,6 +480,21 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
     capture_when(&mut app, &target, &out.join("02-uv-unwrapped.png"), |_| {
         true
     });
+    uv_click(&mut app, window, UvAction::Heatmap);
+    assert!(
+        app.world()
+            .resource::<UvState>()
+            .atlas
+            .angular_p95
+            .is_some_and(f32::is_finite)
+    );
+    capture_when(
+        &mut app,
+        &target,
+        &out.join("07-angular-distortion.png"),
+        |_| true,
+    );
+    uv_click(&mut app, window, UvAction::Heatmap);
     {
         let assets = app.world().resource::<view::AssetsState>();
         assert!(assets.flat.is_some(), "Atlas uses its own unlit material");

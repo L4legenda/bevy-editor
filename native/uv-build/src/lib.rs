@@ -59,6 +59,8 @@ pub fn kernel() {
         .include(root.join("vendor/include"))
         .include(headers)
         .file(root.join("cpp/bridge.cpp"))
+        .file(root.join("cpp/dawand.cpp"))
+        .file(root.join("cpp/dawand_network.cpp"))
         .file(root.join("vendor/xatlas.cpp"));
     for name in [
         "AgglomerativeClustering",

@@ -1,5 +1,5 @@
 //! Scene authoring documents and projections for model/camera/light tools.
-use crate::data::{CameraDefinition, LensKind};
+use crate::data::{CameraDefinition, LensKind, ModelFormat};
 use crate::{CameraPlacement, LevelEdits, PlacedModel, Pose, SceneSettings};
 use bevy_scene_format::{Entity, Resource, Scene};
 use serde::{Deserialize, Serialize};
@@ -189,12 +189,18 @@ pub(crate) fn decode_scene<K: Ord + serde::de::DeserializeOwned>(
     for entity in entities {
         if let Some(model) = &entity.model {
             let resource = &scene.resources[model];
+            let asset = resource
+                .path
+                .as_deref()
+                .ok_or_else(|| invalid("An editor model requires an external GLB or FBX"))?;
+            let format = ModelFormat::from_path(asset)
+                .ok_or_else(|| invalid(format!("Unsupported model path: {asset}")))?;
             if resource
                 .selector
                 .as_deref()
-                .is_some_and(|selector| selector != "Scene0")
+                .is_some_and(|selector| format != ModelFormat::Glb || selector != "Scene0")
             {
-                return Err(invalid("The current editor supports GLB Scene0 models"));
+                return Err(invalid("Only GLB models accept the Scene0 selector"));
             }
             let id = number(&entity.id, "model");
             if !model_ids.insert(id) {
@@ -202,10 +208,7 @@ pub(crate) fn decode_scene<K: Ord + serde::de::DeserializeOwned>(
             }
             edits.models.push(PlacedModel {
                 id,
-                asset: resource
-                    .path
-                    .clone()
-                    .ok_or_else(|| invalid("An editor model requires an external GLB"))?,
+                asset: asset.to_owned(),
                 pose: pose(entity.transform),
                 bounds: entity
                     .components

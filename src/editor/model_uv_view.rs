@@ -19,7 +19,10 @@ pub(super) struct AssetsState {
     pub(super) flat: Option<Handle<StandardMaterial>>,
     entities: Vec<Entity>,
     meshes: Vec<Handle<Mesh>>,
-    stamp: Option<(usize, usize, u64, bool, Vec<usize>, u32)>,
+    stamp: Option<(usize, usize, u64, bool, Vec<usize>, u32, u64)>,
+    overlay: Option<Entity>,
+    overlay_key: Option<(Entity, usize, u64, bool, u64)>,
+    overlay_material: Option<Handle<StandardMaterial>>,
 }
 pub(super) fn setup(commands: &mut Commands, image: Handle<Image>) {
     commands.spawn((
@@ -153,6 +156,7 @@ pub(super) fn refresh(
         uv.comparing,
         uv.selected.iter().copied().collect(),
         line_key,
+        uv.overlay_revision,
     );
     if cache.stamp.as_ref() == Some(&stamp) {
         return;
@@ -192,6 +196,7 @@ pub(super) fn refresh(
     }
     let mut faces = Drawing::default();
     let mut lines = Drawing::default();
+    let shades = Shades::new(index, &uv, doc, object);
     for (fi, face) in geometry.faces.iter().enumerate() {
         let id = uv.atlas.islands.get(fi).copied().unwrap_or(0);
         let selected = uv.selected.contains(&id);
@@ -200,8 +205,11 @@ pub(super) fn refresh(
         } else {
             hue(id)
         };
-        for triangle in geometry.triangles(face) {
-            faces.triangle(triangle.map(|i| face.corners[i].uv), 0., color);
+        for (ti, triangle) in geometry.triangles(face).into_iter().enumerate() {
+            let shade = shades
+                .color(&uv, fi, ti, triangle.map(|i| face.corners[i].vertex))
+                .unwrap_or(color);
+            faces.triangle(triangle.map(|i| face.corners[i].uv), 0., shade);
         }
         for (a, b) in face.corners.iter().zip(face.corners.iter().cycle().skip(1)) {
             lines.line(
@@ -341,4 +349,136 @@ pub(super) fn seams(
             gizmos.line(world(edge.0), world(edge.1), Color::srgb(1., 0.8, 0.3));
         }
     }
+}
+
+struct Shades<'a> {
+    mask: Option<&'a FaceMask>,
+    proposal: Option<&'a FaceMask>,
+}
+impl<'a> Shades<'a> {
+    fn new(index: usize, uv: &'a UvState, doc: &Document, object: &Object) -> Self {
+        Self {
+            mask: uv.masks.get(&(doc.source.path.clone(), object.id)),
+            proposal: uv
+                .proposal
+                .as_ref()
+                .filter(|p| {
+                    p.index == index && p.object == object.id && p.original == object.geometry
+                })
+                .and_then(|p| match &p.result {
+                    Proposed::Island(mask) => Some(mask),
+                    _ => None,
+                }),
+        }
+    }
+    fn color(&self, uv: &UvState, fi: usize, ti: usize, vertices: [usize; 3]) -> Option<Color> {
+        let key = face_key(vertices);
+        if self.proposal.is_some_and(|m| m.contains(&key)) {
+            return Some(Color::srgb(0.77, 0.4, 1.));
+        }
+        if self.mask.is_some_and(|m| m.contains(&key)) && (!uv.heatmap || uv.tool == Tool::Brush) {
+            return Some(Color::srgb(0.22, 0.78, 0.95));
+        }
+        if !uv.heatmap {
+            return None;
+        }
+        let ratio = *uv.atlas.distortion.get(fi)?.get(ti)?;
+        if !ratio.is_finite() {
+            return Some(Color::srgb(0.9, 0.08, 0.62));
+        }
+        let t = ((ratio - 1.) * 2.).clamp(0., 2.);
+        let stops = [
+            Vec3::new(0.16, 0.72, 0.66),
+            Vec3::new(1., 0.76, 0.22),
+            Vec3::new(0.94, 0.17, 0.15),
+        ];
+        let c = if t < 1. {
+            stops[0].lerp(stops[1], t)
+        } else {
+            stops[1].lerp(stops[2], t - 1.)
+        };
+        Some(Color::srgb(c.x, c.y, c.z))
+    }
+}
+pub(super) fn overlay(
+    mut commands: Commands,
+    editor: Res<Editor>,
+    editing: Res<State>,
+    uv: Res<UvState>,
+    mut cache: ResMut<AssetsState>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let active = editor.viewing_model.and_then(|index| {
+        let doc = editing.documents.get(&index)?;
+        let object = doc.active()?;
+        let entity = editing.render_objects.get(&object.id)?.entity;
+        (doc.mode == Mode::Uv
+            && !object.hidden
+            && editor.pending.is_none()
+            && editor.viewing_image.is_none())
+        .then_some((index, doc, object, entity))
+    });
+    let key = active
+        .map(|(idx, d, _, parent)| (parent, idx, d.revision, uv.comparing, uv.overlay_revision));
+    if key == cache.overlay_key {
+        return;
+    }
+    cache.overlay_key = key;
+    if let Some(old) = cache.overlay.take() {
+        commands.entity(old).try_despawn();
+    }
+    let Some((index, doc, object, parent)) = active else {
+        return;
+    };
+    let shades = Shades::new(index, &uv, doc, object);
+    if !uv.heatmap && shades.mask.is_none_or(|m| m.is_empty()) && shades.proposal.is_none() {
+        return;
+    }
+    let geom = uv.display_geometry(index, object);
+    let mut drawing = Drawing::default();
+    let key_light = Vec3::new(-0.4, 0.8, 0.45).normalize();
+    for (fi, face) in geom.faces.iter().enumerate() {
+        let normal = geom.normal(face);
+        for (ti, tri) in geom.triangles(face).into_iter().enumerate() {
+            let vertices = tri.map(|i| face.corners[i].vertex);
+            if let Some(shade) = shades.color(&uv, fi, ti, vertices) {
+                drawing
+                    .positions
+                    .extend(vertices.map(|i| geom.positions[i].to_array()));
+                let [r, g, b, a] = shade.to_linear().to_f32_array();
+                drawing.colors.extend(tri.map(|c| {
+                    let normal = face.corners[c].source_normal.unwrap_or(normal);
+                    let light = 0.72 + 0.28 * normal.dot(key_light).clamp(-1., 1.);
+                    [r * light, g * light, b * light, a]
+                }));
+            }
+        }
+    }
+    if drawing.positions.is_empty() {
+        return;
+    }
+    let material = cache
+        .overlay_material
+        .get_or_insert_with(|| {
+            materials.add(StandardMaterial {
+                unlit: true,
+                cull_mode: None,
+                double_sided: true,
+                depth_bias: 8.,
+                ..default()
+            })
+        })
+        .clone();
+    cache.overlay = Some(
+        commands
+            .spawn((
+                Mesh3d(meshes.add(drawing.mesh())),
+                MeshMaterial3d(material),
+                RenderLayers::layer(LAYER),
+                Transform::IDENTITY,
+                ChildOf(parent),
+            ))
+            .id(),
+    );
 }

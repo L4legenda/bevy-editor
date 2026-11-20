@@ -12,6 +12,8 @@ pub(super) struct UvUi {
     pub image: Handle<Image>,
     pub inspector: Entity,
     toolbar: Entity,
+    decision: Entity,
+    accept: Entity,
     stats: Entity,
     status: Entity,
     empty: Entity,
@@ -167,10 +169,27 @@ pub(super) fn setup(
         ("90°", UvAction::Rotate),
         ("−", UvAction::ScaleDown),
         ("+", UvAction::ScaleUp),
-        ("Упаковать", UvAction::Pack),
+        ("Уплотнить", UvAction::Pack),
     ] {
         control(&mut commands, tools, &interface.font, label, action, false);
     }
+    let decision = wrapping(&mut commands, pane);
+    let accept = control(
+        &mut commands,
+        decision,
+        &interface.font,
+        "Применить UV",
+        UvAction::Accept,
+        true,
+    );
+    control(
+        &mut commands,
+        decision,
+        &interface.font,
+        "Отклонить",
+        UvAction::Dismiss,
+        false,
+    );
     let canvas = surface(
         &mut commands,
         pane,
@@ -253,6 +272,19 @@ pub(super) fn setup(
         &interface.font,
         "Развёртка",
         "PartUV Geometric автоматически выбирает швы и создаёт UV-острова. Нативный движок Rust + C++ входит в редактор и работает локально на CPU. Дополнительная установка не нужна.",
+    );
+    let preview_button = control(
+        &mut commands,
+        unwrap,
+        &interface.font,
+        "Быстрый предпросмотр",
+        UvAction::Preview,
+        false,
+    );
+    control_hints::attach(
+        &mut commands,
+        preview_button,
+        "xatlas быстро строит UV. Осмотрите их и нажмите «Применить UV», чтобы добавить в историю модели.",
     );
     let choices = wrapping(&mut commands, unwrap);
     for (index, label) in ["Точнее", "Баланс", "Меньше швов"].into_iter().enumerate()
@@ -353,6 +385,49 @@ pub(super) fn setup(
         UvAction::Seams,
         false,
     );
+    control(
+        &mut commands,
+        preview,
+        &interface.font,
+        "Растяжение",
+        UvAction::Heatmap,
+        false,
+    );
+    let seams = inspector_section(
+        &mut commands,
+        inspector,
+        &interface.font,
+        "Размещение швов",
+        "Авторазвёртка учитывает границы материалов, жёсткие изгибы и отмеченные области.",
+    );
+    let seam_tools = wrapping(&mut commands, seams);
+    for (label, action, hint) in [
+        (
+            "Беречь от швов",
+            UvAction::Brush,
+            "Кисть по поверхности. ЛКМ отмечает область, Shift + ЛКМ стирает. Разрезы предпочтительны по её границе.",
+        ),
+        (
+            "Предложить остров",
+            UvAction::Suggest,
+            "DA Wand предложит связную область вокруг грани, по которой вы щёлкнете. Результат можно принять или отклонить.",
+        ),
+        (
+            "Очистить защиту",
+            UvAction::ClearMask,
+            "Снять всю защиту швов с активного объекта.",
+        ),
+    ] {
+        let button = control(
+            &mut commands,
+            seam_tools,
+            &interface.font,
+            label,
+            action,
+            false,
+        );
+        control_hints::attach(&mut commands, button, hint);
+    }
     let changes = inspector_section(
         &mut commands,
         inspector,
@@ -469,6 +544,8 @@ pub(super) fn setup(
         image: image.clone(),
         inspector,
         toolbar,
+        decision,
+        accept,
         stats,
         status,
         empty,
@@ -545,6 +622,7 @@ pub(super) fn refresh(
         (ui.pane, showing || uv.split > 0.002),
         (ui.inspector, showing),
         (ui.toolbar, showing),
+        (ui.decision, showing && uv.proposal.is_some()),
         (ui.cancel, showing && uv.job.is_some()),
         (ui.progress, showing && uv.job.is_some()),
         (ui.empty, showing && uv.atlas.area < 1e-9),
@@ -584,11 +662,24 @@ pub(super) fn refresh(
             ));
         }
     }
+    label(
+        ui.accept,
+        if matches!(
+            uv.proposal.as_ref().map(|p| &p.result),
+            Some(Proposed::Island(_))
+        ) {
+            "Принять область"
+        } else {
+            "Применить UV"
+        },
+        &children,
+        &mut texts,
+    );
     if let Ok((mut text, _)) = texts.get_mut(ui.stats) {
         text.0 = doc.and_then(|d| d.active()).map_or_else(
             || "Выберите объект модели".into(),
             |_o| {
-                format!(
+                let mut stats = format!(
                     "{} островов · UV {:0.1}%{}",
                     uv.atlas.count,
                     uv.atlas.area * 100.,
@@ -597,17 +688,28 @@ pub(super) fn refresh(
                     } else {
                         String::new()
                     }
-                )
+                );
+                if uv.heatmap
+                    && let Some(r) = uv.atlas.angular_p95
+                {
+                    stats.push_str(&format!(
+                        "\nИскажение P95 · {}\nБирюзовый 1× · жёлтый 1,5× · красный ≥2×",
+                        if r.is_finite() {
+                            format!("{r:.2}×")
+                        } else {
+                            "∞".into()
+                        }
+                    ));
+                }
+                stats
             },
         );
     }
     if let Ok((mut text, mut color)) = texts.get_mut(ui.status) {
         let content = if !uv.error.is_empty() {
             &uv.error
-        } else if uv.reveal > 0.01 {
-            "Развёртка готова"
-        } else if uv.status.starts_with("Развёртка отменена") {
-            "Расчёт отменён"
+        } else if !uv.status.is_empty() && uv.job.is_none() {
+            &uv.status
         } else if doc.is_some_and(|d| d.dirty()) {
             "Есть изменения"
         } else {
@@ -625,7 +727,13 @@ pub(super) fn refresh(
     if let Ok((mut text, _)) = texts.get_mut(ui.caption) {
         text.0 = format!(
             "{} · {} × {} · отступ {} px",
-            if uv.comparing {
+            if matches!(
+                uv.proposal.as_ref().map(|p| &p.result),
+                Some(Proposed::Layout(_))
+            ) && !uv.comparing
+            {
+                "Предпросмотр xatlas"
+            } else if uv.comparing {
                 "Исходная UV"
             } else {
                 "Атлас 0–1"
@@ -636,7 +744,20 @@ pub(super) fn refresh(
         );
     }
     if let Ok((mut text, _)) = texts.get_mut(ui.selection) {
-        text.0 = if uv.selected.is_empty() {
+        text.0 = if let Some(Proposal {
+            result: Proposed::Island(mask),
+            ..
+        }) = &uv.proposal
+        {
+            format!(
+                "DA Wand · {} треугольников · фиолетовая область",
+                mask.len()
+            )
+        } else if uv.tool == Tool::Wand {
+            "DA Wand · щёлкните по грани в 3D".into()
+        } else if uv.tool == Tool::Brush {
+            "Защита швов · рисуйте в 3D · Shift — стереть".into()
+        } else if uv.selected.is_empty() {
             "ЛКМ — остров · Shift — добавить".into()
         } else {
             format!(
@@ -672,7 +793,11 @@ pub(super) fn refresh(
     );
     label(
         ui.auto,
-        if uv.job.is_some() {
+        if uv
+            .job
+            .as_ref()
+            .is_some_and(|j| j.action == UvAction::Unwrap)
+        {
             "Разворачиваем…"
         } else {
             "Авторазвёртка"

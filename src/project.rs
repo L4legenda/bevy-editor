@@ -10,7 +10,10 @@ use std::{
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{LevelEdits, data::relative_path};
+use crate::{
+    LevelEdits,
+    data::{ModelFormat, relative_path},
+};
 
 /// Optional hooks let the host apply its own lighting and materials.
 pub type SceneSetup = fn(&mut EntityCommands, &AssetServer, &str);
@@ -119,7 +122,7 @@ impl EditorProject {
         }
         for item in &self.catalog {
             let direction = Vec3::from(item.preview_direction);
-            if !relative_path(&item.asset, "glb")
+            if ModelFormat::from_path(&item.asset).is_none()
                 || !self.asset_root.join(&item.asset).is_file()
                 || !direction.is_finite()
                 || direction.length_squared() < 1e-6

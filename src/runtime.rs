@@ -2,6 +2,11 @@
 use crate::PlacedModel;
 use bevy::prelude::*;
 
+#[cfg(feature = "game")]
+pub(crate) mod fbx;
+#[cfg(feature = "game")]
+pub use fbx::FbxPlugin;
+
 #[cfg(all(feature = "game", not(target_arch = "wasm32")))]
 mod game;
 #[cfg(all(feature = "game", not(target_arch = "wasm32")))]
@@ -69,5 +74,8 @@ pub fn spawn_model(commands: &mut Commands, server: &AssetServer, model: &Placed
 }
 
 pub fn load_model(server: &AssetServer, model: &PlacedModel) -> Handle<WorldAsset> {
-    server.load(format!("{}#Scene0", model.asset))
+    match crate::data::ModelFormat::from_path(&model.asset) {
+        Some(crate::data::ModelFormat::Fbx) => server.load(model.asset.clone()),
+        _ => server.load(format!("{}#Scene0", model.asset)),
+    }
 }

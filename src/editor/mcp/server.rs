@@ -121,7 +121,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "List project GLB models available for add_model",
+        description = "List project GLB and FBX models available for add_model",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_assets(
@@ -181,7 +181,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Add and select one instance of a project GLB model. Use an asset from list_assets. Can be undone",
+        description = "Add and select one instance of a project GLB or FBX model. Use an asset from list_assets. Can be undone",
         annotations(destructive_hint = false, open_world_hint = false)
     )]
     async fn add_model(

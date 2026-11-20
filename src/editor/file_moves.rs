@@ -1,8 +1,7 @@
 //! Guarded moves inside an asset root, with editor-document reference updates.
 //!
-//! Relative glTF dependencies are checked before touching the filesystem. A
-//! move requiring a URI rewrite is rejected, so embedded models and complete
-//! model/texture folders can move without silently breaking external resources.
+//! Model dependencies are checked before filesystem changes. Embedded models
+//! and complete model/texture folders can move together.
 
 use std::{
     fs,
@@ -16,6 +15,7 @@ use super::{
     browser::{Browser, Entry},
 };
 use crate::asset_paths::{FILE as REDIRECT_FILE, Redirects};
+use crate::data::ModelFormat;
 
 struct Rewrite {
     before: PathBuf,
@@ -101,7 +101,7 @@ fn validate_edit_paths(edits: &RoomEdits, from: &Path, to: &Path) -> io::Result<
     for model in &edits.models {
         let mapped = remap(Path::new(&model.asset), from, to);
         if !mapped.to_str().is_some_and(|path| {
-            crate::data::relative_path(&path.replace(std::path::MAIN_SEPARATOR, "/"), "glb")
+            ModelFormat::from_path(&path.replace(std::path::MAIN_SEPARATOR, "/")).is_some()
         }) {
             return Err(invalid(
                 "Путь размещённой модели после перемещения не поддерживается редактором",
@@ -373,7 +373,7 @@ fn prepare_to(
     if original_redirects.is_some() {
         checked_path(&editor.root, &redirect_path)?;
     }
-    let mut redirects = Redirects::read(&editor.root)?;
+    let redirects = Redirects::read(&editor.root)?;
     let mut companions = Vec::new();
     if matches!(entry, Entry::Image(_)) {
         let native = from.with_extension("pcraft");
@@ -433,7 +433,12 @@ fn prepare_to(
         }
     }
 
-    // Read only JSON chunks, not the potentially huge embedded BIN payloads.
+    let mut moved_redirects = redirects.clone();
+    moved_redirects.record_move(&from, &to)?;
+    for (from, to) in &companions {
+        moved_redirects.record_move(from, to)?;
+    }
+    // For glTF, inspect JSON without loading the embedded BIN payloads.
     for file in all_files(&editor.root)? {
         let extension = file
             .extension()
@@ -444,6 +449,29 @@ fn prepare_to(
             "glb" => glb_json(&editor.root.join(&file)),
             "gltf" => fs::read(editor.root.join(&file))
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(io::Error::other)),
+            "fbx" if file.starts_with(&from) => {
+                let destination = remap(&file, &from, &to);
+                if destination.parent() != file.parent() {
+                    for (old, new) in crate::runtime::fbx::external_texture_paths(
+                        &editor.root,
+                        &file,
+                        &destination,
+                    )? {
+                        let previous = redirects.resolve(&old)?;
+                        if editor.root.join(&previous).is_file()
+                            && new.map(|path| moved_redirects.resolve(path)).transpose()?
+                                != Some(remap(&previous, &from, &to))
+                        {
+                            return Err(invalid(format!(
+                                "Переместите FBX {} вместе с текстурой {} в общей папке.",
+                                file.display(),
+                                old.display(),
+                            )));
+                        }
+                    }
+                }
+                continue;
+            }
             _ => continue,
         }
         .map_err(|error| {
@@ -458,7 +486,7 @@ fn prepare_to(
     let mut updated = editor.project.clone();
     for model in &mut updated.catalog {
         remap_string(&mut model.asset, &from, &to);
-        if !crate::data::relative_path(&model.asset, "glb") {
+        if ModelFormat::from_path(&model.asset).is_none() {
             return Err(invalid(
                 "Путь модели после перемещения не поддерживается редактором",
             ));
@@ -511,15 +539,11 @@ fn prepare_to(
             permissions: Some(fs::metadata(absolute)?.permissions()),
         });
     }
-    redirects.record_move(&from, &to)?;
-    for (from, to) in &companions {
-        redirects.record_move(from, to)?;
-    }
     rewrites.push(Rewrite {
         before: redirect_path.clone(),
         after: redirect_path,
         original: original_redirects,
-        updated: redirects.encode()?,
+        updated: moved_redirects.encode()?,
         permissions: fs::metadata(editor.root.join(REDIRECT_FILE))
             .ok()
             .map(|metadata| metadata.permissions()),
@@ -1472,6 +1496,35 @@ mod tests {
                 .iter()
                 .any(|item| item.asset == "archive/chair/model.glb")
         );
+    }
+
+    #[test]
+    fn moving_a_textured_fbx_requires_its_dependencies_and_keeps_scene_references() {
+        let files = Fixture::new();
+        files.file(
+            "pack/props.FBX",
+            include_bytes!("../../tests/fixtures/fbx/props_external.FBX"),
+        );
+        files.file(
+            "pack/textures/checker.png",
+            include_bytes!("../../tests/fixtures/fbx/textures/checker.png"),
+        );
+        fs::create_dir(files.0.join("archive")).unwrap();
+        let (mut editor, mut browser) = files.editor();
+        editor.edits = placements("pack/props.FBX");
+        editor.edits.write(&files.0, "levels/room.json").unwrap();
+        let target = folder(&browser, "archive");
+        let asset = model(&editor, "pack/props.FBX");
+        let error = move_entry(&mut editor, &mut browser, Entry::Model(asset), target).unwrap_err();
+        assert!(error.to_string().contains("checker.png"), "{error}");
+        assert!(files.0.join("pack/props.FBX").is_file());
+
+        let pack = folder(&browser, "pack");
+        assert!(move_entry(&mut editor, &mut browser, Entry::Folder(pack), target).unwrap());
+        assert!(files.0.join("archive/pack/textures/checker.png").is_file());
+        assert_eq!(editor.edits.models[0].asset, "archive/pack/props.FBX");
+        let saved: RoomEdits = RoomEdits::read(&files.0, "levels/room.json").unwrap();
+        assert_eq!(saved.models[0].asset, "archive/pack/props.FBX");
     }
 
     #[test]

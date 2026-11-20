@@ -1,5 +1,238 @@
 use super::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore = "requires GPU; checks FBX thumbnail, model viewer, placement and native scene persistence"]
+fn gpu_fbx_renders_in_browser_and_viewer_then_saves_a_scene_instance() {
+    use crate::editor::{
+        selection_outline::render_tests::{capture_when, frame},
+        tests::lighting_ui_render::{fixture_project, mouse, move_pointer},
+        thumbnails::{PreviewState, Thumbnails},
+    };
+    use bevy::input::ButtonState;
+    use std::{fs, path::Path};
+
+    struct ProjectFiles(std::path::PathBuf);
+    impl Drop for ProjectFiles {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let files = ProjectFiles(std::env::temp_dir().join(format!(
+        "bevy-editor-fbx-{}",
+        bevy::asset::uuid::Uuid::new_v4(),
+    )));
+    let root = files.0.join("assets");
+    fs::create_dir_all(root.join("scenes")).unwrap();
+    fs::create_dir_all(root.join("models")).unwrap();
+    let external = files.0.join("downloads");
+    fs::create_dir_all(external.join("textures")).unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fbx");
+    fs::copy(
+        fixtures.join("props_external.FBX"),
+        external.join("Props.FBX"),
+    )
+    .unwrap();
+    fs::copy(
+        fixtures.join("textures/checker.png"),
+        external.join("textures/checker.png"),
+    )
+    .unwrap();
+    let file = "scenes/fbx.scene";
+    let camera = crate::CameraDefinition {
+        id: "main".into(),
+        label: "Main".into(),
+        placement: crate::CameraPlacement {
+            lens: 50.0,
+            pose: Transform::from_xyz(4.0, 3.0, 4.0)
+                .looking_at(Vec3::ZERO, Vec3::Y)
+                .into(),
+        },
+        projection: Default::default(),
+    };
+    crate::LevelEdits::<String> {
+        scene: Some(crate::SceneSettings {
+            label: "FBX Preview".into(),
+            cameras: vec![camera],
+        }),
+        ..default()
+    }
+    .write(&root, file)
+    .unwrap();
+    let manifest = files.0.join("project.bevyeditor");
+    fs::write(
+        &manifest,
+        br#"{"title":"FBX","asset_root":"assets","scenes":[{"file":"scenes/fbx.scene"}]}"#,
+    )
+    .unwrap();
+    let (mut app, window, target) = fixture_project(crate::EditorProject::load(manifest).unwrap());
+    let folder = app
+        .world()
+        .resource::<Browser>()
+        .folders
+        .iter()
+        .position(|folder| folder.path == Path::new("models"))
+        .unwrap();
+    app.world_mut().write_message(Action::OpenBrowser);
+    app.world_mut().write_message(Action::Browse(folder));
+    for _ in 0..30 {
+        frame(&mut app);
+    }
+    let grid = app
+        .world()
+        .resource::<crate::editor::ui::drawer::BrowserUi>()
+        .grid;
+    let node = app.world().get::<ComputedNode>(grid).unwrap();
+    let point = app
+        .world()
+        .get::<UiGlobalTransform>(grid)
+        .unwrap()
+        .affine()
+        .translation
+        * node.inverse_scale_factor();
+    move_pointer(&mut app, window, point);
+    app.world_mut()
+        .write_message(bevy::window::FileDragAndDrop::DroppedFile {
+            window,
+            path_buf: external.join("Props.FBX"),
+        });
+    let started = std::time::Instant::now();
+    let index = loop {
+        frame(&mut app);
+        let editor = app.world().resource::<Editor>();
+        if let Some(index) = editor
+            .project
+            .catalog
+            .iter()
+            .position(|m| m.asset == "models/Props.FBX")
+        {
+            break index;
+        }
+        assert!(
+            started.elapsed().as_secs() < 15,
+            "FBX drop: {}",
+            editor.status
+        );
+    };
+    assert_eq!(
+        fs::read(root.join("models/textures/checker.png")).unwrap(),
+        fs::read(fixtures.join("textures/checker.png")).unwrap()
+    );
+    let entry = browser::Entry::Model(index);
+    for _ in 0..180 {
+        frame(&mut app);
+        if app.world().resource::<Thumbnails>().state(entry) == PreviewState::Ready {
+            break;
+        }
+    }
+    assert_eq!(
+        app.world().resource::<Thumbnails>().state(entry),
+        PreviewState::Ready
+    );
+    for _ in 0..20 {
+        frame(&mut app);
+    }
+    let (card, card_size) = {
+        let world = app.world_mut();
+        let (_, node, pose) = world
+            .query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find(|(label, _, _)| label.0 == "Открыть модель Props.FBX · Props")
+            .unwrap();
+        (
+            pose.affine().translation * node.inverse_scale_factor(),
+            node.size() * node.inverse_scale_factor(),
+        )
+    };
+    let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/fbx-qa");
+    fs::create_dir_all(&output).unwrap();
+    let is_turquoise = |pixel: &image::Rgba<u8>| {
+        let [r, g, b, _] = pixel.0.map(u16::from);
+        g > r + 20 && g > b + 6 && g > 55
+    };
+    let thumbnail = Rect::from_center_size(card, card_size);
+    capture_when(&mut app, &target, &output.join("browser.png"), |image| {
+        image
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| {
+                thumbnail.contains(Vec2::new(*x as f32, *y as f32)) && is_turquoise(pixel)
+            })
+            .count()
+            > 35
+    });
+    move_pointer(&mut app, window, card);
+    for _ in 0..2 {
+        mouse(&mut app, window, ButtonState::Pressed);
+        mouse(&mut app, window, ButtonState::Released);
+    }
+    for _ in 0..180 {
+        frame(&mut app);
+        if app.world().resource::<Viewer>().fitted {
+            break;
+        }
+    }
+    assert_eq!(app.world().resource::<Editor>().viewing_model, Some(index));
+    let viewer = app.world().resource::<Viewer>();
+    assert!(viewer.fitted, "{:?}", viewer.error);
+    let editing = app.world().resource::<editing::State>();
+    assert!(editing.errors[&index].contains("FBX"));
+    assert!(!editing.documents.contains_key(&index));
+
+    let lit_geometry = |image: &image::RgbaImage| {
+        image
+            .enumerate_pixels()
+            .filter(|(x, y, _)| (200..800).contains(x) && (150..650).contains(y))
+            .filter(|(_, _, pixel)| is_turquoise(pixel))
+            .count()
+            > 300
+    };
+    if app.world().resource::<Editor>().drawer {
+        app.world_mut().write_message(Action::Drawer);
+        for _ in 0..25 {
+            frame(&mut app);
+        }
+    }
+    capture_when(&mut app, &target, &output.join("viewer.png"), lit_geometry);
+
+    app.world_mut().write_message(Action::CloseModelTab(index));
+    frame(&mut app);
+    app.world_mut()
+        .write_message(Action::DropAsset(entry, Vec2::new(480.0, 330.0)));
+    for _ in 0..180 {
+        frame(&mut app);
+        if !app.world().resource::<Editor>().edits.models.is_empty() {
+            break;
+        }
+    }
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.edits.models.len(), 1, "{}", editor.status);
+    assert_eq!(editor.edits.models[0].asset, "models/Props.FBX");
+    app.world_mut().write_message(Action::Save);
+    frame(&mut app);
+    let level = crate::runtime::GameLevel::read(&root, file).unwrap();
+    assert_eq!(level.edits.models.len(), 1);
+    assert_eq!(level.edits.models[0].asset, "models/Props.FBX");
+    app.world_mut().write_message(Action::CloseTab(0));
+    frame(&mut app);
+    assert!(app.world().resource::<Editor>().open_tabs.is_empty());
+    app.world_mut().write_message(Action::Open(0));
+    for _ in 0..120 {
+        frame(&mut app);
+        let editor = app.world().resource::<Editor>();
+        if editor.ready && editor.edits.models == level.edits.models {
+            break;
+        }
+    }
+    assert_eq!(
+        app.world().resource::<Editor>().edits.models,
+        level.edits.models
+    );
+    assert_eq!(
+        fs::read(root.join("models/Props.FBX")).unwrap(),
+        fs::read(fixtures.join("props_external.FBX")).unwrap(),
+    );
+}
+
 #[test]
 fn orthographic_zoom_projects_and_picks_surfaces_behind_the_eye_at_all_scales() {
     let rect = Rect::from_center_size(Vec2::splat(400.0), Vec2::new(800.0, 600.0));

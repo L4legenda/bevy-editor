@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -12,6 +12,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 include!(concat!(env!("OUT_DIR"), "/uv_native_bundle.rs"));
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Method {
+    #[default]
+    Unwrap,
+    Preview,
+    Suggest,
+}
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+pub(super) struct Options {
+    pub method: Method,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materials: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<usize>,
+    pub guide_seams: bool,
+    pub seed: Option<usize>,
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub(super) struct Request {
     pub positions: Vec<[f32; 3]>,
@@ -21,11 +39,18 @@ pub(super) struct Request {
     pub padding: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub existing_uv: Option<Vec<[[f32; 2]; 3]>>,
+    #[serde(default)]
+    pub options: Options,
 }
 #[derive(Clone, Deserialize, Debug)]
 pub(super) struct Output {
+    #[serde(default)]
+    pub suggestion: Vec<usize>,
+    #[serde(default)]
     pub uv: Vec<[[f32; 2]; 3]>,
+    #[serde(default)]
     pub charts: usize,
+    #[serde(default)]
     pub utilization: f32,
 }
 #[derive(Default, Clone)]
@@ -168,11 +193,12 @@ pub(super) fn run(request: Request, progress: Arc<Progress>) -> Result<Output, S
     let input = root.join("input.json");
     let output = root.join("output.json");
     let log = root.join("worker.log");
-    serde_json::to_writer(
-        fs::File::create(&input).map_err(|e| e.to_string())?,
-        &request,
-    )
-    .map_err(|e| e.to_string())?;
+    {
+        let mut writer = BufWriter::new(fs::File::create(&input).map_err(|e| e.to_string())?);
+        serde_json::to_writer(&mut writer, &request).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+    }
+    progress.check()?;
     let mut command = Command::new(worker);
     command
         .arg(&input)
@@ -242,9 +268,23 @@ pub(super) fn run(request: Request, progress: Arc<Progress>) -> Result<Output, S
     if fs::metadata(&output).map_err(|e| e.to_string())?.len() > 128 * 1024 * 1024 {
         return Err("Ответ движка UV слишком большой".into());
     }
-    let result: Output =
-        serde_json::from_reader(fs::File::open(output).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("Повреждён ответ нативного движка UV: {e}"))?;
+    let result: Output = serde_json::from_reader(BufReader::new(
+        fs::File::open(output).map_err(|e| e.to_string())?,
+    ))
+    .map_err(|e| format!("Повреждён ответ нативного движка UV: {e}"))?;
+    if request.options.method == Method::Suggest {
+        let seed = request.options.seed.ok_or("Не выбрана грань для DA Wand")?;
+        if !result.suggestion.contains(&seed)
+            || result.suggestion.len() > request.triangles.len()
+            || result
+                .suggestion
+                .iter()
+                .any(|&i| i >= request.triangles.len())
+        {
+            return Err("Некорректное предложение DA Wand".into());
+        }
+        return Ok(result);
+    }
     if result.charts == 0
         || result.charts > request.triangles.len()
         || !result.utilization.is_finite()
@@ -286,6 +326,7 @@ mod tests {
             resolution: 1024,
             padding: 8,
             existing_uv: None,
+            options: Default::default(),
         }
     }
     #[test]
@@ -360,6 +401,7 @@ mod tests {
             threshold: 1.25,
             resolution: 1024,
             padding: 8,
+            options: Default::default(),
             existing_uv: Some(before.clone()),
         };
         let result = run(request, Arc::new(Progress::default())).unwrap();

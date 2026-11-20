@@ -155,7 +155,7 @@ impl Work {
                 },
             },
             Self::Import(paths) => {
-                let report = browser_files::import_images(&root, &parent, paths);
+                let report = browser_files::import_files(&root, &parent, paths);
                 let status = report.status();
                 Outcome { report, status }
             }
@@ -960,7 +960,7 @@ pub(in crate::editor) fn input(
                 });
             } else {
                 editor.status =
-                    "Перетащите изображения в папку или свободное место файлового менеджера".into();
+                    "Перетащите файлы в папку или свободное место файлового менеджера".into();
             }
             context.hovered.clear();
             context.target = None;
@@ -968,7 +968,7 @@ pub(in crate::editor) fn input(
     }
     if received {
         if !allowed || context.phase != Phase::Closed {
-            editor.status = "Закройте открытое меню или просмотр и перетащите изображения в папку файлового менеджера".into();
+            editor.status = "Закройте открытое меню или просмотр и перетащите файлы в папку файлового менеджера".into();
         }
         context.hovered.clear();
         context.target = None;
@@ -1505,7 +1505,7 @@ pub(in crate::editor) fn update(
             Work::Primitive { .. } => "Создание 3D-модели…",
             Work::Image { .. } => "Создание изображения…",
             Work::Scene { .. } => "Создание сцены…",
-            Work::Import(_) => "Добавление изображений…",
+            Work::Import(_) => "Добавление файлов…",
         };
         context.pending = Some(Import {
             parent: batch.parent,
@@ -1948,7 +1948,7 @@ pub(in crate::editor) fn refresh(
         }
         if let Ok(mut label) = labels.get_mut(interface.drop_label) {
             label.set_if_neq(Text(format!(
-                "Добавить изображения в «{}»",
+                "Добавить файлы в «{}»",
                 browser.folders[folder].label
             )));
         }

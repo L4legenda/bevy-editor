@@ -20,6 +20,7 @@ mod model_document;
 mod model_mesh;
 mod model_paint_data;
 mod model_primitives;
+mod model_source;
 mod model_uv_backend;
 mod model_uv_mesh;
 mod object_visibility;
@@ -1034,6 +1035,9 @@ impl Plugin for EditorPlugin {
         wireframe::register(app);
         if !app.is_plugin_added::<crate::HdriPlugin>() {
             app.add_plugins(crate::HdriPlugin);
+        }
+        if !app.is_plugin_added::<crate::runtime::FbxPlugin>() {
+            app.add_plugins(crate::runtime::FbxPlugin);
         }
         app.add_plugins((
             TabNavigationPlugin,

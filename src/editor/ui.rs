@@ -2085,8 +2085,12 @@ pub(super) fn refresh(
             } else {
                 "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
             }
-        } else if editor.viewing_model.is_some() {
-            "Модель · ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Tab — режим"
+        } else if let Some(model) = editor.viewing_model.and_then(|i| editor.project.catalog.get(i)) {
+            use crate::data::ModelFormat;
+            match ModelFormat::from_path(&model.asset) {
+                Some(ModelFormat::Fbx) => "Просмотр FBX · ПКМ + WASD — полёт · Alt+ЛКМ — орбита",
+                _ => "Модель · ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Tab — режим",
+            }
         } else if !editor.has_scene() {
             "Откройте сцену в файловом менеджере"
         } else if editor.pilot {
