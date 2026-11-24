@@ -228,20 +228,21 @@ fn gpu_browser_renames_files_without_losing_open_image_edits() {
     eprintln!("Rename screenshots: {}", output.display());
 }
 
-#[test]
-#[ignore = "requires GPU; duplicates an open GLB through the real file menu, selects copies and keeps the original tab and scene edits"]
-fn gpu_browser_duplicates_saved_models_from_the_file_menu() {
-    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
-        std::fs::create_dir_all(to).unwrap();
-        for entry in std::fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir() {
-                copy_tree(&entry.path(), &to.join(entry.file_name()));
-            } else {
-                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
-            }
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
         }
     }
+}
+
+#[test]
+#[ignore = "requires GPU; duplicates and recovers a GLB through the real file menu"]
+fn gpu_browser_duplicates_saved_models_from_the_file_menu() {
     let fixture = Fixture::new();
     let mut project = crate::EditorProject::load(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
@@ -342,7 +343,75 @@ fn gpu_browser_duplicates_saved_models_from_the_file_menu() {
         &output.join("02-created-copies.png"),
         |_| true,
     );
+    let recovered_bytes = std::fs::read(fixture.assets().join("models/blue_block.glb")).unwrap();
+    recovery::seed_abandoned_copy(&fixture.assets(), &original_path, &recovered_bytes);
+    let card = {
+        let world = app.world_mut();
+        world.query::<(Entity, &drawer::FileCard)>().iter(world)
+            .find(|(_, card)| card.0 == browser::Entry::Model(0)).unwrap().0
+    };
+    let point = rect(&mut app, card).center();
+    click(&mut app, window, point, MouseButton::Right);
+    let recover = app.world().resource::<ContextUi>().recover_model;
+    let point = rect(&mut app, recover).center();
+    click(&mut app, window, point, MouseButton::Left);
+    let recovered = original_path.with_file_name("block — восстановлено.glb");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    loop {
+        frame(&mut app);
+        let editor = app.world().resource::<Editor>();
+        if editor.viewing_model.is_some_and(|index| PathBuf::from(&editor.project.catalog[index].asset) == recovered) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", editor.status);
+    }
+    assert_eq!(std::fs::read(fixture.assets().join(recovered)).unwrap(), recovered_bytes);
+    assert_eq!(std::fs::read(fixture.assets().join(original_path)).unwrap(), original_bytes);
     eprintln!("Duplicate screenshots: {}", output.display());
+}
+
+#[test]
+#[ignore = "requires GPU; recovers the offered GLB with the real startup confirmation"]
+fn gpu_browser_offers_model_recovery_at_startup() {
+    let fixture = Fixture::new();
+    let mut project = crate::EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    copy_tree(&project.asset_root, &fixture.assets());
+    project.asset_root = fixture.assets();
+    let source = std::path::Path::new("models/block.glb");
+    let original = std::fs::read(project.asset_root.join(source)).unwrap();
+    let recovered = std::fs::read(project.asset_root.join("models/blue_block.glb")).unwrap();
+    recovery::seed_abandoned_copy(&project.asset_root, source, &recovered);
+    let (mut app, window, _) = lighting_ui_render::fixture_project(project);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    let button = loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let visible = world.query::<(Entity, &Control, &ComputedNode)>().iter(world)
+            .find(|(_, control, node)| matches!(control.action, Action::SaveAndContinue) && !node.is_empty())
+            .map(|(entity, _, _)| entity);
+        if let Some(entity) = visible {
+            break entity;
+        }
+        assert!(std::time::Instant::now() < deadline, "recovery confirmation did not appear");
+    };
+    assert_eq!(app.world().resource::<Editor>().pending, Some(crate::editor::PendingAction::RecoverModel));
+    assert_eq!(app.world().resource::<BrowserContext>().recovery_path(), Some(source));
+    let point = rect(&mut app, button).center();
+    click(&mut app, window, point, MouseButton::Left);
+    let target = source.with_file_name("block — восстановлено.glb");
+    loop {
+        frame(&mut app);
+        let editor = app.world().resource::<Editor>();
+        if editor.viewing_model.is_some_and(|index| std::path::Path::new(&editor.project.catalog[index].asset) == target) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", editor.status);
+    }
+    assert_eq!(std::fs::read(fixture.assets().join(target)).unwrap(), recovered);
+    assert_eq!(std::fs::read(fixture.assets().join(source)).unwrap(), original);
+    assert!(recovery::startup_offer(&fixture.assets(), &[]).is_none());
 }
 
 struct Fixture(PathBuf);
@@ -773,7 +842,7 @@ fn gpu_browser_context_menu_selects_files_and_separates_creation_actions() {
     click(&mut app, window, empty, MouseButton::Right);
     assert_menu(&app, None);
     assert!(app.world().resource::<Editor>().viewing_model.is_none());
-    let [(unwrap, _), (udim, _), (size, _), (bake, _)] =
+    let [(unwrap, _), (udim, _), (size, _), (bake, _), (quality, _), (names, _)] =
         app.world().resource::<ContextUi>().import_labels;
     for expected in [AutoUnwrap::All, AutoUnwrap::Off, AutoUnwrap::Missing] {
         let point = rect(&mut app, unwrap).center();
@@ -792,6 +861,15 @@ fn gpu_browser_context_menu_selects_files_and_separates_creation_actions() {
     let point = rect(&mut app, bake).center();
     click(&mut app, window, point, MouseButton::Left);
     assert!(app.world().resource::<UvState>().bake_on_load());
+    let point = rect(&mut app, quality).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert_eq!(
+        app.world().resource::<UvState>().bake_defaults().quality,
+        crate::editor::model_bake_settings::Quality::Standard,
+    );
+    let point = rect(&mut app, names).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(!app.world().resource::<UvState>().bake_defaults().match_names);
     capture_when(&mut app, &target, &output.join("02-empty-menu.png"), |_| {
         true
     });

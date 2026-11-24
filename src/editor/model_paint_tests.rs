@@ -506,15 +506,21 @@ fn paint_button_rect(app: &mut App, action: PaintAction) -> Rect {
 }
 
 fn scroll_to_paint_control(app: &mut App, action: PaintAction) {
-    use bevy::ui::{OverflowAxis, ScrollPosition};
-    let target = paint_button_rect(app, action).center().y;
     let world = app.world_mut();
     let mut buttons = world.query::<(Entity, &Control, &ComputedNode)>();
-    let mut entity = buttons.iter(world).find_map(|(entity, control, node)| {
+    let entity = buttons.iter(world).find_map(|(entity, control, node)| {
         (node.size().min_element() > 0.
             && matches!(control.action, Action::ModelView(ModelViewAction::Paint(value)) if value == action))
             .then_some(entity)
     }).unwrap();
+    scroll_to_paint_entity(app, entity);
+}
+
+fn scroll_to_paint_entity(app: &mut App, mut entity: Entity) {
+    use bevy::ui::{OverflowAxis, ScrollPosition};
+    let world = app.world_mut();
+    let target = world.get::<UiGlobalTransform>(entity).unwrap().affine().translation.y
+        * world.get::<ComputedNode>(entity).unwrap().inverse_scale_factor();
     while !world.get::<Node>(entity).is_some_and(|node| node.overflow.y == OverflowAxis::Scroll) {
         entity = world.get::<ChildOf>(entity).unwrap().parent();
     }
@@ -566,7 +572,7 @@ fn shift_fill_drag(app: &mut App, window: Entity, points: &[Vec2]) {
     paint_ready(app);
 }
 #[track_caller]
-fn paint_ready(app: &mut App) {
+pub(super) fn paint_ready(app: &mut App) {
     for _ in 0..600 {
         frame(app);
         if app
@@ -1503,6 +1509,59 @@ fn gpu_mesh_map_graph_updates_after_a_real_bake() {
 }
 
 #[test]
+#[ignore = "requires GPU; changes recovery preferences from the painting properties"]
+fn gpu_paint_sets_recovery_preferences_from_properties() {
+    let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(std::time::Instant::now() < deadline);
+    }
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(
+        editing::EditAction::Mode(Mode::Paint),
+    )));
+    warm(&mut app, 8);
+    paint_ready(&mut app);
+    scroll_to_paint_control(&mut app, PaintAction::ToggleRecovery);
+    paint_click(&mut app, window, PaintAction::ToggleRecovery);
+    assert!(!app.world().resource::<editing::recovery::Preferences>().settings().enabled);
+
+    let field = {
+        let world = app.world_mut();
+        world.query_filtered::<Entity, With<ui::RecoveryLimit>>().single(world).unwrap()
+    };
+    scroll_to_paint_entity(&mut app, field);
+    let point = labelled(&mut app, "Рисование: Правок между автокопиями").center();
+    let world = app.world();
+    let scale = world.get::<Window>(window).unwrap().scale_factor();
+    assert!(world.get::<bevy::ui::CalculatedClip>(field)
+        .is_none_or(|clip| clip.contains_point(point * scale)), "threshold field is clipped at {point:?}");
+    move_pointer(&mut app, window, point);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    for (typed, expected) in [("501", 10), ("37", 37)] {
+        app.world_mut().get_mut::<bevy::text::EditableText>(field).unwrap()
+            .editor_mut().set_text(typed);
+        fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Pressed);
+        fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Released);
+        assert_eq!(app.world().resource::<editing::recovery::Preferences>().settings().edits, expected);
+    }
+    paint_click(&mut app, window, PaintAction::ToggleRecovery);
+    let settings = app.world().resource::<editing::recovery::Preferences>().settings();
+    assert!(settings.enabled);
+    assert_eq!(settings.edits, 37);
+    assert!(!app.world().resource::<editing::State>().documents[&0].dirty());
+    let edits = app.world().resource::<editing::State>().documents[&0].recovery_edits;
+    let add = PaintAction::Add(LayerKind::Paint);
+    scroll_to_paint_control(&mut app, add);
+    paint_click(&mut app, window, add);
+    assert_eq!(app.world().resource::<editing::State>().documents[&0].recovery_edits, edits + 1);
+}
+
+#[test]
 #[ignore = "requires GPU; checks automatic bake for new texture sets and preserves saved maps"]
 fn gpu_paint_uses_import_resolution_and_bakes_unprepared_sets() {
     use crate::editor::{
@@ -1518,6 +1577,8 @@ fn gpu_paint_uses_import_resolution_and_bakes_unprepared_sets() {
             prefs.cycle_texture_size().unwrap();
         }
         prefs.toggle_bake_on_load().unwrap();
+        prefs.cycle_bake_quality().unwrap();
+        prefs.toggle_bake_match_names().unwrap();
     }
     app.world_mut().write_message(Action::ViewModel(0));
     for _ in 0..240 {
@@ -1545,6 +1606,8 @@ fn gpu_paint_uses_import_resolution_and_bakes_unprepared_sets() {
         let doc = editing.documents.get_mut(&0).unwrap();
         assert_eq!(doc.paint_default_size, 512);
         assert!(doc.auto_bake_pending);
+        assert_eq!(doc.bake_settings.quality, bake::Quality::Standard);
+        assert!(!doc.bake_settings.match_names);
         let object = &mut doc.objects[0];
         object.materials = vec![object.materials[0].clone(); 3];
         object.materials[2].paint = Some(saved.clone());
@@ -5274,7 +5337,11 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
     warm(&mut app, 4);
     let zoomed = uv_rect::<engine::TextureCanvas>(&mut app);
     assert!(zoomed.width() > fitted.width() * 2.);
-    assert!((zoomed.min + anchor_uv * zoomed.size()).distance(anchor) < 1.5);
+    let anchor_error = (zoomed.min + anchor_uv * zoomed.size()).distance(anchor);
+    // Pixel snapping affects both rectangles. The old rounding is magnified by the zoom.
+    let scale = app.world().get::<Window>(window).unwrap().scale_factor();
+    let snap_error = (1. + zoomed.width() / fitted.width()) * std::f32::consts::FRAC_1_SQRT_2 / scale;
+    assert!(anchor_error <= snap_error, "UV zoom shifted its anchor by {anchor_error:.2}px");
     let button = |app: &mut App, state| {
         app.world_mut().write_message(bevy::input::mouse::MouseButtonInput {
             window, button: MouseButton::Right, state,
@@ -6357,7 +6424,15 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
         editing::EditAction::Operate(crate::editor::model_document::Operation::Extrude),
         Some(0)
     ));
-    let side = labelled(&mut app, "Рисование: слои и свойства");
+    let side = {
+        let world = app.world_mut();
+        world.query::<(&sidebar::PanelBody, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find_map(|(panel, node, transform)| {
+                (panel.0 == Panel::Layers).then(|| engine::node_rect(node, transform)).flatten()
+            })
+            .unwrap()
+    };
     let shelf = labelled(&mut app, "Рисование: библиотека ресурсов");
     let uv = labelled(&mut app, "Рисование: 2D-вид UV");
     let view = labelled(&mut app, "3D-вид модели");

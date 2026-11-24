@@ -234,17 +234,6 @@ impl Sampling {
 }
 
 impl Quality {
-    pub(super) const ALL: [Self; 4] = [Self::Draft, Self::Standard, Self::High, Self::Ultra];
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Draft => "Черновик",
-            Self::Standard => "Стандарт",
-            Self::High => "Высокое",
-            Self::Ultra => "Максимум",
-        }
-    }
-
     pub(super) fn hint(self) -> &'static str {
         match self {
             Self::Draft => "1 проба проекции на тексель. Лучи AO, толщины и неба — 16, 8 и 8.",

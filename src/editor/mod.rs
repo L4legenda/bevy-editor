@@ -174,6 +174,8 @@ enum Action {
     BrowserDetectUdim,
     BrowserTextureSize,
     BrowserBakeOnLoad,
+    BrowserBakeQuality,
+    BrowserBakeMatchNames,
     BrowserCreateScene,
     BrowserDialogueMenu,
     BrowserPrimitiveMenu,
@@ -186,6 +188,7 @@ enum Action {
     BrowserRenameFile,
     BrowserConfirmRename,
     BrowserDuplicateFile,
+    BrowserRecoverModel,
     BrowserRestoreFile,
     ViewImage(usize),
     EditBrowserImage(usize, u64),
@@ -230,6 +233,7 @@ enum PendingAction {
     CloseImageEditor(usize),
     CloseModelTab(usize),
     CloseModelEditor(usize),
+    RecoverModel,
     Close,
 }
 
@@ -422,6 +426,8 @@ impl Editor {
                 | Action::BrowserDetectUdim
                 | Action::BrowserTextureSize
                 | Action::BrowserBakeOnLoad
+                | Action::BrowserBakeQuality
+                | Action::BrowserBakeMatchNames
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -436,6 +442,7 @@ impl Editor {
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
+                | Action::BrowserRecoverModel
                 | Action::BrowserRestoreFile
         )
     }
@@ -1766,6 +1773,8 @@ fn handle_actions(
                 | Action::BrowserDetectUdim
                 | Action::BrowserTextureSize
                 | Action::BrowserBakeOnLoad
+                | Action::BrowserBakeQuality
+                | Action::BrowserBakeMatchNames
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -1781,6 +1790,7 @@ fn handle_actions(
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
+                | Action::BrowserRecoverModel
                 | Action::BrowserRestoreFile
                 | Action::OpenImageTab(_)
                 | Action::CloseImageTab(_)
@@ -1808,6 +1818,7 @@ fn handle_actions(
                     | PendingAction::CloseImageEditor(_)
                     | PendingAction::CloseModelTab(_)
                     | PendingAction::CloseModelEditor(_)
+                    | PendingAction::RecoverModel
             )
         ) {
             continue;
@@ -2066,6 +2077,7 @@ fn continue_pending(editor: &mut Editor) {
         Some(PendingAction::CloseImageEditor(_)) => editor.continue_exit(),
         Some(PendingAction::CloseModelTab(id)) => editor.close_model_tab(id),
         Some(PendingAction::CloseModelEditor(_)) => editor.continue_exit(),
+        Some(PendingAction::RecoverModel) => {}
         None => {}
     }
 }

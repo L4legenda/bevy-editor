@@ -2,6 +2,7 @@
 use super::*;
 use crate::editor::{model_uv_backend as backend, model_uv_mesh as topology};
 use crate::editor::model_import_mesh::AutoUnwrap;
+use crate::editor::model_bake_settings;
 use bevy::tasks::{IoTaskPool, Task, block_on, poll_once};
 use bevy::window::RequestRedraw;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +54,7 @@ struct ImportPreferences {
     auto_unwrap: AutoUnwrap,
     texture_size: u32,
     bake_on_load: bool,
+    bake_defaults: model_bake_settings::Defaults,
     #[serde(skip)]
     path: Option<PathBuf>,
 }
@@ -64,6 +66,7 @@ impl Default for ImportPreferences {
             auto_unwrap: AutoUnwrap::default(),
             texture_size: crate::editor::model_paint_data::DEFAULT_SIZE,
             bake_on_load: false,
+            bake_defaults: model_bake_settings::Defaults::default(),
             path: None,
         }
     }
@@ -278,6 +281,18 @@ impl UvState {
 
     pub(in crate::editor) fn toggle_bake_on_load(&mut self) -> std::io::Result<()> {
         self.import.update(|prefs| prefs.bake_on_load = !prefs.bake_on_load)
+    }
+
+    pub(in crate::editor) fn bake_defaults(&self) -> model_bake_settings::Defaults {
+        self.import.bake_defaults
+    }
+
+    pub(in crate::editor) fn cycle_bake_quality(&mut self) -> std::io::Result<()> {
+        self.import.update(|prefs| prefs.bake_defaults.quality = prefs.bake_defaults.quality.next())
+    }
+
+    pub(in crate::editor) fn toggle_bake_match_names(&mut self) -> std::io::Result<()> {
+        self.import.update(|prefs| prefs.bake_defaults.match_names = !prefs.bake_defaults.match_names)
     }
 
     pub(super) fn display_geometry(&self, index: usize, object: &Object) -> document::MeshData {

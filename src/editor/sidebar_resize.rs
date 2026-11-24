@@ -1,5 +1,6 @@
 //! Shared sidebar width and the split between the tree and inspector.
 use super::*;
+use crate::editor::ui::model_viewer::paint::PaintDock;
 use bevy::{
     input_focus::FocusCause,
     ui::CalculatedClip,
@@ -374,6 +375,7 @@ pub(in crate::editor) fn resize(
 
 pub(in crate::editor) fn layout(
     editor: Res<Editor>,
+    paint: Option<Res<PaintDock>>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut panes: Query<
         (&mut Node, Has<Sidebar>, Has<Inspector>, Option<&Axis>),
@@ -388,12 +390,18 @@ pub(in crate::editor) fn layout(
         );
     for (mut node, sidebar, inspector, axis) in &mut panes {
         if sidebar {
-            node.display = if editor.generation.active || editor.viewing_image.is_some() {
+            let display = if editor.generation.active || editor.viewing_image.is_some()
+                || paint.as_ref().is_some_and(|dock| dock.uses_full_width())
+            {
                 Display::None
             } else {
                 Display::Flex
             };
-            node.width = px(layout.width(window.width()));
+            let width = px(layout.width(window.width()));
+            if (node.display, node.width) != (display, width) {
+                node.display = display;
+                node.width = width;
+            }
         } else if inspector {
             node.height = px(layout.inspector_height(window.height(), light));
             node.min_height = px(0);

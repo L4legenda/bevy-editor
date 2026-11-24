@@ -33,6 +33,8 @@ enum Tab {
     GraphPreview,
     Graph,
     NodeSettings,
+    View3d,
+    View2d,
 }
 
 impl Tab {
@@ -47,6 +49,8 @@ impl Tab {
             Self::GraphPreview => 10,
             Self::Graph => 11,
             Self::NodeSettings => 12,
+            Self::View3d => 13,
+            Self::View2d => 14,
         }
     }
 
@@ -65,6 +69,8 @@ impl Tab {
             Self::GraphPreview => "Модель",
             Self::Graph => "Холст",
             Self::NodeSettings => "Параметры узлов",
+            Self::View3d => "3D-вид",
+            Self::View2d => "2D-вид · UV",
         }
     }
 }
@@ -84,6 +90,12 @@ enum Layout {
 
 impl Default for Layout {
     fn default() -> Self {
+        Self::paint(Self::legacy_sidebar(), super::dock::LegacyLayout::default())
+    }
+}
+
+impl Layout {
+    fn legacy_sidebar() -> Self {
         Self::Split {
             horizontal: false,
             fraction: 0.43,
@@ -96,9 +108,28 @@ impl Default for Layout {
             ]),
         }
     }
-}
 
-impl Layout {
+    fn paint(sidebar: Self, views: super::dock::LegacyLayout) -> Self {
+        let model_first = matches!(views.model_side, Side::Left | Side::Top);
+        let (tabs, fraction) = if model_first {
+            ([Tab::View3d, Tab::View2d], views.model_fraction)
+        } else {
+            ([Tab::View2d, Tab::View3d], 1. - views.model_fraction)
+        };
+        Self::Split {
+            horizontal: true,
+            fraction: 0.74,
+            children: Box::new([
+                Self::Split {
+                    horizontal: views.model_side.horizontal(),
+                    fraction: fraction.clamp(0.2, 0.8),
+                    children: Box::new(tabs.map(Self::single)),
+                },
+                sidebar,
+            ]),
+        }
+    }
+
     #[cfg(test)]
     fn valid(&self) -> bool {
         self.valid_for(Workspace::Paint)
@@ -144,12 +175,19 @@ impl Layout {
                 Workspace::Graph => {
                     seen == HashSet::from([Tab::GraphPreview, Tab::Graph, Tab::NodeSettings])
                 }
-                Workspace::Paint => {
+                Workspace::Paint | Workspace::LegacyPaint => {
+                    let has_views = matches!(workspace, Workspace::Paint);
                     PANELS
                         .iter()
                         .all(|&panel| seen.contains(&Tab::Panel(panel)))
                         && seen.contains(&Tab::Properties)
-                        && seen.len() == PANELS.len() + 1 + usize::from(seen.contains(&Tab::Shelf))
+                        && seen.contains(&Tab::View3d) == has_views
+                        && seen.contains(&Tab::View2d) == has_views
+                        && seen.len()
+                            == PANELS.len()
+                                + 1
+                                + usize::from(seen.contains(&Tab::Shelf))
+                                + if has_views { 2 } else { 0 }
                 }
             }
     }
@@ -230,16 +268,35 @@ impl Layout {
         }
     }
 
-    fn minimum_size(&self) -> Vec2 {
+    fn showing(&self, views: DockViews) -> bool {
         match self {
-            Self::Group { .. } => Vec2::new(82., 70.),
+            Self::Group { tabs, .. } => tabs.iter().any(|&tab| views.shows(tab)),
+            Self::Split { children, .. } => children.iter().any(|child| child.showing(views)),
+        }
+    }
+
+    fn visible_tabs(&self, views: DockViews, visit: &mut impl FnMut(Tab)) {
+        self.walk(&mut |tabs, active| {
+            if let Some(active) = views.active(tabs, active) {
+                visit(active);
+            }
+        });
+    }
+
+    fn minimum_size(&self, views: DockViews) -> Vec2 {
+        match self {
+            Self::Group { .. } if self.showing(views) => Vec2::new(82., 70.),
+            Self::Group { .. } => Vec2::ZERO,
             Self::Split {
                 horizontal,
                 children,
                 ..
             } => {
-                let first = children[0].minimum_size();
-                let second = children[1].minimum_size();
+                let first = children[0].minimum_size(views);
+                let second = children[1].minimum_size(views);
+                if first == Vec2::ZERO || second == Vec2::ZERO {
+                    return first + second;
+                }
                 if *horizontal {
                     Vec2::new(first.x + DIVIDER + second.x, first.y.max(second.y))
                 } else {
@@ -326,6 +383,15 @@ mod tests {
     };
     use bevy::input::ButtonState;
 
+    fn group_for(state: &State, tab: Tab) -> &Group {
+        state
+            .dock
+            .groups
+            .iter()
+            .find(|group| group.tabs.iter().any(|&(_, candidate)| candidate == tab))
+            .unwrap()
+    }
+
     #[test]
     fn paint_sidebar_splits_merges_and_round_trips_unique_tabs() {
         let maps = Tab::Panel(Panel::Maps);
@@ -349,9 +415,9 @@ mod tests {
         assert!(merged.valid());
         let mut groups = Vec::new();
         merged.walk(&mut |tabs, active| groups.push((tabs.to_vec(), active)));
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0[..2], [maps, layers]);
-        assert_eq!(groups[0].1, maps);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[2].0[..2], [maps, layers]);
+        assert_eq!(groups[2].1, maps);
         let docked = merged
             .move_tab(
                 Tab::Shelf,
@@ -363,6 +429,216 @@ mod tests {
         assert!(docked.contains(Tab::Shelf));
         let restored = docked.without(Tab::Shelf).unwrap();
         assert_eq!(restored, merged);
+    }
+
+    #[test]
+    fn paint_dock_migrates_both_layouts_and_filters_views_without_losing_tabs() {
+        let legacy = Layout::legacy_sidebar();
+        assert!(legacy.valid_for(Workspace::LegacyPaint));
+        assert!(!legacy.valid_for(Workspace::Paint));
+        let layout = Layout::paint(
+            legacy.clone(),
+            super::super::dock::LegacyLayout {
+                model_side: Side::Bottom,
+                model_fraction: 0.75,
+            },
+        );
+        assert_eq!(layout.split_at(&[]).unwrap().0[1], legacy);
+        let (views, fraction) = layout.split_at(&[0]).unwrap();
+        assert_eq!(fraction, 0.25);
+        assert!(views[0].contains(Tab::View2d));
+        assert!(views[1].contains(Tab::View3d));
+        let mixed = layout
+            .move_tab(
+                Tab::View2d,
+                Tab::Properties,
+                Placement::Tabs { before: None },
+            )
+            .unwrap();
+        assert!(mixed.valid());
+        let visible = |views| {
+            let mut tabs = Vec::new();
+            mixed.visible_tabs(views, &mut |tab| tabs.push(tab));
+            tabs
+        };
+        assert!(visible(DockViews::Both).contains(&Tab::View2d));
+        assert!(visible(DockViews::Model).contains(&Tab::Properties));
+        assert!(!visible(DockViews::Model).contains(&Tab::View2d));
+        assert!(!visible(DockViews::Hidden).contains(&Tab::View3d));
+        assert_eq!(
+            serde_json::from_slice::<Layout>(&serde_json::to_vec(&mixed).unwrap()).unwrap(),
+            mixed
+        );
+    }
+
+    #[test]
+    #[ignore = "requires GPU; moves the actual model and UV views between groups"]
+    fn gpu_paint_dock_moves_views_across_workspace_and_switches_modes() {
+        let project = crate::EditorProject::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/legacy/project.json"),
+        )
+        .unwrap();
+        let (mut app, window, _target) = fixture_project(project);
+        app.world_mut().resource_mut::<Editor>().drawer = false;
+        app.world_mut().write_message(Action::ViewModel(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        loop {
+            frame(&mut app);
+            if app
+                .world()
+                .resource::<editing::State>()
+                .documents
+                .contains_key(&0)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}",
+                app.world().resource::<Editor>().status
+            );
+        }
+        {
+            let mut editing = app.world_mut().resource_mut::<editing::State>();
+            let doc = editing.documents.get_mut(&0).unwrap();
+            for face in &mut doc.objects[0].geometry.faces {
+                for (corner, uv) in
+                    face.corners
+                        .iter_mut()
+                        .zip([Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y])
+                {
+                    corner.uv = uv;
+                }
+            }
+            doc.revision += 1;
+        }
+        app.world_mut()
+            .write_message(Action::ModelView(ModelViewAction::Edit(
+                editing::EditAction::Mode(Mode::Paint),
+            )));
+        for _ in 0..8 {
+            frame(&mut app);
+        }
+
+        #[track_caller]
+        fn rect(app: &App, entity: Entity) -> Rect {
+            let world = app.world();
+            engine::node_rect(
+                world.get::<ComputedNode>(entity).unwrap(),
+                world.get::<UiGlobalTransform>(entity).unwrap(),
+            )
+            .unwrap_or_else(|| panic!("Dock entity {entity} has an empty layout rectangle"))
+        }
+        let body =
+            |app: &App, tab: Tab| app.world().resource::<State>().bodies[tab.index()].unwrap();
+        let group = |app: &App, tab| group_for(app.world().resource::<State>(), tab).frame;
+        let tab = |app: &App, tab| {
+            group_for(app.world().resource::<State>(), tab)
+                .tabs
+                .iter()
+                .find(|&&(_, candidate)| candidate == tab)
+                .unwrap()
+                .0
+        };
+        let drag = |app: &mut App, from, to| {
+            move_pointer(app, window, from);
+            mouse(app, window, ButtonState::Pressed);
+            move_pointer(app, window, to);
+            mouse(app, window, ButtonState::Released);
+            for _ in 0..5 {
+                frame(app);
+            }
+        };
+        let set_view = |app: &mut App, view| {
+            app.world_mut()
+                .write_message(Action::ModelView(ModelViewAction::Paint(
+                    PaintAction::View(view),
+                )));
+            for _ in 0..5 {
+                frame(app);
+            }
+        };
+        let model = body(&app, Tab::View3d);
+        let uv = body(&app, Tab::View2d);
+        let properties = body(&app, Tab::Properties);
+        let old_model = rect(&app, model);
+        let target = rect(&app, group(&app, Tab::Properties));
+        let from = rect(&app, tab(&app, Tab::View3d)).center();
+        drag(
+            &mut app,
+            from,
+            Vec2::new(target.center().x, target.min.y + target.height() * 0.18),
+        );
+        assert!(rect(&app, model).min.x > old_model.min.x + 200.);
+        assert!(rect(&app, model).max.y <= rect(&app, properties).min.y);
+        let canvas = {
+            let world = app.world_mut();
+            world
+                .query_filtered::<Entity, With<crate::editor::ui::model_viewer::Canvas>>()
+                .single(world)
+                .unwrap()
+        };
+        let point = rect(&app, canvas).center();
+        assert!(rect(&app, model).contains(point));
+        let stroke = |app: &mut App, point| {
+            let undo = app.world().resource::<PaintState>().sessions[&0].undo.len();
+            let recovery_edits = app.world().resource::<editing::State>().documents[&0].recovery_edits;
+            move_pointer(app, window, point);
+            mouse(app, window, ButtonState::Pressed);
+            mouse(app, window, ButtonState::Released);
+            super::super::tests::paint_ready(app);
+            assert_eq!(
+                app.world().resource::<PaintState>().sessions[&0].undo.len(),
+                undo + 1,
+                "{}",
+                app.world().resource::<Editor>().status
+            );
+            assert_eq!(app.world().resource::<editing::State>().documents[&0].recovery_edits,
+                recovery_edits + 1);
+        };
+        stroke(&mut app, point);
+
+        let target = rect(&app, tab(&app, Tab::Properties)).center();
+        let from = rect(&app, tab(&app, Tab::View2d)).center();
+        drag(&mut app, from, target);
+        assert_eq!(group(&app, Tab::View2d), group(&app, Tab::Properties));
+        assert_eq!(
+            app.world().get::<Node>(properties).unwrap().display,
+            Display::None
+        );
+        let texture = {
+            let world = app.world_mut();
+            world
+                .query_filtered::<Entity, With<engine::TextureCanvas>>()
+                .single(world)
+                .unwrap()
+        };
+        let image = rect(&app, texture);
+        let point = image.center() + Vec2::X * image.width() * 0.25;
+        assert!(rect(&app, uv).contains(point));
+        stroke(&mut app, point);
+        set_view(&mut app, View::Three);
+        assert_eq!(app.world().get::<Node>(uv).unwrap().display, Display::None);
+        let _ = rect(&app, properties);
+        set_view(&mut app, View::Two);
+        assert_eq!(
+            app.world().get::<Node>(model).unwrap().display,
+            Display::None
+        );
+        let _ = rect(&app, uv);
+        set_view(&mut app, View::Split);
+        let _ = rect(&app, model);
+        assert_eq!(group(&app, Tab::View2d), group(&app, Tab::Properties));
+        app.world_mut()
+            .write_message(Action::ModelView(ModelViewAction::Paint(
+                PaintAction::Reset,
+            )));
+        for _ in 0..5 {
+            frame(&mut app);
+        }
+        assert_eq!(app.world().resource::<State>().layout, Layout::default());
+        assert!(rect(&app, model).max.x <= rect(&app, uv).min.x);
     }
 
     #[test]
@@ -442,7 +718,7 @@ mod tests {
                 shelf.body,
                 shelf.home,
                 shelf.overlay,
-                state.dock.groups[1].frame,
+                group_for(state, Tab::Properties).frame,
             )
         };
         let old_height = rect(&app, canvas).height();
@@ -571,7 +847,10 @@ mod tests {
                 frame(app);
             }
         };
-        let properties = rect(&app, app.world().resource::<State>().dock.groups[1].frame);
+        let properties = rect(
+            &app,
+            group_for(app.world().resource::<State>(), Tab::Properties).frame,
+        );
         let from = rect(&app, tab(&app, maps)).center();
         drag(
             &mut app,
@@ -579,7 +858,7 @@ mod tests {
             Vec2::new(properties.center().x, properties.max.y - 8.),
         );
         let state = app.world().resource::<State>();
-        assert_eq!(state.dock.groups.len(), 3);
+        assert_eq!(state.dock.groups.len(), 5);
         let (layers_body, maps_body) = (state.bodies[0].unwrap(), state.bodies[1].unwrap());
         assert!(rect(&app, layers_body).max.y < rect(&app, maps_body).min.y);
         for body in [layers_body, maps_body] {
@@ -603,6 +882,16 @@ mod tests {
                 .unwrap()
                 .0
         };
+        let bounds = rect(&app, maps_body);
+        let initial = rect(&app, map_options).center();
+        if initial.y >= bounds.max.y {
+            app.world_mut()
+                .get_mut::<ScrollPosition>(maps_body)
+                .unwrap()
+                .0
+                .y = initial.y - bounds.center().y;
+            frame(&mut app);
+        }
         let options = rect(&app, map_options).center();
         assert!(rect(&app, maps_body).contains(options));
         move_pointer(&mut app, window, options);
@@ -620,7 +909,7 @@ mod tests {
         let to = rect(&app, tab(&app, layers)).center();
         drag(&mut app, from, to);
         let state = app.world().resource::<State>();
-        assert_eq!(state.dock.groups.len(), 2);
+        assert_eq!(state.dock.groups.len(), 4);
         assert_eq!(
             app.world().get::<Node>(layers_body).unwrap().display,
             Display::None
@@ -639,7 +928,7 @@ mod tests {
                 .dock
                 .dividers
                 .iter()
-                .find(|split| split.path.is_empty())
+                .find(|split| split.path == [1])
                 .unwrap();
             (split.handle, split.members[0], state.tree)
         };
@@ -653,31 +942,35 @@ mod tests {
         mouse(&mut app, window, ButtonState::Released);
         assert_eq!(app.world().resource::<State>().tree, tree);
         let saved: Layout = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert!(saved.split_at(&[]).unwrap().1 > 0.43);
+        assert!(saved.split_at(&[1]).unwrap().1 > 0.43);
 
-        let properties = rect(&app, app.world().resource::<State>().dock.groups[1].frame);
+        let properties = rect(
+            &app,
+            group_for(app.world().resource::<State>(), Tab::Properties).frame,
+        );
         let from = rect(&app, tab(&app, layers)).center();
         drag(
             &mut app,
             from,
             Vec2::new(properties.max.x - 8., properties.center().y),
         );
-        let (grip, right) = {
+        let (grip, right, path) = {
             let state = app.world().resource::<State>();
+            let layers_frame = group_for(state, layers).frame;
             let split = state
                 .dock
                 .dividers
                 .iter()
-                .find(|split| split.side.horizontal())
+                .find(|split| split.side.horizontal() && split.members[1] == layers_frame)
                 .unwrap();
-            (split.handle, split.members[1])
+            (split.handle, split.members[1], split.path.clone())
         };
         let from = rect(&app, grip).center();
         let width = rect(&app, right).width();
         drag(&mut app, from, from - Vec2::X * 30.);
         assert!(rect(&app, right).width() > width + 25.);
         let saved: Layout = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert!(saved.split_at(&[1]).unwrap().1 < 0.5);
+        assert!(saved.split_at(&path).unwrap().1 < 0.5);
         app.world_mut()
             .write_message(Action::ModelView(ModelViewAction::Paint(
                 PaintAction::Reset,
@@ -697,6 +990,31 @@ enum Placement {
     Edge(Side),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum DockViews {
+    #[default]
+    Both,
+    Model,
+    Uv,
+    Hidden,
+}
+
+impl DockViews {
+    fn shows(self, tab: Tab) -> bool {
+        match tab {
+            Tab::View3d => matches!(self, Self::Both | Self::Model),
+            Tab::View2d => matches!(self, Self::Both | Self::Uv),
+            _ => true,
+        }
+    }
+
+    fn active(self, tabs: &[Tab], active: Tab) -> Option<Tab> {
+        self.shows(active)
+            .then_some(active)
+            .or_else(|| tabs.iter().copied().find(|&tab| self.shows(tab)))
+    }
+}
+
 struct Group {
     frame: Entity,
     header: Entity,
@@ -712,12 +1030,18 @@ struct Divider {
 }
 
 impl Divider {
-    fn fraction(&self, layout: &Layout, frame: Rect, cursor: Vec2) -> Option<f32> {
+    fn fraction(
+        &self,
+        layout: &Layout,
+        views: DockViews,
+        frame: Rect,
+        cursor: Vec2,
+    ) -> Option<f32> {
         let (children, _) = layout.split_at(&self.path)?;
         let axis = if self.side.horizontal() { 0 } else { 1 };
         let length = (frame.size()[axis] - DIVIDER).max(1.);
-        let lower = (children[0].minimum_size()[axis] / length).max(0.2);
-        let upper = (1. - children[1].minimum_size()[axis] / length).min(0.8);
+        let lower = (children[0].minimum_size(views)[axis] / length).max(0.2);
+        let upper = (1. - children[1].minimum_size(views)[axis] / length).min(0.8);
         (lower <= upper).then(|| self.side.size_from_edge(frame, cursor).clamp(lower, upper))
     }
 }
@@ -735,10 +1059,12 @@ struct DockNodes {
 }
 
 #[derive(Resource)]
-pub(in crate::editor::ui::model_viewer) struct State {
+pub(in crate::editor) struct State {
     path: Option<PathBuf>,
     layout: Layout,
     rendered: Option<Layout>,
+    views: DockViews,
+    rendered_views: DockViews,
     focus: Option<(usize, Panel)>,
     root: Entity,
     tree: Option<Entity>,
@@ -758,6 +1084,7 @@ pub(in crate::editor::ui::model_viewer) struct GraphDock(State);
 #[derive(Clone, Copy)]
 enum Workspace {
     Paint,
+    LegacyPaint,
     Shader,
     Graph,
 }
@@ -765,7 +1092,8 @@ enum Workspace {
 impl Workspace {
     fn file(self) -> &'static str {
         match self {
-            Self::Paint => "paint-sidebar.json",
+            Self::Paint => "paint-workspace.json",
+            Self::LegacyPaint => "paint-sidebar.json",
             Self::Shader => "paint-shader-layout.json",
             Self::Graph => "paint-graph-layout.json",
         }
@@ -774,6 +1102,7 @@ impl Workspace {
     fn layout(self) -> Layout {
         match self {
             Self::Paint => Layout::default(),
+            Self::LegacyPaint => Layout::legacy_sidebar(),
             Self::Shader => Layout::shader(),
             Self::Graph => Layout::graph(),
         }
@@ -801,6 +1130,10 @@ pub(super) struct ShelfDock {
 }
 
 impl State {
+    pub(in crate::editor) fn uses_full_width(&self) -> bool {
+        self.focus.is_some() && self.views != DockViews::Hidden
+    }
+
     fn reset(&mut self, workspace: Workspace) {
         self.layout = workspace.layout();
         self.drag = None;
@@ -811,7 +1144,7 @@ impl State {
 
     pub(super) fn visible_panels(&self) -> [bool; 5] {
         let mut visible = [false; 5];
-        self.layout.walk(&mut |_, active| {
+        self.layout.visible_tabs(self.views, &mut |active| {
             if let Tab::Panel(panel) = active {
                 visible[panel_index(panel)] = true;
             }
@@ -826,7 +1159,7 @@ impl State {
     pub(super) fn shelf_tab_visible(&self) -> bool {
         let mut visible = false;
         self.layout
-            .walk(&mut |_, active| visible |= active == Tab::Shelf);
+            .visible_tabs(self.views, &mut |active| visible |= active == Tab::Shelf);
         visible
     }
 
@@ -848,12 +1181,15 @@ pub(super) fn setup(
     stacks: [Entity; 5],
     properties: Entity,
     shelf: ShelfDock,
+    viewports: [Entity; 2],
 ) {
-    let bodies = stacks
+    let mut bodies: Vec<_> = stacks
         .into_iter()
         .chain([properties, shelf.body])
         .map(Some)
         .collect();
+    bodies.resize(Tab::View3d.index(), None);
+    bodies.extend(viewports.map(Some));
     let state = make_state(commands, root, bodies, Some(shelf), Workspace::Paint);
     commands.insert_resource(state);
     for (body, panel) in stacks.into_iter().zip(PANELS) {
@@ -899,8 +1235,18 @@ fn make_state(
     let layout = path
         .as_deref()
         .and_then(|path| {
-            let layout = serde_json::from_slice::<Layout>(&read_limited(path, 8192).ok()?).ok()?;
-            layout.valid_for(workspace).then_some(layout)
+            read_layout(path, workspace).or_else(|| {
+                if !matches!(workspace, Workspace::Paint) {
+                    return None;
+                }
+                let root = path.parent()?;
+                let legacy = Workspace::LegacyPaint;
+                let sidebar = read_layout(&root.join(legacy.file()), legacy)
+                    .unwrap_or_else(|| legacy.layout());
+                let views = super::dock::LegacyLayout::load(&root.join("paint-layout.json"))
+                    .unwrap_or_default();
+                Some(Layout::paint(sidebar, views))
+            })
         })
         .unwrap_or_else(|| workspace.layout());
     let preview_zone = commands
@@ -923,12 +1269,19 @@ fn make_state(
         bodies,
         shelf,
         rendered: None,
+        views: DockViews::Both,
+        rendered_views: DockViews::Both,
         focus: None,
         tree: None,
         preview: preview_zone,
         dock: DockNodes::default(),
         drag: None,
     }
+}
+
+fn read_layout(path: &std::path::Path, workspace: Workspace) -> Option<Layout> {
+    let layout = serde_json::from_slice::<Layout>(&read_limited(path, 8192).ok()?).ok()?;
+    layout.valid_for(workspace).then_some(layout)
 }
 
 fn paint_tab(
@@ -986,6 +1339,7 @@ fn spawn_layout(
     parent: Entity,
     font: &Handle<Font>,
     layout: &Layout,
+    views: DockViews,
     weight: f32,
     bodies: &[Option<Entity>],
     dock: &mut DockNodes,
@@ -993,6 +1347,11 @@ fn spawn_layout(
     nodes: &mut Query<&mut Node>,
 ) -> Entity {
     let shape = Node {
+        display: if layout.showing(views) {
+            Display::Flex
+        } else {
+            Display::None
+        },
         align_self: AlignSelf::Stretch,
         min_width: px(0),
         min_height: px(0),
@@ -1007,6 +1366,13 @@ fn spawn_layout(
             fraction,
             children,
         } => {
+            let split_visible = children.iter().all(|child| child.showing(views));
+            // A single flex child with a fractional grow factor leaves unused space.
+            let weights = if split_visible {
+                [*fraction, 1. - *fraction]
+            } else {
+                [1., 1.]
+            };
             let frame = node(
                 commands,
                 parent,
@@ -1026,7 +1392,8 @@ fn spawn_layout(
                 frame,
                 font,
                 &children[0],
-                *fraction,
+                views,
+                weights[0],
                 bodies,
                 dock,
                 &child_path,
@@ -1051,6 +1418,11 @@ fn spawn_layout(
                 commands,
                 frame,
                 Node {
+                    display: if split_visible {
+                        Display::Flex
+                    } else {
+                        Display::None
+                    },
                     width,
                     height,
                     flex_shrink: 0.,
@@ -1067,22 +1439,26 @@ fn spawn_layout(
                 frame,
                 font,
                 &children[1],
-                1. - *fraction,
+                views,
+                weights[1],
                 bodies,
                 dock,
                 &child_path,
                 nodes,
             );
-            dock.dividers.push(Divider {
-                handle,
-                frame,
-                members: [first, second],
-                path: path.to_vec(),
-                side,
-            });
+            if split_visible {
+                dock.dividers.push(Divider {
+                    handle,
+                    frame,
+                    members: [first, second],
+                    path: path.to_vec(),
+                    side,
+                });
+            }
             frame
         }
         Layout::Group { tabs, active } => {
+            let active = views.active(tabs, *active);
             let frame = node(commands, parent, shape);
             let header = surface(
                 commands,
@@ -1099,20 +1475,29 @@ fn spawn_layout(
             );
             let buttons = tabs
                 .iter()
-                .map(|&tab| (paint_tab(commands, header, font, tab, tab == *active), tab))
-                .collect();
-            dock.groups.push(Group {
-                frame,
-                header,
-                tabs: buttons,
-            });
+                .copied()
+                .filter(|&tab| views.shows(tab))
+                .map(|tab| {
+                    (
+                        paint_tab(commands, header, font, tab, Some(tab) == active),
+                        tab,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !buttons.is_empty() {
+                dock.groups.push(Group {
+                    frame,
+                    header,
+                    tabs: buttons,
+                });
+            }
             for &tab in tabs {
                 let Some(body) = bodies.get(tab.index()).copied().flatten() else {
                     continue;
                 };
                 commands.entity(body).insert(ChildOf(frame));
                 if let Ok(mut node) = nodes.get_mut(body) {
-                    node.display = if tab == *active {
+                    node.display = if Some(tab) == active {
                         Display::Flex
                     } else {
                         Display::None
@@ -1160,12 +1545,14 @@ pub(in crate::editor::ui::model_viewer) fn update(
 ) {
     let mut reset = false;
     let mut explicit_focus = None;
+    let mut explicit_view = false;
     for action in actions.read() {
         match action {
             Action::ModelView(ModelViewAction::Paint(PaintAction::Panel(panel))) => {
                 explicit_focus = Some(*panel)
             }
             Action::ModelView(ModelViewAction::Paint(PaintAction::Reset)) => reset = true,
+            Action::ModelView(ModelViewAction::Paint(PaintAction::View(_))) => explicit_view = true,
             _ => {}
         }
     }
@@ -1192,6 +1579,32 @@ pub(in crate::editor::ui::model_viewer) fn update(
     if focus != state.focus {
         state.drag = None;
         state.focus = focus;
+    }
+    let session = active.and_then(|model| paint.sessions.get(&model));
+    let views = match session {
+        Some(session)
+            if session.panel == Panel::Shader
+                || (!editor.browser_popup
+                    && !editor.hdri_library_open
+                    && session.graph_canvas_open()) =>
+        {
+            DockViews::Hidden
+        }
+        Some(session) => match session.view {
+            View::Three => DockViews::Model,
+            View::Two => DockViews::Uv,
+            View::Split => DockViews::Both,
+        },
+        None => DockViews::Both,
+    };
+    if views != state.views || explicit_view {
+        state.drag = None;
+        match views {
+            DockViews::Model => state.layout.activate(Tab::View3d),
+            DockViews::Uv => state.layout.activate(Tab::View2d),
+            _ => {}
+        }
+        state.views = views;
     }
 
     let cursor =
@@ -1307,8 +1720,9 @@ fn update_dock(
             if (mouse.pressed(MouseButton::Left) || mouse.just_released(MouseButton::Left))
                 && state.rendered.as_ref() == Some(&state.layout)
                 && let Some(split) = state.dock.dividers.get(divider)
-                && let Some(fraction) = rect(split.frame)
-                    .and_then(|frame| split.fraction(&state.layout, frame, cursor - grab))
+                && let Some(fraction) = rect(split.frame).and_then(|frame| {
+                    split.fraction(&state.layout, state.views, frame, cursor - grab)
+                })
             {
                 if mouse.just_released(MouseButton::Left) {
                     let path = split.path.clone();
@@ -1398,7 +1812,7 @@ fn update_dock(
     if persist && let Err(error) = state.save() {
         warn!("Could not save paint sidebar: {error}");
     }
-    if state.rendered.as_ref() != Some(&state.layout) {
+    if state.rendered.as_ref() != Some(&state.layout) || state.rendered_views != state.views {
         state.drag = None;
         let mut dock = DockNodes::default();
         let next = spawn_layout(
@@ -1406,6 +1820,7 @@ fn update_dock(
             state.root,
             font,
             &state.layout,
+            state.views,
             1.,
             &state.bodies,
             &mut dock,
@@ -1422,6 +1837,7 @@ fn update_dock(
         }
         state.dock = dock;
         state.rendered = Some(state.layout.clone());
+        state.rendered_views = state.views;
     } else {
         for (index, divider) in state.dock.dividers.iter().enumerate() {
             let Some((_, saved)) = state.layout.split_at(&divider.path) else {

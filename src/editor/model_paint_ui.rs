@@ -222,6 +222,9 @@ fn hide_paint_drop(
 
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct Value(Parameter);
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct RecoveryLimit;
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct CustomMapName(pub u64);
 #[derive(Resource)]
@@ -234,8 +237,9 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     canvas_parent: Entity,
     graph_settings_stamp: Option<(usize, u64, u64)>,
     model_pane: Entity,
-    uv: Entity,
-    divider: Entity,
+    workspace: Entity,
+    side: Entity,
+    workspace_parent: Entity,
     uv_image: Handle<Image>,
     uv_info: Entity,
     content: Entity,
@@ -253,6 +257,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     requested_swatches: std::collections::HashSet<ShelfMaterial>,
     shelf_preview_job: Option<(ShelfMaterial, Task<Result<image::RgbaImage, String>>)>,
     layer_name: Entity,
+    recovery_limit: Entity,
     brush_name: Entity,
     fill_options: Entity,
     fill_angle: Entity,
@@ -701,6 +706,28 @@ fn number(
     parameter: Parameter,
     compact: bool,
 ) {
+    let (min, max) = parameter.bounds();
+    let number = if parameter == Parameter::GrainScale {
+        Number::decimal(min as f32, max as f32, 0.25, 2)
+    } else if texture_decimal(parameter) {
+        Number::decimal(min as f32, max as f32, 0.05, 2)
+    } else if parameter == Parameter::CageStrength {
+        Number::decimal(min as f32, max as f32, 0.1, 1)
+    } else {
+        Number::decimal(min as f32, max as f32, 1., 0)
+    }.finish();
+    let field = number_line(commands, parent, font, parameter.label(), number, compact);
+    commands.entity(field).insert(Value(parameter));
+}
+
+fn number_line(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    name: &str,
+    number: Number,
+    compact: bool,
+) -> Entity {
     let line = node(
         commands,
         parent,
@@ -709,31 +736,21 @@ fn number(
             ..row(5.)
         },
     );
-    let label = text(commands, line, font, parameter.label(), 12., MUTED);
+    let label = text(commands, line, font, name, 12., MUTED);
     if !compact {
         commands.entity(label).insert(Node {
             flex_grow: 1.,
             ..default()
         });
     }
-    let (min, max) = parameter.bounds();
     commands.spawn((
         TextInput,
-        Value(parameter),
         EditableText::new(""),
         SelectAllOnFocus,
         crate::ui_theme::text_cursor_style(),
-        if parameter == Parameter::GrainScale {
-            Number::decimal(min as f32, max as f32, 0.25, 2).finish()
-        } else if texture_decimal(parameter) {
-            Number::decimal(min as f32, max as f32, 0.05, 2).finish()
-        } else if parameter == Parameter::CageStrength {
-            Number::decimal(min as f32, max as f32, 0.1, 1).finish()
-        } else {
-            Number::decimal(min as f32, max as f32, 1., 0).finish()
-        },
+        number,
         TabIndex(0),
-        AccessibleLabel(format!("Рисование: {}", parameter.label())),
+        AccessibleLabel(format!("Рисование: {name}")),
         TextFont {
             font: font.clone().into(),
             font_size: FontSize::Px(12.),
@@ -751,7 +768,7 @@ fn number(
         BackgroundColor(WELL),
         BorderColor::all(EDGE),
         ChildOf(line),
-    ));
+    )).id()
 }
 fn alpha_card(
     commands: &mut Commands,
@@ -1576,7 +1593,14 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         overflow: Overflow::clip(),
         ..column(0.)
     };
-    let model_pane = node(&mut commands, viewer.content, pane());
+    let workspace = surface(
+        &mut commands,
+        viewer.content,
+        Node { display: Display::None, ..pane() },
+        PANEL,
+    );
+    commands.entity(workspace).insert(AccessibleLabel("Рабочая область рисования".into()));
+    let model_pane = node(&mut commands, workspace, pane());
     let three_title = surface(
         &mut commands,
         model_pane,
@@ -1590,24 +1614,10 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         },
         CHROME,
     );
-    commands
-        .entity(three_title)
-        .insert(AccessibleLabel("3D-вид. Перетащите заголовок, чтобы переместить вид".into()));
-    icons::themed(&mut commands, three_title, icons::Glyph::Box, 15.);
-    let three_label = text(&mut commands, three_title, font, "3D-вид", 12., TEXT);
-    commands.entity(*canvas).insert(ChildOf(model_pane)).entry::<Node>().and_modify(|mut node| {
-        node.height = Val::Auto;
-    });
-    let divider = surface(
-        &mut commands,
-        viewer.content,
-        Node { display: Display::None, width: px(6), height: percent(100), flex_shrink: 0., ..default() },
-        CHROME,
-    );
-    commands.entity(divider).insert(AccessibleLabel("Изменить размер 3D- и UV-видов".into()));
+    let three_label = text(&mut commands, three_title, font, "", 12., TEXT);
     let uv = surface(
         &mut commands,
-        viewer.content,
+        workspace,
         Node {
             display: Display::None,
             ..pane()
@@ -1617,14 +1627,6 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     commands
         .entity(uv)
         .insert(AccessibleLabel("Рисование: 2D-вид UV".into()));
-    let uv_title = title(&mut commands, uv, font, "2D-вид · UV");
-    commands.entity(uv_title).insert(AccessibleLabel("UV-вид. Перетащите заголовок, чтобы переместить вид".into()));
-    let preview = surface(&mut commands, viewer.overlay, Node { display: Display::None, ..default() }, Color::srgba(0.86, 0.67, 0.37, 0.20));
-    commands.entity(preview).insert((ZIndex(84), Pickable::IGNORE, BorderColor::all(FOCUS)));
-    dock::setup(&mut commands, dock::Panels {
-        content: viewer.content, overlay: viewer.overlay, model: model_pane, model_title: three_title,
-        uv, uv_title, divider, preview,
-    });
     let uv_info = text(&mut commands, uv, font, "UV · 0–1", 11., MUTED);
     commands.entity(uv_info).insert(TextLayout::default());
     text(&mut commands, uv, font, "Колесо — масштаб · СКМ — панорама · F — вписать", 11., MUTED);
@@ -1843,26 +1845,8 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     );
     commands.entity(shelf).insert(HorizontalScroller);
     commands.entity(categories).insert(HorizontalScroller);
-    let sidebar = surface(
-        &mut commands,
-        interface.side,
-        Node {
-            display: Display::None,
-            position_type: PositionType::Absolute,
-            left: px(6),
-            right: px(0),
-            top: px(0),
-            bottom: px(0),
-            ..column(0.)
-        },
-        PANEL,
-    );
-    commands.entity(sidebar).insert((
-        ZIndex(25),
-        AccessibleLabel("Рисование: слои и свойства".into()),
-    ));
     let stacks = std::array::from_fn(|_| {
-        let stack = node(&mut commands, sidebar, Node {
+        let stack = node(&mut commands, workspace, Node {
             width: percent(100), min_width: px(0), min_height: px(0), flex_grow: 1.,
             overflow: Overflow::scroll_y(), padding: UiRect::all(px(7)), ..column(5.)
         });
@@ -1871,7 +1855,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     });
     let properties = surface(
         &mut commands,
-        sidebar,
+        workspace,
         Node {
             width: percent(100),
             min_height: px(0),
@@ -1886,10 +1870,10 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         BackgroundColor(FOCUS.with_alpha(0.22)), BorderColor::all(FOCUS),
         Pickable::IGNORE, ZIndex(90), ChildOf(viewer.overlay),
     )).id();
-    sidebar::setup(&mut commands, sidebar, stacks, properties, sidebar::ShelfDock {
+    sidebar::setup(&mut commands, workspace, stacks, properties, sidebar::ShelfDock {
         home: shelf_home, handle: shelf_handle, body: shelf_root,
         overlay: viewer.overlay, preview: shelf_home_preview,
-    });
+    }, [model_pane, uv]);
     let body = node(
         &mut commands,
         properties,
@@ -1951,6 +1935,34 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     ] {
         number(&mut commands, body, font, parameter, false);
     }
+    let defaults = node(
+        &mut commands,
+        body,
+        Node { flex_wrap: FlexWrap::Wrap, ..row(4.) },
+    );
+    button(&mut commands, defaults, font, "Сохранить стартовые", PaintAction::SaveBrushDefaults);
+    button(&mut commands, defaults, font, "Вернуть стандартные", PaintAction::ResetBrushDefaults);
+    text(&mut commands, body, font, "ВОССТАНОВЛЕНИЕ", 11., MUTED);
+    button(&mut commands, body, font, "Автокопии", PaintAction::ToggleRecovery);
+    let recovery_limit = number_line(
+        &mut commands, body, font, "Правок между автокопиями",
+        Number::integer(1, editing::recovery::MAX_EDITS.into()), false,
+    );
+    commands.entity(recovery_limit).insert(RecoveryLimit).observe(
+        |mut event: On<FocusedInput<KeyboardInput>>, mut actions: MessageWriter<Action>| {
+            if event.input.state == ButtonState::Pressed && !event.input.repeat
+                && matches!(event.input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
+            {
+                actions.write(Action::ModelView(ModelViewAction::Paint(
+                    PaintAction::ApplyRecoveryLimit(event.focused_entity),
+                )));
+                event.propagate(false);
+            }
+        },
+    );
+    control_hints::attach(&mut commands, recovery_limit,
+        "Введите число от 1 до 500 и нажмите Enter. После паузы редактор сохраняет накопленные правки.");
+    commands.entity(recovery_limit).insert(Pickable::default());
     text(&mut commands, body, font, "МАТЕРИАЛ", 11., MUTED);
     let palette = node(
         &mut commands,
@@ -2116,15 +2128,16 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     shader_maker::setup(&mut commands, viewer.overlay, font, &mut fonts);
     commands.insert_resource(PaintUi {
         graph,
-        roots: vec![toolbar, views, tool_rail, three_title, shelf_home, sidebar],
+        roots: vec![toolbar, views, tool_rail, shelf_home],
         original,
         hidden: vec![],
         canvas: *canvas,
-        canvas_parent: model_pane,
+        canvas_parent: viewer.content,
         graph_settings_stamp: None,
         model_pane,
-        uv,
-        divider,
+        workspace,
+        side: interface.side,
+        workspace_parent: viewer.content,
         uv_image,
         uv_info,
         content: viewer.content,
@@ -2145,6 +2158,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         requested_swatches: Default::default(),
         shelf_preview_job: None,
         layer_name,
+        recovery_limit,
         brush_name,
         fill_options,
         fill_angle,
@@ -2218,6 +2232,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         Query<(Entity, &Value, &mut EditableText, &mut BorderColor)>,
         Query<&mut EditableText, With<ShelfSearch>>,
         Query<&LayerNameField>,
+        Query<(&mut EditableText, &mut BorderColor), With<RecoveryLimit>>,
     )>,
     buttons: Query<
         (
@@ -2227,24 +2242,20 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             &BorderColor,
             Option<&bevy::ui::InteractionDisabled>,
         ),
-        Without<Value>,
+        (Without<Value>, Without<RecoveryLimit>),
     >,
     mut images: ResMut<Assets<Image>>,
-    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>),
+    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>),
     baked: Res<bake::State>,
     mut texture_nodes: Query<&mut ImageNode, With<engine::TextureCanvas>>,
 ) {
-    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels) = rendering;
+    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences) = rendering;
     let doc = editor
         .viewing_model
         .and_then(|index| editing.documents.get(&index));
     let showing = doc.is_some_and(|doc| doc.mode == Mode::Paint)
         && editor.viewing_image.is_none()
         && editor.pending.is_none();
-    let view = editor
-        .viewing_model
-        .and_then(|i| paint.sessions.get(&i))
-        .map_or(View::Split, |session| session.viewport_layout(maker.shows_model()));
     let shader_workspace = showing && editor.viewing_model.and_then(|i| paint.sessions.get(&i))
         .is_some_and(|session| session.panel == Panel::Shader);
     let graph_workspace = showing && !editor.browser_popup && !editor.hdri_library_open
@@ -2254,12 +2265,42 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ui.graph.preview
     } else if shader_workspace && maker.shows_model() {
         maker.preview_pane()
-    } else {
+    } else if showing && !custom_workspace {
         ui.model_pane
+    } else {
+        ui.content
     };
     if ui.canvas_parent != canvas_parent {
         commands.entity(ui.canvas).insert(ChildOf(canvas_parent));
         ui.canvas_parent = canvas_parent;
+    }
+    let workspace_parent = if custom_workspace { ui.side } else { ui.content };
+    if ui.workspace_parent != workspace_parent {
+        commands.entity(ui.workspace).insert(ChildOf(workspace_parent));
+        ui.workspace_parent = workspace_parent;
+    }
+    if let Ok(mut node) = nodes.get_mut(ui.workspace) {
+        let display = if showing { Display::Flex } else { Display::None };
+        let (position, left) = if custom_workspace {
+            (PositionType::Absolute, px(6.))
+        } else {
+            (PositionType::Relative, px(0.))
+        };
+        if (node.display, node.position_type, node.left) != (display, position, left) {
+            (node.display, node.position_type, node.left) = (display, position, left);
+            (node.top, node.right, node.bottom) = (px(0), px(0), px(0));
+        }
+    }
+    if let Ok(mut node) = nodes.get_mut(ui.canvas) {
+        let display = if shader_workspace && !graph_workspace && !maker.shows_model() {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        let height = if canvas_parent == ui.content { percent(100) } else { Val::Auto };
+        if (node.display, node.height) != (display, height) {
+            (node.display, node.height) = (display, height);
+        }
     }
     if showing != ui.showing {
         if showing {
@@ -2302,8 +2343,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     }
     for &entity in &ui.roots {
         if let Ok(mut node) = nodes.get_mut(entity) {
-            let display = if showing && (entity != ui.three_title || (view != View::Two && !custom_workspace))
-                && (entity != ui.shelf_layout.home || !shelf_docked)
+            let display = if showing && (entity != ui.shelf_layout.home || !shelf_docked)
             {
                 Display::Flex
             } else {
@@ -2341,32 +2381,6 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             node.right = right;
         }
     }
-    if let Ok(mut node) = nodes.get_mut(ui.model_pane) {
-        let display = if showing && (view == View::Two || custom_workspace) {
-            Display::None
-        } else {
-            Display::Flex
-        };
-        if node.display != display {
-            node.display = display;
-        }
-    }
-    if let Ok(mut node) = nodes.get_mut(ui.uv) {
-        let display = if showing && view != View::Three && !custom_workspace {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        if node.display != display {
-            node.display = display;
-        }
-    }
-    if let Ok(mut node) = nodes.get_mut(ui.divider) {
-        let display = if showing && view == View::Split && !custom_workspace { Display::Flex } else { Display::None };
-        if node.display != display {
-            node.display = display;
-        }
-    }
     if !showing {
         ui.stamps = [None; 5];
         ui.stack_context = [None; 5];
@@ -2394,8 +2408,14 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 _ => map.label(),
             }
         } else {
-            "3D-вид"
+            ""
         };
+        if let Ok(mut node) = nodes.get_mut(ui.three_title) {
+            let display = if current.is_empty() { Display::None } else { Display::Flex };
+            if node.display != display {
+                node.display = display;
+            }
+        }
         if label.0 != current {
             label.0 = current.to_owned();
         }
@@ -2489,6 +2509,19 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             session.set_value(edit.parameter, edit.value);
         }
     }
+    let recovery = recovery_preferences.settings();
+    if let Ok((mut input, mut border)) = fields.p3().get_mut(ui.recovery_limit) {
+        if focus.get() == Some(ui.recovery_limit) {
+            let valid = parse_recovery_limit(&input).is_some();
+            border.set_if_neq(BorderColor::all(if valid { FOCUS } else { ERROR }));
+        } else {
+            let saved = recovery.edits.to_string();
+            if input.value().to_string() != saved {
+                input.editor_mut().set_text(&saved);
+            }
+            border.set_if_neq(BorderColor::all(EDGE));
+        }
+    }
     let visible_panels = sidebar.visible_panels();
     let use_pane_context = !visible_panels[sidebar::panel_index(session.panel)]
         || visible_panels.into_iter().filter(|&visible| visible).count() > 1;
@@ -2513,6 +2546,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             PaintAction::Panel(panel) => visible_panels[sidebar::panel_index(panel)],
             PaintAction::ShelfType(kind) => shelf_filter.material == kind,
             PaintAction::ShelfTypeMenu => shelf_filter.menu,
+            PaintAction::ToggleRecovery => recovery.enabled,
             PaintAction::EditExportTemplate { recipe, output, channel, edit } => {
                 use export::recipe::Edit;
                 export_preferences.recipe(recipe).and_then(|recipe| recipe.maps.get(output))
@@ -4040,4 +4074,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             info.0 = summary;
         }
     }
+}
+
+pub(super) fn parse_recovery_limit(input: &EditableText) -> Option<u16> {
+    input.value().to_string().trim().parse::<u16>().ok()
+        .filter(|number| (1..=editing::recovery::MAX_EDITS).contains(number))
 }

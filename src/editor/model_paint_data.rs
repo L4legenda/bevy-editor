@@ -613,8 +613,11 @@ impl Surface {
     }
 }
 pub(super) fn same_stack(a: &Stack, b: &Stack) -> bool {
-    a.selected == b.selected
-        && compare_layers(a, b, true)
+    a.selected == b.selected && same_layer_list(a, b)
+}
+
+pub(super) fn same_layer_list(a: &Stack, b: &Stack) -> bool {
+    compare_layers(a, b, true)
 }
 
 pub(super) fn same_composite(a: &Stack, b: &Stack) -> bool {

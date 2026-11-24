@@ -117,7 +117,20 @@ struct Saving {
     custom_bakes: Arc<Vec<crate::editor::model_paint_data::custom::Recipe>>,
     bake_settings: crate::editor::model_bake_settings::Settings,
     cage_edits: Arc<crate::editor::model_cage_data::Edits>,
+    recovery_edits: u64,
     task: Task<Result<document::glb::Glb, String>>,
+}
+
+#[path = "model_recovery.rs"]
+pub(in crate::editor) mod recovery;
+
+fn write_model_metadata(
+    source: &mut document::glb::Glb,
+    custom: &[crate::editor::model_paint_data::custom::Recipe],
+    settings: &crate::editor::model_bake_settings::Settings,
+) -> Result<(), String> {
+    crate::editor::model_paint_data::custom::write_document(&mut source.json, custom)?;
+    crate::editor::model_bake_settings::write(&mut source.json, &source.path, settings)
 }
 
 #[derive(Clone)]
@@ -160,6 +173,7 @@ pub(in crate::editor) struct State {
     pub bisect_start: Option<Vec2>,
     pub bisect: bool,
     saving: Option<Saving>,
+    recovery: recovery::Store,
     pub status: String,
     drafts: BTreeSet<usize>,
     input_error: Option<String>,
@@ -197,6 +211,7 @@ impl Default for State {
             bisect_start: None,
             bisect: false,
             saving: None,
+            recovery: recovery::Store::default(),
             status: String::new(),
             drafts: default(),
             input_error: None,
@@ -270,9 +285,9 @@ impl State {
             custom_bakes,
             bake_settings,
             cage_edits,
+            recovery_edits: doc.recovery_edits,
             task: AsyncComputeTaskPool::get().spawn(async move {
-                crate::editor::model_paint_data::custom::write_document(&mut source.json, &baked_recipes)?;
-                crate::editor::model_bake_settings::write(&mut source.json, &source.path, &settings)?;
+                write_model_metadata(&mut source, &baked_recipes, &settings)?;
                 source.save_with_cage(&work, &original, Some(&cage))?;
                 crate::asset_registry::scan::record_save(&root, &source.path)
                     .map_err(|e| format!("Модель сохранена, ошибка обновления реестра: {e}"))?;
@@ -709,6 +724,7 @@ pub(super) fn initialize(
             }
         }
         let mut doc = Document::new(source, objects);
+        doc.initialize_bake_defaults(uv.bake_defaults());
         doc.paint_default_size = uv.texture_size_on_import();
         doc.auto_bake_pending = uv.bake_on_load();
         doc.validate()?;
@@ -902,9 +918,9 @@ pub(super) fn process_actions(
     materials: &mut Assets<StandardMaterial>,
     shift: bool,
 ) {
-    if let Some((index, objects, custom_bakes, bake_settings, cage_edits, result)) = state.saving.as_mut().and_then(|job| {
+    if let Some((index, objects, custom_bakes, bake_settings, cage_edits, recovery_edits, result)) = state.saving.as_mut().and_then(|job| {
         block_on(poll_once(&mut job.task)).map(|result| {
-            (job.index, job.objects.clone(), job.custom_bakes.clone(), job.bake_settings.clone(), job.cage_edits.clone(), result)
+            (job.index, job.objects.clone(), job.custom_bakes.clone(), job.bake_settings.clone(), job.cage_edits.clone(), job.recovery_edits, result)
         })
     }) {
         state.saving = None;
@@ -916,7 +932,11 @@ pub(super) fn process_actions(
                     doc.saved_custom_bakes = custom_bakes;
                     doc.saved_bake_settings = bake_settings;
                     doc.saved_cage_edits = cage_edits;
+                    doc.saved_recovery_edits = recovery_edits;
                     doc.ui_revision += 1;
+                    if !doc.dirty() {
+                        state.recovery.clear(&doc.source.path);
+                    }
                 }
                 editor.status = "Модель сохранена в GLB".into();
                 // Scene instances retain Scene0 after the viewer releases its
@@ -935,7 +955,9 @@ pub(super) fn process_actions(
                         );
                         editor.pending = None;
                         editor.close_model_tab(index);
-                        state.documents.remove(&index);
+                        if let Some(doc) = state.documents.remove(&index) {
+                            state.recovery.clear(&doc.source.path);
+                        }
                         editor.dirty_models.remove(&index);
                         if exiting {
                             editor.continue_exit();
@@ -973,7 +995,9 @@ pub(super) fn process_actions(
                             editor.pending,
                             Some(crate::editor::PendingAction::CloseModelEditor(_))
                         );
-                        state.documents.remove(&index);
+                        if let Some(doc) = state.documents.remove(&index) {
+                            state.recovery.clear(&doc.source.path);
+                        }
                         editor.dirty_models.remove(&index);
                         editor.pending = None;
                         editor.close_model_tab(index);
@@ -1418,6 +1442,30 @@ pub(super) fn process_actions(
         .map(|(&i, _)| i)
         .chain(state.drafts.iter().copied())
         .collect();
+}
+
+pub(super) fn update_recovery(
+    editor: Res<Editor>,
+    mut editing: ResMut<State>,
+    mut exit: MessageReader<AppExit>,
+    preferences: Res<recovery::Preferences>,
+) {
+    if let Some(event) = exit.read().last() {
+        if matches!(event, AppExit::Success) {
+            editing.recovery.clear_session();
+        }
+        return;
+    }
+    if editing.saving.is_none() && editing.gesture.is_none() && editing.recovery.due() {
+        let state = &mut *editing;
+        state.recovery.update(
+            &editor.root,
+            &preferences,
+            state.documents.iter()
+                .filter(|(index, doc)| editor.model_tabs.contains(index) || !doc.dirty())
+                .map(|(_, doc)| doc),
+        );
+    }
 }
 
 pub(in crate::editor) fn shortcuts(

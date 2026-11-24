@@ -1003,6 +1003,8 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                 | Action::BrowserDetectUdim
                 | Action::BrowserTextureSize
                 | Action::BrowserBakeOnLoad
+                | Action::BrowserBakeQuality
+                | Action::BrowserBakeMatchNames
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -1017,6 +1019,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                 | Action::BrowserRenameFile
                 | Action::BrowserConfirmRename
                 | Action::BrowserDuplicateFile
+                | Action::BrowserRecoverModel
                 | Action::BrowserRestoreFile
         );
     }
@@ -1061,12 +1064,15 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         | Action::BrowserDetectUdim
         | Action::BrowserTextureSize
         | Action::BrowserBakeOnLoad
+        | Action::BrowserBakeQuality
+        | Action::BrowserBakeMatchNames
         | Action::BrowserOpenEntry
         | Action::BrowserRevealEntry
         | Action::BrowserInstanceScene
         | Action::BrowserRenameFile
         | Action::BrowserConfirmRename
         | Action::BrowserDuplicateFile
+        | Action::BrowserRecoverModel
         | Action::BrowserDialogueMenu
         | Action::BrowserPrimitiveMenu
         | Action::BrowserCreatePrimitive(_) => editor.drawer,

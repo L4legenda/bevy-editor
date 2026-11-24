@@ -50,6 +50,34 @@ fn fixture() -> (Glb, Object) {
 }
 
 #[test]
+fn imported_bake_defaults_are_clean_and_explicit_factory_settings_survive_profile_changes() {
+    use crate::editor::model_bake_settings::{Defaults, Quality, Settings};
+
+    let (source, object) = fixture();
+    let folder = source.path.parent().unwrap().to_path_buf();
+    let mut doc = Document::new(source, vec![object]);
+    doc.initialize_bake_defaults(Defaults { quality: Quality::High, match_names: false });
+    assert_eq!(doc.bake_settings.quality, Quality::High);
+    assert!(!doc.bake_settings.match_names);
+    assert!(!doc.dirty());
+
+    doc.bake_settings = Settings::default();
+    doc.save().unwrap();
+    let mut reopened = Document::new(Glb::load(&doc.source.path).unwrap(), doc.objects.clone());
+    reopened.initialize_bake_defaults(Defaults { quality: Quality::Ultra, match_names: false });
+    assert_eq!(reopened.bake_settings, Settings::default());
+    assert!(!reopened.dirty());
+
+    reopened.source.json["extras"] = json!(["third-party data"]);
+    reopened.initialize_bake_defaults(Defaults { quality: Quality::Ultra, match_names: false });
+    assert_eq!(reopened.bake_settings, Settings::default());
+    reopened.save().unwrap();
+    let saved = Glb::load(&reopened.source.path).unwrap();
+    assert_eq!(saved.json["extras"], json!(["third-party data"]));
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
 fn bake_settings_survive_glb_reopen_move_and_document_undo() {
     use crate::editor::model_bake_settings::{self as bake, Quality, Settings};
 

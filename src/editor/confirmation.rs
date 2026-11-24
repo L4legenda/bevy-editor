@@ -6,9 +6,13 @@ use bevy::input_focus::FocusCause;
 #[derive(Resource)]
 pub(in crate::editor) struct Confirmation {
     overlay: Entity,
+    title: Entity,
     message: Entity,
     error: Entity,
     cancel: Entity,
+    actions: Entity,
+    recovery_actions: Entity,
+    later: Entity,
     previous_focus: Option<Entity>,
     shown: Option<(PendingAction, Room)>,
 }
@@ -44,21 +48,18 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font: &Handle<Font>) 
         },
         PANEL,
     );
-    text(commands, card, font, "Сохранить изменения?", 21.0, TEXT);
+    let title = text(commands, card, font, "Сохранить изменения?", 21.0, TEXT);
     let message = text(commands, card, font, "", 14.0, TEXT);
     commands.entity(message).insert(TextLayout::default());
     let error = text(commands, card, font, "", 12.0, AMBER);
     commands.entity(error).insert(TextLayout::default());
-    let actions = node(
-        commands,
-        card,
-        Node {
-            justify_content: JustifyContent::End,
-            flex_wrap: FlexWrap::Wrap,
-            row_gap: px(8),
-            ..row(8.0)
-        },
-    );
+    let action_row = Node {
+        justify_content: JustifyContent::End,
+        flex_wrap: FlexWrap::Wrap,
+        row_gap: px(8),
+        ..row(8.0)
+    };
+    let actions = node(commands, card, action_row.clone());
     let cancel = button(
         commands,
         actions,
@@ -86,11 +87,50 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font: &Handle<Font>) 
     for (index, entity) in [cancel, discard, save].into_iter().enumerate() {
         commands.entity(entity).insert(TabIndex(index as i32));
     }
+    let recovery_actions = node(
+        commands,
+        card,
+        Node {
+            display: Display::None,
+            ..action_row
+        },
+    );
+    let later = button(
+        commands,
+        recovery_actions,
+        font,
+        "Позже",
+        Action::CancelPending,
+        Look::Regular,
+    );
+    let discard_copy = button(
+        commands,
+        recovery_actions,
+        font,
+        "Удалить автокопию",
+        Action::DiscardAndContinue,
+        Look::Regular,
+    );
+    let recover = button(
+        commands,
+        recovery_actions,
+        font,
+        "Восстановить",
+        Action::SaveAndContinue,
+        Look::Primary,
+    );
+    for (index, entity) in [later, discard_copy, recover].into_iter().enumerate() {
+        commands.entity(entity).insert(TabIndex(index as i32));
+    }
     commands.insert_resource(Confirmation {
         overlay,
+        title,
         message,
         error,
         cancel,
+        actions,
+        recovery_actions,
+        later,
         previous_focus: None,
         shown: None,
     });
@@ -98,6 +138,7 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font: &Handle<Font>) 
 
 pub(in crate::editor) fn update(
     editor: Res<Editor>,
+    browser: Option<Res<super::browser_context::BrowserContext>>,
     mut dialog: ResMut<Confirmation>,
     mut focus: ResMut<InputFocus>,
     mut panes: Query<&mut Node>,
@@ -105,6 +146,12 @@ pub(in crate::editor) fn update(
     entities: Query<()>,
     parents: Query<&ChildOf>,
 ) {
+    let recovering = editor.pending == Some(PendingAction::RecoverModel);
+    let cancel = if recovering {
+        dialog.later
+    } else {
+        dialog.cancel
+    };
     let request = editor.pending.map(|action| (action, editor.room));
     if dialog.shown != request {
         if let Ok(mut pane) = panes.get_mut(dialog.overlay) {
@@ -118,7 +165,7 @@ pub(in crate::editor) fn update(
             if dialog.shown.is_none() {
                 dialog.previous_focus = focus.get();
             }
-            focus.set(dialog.cancel, FocusCause::Auto);
+            focus.set(cancel, FocusCause::Auto);
         } else if let Some(entity) = dialog
             .previous_focus
             .take()
@@ -127,6 +174,26 @@ pub(in crate::editor) fn update(
             focus.set(entity, FocusCause::Auto);
         } else {
             focus.clear();
+        }
+        for (entity, visible) in [
+            (dialog.actions, !recovering),
+            (dialog.recovery_actions, recovering),
+        ] {
+            if let Ok(mut pane) = panes.get_mut(entity) {
+                pane.display = if visible {
+                    Display::Flex
+                } else {
+                    Display::None
+                };
+            }
+        }
+        if let Ok(mut title) = labels.get_mut(dialog.title) {
+            title.0 = if recovering {
+                "Восстановить правки?"
+            } else {
+                "Сохранить изменения?"
+            }
+            .into();
         }
         dialog.shown = request;
     }
@@ -140,7 +207,25 @@ pub(in crate::editor) fn update(
             .iter_ancestors(entity)
             .any(|ancestor| ancestor == dialog.overlay)
     }) {
-        focus.set(dialog.cancel, FocusCause::Auto);
+        focus.set(cancel, FocusCause::Auto);
+    }
+    if recovering {
+        let path = browser.as_ref().and_then(|browser| browser.recovery_path());
+        let message = match path {
+            Some(path) => format!(
+                "Найдена автокопия модели «{}». Восстановленные правки откроются в отдельном GLB.",
+                path.display()
+            ),
+            None => "Найдена автокопия модели.".into(),
+        };
+        for (entity, content) in [(dialog.message, message.as_str()), (dialog.error, "")] {
+            if let Ok(mut label) = labels.get_mut(entity)
+                && label.0 != content
+            {
+                label.0 = content.to_owned();
+            }
+        }
+        return;
     }
     let destination = match pending {
         PendingAction::CloseNarrative(_)
@@ -151,6 +236,7 @@ pub(in crate::editor) fn update(
         | PendingAction::Close
         | PendingAction::CloseImageEditor(_)
         | PendingAction::CloseModelEditor(_) => "закрытием редактора",
+        PendingAction::RecoverModel => unreachable!(),
     };
     let message = if let PendingAction::CloseNarrative(id) | PendingAction::ExitNarrative(id) =
         pending
@@ -244,12 +330,19 @@ mod tests {
         let save = app.world_mut().spawn((TabIndex(1), ChildOf(overlay))).id();
         let message = app.world_mut().spawn(Text::new("")).id();
         let error = app.world_mut().spawn(Text::new("")).id();
+        let title = app.world_mut().spawn(Text::new("")).id();
+        let actions = app.world_mut().spawn(Node::default()).id();
+        let recovery_actions = app.world_mut().spawn(Node::default()).id();
         app.insert_resource(InputFocus::from_entity(outside));
         app.insert_resource(Confirmation {
             overlay,
+            title,
             message,
             error,
             cancel,
+            actions,
+            recovery_actions,
+            later: cancel,
             previous_focus: None,
             shown: None,
         });

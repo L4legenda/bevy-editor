@@ -7,6 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 #[path = "model_paint_io.rs"]
 mod paint_io;
@@ -15,9 +16,9 @@ mod paint_io;
 pub(in crate::editor) struct Glb {
     pub path: PathBuf,
     pub json: Value,
-    bin: Vec<u8>,
-    extra: Vec<(u32, Vec<u8>)>,
-    expected: Vec<u8>,
+    bin: Arc<Vec<u8>>,
+    extra: Arc<Vec<(u32, Vec<u8>)>>,
+    expected: Arc<Vec<u8>>,
 }
 fn word(bytes: &[u8], offset: usize) -> Result<u32, String> {
     bytes
@@ -49,17 +50,18 @@ impl Glb {
                 }],
                 "buffers": [{"byteLength": 0}]
             }),
-            bin: Vec::new(),
-            extra: Vec::new(),
-            expected: Vec::new(),
+            bin: Arc::default(),
+            extra: Arc::default(),
+            expected: Arc::default(),
         };
         if !pngs.is_empty() {
+            let bin = Arc::make_mut(&mut source.bin);
             source.json["bufferViews"] = json!([]);
             let mut images = Vec::with_capacity(pngs.len());
             for png in pngs {
-                align(&mut source.bin, 0);
-                let start = source.bin.len();
-                source.bin.extend_from_slice(png);
+                align(bin, 0);
+                let start = bin.len();
+                bin.extend_from_slice(png);
                 let view = source.json["bufferViews"].as_array_mut().unwrap();
                 images.push(json!({"bufferView":view.len(), "mimeType":"image/png"}));
                 view.push(json!({"buffer":0, "byteOffset":start, "byteLength":png.len()}));
@@ -142,23 +144,23 @@ impl Glb {
         Ok(Self {
             path,
             json,
-            bin: bin.unwrap_or_default(),
-            extra,
-            expected: bytes,
+            bin: Arc::new(bin.unwrap_or_default()),
+            extra: Arc::new(extra),
+            expected: Arc::new(bytes),
         })
     }
     pub fn encode(&self, objects: &[Object], original: &[Object]) -> Result<Vec<u8>, String> {
         self.encode_with_cage(objects, original, None)
     }
 
-    fn encode_with_cage(
+    pub(in crate::editor) fn encode_with_cage(
         &self,
         objects: &[Object],
         original: &[Object],
         cage_edits: Option<&crate::editor::model_cage_data::Edits>,
     ) -> Result<Vec<u8>, String> {
         let mut root = self.json.clone();
-        let mut bin = self.bin.clone();
+        let mut bin = self.bin.as_ref().clone();
         for name in ["nodes", "meshes", "bufferViews", "accessors"] {
             if root[name].is_null() {
                 root[name] = json!([]);
@@ -389,7 +391,7 @@ impl Glb {
         }
         chunk(&mut output, 0x4e4f534a, &json);
         chunk(&mut output, 0x004e4942, &bin);
-        for (kind, bytes) in &self.extra {
+        for (kind, bytes) in self.extra.iter() {
             chunk(&mut output, *kind, bytes);
         }
         Ok(output)
@@ -405,7 +407,7 @@ impl Glb {
         original: &[Object],
         cage_edits: Option<&crate::editor::model_cage_data::Edits>,
     ) -> Result<(), String> {
-        if fs::read(&self.path).map_err(|e| e.to_string())? != self.expected {
+        if fs::read(&self.path).map_err(|e| e.to_string())? != *self.expected {
             return Err("GLB изменён другой программой. Сохранение отменено; ваши правки остались в памяти.".into());
         }
         let bytes = self.encode_with_cage(objects, original, cage_edits)?;
@@ -424,7 +426,7 @@ impl Glb {
                 .and_then(|_| file.sync_all())
                 .map_err(|e| e.to_string())?;
             drop(file);
-            if fs::read(&self.path).map_err(|e| e.to_string())? != self.expected {
+            if fs::read(&self.path).map_err(|e| e.to_string())? != *self.expected {
                 return Err("Файл изменился во время сохранения".into());
             }
             fs::rename(&path, &self.path).map_err(|e| e.to_string())
@@ -433,7 +435,7 @@ impl Glb {
             let _ = fs::remove_file(&path);
         }
         result?;
-        self.expected = bytes;
+        self.expected = Arc::new(bytes);
         Ok(())
     }
 }

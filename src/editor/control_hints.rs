@@ -134,6 +134,10 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             "Разрешение новых наборов текстур при открытии модели. Сохранённые наборы используют своё разрешение.".into(),
         Action::BrowserBakeOnLoad =>
             "Подготовить карты видимых наборов при первом входе в режим рисования. Сохранённые карты используются повторно.".into(),
+        Action::BrowserBakeQuality =>
+            "Качество ручного и автоматического запекания для моделей без записанных настроек. Нажмите, чтобы выбрать следующий вариант.".into(),
+        Action::BrowserBakeMatchNames =>
+            "Для новых моделей сопоставлять детали high-poly и low-poly по именам с учётом окончаний _high и _low.".into(),
         Action::Generation(super::GenerationAction::Open) => "Открыть генерацию 3D модели по изображению. Настройки сохраняются при переключении вкладок.".into(),
         Action::Generation(super::GenerationAction::Toggle) if editor.generation.active => "Закрыть вкладку генерации и вернуться к предыдущему документу.".into(),
         Action::Generation(super::GenerationAction::Toggle) => "Открыть генерацию 3D модели по изображению.".into(),
@@ -291,6 +295,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             editor.image_tab(id)?.path.display()
         ),
         Action::BrowserDuplicateFile => "Создать копию сохранённого файла в той же папке. Файл слоёв изображения и настройки импорта копируются вместе с ним.".into(),
+        Action::BrowserRecoverModel => "Открыть черновик завершившегося сеанса как отдельную модель рядом с исходным GLB.".into(),
         Action::BrowserRenameFile => "F2 · Переименовать выбранный файл. Расширение сохраняется, ссылки проекта обновляются.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Menu)) =>
             "Выберите режим: объект, редактирование сетки, UV-развёртка или рисование. Tab возвращает к объекту.".into(),

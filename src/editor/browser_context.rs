@@ -25,6 +25,7 @@ use crate::editor::{
     thumbnails::Thumbnails,
 };
 use super::model_viewer::editing::uv::UvState;
+use super::model_viewer::editing::recovery;
 use bevy::{
     input_focus::FocusCause,
     tasks::{IoTaskPool, Task, block_on, poll_once},
@@ -73,6 +74,9 @@ enum Work {
     Duplicate {
         path: PathBuf,
     },
+    RecoverModel(PathBuf),
+    RecoverOffer(recovery::Offer),
+    DiscardOffer(recovery::Offer),
     Scene {
         name: String,
     },
@@ -120,6 +124,15 @@ impl Work {
                         errors: vec![error],
                         ..default()
                     },
+                },
+            },
+            Self::RecoverModel(path) => Self::recovered(recovery::restore(&root, &path)),
+            Self::RecoverOffer(offer) => Self::recovered(offer.restore(&root)),
+            Self::DiscardOffer(offer) => Outcome {
+                report: default(),
+                status: match offer.discard() {
+                    Ok(()) => "Автокопия удалена".into(),
+                    Err(error) => format!("Не удалось удалить автокопию · {error}"),
                 },
             },
             Self::Scene { name } => match scene_creation::create(&root, &parent, &name) {
@@ -205,15 +218,30 @@ impl Work {
             },
         }
     }
+
+    fn recovered(result: Result<PathBuf, String>) -> Outcome {
+        match result {
+            Ok(path) => Outcome {
+                status: format!("Создана копия восстановления · {}", path.display()),
+                report: browser_files::ImportReport { imported: vec![path], ..default() },
+            },
+            Err(error) => Outcome {
+                status: format!("Не удалось восстановить модель · {error}"),
+                report: browser_files::ImportReport { errors: vec![error], ..default() },
+            },
+        }
+    }
 }
 struct Import {
     parent: PathBuf,
     revision: u64,
+    open_model: bool,
     task: Task<Outcome>,
 }
 struct Completed {
     parent: PathBuf,
     revision: u64,
+    open_model: bool,
     report: browser_files::ImportReport,
     status: String,
 }
@@ -226,8 +254,18 @@ struct MenuEntry {
     action: Action,
 }
 
+#[derive(Default)]
+enum StartupRecovery {
+    #[default]
+    Initial,
+    Scan(Task<Option<recovery::Offer>>),
+    Offer(recovery::Offer),
+    Done,
+}
+
 #[derive(Resource, Default)]
 pub(in crate::editor) struct BrowserContext {
+    startup_recovery: StartupRecovery,
     phase: Phase,
     parent: PathBuf,
     anchor: Vec2,
@@ -246,6 +284,39 @@ pub(in crate::editor) struct BrowserContext {
 }
 
 impl BrowserContext {
+    pub(super) fn recovery_path(&self) -> Option<&std::path::Path> {
+        match &self.startup_recovery {
+            StartupRecovery::Offer(offer) => Some(&offer.relative),
+            _ => None,
+        }
+    }
+
+    fn poll_startup_recovery(&mut self, editor: &mut Editor) {
+        match &mut self.startup_recovery {
+            StartupRecovery::Initial => {
+                let root = editor.root.clone();
+                let models: Vec<_> = editor.project.catalog.iter()
+                    .map(|model| PathBuf::from(&model.asset)).collect();
+                self.startup_recovery = StartupRecovery::Scan(
+                    IoTaskPool::get().spawn(async move { recovery::startup_offer(&root, &models) }),
+                );
+            }
+            StartupRecovery::Scan(task) => {
+                if let Some(offer) = block_on(poll_once(task)) {
+                    self.startup_recovery = offer.map_or(StartupRecovery::Done, StartupRecovery::Offer);
+                }
+            }
+            StartupRecovery::Offer(_) => {
+                if editor.ready && editor.pending.is_none() && self.phase == Phase::Closed
+                    && self.pending.is_none() && !editor.hdri_library_open && !editor.scene_object_popup
+                {
+                    editor.pending = Some(crate::editor::PendingAction::RecoverModel);
+                }
+            }
+            StartupRecovery::Done => {}
+        }
+    }
+
     pub(super) fn is_menu(&self) -> bool {
         self.phase == Phase::Menu
     }
@@ -267,8 +338,8 @@ pub(in crate::editor) struct ContextUi {
     menu: Entity,
     menu_title: Entity,
     new_folder: Entity,
-    creation: [Entity; 10],
-    import_labels: [(Entity, Entity); 4],
+    creation: [Entity; 12],
+    import_labels: [(Entity, Entity); 6],
     open: Entity,
     instance: Entity,
     open_icon: Entity,
@@ -276,6 +347,7 @@ pub(in crate::editor) struct ContextUi {
     reveal: Entity,
     rename: Entity,
     duplicate: Entity,
+    recover_model: Entity,
     shown_entry: Option<Entity>,
     dialogues: primitive_creation::MenuUi,
     primitives: primitive_creation::MenuUi,
@@ -428,6 +500,9 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         .insert(AccessibleLabel("Дублировать файл".into()));
     icons::themed(commands, duplicate, icons::Glyph::Copy, 16.0);
     text(commands, duplicate, font_handle, "Дублировать", 13.0, TEXT);
+    let recover_model = button(
+        commands, menu, font_handle, "Восстановить правки…", Action::BrowserRecoverModel, Look::Regular,
+    );
     let new_folder = button(
         commands,
         menu,
@@ -512,6 +587,8 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         Action::BrowserDetectUdim,
         Action::BrowserTextureSize,
         Action::BrowserBakeOnLoad,
+        Action::BrowserBakeQuality,
+        Action::BrowserBakeMatchNames,
     ].map(|action| {
         let row = control(
             commands,
@@ -766,6 +843,8 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
             import_labels[1].0,
             import_labels[2].0,
             import_labels[3].0,
+            import_labels[4].0,
+            import_labels[5].0,
             dialogues.trigger,
             primitives.trigger,
         ],
@@ -777,6 +856,7 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         reveal,
         rename,
         duplicate,
+        recover_model,
         shown_entry: None,
         dialogues,
         primitives,
@@ -1158,6 +1238,21 @@ pub(in crate::editor) fn update(
         }
     }
     for action in actions.read() {
+        if editor.pending == Some(crate::editor::PendingAction::RecoverModel)
+            && matches!(action, Action::SaveAndContinue | Action::DiscardAndContinue | Action::CancelPending)
+        {
+            editor.pending = None;
+            if let StartupRecovery::Offer(offer) = std::mem::replace(&mut context.startup_recovery, StartupRecovery::Done) {
+                let parent = offer.relative.parent().unwrap_or(std::path::Path::new("")).to_owned();
+                let work = match action {
+                    Action::SaveAndContinue => Work::RecoverOffer(offer),
+                    Action::DiscardAndContinue => Work::DiscardOffer(offer),
+                    _ => continue,
+                };
+                context.queue.push_back(Batch { parent, revision: browser.revision, work });
+            }
+            continue;
+        }
         match *action {
             Action::BrowserDuplicateFile if allowed && context.is_menu() => {
                 let Some(entry) = context
@@ -1203,6 +1298,19 @@ pub(in crate::editor) fn update(
                     Err(error) => editor.status = error,
                 }
                 context.phase = Phase::Closed;
+            }
+            Action::BrowserRecoverModel if allowed && context.is_menu() => {
+                if let Some(entry) = context.menu_entry.filter(|entry| entry.revision == browser.scan_revision)
+                    && let Ok(target) = rename::Target::new(&editor, &browser, entry.entry)
+                    && is_glb(&target.path)
+                {
+                    context.queue.push_back(Batch {
+                        parent: target.path.parent().unwrap_or(std::path::Path::new("")).to_owned(),
+                        revision: browser.revision,
+                        work: Work::RecoverModel(target.path),
+                    });
+                    context.phase = Phase::Closed;
+                }
             }
             Action::BrowserRenameFile
                 if allowed && matches!(context.phase, Phase::Menu | Phase::Closed) =>
@@ -1385,6 +1493,7 @@ pub(in crate::editor) fn update(
             }
             Action::BrowserAutoUnwrap | Action::BrowserDetectUdim
             | Action::BrowserTextureSize | Action::BrowserBakeOnLoad
+            | Action::BrowserBakeQuality | Action::BrowserBakeMatchNames
                 if allowed && context.is_menu() && !context.file_menu() =>
             {
                 let result = match action {
@@ -1392,6 +1501,8 @@ pub(in crate::editor) fn update(
                     Action::BrowserDetectUdim => prefs.toggle_udim_import(),
                     Action::BrowserTextureSize => prefs.cycle_texture_size(),
                     Action::BrowserBakeOnLoad => prefs.toggle_bake_on_load(),
+                    Action::BrowserBakeQuality => prefs.cycle_bake_quality(),
+                    Action::BrowserBakeMatchNames => prefs.toggle_bake_match_names(),
                     _ => unreachable!(),
                 };
                 if let Err(error) = result {
@@ -1576,14 +1687,15 @@ pub(in crate::editor) fn update(
             _ => {}
         }
     }
-    if let Some((parent, revision, outcome)) = context.pending.as_mut().and_then(|pending| {
+    if let Some((parent, revision, open_model, outcome)) = context.pending.as_mut().and_then(|pending| {
         block_on(poll_once(&mut pending.task))
-            .map(|outcome| (pending.parent.clone(), pending.revision, outcome))
+            .map(|outcome| (pending.parent.clone(), pending.revision, pending.open_model, outcome))
     }) {
         context.pending = None;
         context.completed = Some(Completed {
             parent,
             revision,
+            open_model,
             report: outcome.report,
             status: outcome.status,
         });
@@ -1631,6 +1743,13 @@ pub(in crate::editor) fn update(
                     });
                 context.focus_after = Some(path.clone());
             }
+            if completed.open_model
+                && let Some(path) = completed.report.imported.last()
+                && let Some(model) = editor.project.catalog.iter()
+                    .position(|model| std::path::Path::new(&model.asset) == path)
+            {
+                editor.open_model_tab(model);
+            }
         }
         if let Some(details) = completed.report.spp_details() {
             context.previous_focus = focus.get();
@@ -1653,6 +1772,9 @@ pub(in crate::editor) fn update(
         let parent = batch.parent.clone();
         let status = match &batch.work {
             Work::Duplicate { .. } => "Создание копии файла…",
+            Work::RecoverModel(_) => "Восстановление правок модели…",
+            Work::RecoverOffer(_) => "Восстановление правок модели…",
+            Work::DiscardOffer(_) => "Удаление автокопии…",
             Work::Primitive { .. } => "Создание 3D-модели…",
             Work::Image { .. } => "Создание изображения…",
             Work::Scene { .. } => "Создание сцены…",
@@ -1662,6 +1784,7 @@ pub(in crate::editor) fn update(
         context.pending = Some(Import {
             parent: batch.parent,
             revision: batch.revision,
+            open_model: matches!(&batch.work, Work::RecoverModel(_) | Work::RecoverOffer(_)),
             task: IoTaskPool::get().spawn(async move { batch.work.run(root, parent) }),
         });
         editor.status = status.into();
@@ -1669,6 +1792,11 @@ pub(in crate::editor) fn update(
     editor.browser_popup = (context.phase != Phase::Closed || context.suppress_release)
         && editor.pending.is_none()
         && !editor.hdri_library_open;
+    context.poll_startup_recovery(&mut editor);
+}
+
+fn is_glb(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
 }
 
 pub(in crate::editor) fn refresh(
@@ -1719,11 +1847,14 @@ pub(in crate::editor) fn refresh(
         }
     }
     if phase == Phase::Menu && !file_menu {
+        let bake = prefs.bake_defaults();
         let names = [
             format!("Авторазвёртка · {}", prefs.auto_unwrap().label()),
             format!("Распознавать UDIM · {}", if prefs.detect_udim_on_import() { "Вкл." } else { "Выкл." }),
             format!("Новые текстуры · {}²", prefs.texture_size_on_import()),
             format!("Автозапекание · {}", if prefs.bake_on_load() { "Вкл." } else { "Выкл." }),
+            format!("Качество запекания · {}", bake.quality.label()),
+            format!("Имена high/low · {}", if bake.match_names { "Вкл." } else { "Выкл." }),
         ];
         for ((control, label), name) in interface.import_labels.into_iter().zip(names) {
             if let Ok(mut text) = labels.get_mut(label)
@@ -1750,6 +1881,19 @@ pub(in crate::editor) fn refresh(
             } else {
                 Display::None
             };
+        }
+    }
+    if let Ok(mut node) = nodes.get_mut(interface.recover_model) {
+        let display = if file_menu && context.menu_entry
+            .and_then(|entry| rename::Target::new(&editor, &browser, entry.entry).ok())
+            .is_some_and(|target| is_glb(&target.path))
+        {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
         }
     }
     if let Ok(mut node) = nodes.get_mut(interface.instance) {

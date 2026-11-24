@@ -1054,9 +1054,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
         }
         if let Some(result) = live.task.as_mut().and_then(|job| block_on(poll_once(job))) {
             live.task = None;
-            live.resizing = false;
+            let resized = std::mem::take(&mut live.resizing);
             let finished = true;
             let history_changed = !result.history.is_empty();
+            doc.recovery_edits += result.history.len() as u64 + u64::from(resized);
             if bound {
                 for history in result.history {
                     if session.undo.len() >= 32 {
@@ -1158,11 +1159,14 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
             }
             let work = live.work.as_mut().unwrap();
-            let stack_changed = bound && !data::same_stack(&session.stack, &live.ui_stack);
+            let layers_changed = bound && !data::same_layer_list(&session.stack, &live.ui_stack);
+            let stack_changed = bound
+                && (layers_changed || session.stack.selected != live.ui_stack.selected);
             let composite_changed = stack_changed
                 && (session.stack.selected != live.ui_stack.selected
                     || !data::same_composite(&session.stack, &live.ui_stack));
             if stack_changed {
+                doc.recovery_edits += u64::from(layers_changed);
                 work.surface.stack = session.stack.clone();
                 live.ui_stack = session.stack.clone();
             }

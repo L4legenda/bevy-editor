@@ -100,6 +100,7 @@ impl Plugin for ModelViewerPlugin {
             .add_plugins(super::image_viewer::paint_input::PointerPlugin)
             .add_plugins(editing::selection::SelectionPlugin)
             .init_resource::<editing::State>()
+            .init_resource::<editing::recovery::Preferences>()
             .init_resource::<paint::PaintState>()
             .init_resource::<paint::sets::ShelfPick>()
             .init_resource::<paint::export::prefs::Store>()
@@ -138,7 +139,7 @@ impl Plugin for ModelViewerPlugin {
             .add_systems(Update, paint::refresh_graph.after(paint::refresh))
             .add_systems(Update, paint::refresh_shader_maker.after(paint::refresh))
             .add_systems(Update, paint::decorate_shader_code.after(paint::refresh_shader_maker))
-            .add_systems(Update, paint::dock::update.after(paint::refresh))
+            .add_systems(Last, editing::update_recovery)
             .add_systems(Update, paint::sidebar::update.after(paint::actions).before(paint::refresh))
             .add_systems(
                 Update,

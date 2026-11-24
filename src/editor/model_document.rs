@@ -224,6 +224,8 @@ pub(super) struct Document {
     pub redo: Vec<Snapshot>,
     pub revision: u64,
     pub ui_revision: u64,
+    pub recovery_edits: u64,
+    pub saved_recovery_edits: u64,
     pub amount: f32,
     pub slide_percent: f32,
     pub material_draft: MaterialDraft,
@@ -262,6 +264,8 @@ impl Document {
             redo: Vec::new(),
             revision: 0,
             ui_revision: 0,
+            recovery_edits: 0,
+            saved_recovery_edits: 0,
             amount: 0.1,
             slide_percent: 10.0,
             material_draft: MaterialDraft::default(),
@@ -273,6 +277,14 @@ impl Document {
     }
     pub fn paint_size(&self, material: &MaterialSlot) -> u32 {
         material.paint.as_ref().map_or(self.paint_default_size, |surface| surface.size)
+    }
+
+    pub(super) fn initialize_bake_defaults(&mut self, defaults: super::model_bake_settings::Defaults) {
+        if super::model_bake_settings::accepts_defaults(&self.source.json) {
+            self.bake_settings.quality = defaults.quality;
+            self.bake_settings.match_names = defaults.match_names;
+            self.saved_bake_settings = self.bake_settings.clone();
+        }
     }
     pub fn dirty(&self) -> bool {
         self.paint_pending || self.objects != self.saved || self.custom_bakes != self.saved_custom_bakes
@@ -323,6 +335,7 @@ impl Document {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.recovery_edits += 1;
         self.revision += 1;
         self.ui_revision += 1;
     }
@@ -371,12 +384,14 @@ impl Document {
         if let Some(previous) = self.undo.pop() {
             self.redo.push(self.snapshot());
             self.restore(previous);
+            self.recovery_edits += 1;
         }
     }
     pub fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
             self.undo.push(self.snapshot());
             self.restore(next);
+            self.recovery_edits += 1;
         }
     }
     pub fn set_mode(&mut self, mode: Mode) {
@@ -533,6 +548,7 @@ impl Document {
         self.source.save_with_cage(&self.objects, &self.original, Some(&self.cage_edits))?;
         self.saved = self.objects.clone();
         self.saved_bake_settings = self.bake_settings.clone();
+        self.saved_recovery_edits = self.recovery_edits;
         self.saved_cage_edits = self.cage_edits.clone();
         self.ui_revision += 1;
         Ok(())

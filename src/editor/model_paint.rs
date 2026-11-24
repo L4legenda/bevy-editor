@@ -9,10 +9,13 @@ use crate::editor::model_paint_data::mask::{
 use crate::editor::model_paint_data::{Blend, Layer, MAX_LAYER_DEPTH, MAX_LAYERS, Stack, Surface, texture_fill};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+#[path = "model_paint_brush_defaults.rs"]
+mod brush_defaults;
 #[path = "model_paint_dock.rs"]
 pub(super) mod dock;
 #[path = "model_paint_sidebar.rs"]
 pub(super) mod sidebar;
+pub(in crate::editor) use sidebar::State as PaintDock;
 pub(in crate::editor::ui) use sidebar::PanelBody;
 #[path = "model_paint_engine.rs"]
 pub(super) mod engine;
@@ -315,6 +318,10 @@ pub(in crate::editor) enum PaintAction {
     Category(Category),
     BrushTip(Option<usize>),
     ImportBrushTip,
+    SaveBrushDefaults,
+    ResetBrushDefaults,
+    ToggleRecovery,
+    ApplyRecoveryLimit(Entity),
     FollowStroke,
     PressureSize,
     PressureFlow,
@@ -631,6 +638,10 @@ impl PaintAction {
             Self::Category(_) => "Открыть категорию библиотеки.",
             Self::BrushTip(_) => "Выбрать форму отпечатка кисти и ластика.",
             Self::ImportBrushTip => "Загрузить наконечник из изображения.",
+            Self::SaveBrushDefaults => "Сохранить размер, жёсткость, шаг кисти и отступ UV-заливки для следующих запусков.",
+            Self::ResetBrushDefaults => "Восстановить стандартные параметры кисти и отступа UV-заливки.",
+            Self::ToggleRecovery => "Включить или выключить запись новых автокопий GLB.",
+            Self::ApplyRecoveryLimit(_) => "Сохранить число правок между автокопиями.",
             Self::FollowStroke => "Поворачивать наконечник по направлению движения.",
             Self::PressureSize => "Нажим пера управляет размером отпечатка.",
             Self::PressureFlow => "Нажим пера управляет потоком отдельного отпечатка.",
@@ -836,6 +847,7 @@ struct Session {
 }
 impl Default for Session {
     fn default() -> Self {
+        let defaults = brush_defaults::Settings::default();
         Self {
             stack: Stack::default(),
             undo: vec![],
@@ -864,11 +876,11 @@ impl Default for Session {
             set_menu: false,
             color: 0,
             preset: 0,
-            size: 70.,
+            size: defaults.size,
             flow: 100.,
             opacity: 100.,
-            hardness: 55.,
-            spacing: 8.,
+            hardness: defaults.hardness,
+            spacing: defaults.spacing,
             stabilizer: 0.,
             brush_scatter: 0.,
             brush_size_jitter: 0.,
@@ -891,7 +903,7 @@ impl Default for Session {
             fill_lasso: false,
             fill_through: false,
             fill_erase: false,
-            fill_padding: 2.,
+            fill_padding: defaults.fill_padding,
             path_smooth: true,
             path_closed: false,
             path_align: true,
@@ -1844,7 +1856,8 @@ impl Session {
                 self.refresh_folder_view();
             }
             PaintAction::BrushTip(tip) => self.tip = tip,
-            PaintAction::ImportBrushTip => {}
+            PaintAction::ImportBrushTip | PaintAction::SaveBrushDefaults | PaintAction::ResetBrushDefaults => {}
+            PaintAction::ToggleRecovery | PaintAction::ApplyRecoveryLimit(_) => {}
             PaintAction::FollowStroke => self.follow_stroke = !self.follow_stroke,
             PaintAction::PressureSize => self.pressure_size = !self.pressure_size,
             PaintAction::PressureFlow => self.pressure_flow = !self.pressure_flow,
@@ -2719,6 +2732,7 @@ impl Session {
 #[derive(Resource, Default)]
 pub(in crate::editor) struct PaintState {
     sessions: HashMap<usize, Session>,
+    brush_defaults: brush_defaults::Store,
     last_painted_model: Option<usize>,
     tips: tips::Library,
     shelf: ShelfFilter,
@@ -2801,7 +2815,11 @@ impl PaintState {
     }
 
     fn activate(&mut self, model: usize) {
-        self.sessions.entry(model).or_default();
+        self.sessions.entry(model).or_insert_with(|| {
+            let mut session = Session::default();
+            self.brush_defaults.settings().apply(&mut session);
+            session
+        });
         if let Some(previous) = self.last_painted_model.replace(model).filter(|&previous| previous != model)
             && let [Some(source), Some(target)] = self.sessions.get_disjoint_mut([&previous, &model])
         {
@@ -2921,9 +2939,13 @@ pub(super) fn actions(
     device: Option<Res<bevy::render::renderer::RenderDevice>>,
     queue: Option<Res<bevy::render::renderer::RenderQueue>>,
     graph_labels: Query<(&GraphLabel, &bevy::text::EditableText)>,
-    mut layer_names: Query<(&LayerNameField, &mut bevy::text::EditableText), Without<GraphLabel>>,
+    mut layer_names: Query<(&LayerNameField, &mut bevy::text::EditableText),
+        (Without<GraphLabel>, Without<ui::RecoveryLimit>)>,
     baked: Res<bake::State>,
-    export_preferences: Res<export::prefs::Store>,
+    (export_preferences, mut recovery, recovery_fields): (
+        Res<export::prefs::Store>, ResMut<editing::recovery::Preferences>,
+        Query<&bevy::text::EditableText, With<ui::RecoveryLimit>>,
+    ),
 ) {
     let paint = &mut *paint;
     for (&model, session) in &mut paint.sessions {
@@ -3126,6 +3148,7 @@ pub(super) fn actions(
         return;
     }
     paint.activate(index);
+    let paint = &mut *paint;
     let session = paint.sessions.get_mut(&index).unwrap();
     let stored_settings = export_preferences.settings();
     if session.export_settings != stored_settings {
@@ -3325,6 +3348,51 @@ pub(super) fn actions(
                 continue;
             }
             match action {
+                PaintAction::ToggleRecovery | PaintAction::ApplyRecoveryLimit(_) => {
+                    if editor.browser_popup || editor.hdri_library_open {
+                        continue;
+                    }
+                    let mut settings = recovery.settings();
+                    match action {
+                        PaintAction::ToggleRecovery => settings.enabled = !settings.enabled,
+                        PaintAction::ApplyRecoveryLimit(entity) => {
+                            let Some(limit) = recovery_fields.get(entity).ok().and_then(ui::parse_recovery_limit) else {
+                                editor.status = "Введите целое число от 1 до 500".into();
+                                continue;
+                            };
+                            settings.edits = limit;
+                        }
+                        _ => unreachable!(),
+                    }
+                    editor.status = match recovery.save(settings) {
+                        Ok(()) => "Настройки автокопий сохранены".into(),
+                        Err(error) => format!("Не удалось сохранить настройки автокопий · {error}"),
+                    };
+                    continue;
+                }
+                PaintAction::SaveBrushDefaults | PaintAction::ResetBrushDefaults => {
+                    if editor.browser_popup || editor.hdri_library_open {
+                        continue;
+                    }
+                    let reset = action == PaintAction::ResetBrushDefaults;
+                    let settings = if reset {
+                        brush_defaults::Settings::default()
+                    } else {
+                        brush_defaults::Settings::capture(session)
+                    };
+                    match paint.brush_defaults.save(settings) {
+                        Ok(()) if reset => {
+                            settings.apply(session);
+                            session.revision += 1;
+                            editor.status = "Стандартные параметры рисования восстановлены".into();
+                        }
+                        Ok(()) => editor.status = "Стартовые параметры рисования сохранены".into(),
+                        Err(error) => {
+                            editor.status = format!("Не удалось сохранить параметры рисования · {error}");
+                        }
+                    }
+                    continue;
+                }
                 PaintAction::ImportShelfMaterial => {
                     let directory = editor.project.asset_root.clone();
                     if let Err(error) = paint.library.start_import(move || {

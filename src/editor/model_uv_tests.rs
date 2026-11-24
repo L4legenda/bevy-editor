@@ -16,6 +16,8 @@ fn udim_import_preference_persists_and_defaults_to_enabled() {
         prefs.auto_unwrap = AutoUnwrap::All;
         prefs.texture_size = 2048;
         prefs.bake_on_load = true;
+        prefs.bake_defaults.quality = model_bake_settings::Quality::High;
+        prefs.bake_defaults.match_names = false;
     }).unwrap();
     assert_eq!(ImportPreferences::open(Some(file.clone())).auto_unwrap, AutoUnwrap::All);
     reopened.toggle_udim().unwrap();
@@ -24,9 +26,15 @@ fn udim_import_preference_persists_and_defaults_to_enabled() {
     assert_eq!(reopened.auto_unwrap, AutoUnwrap::All);
     assert_eq!(reopened.texture_size, 2048);
     assert!(reopened.bake_on_load);
+    assert_eq!(reopened.bake_defaults, model_bake_settings::Defaults {
+        quality: model_bake_settings::Quality::High,
+        match_names: false,
+    });
 
     std::fs::write(&file, "{}").unwrap();
-    assert!(ImportPreferences::open(Some(file.clone())).udim_tiles);
+    let legacy = ImportPreferences::open(Some(file.clone()));
+    assert!(legacy.udim_tiles);
+    assert_eq!(legacy.bake_defaults, model_bake_settings::Defaults::default());
     let mut invalid = ImportPreferences { path: Some(file.join("invalid")), ..default() };
     assert!(invalid.toggle_udim().is_err());
     assert!(invalid.udim_tiles);
