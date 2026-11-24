@@ -12,7 +12,7 @@ pub(in crate::editor) struct PolygonReplay {
     parts: Vec<(String, Range<usize>)>,
     uv_offsets: Vec<Vec2>,
     uv_tiles: Vec<Vec2>,
-    visibility_tolerance: f32,
+    pub(super) visibility_tolerance: f32,
 }
 
 impl PolygonReplay {

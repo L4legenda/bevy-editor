@@ -16,11 +16,12 @@ pub(super) mod sidebar;
 pub(in crate::editor::ui) use sidebar::PanelBody;
 #[path = "model_paint_engine.rs"]
 pub(super) mod engine;
-pub(in crate::editor) use engine::surface::{PolygonReplay, Stencil, StrokeCoverage};
+pub(in crate::editor) use engine::surface::{PolygonReplay, Stencil, StencilCache, StrokeCoverage};
 #[path = "model_paint_export.rs"]
 pub(in crate::editor) mod export;
 #[path = "model_paint_bake.rs"]
 pub(super) mod bake;
+pub(in crate::editor) use bake::import_generator_inputs;
 #[path = "model_paint_pathtrace.rs"]
 pub(super) mod pathtrace;
 #[path = "model_paint_post.rs"]

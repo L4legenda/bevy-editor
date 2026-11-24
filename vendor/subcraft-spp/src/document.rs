@@ -478,8 +478,10 @@ pub struct BrushInfo {
     pub sources: Vec<SourceInfo>,
     /// Brush size; `size_space` says relative to what (see [`StrokeInfo`]).
     pub size: f32,
+    pub size_jitter: f32,
     pub size_space: i64,
     pub flow: f32,
+    pub flow_jitter: f32,
     pub spacing: f32,
     /// Fixed stamp angle and random angular range, in radians.
     pub rotation: f32,
@@ -509,12 +511,17 @@ pub struct BrushInfo {
     /// The string a text tip draws (Painter's font resources, e.g. `font_chathura`, have a
     /// `text` tweak holding it); `None` for other tips.
     pub tip_text: Option<String>,
-    /// Painter's alignment id (0 tangent wrap, 1 tangent planar, 2 camera, 3 UV, as SubCraft's).
+    /// Painter's stored alignment id: 1 tangent planar, 2 UV, 3 tangent wrap, 4 camera.
     pub alignment: i64,
     pub culling: bool,
+    /// Maximum angle from the stamp normal, stored as a fraction of 180 degrees.
+    pub culling_angle: f32,
+    pub paint_through: bool,
     /// Screen-space stencil: the image resource URL and the action's 3x3 `projMatrix` (column
     /// major) taking clip-space screen positions (-1..1, y up) to stencil UV (v up).
     pub stencil: Option<(String, [f32; 9])>,
+    /// Serialized projection sampling wrap mode for the stencil (`projSamplingWrap`).
+    pub stencil_wrap: i64,
     /// The set tweaks of a Substance-graph stencil (`switch_stencil`, `Switch_Alpha`... pick the
     /// sheet's image); empty for a bitmap stencil.
     pub stencil_tweaks: Vec<(String, Vec<f32>)>,
@@ -779,8 +786,10 @@ fn brush_of(a: &Obj) -> Option<BrushInfo> {
     Some(BrushInfo {
         sources: a.list("sourceColor").iter().filter_map(source_of).collect(),
         size: b.float("brushSize").unwrap_or(0.1),
+        size_jitter: b.float("brushSizeJitter").filter(|v| v.is_finite()).unwrap_or_default(),
         size_space: b.int("brushSizeSpace").unwrap_or(1),
         flow: b.float("flow").unwrap_or(1.0),
+        flow_jitter: b.float("flowJitter").filter(|v| v.is_finite()).unwrap_or_default(),
         spacing: emitter.and_then(|e| e.float("spacing")).unwrap_or(0.2),
         rotation: emitter.and_then(|e| e.float("rotation")).filter(|v| v.is_finite()).unwrap_or_default(),
         rotation_jitter: emitter.and_then(|e| e.float("rotationJitter")).filter(|v| v.is_finite()).unwrap_or_default(),
@@ -805,8 +814,10 @@ fn brush_of(a: &Obj) -> Option<BrushInfo> {
         }),
         tip_seed: tip.as_ref().and_then(|g| g.value("$randomseed")).unwrap_or_default() as u32,
         tip_text: a.list("sourceTransparent").iter().filter_map(|s| s.obj("procedural")).flat_map(|p| p.list("tweaks")).find(|t| t.class == "DataTweakByteArray" && t.str("identifier") == Some("text")).and_then(|t| t.str("value")).map(str::to_string),
-        alignment: b.int("alignment").unwrap_or(0),
+        alignment: b.int("alignment").unwrap_or(3),
         culling: b.int("cullingEnabled").map(|v| v != 0).or(b.bool("cullingEnabled")).unwrap_or(true),
+        culling_angle: b.float("cullingAngle").filter(|v| v.is_finite()).unwrap_or(0.5),
+        paint_through: b.int("paintThrough").map(|v| v != 0).or(b.bool("paintThrough")).unwrap_or(false),
         // A bitmap (`.image`) or a Substance graph (`.sbsar`, e.g. a splatter or a stencil sheet).
         stencil: a.obj("sourceStencil").and_then(|s| {
             let url = match s.class.as_str() {
@@ -818,6 +829,7 @@ fn brush_of(a: &Obj) -> Option<BrushInfo> {
             Some((url, m))
         }),
         stencil_tweaks: a.obj("sourceStencil").filter(|s| s.class == "DataSourceProcedural").and_then(|s| s.obj("procedural")).and_then(graph_of).map(|g| g.tweaks).unwrap_or_default(),
+        stencil_wrap: a.int("projSamplingWrap").unwrap_or_default(),
     })
 }
 

@@ -364,7 +364,11 @@ pub fn document_with_bitmap(normal_syscoord: i32, bitmap: Option<&str>) -> Vec<u
 }
 
 pub fn document_with_polygon_mask() -> Vec<u8> {
-    document_options(0, None, TestMask::Polygon)
+    document_options(0, None, TestMask::Polygon(None))
+}
+
+pub fn document_with_generator_and_polygon_mask(url: &str) -> Vec<u8> {
+    document_options(0, None, TestMask::Polygon(Some(url)))
 }
 
 pub fn document_with_strokes() -> Vec<u8> {
@@ -396,11 +400,15 @@ pub fn document_with_udim() -> Vec<u8> {
 }
 
 pub fn document_with_stencil(url: &str) -> Vec<u8> {
-    document_options(0, None, TestMask::Stencil(url, false, None))
+    document_options(0, None, TestMask::Stencil(url, false, None, None))
 }
 
 pub fn document_with_uv_stencil(url: &str) -> Vec<u8> {
-    document_options(0, None, TestMask::Stencil(url, true, None))
+    document_with_uv_stencil_wrap(url, None)
+}
+
+pub fn document_with_uv_stencil_wrap(url: &str, wrap: Option<u32>) -> Vec<u8> {
+    document_options(0, None, TestMask::Stencil(url, true, None, wrap))
 }
 
 pub fn document_with_procedural_stencil(uv: bool, inverted: bool) -> Vec<u8> {
@@ -411,6 +419,20 @@ pub fn document_with_procedural_stencil(uv: bool, inverted: bool) -> Vec<u8> {
             "resource://starter_assets/drop_splatter/drop_splatter?version=1.sbsar",
             uv,
             Some(inverted),
+            None,
+        ),
+    )
+}
+
+pub fn document_with_perlin_stencil(uv: bool, inverted: bool) -> Vec<u8> {
+    document_options(
+        0,
+        None,
+        TestMask::Stencil(
+            "resource://starter_assets/3D_perlin_noise/3D_perlin_noise?version=1.sbsar",
+            uv,
+            Some(inverted),
+            None,
         ),
     )
 }
@@ -426,6 +448,11 @@ pub enum TipStroke {
     Follow,
     FollowTap,
     Jittered,
+    SizeJitter,
+    FlowJitter,
+    UvProjection,
+    PlanarProjection,
+    Camera { culling: bool, paint_through: bool, angle: u8 },
     Splatter {
         uv: bool,
         inverted: bool,
@@ -443,14 +470,14 @@ pub fn document_with_pressure() -> Vec<u8> {
 
 enum TestMask<'a> {
     None,
-    Polygon,
+    Polygon(Option<&'a str>),
     Strokes,
     PaintFill,
     Effects(&'a str, bool),
     OrderedFilters,
     Anchors,
     Udim,
-    Stencil(&'a str, bool, Option<bool>),
+    Stencil(&'a str, bool, Option<bool>, Option<u32>),
     BitmapTip(&'a str, TipStroke),
     Pressure,
 }
@@ -462,7 +489,7 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     let udim = matches!(mask, TestMask::Udim);
     let pressure = matches!(mask, TestMask::Pressure);
     let stencil = match mask {
-        TestMask::Stencil(url, uv, inverted) => Some((url, uv, inverted)),
+        TestMask::Stencil(url, uv, inverted, wrap) => Some((url, uv, inverted, wrap)),
         _ => None,
     };
     let tip = match mask {
@@ -574,8 +601,8 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     }
     w.out.push(1);
     w.string("Rust");
-    if matches!(mask, TestMask::Polygon) {
-        write_polygon_mask(&mut w);
+    if let TestMask::Polygon(generator) = mask {
+        write_polygon_mask(&mut w, generator);
     } else if strokes {
         write_strokes(&mut w, 0x400, true, None, None, false, false);
     } else if let Some(url) = mask_image {
@@ -873,6 +900,10 @@ fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
 
 fn write_generator(w: &mut DocWriter) {
     w.u32(1);
+    write_generator_fill(w, "starter/mg_dirt/mg_dirt");
+}
+
+fn write_generator_fill(w: &mut DocWriter, url: &str) {
     w.u32(0x610);
     w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
     w.out.extend(u64::MAX.to_le_bytes());
@@ -885,17 +916,33 @@ fn write_generator(w: &mut DocWriter) {
     w.out.extend(u64::MAX.to_le_bytes());
     w.u32(0x612);
     w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
-    w.string("starter/mg_dirt/mg_dirt");
+    w.string(url);
     w.u32(0);
 }
 
-fn write_polygon_mask(w: &mut DocWriter) {
+fn write_polygon_mask(w: &mut DocWriter, generator: Option<&str>) {
     w.u32(0x320);
     w.class("DataStackActions", &[("items", 19)]);
-    w.u32(1);
+    w.u32(if generator.is_some() { 3 } else { 1 });
+    if let Some(url) = generator {
+        write_uniform(w, 0x600, 0.5);
+        w.u32(0x602);
+        w.class(
+            "DataActionGroup",
+            &[("perChannelBlending", 19), ("subStack", 18)],
+        );
+        w.u32(1);
+        w.u32(0x603);
+        w.class("DataBlending", &[("blendingMode", 9)]);
+        w.u32(4); // Multiply
+        w.u32(0x604);
+        w.class("DataStackActions", &[("items", 19)]);
+        w.u32(1);
+        write_generator_fill(w, url);
+    }
     w.u32(0x321);
     w.class("DataActionDecal", &[("hits", 19)]);
-    w.u32(2);
+    w.u32(if generator.is_some() { 1 } else { 2 });
     w.u32(0x322);
     w.class(
         "DataDecalHitPunctual",
@@ -914,6 +961,9 @@ fn write_polygon_mask(w: &mut DocWriter) {
     w.u32(0); // UV view
     for f in bevy::math::Mat4::IDENTITY.to_cols_array() {
         w.u32(f.to_bits());
+    }
+    if generator.is_some() {
+        return;
     }
     w.u32(0x323);
     w.class(
@@ -941,7 +991,7 @@ fn write_strokes(
     w: &mut DocWriter,
     id: u32,
     mask: bool,
-    stencil: Option<(&str, bool, Option<bool>)>,
+    stencil: Option<(&str, bool, Option<bool>, Option<u32>)>,
     tip: Option<(&str, TipStroke)>,
     pressure: bool,
     initial_fill: bool,
@@ -978,7 +1028,7 @@ fn write_strokes(
         let tip_stroke = tip.map_or(TipStroke::Plain, |(_, stroke)| stroke);
         let follow_path = matches!(tip_stroke, TipStroke::Follow | TipStroke::FollowTap);
         let uv = uv
-            || stencil.is_some_and(|(_, uv, _)| uv)
+            || stencil.is_some_and(|(_, uv, _, _)| uv)
             || follow_path
             || matches!(tip_stroke, TipStroke::Splatter { uv: true, .. });
         let tip_emitter = matches!(
@@ -996,17 +1046,43 @@ fn write_strokes(
         if stencil.is_some() {
             properties.extend([("sourceStencil", 18), ("projMatrix", 13)]);
         }
+        if stencil.is_some_and(|(_, _, _, wrap)| wrap.is_some()) {
+            properties.push(("projSamplingWrap", 9));
+        }
         if tip.is_some() {
             properties.push(("sourceTransparent", 19));
         }
         w.class(kind, &properties);
         w.u32(id + 1);
-        if pressure || tip_emitter {
+        if matches!(tip_stroke, TipStroke::Camera { .. }) {
+            w.class("DataBrush", &[("brushSize", 1), ("alignment", 9), ("cullingEnabled", 10), ("paintThrough", 9), ("cullingAngle", 1)]);
+        } else if matches!(tip_stroke, TipStroke::SizeJitter | TipStroke::FlowJitter) {
+            w.class("DataBrush", &[("brushSize", 1), ("brushSizeJitter", 1), ("flowJitter", 1)]);
+        } else if matches!(tip_stroke, TipStroke::UvProjection | TipStroke::PlanarProjection) {
+            w.class("DataBrush", &[("brushSize", 1), ("alignment", 9)]);
+        } else if pressure || tip_emitter {
             w.class("DataBrush", &[("brushSize", 1), ("stampsEmitter", 18)]);
         } else {
             w.class("DataBrush", &[("brushSize", 1)]);
         }
         w.u32(if uv { 0.3f32 } else { 0.035f32 }.to_bits());
+        if let TipStroke::Camera { culling, paint_through, angle } = tip_stroke {
+            w.u32(4);
+            w.out.push(u8::from(culling));
+            w.u32(u32::from(paint_through));
+            w.u32((f32::from(angle) / 180.).to_bits());
+        }
+        if matches!(tip_stroke, TipStroke::SizeJitter | TipStroke::FlowJitter) {
+            let (size, flow) = if tip_stroke == TipStroke::SizeJitter { (0.9_f32, 0.) } else { (0., 0.9_f32) };
+            w.u32(size.to_bits());
+            w.u32(flow.to_bits());
+        }
+        if tip_stroke == TipStroke::UvProjection {
+            w.u32(2);
+        }
+        if tip_stroke == TipStroke::PlanarProjection {
+            w.u32(1);
+        }
         if pressure {
             w.u32(id + 9);
             w.class(
@@ -1069,9 +1145,11 @@ fn write_strokes(
                 }
             }
             w.u32(1);
-            let point = if uv {
+            let point = if matches!(tip_stroke, TipStroke::Camera { .. }) {
+                [0.625, 0.75]
+            } else if uv {
                 [0.75, 0.25]
-            } else if stencil.is_some_and(|(_, _, inverted)| inverted.is_none()) {
+            } else if stencil.is_some_and(|(_, _, inverted, _)| inverted.is_none()) {
                 [0.63, 0.875]
             } else {
                 [0.625, 0.875]
@@ -1099,7 +1177,7 @@ fn write_strokes(
         for f in color {
             w.u32(f32::to_bits(f));
         }
-        if let Some((url, uv, inverted)) = stencil {
+        if let Some((url, uv, inverted, wrap)) = stencil {
             w.u32(id + 5);
             let matrix = if let Some(inverted) = inverted {
                 w.class(
@@ -1110,11 +1188,17 @@ fn write_strokes(
                 w.u32(id + 6);
                 w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
                 w.string(url);
-                w.u32(1);
-                w.u32(id + 7);
-                w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
-                w.string("invert");
-                w.u32(f32::from(u8::from(inverted)).to_bits());
+                let mut tweaks = vec![("invert", f32::from(u8::from(inverted)))];
+                if url.contains("3D_perlin_noise") {
+                    tweaks.extend([("scale", 9.), ("Position", 0.37)]);
+                }
+                w.u32(tweaks.len() as u32);
+                for (i, (key, value)) in tweaks.into_iter().enumerate() {
+                    w.u32(id + 7 + i as u32);
+                    w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
+                    w.string(key);
+                    w.u32(value.to_bits());
+                }
                 let offset = if uv { [3., 2.5] } else { [1.75, -2.5] };
                 [-5f32, 0., 0., 0., 4., 0., offset[0], offset[1], 1.]
             } else {
@@ -1131,6 +1215,9 @@ fn write_strokes(
             };
             for f in matrix {
                 w.u32(f.to_bits());
+            }
+            if let Some(wrap) = wrap {
+                w.u32(wrap);
             }
         }
         if let Some((url, stroke)) = tip {
@@ -1236,6 +1323,18 @@ pub fn assbin_quad() -> Vec<u8> {
     assbin_quads(&[("Cube", 0., 1., 0., 0.)])
 }
 
+pub fn assbin_quad_with_narrow_uv() -> Vec<u8> {
+    assbin_quads_with_uv_scale(&[("Cube", 0., 1., 0., 0.)], [0.25, 1.], 1.)
+}
+
+pub fn assbin_projection_layers(back_depth: f32, front_normal: f32) -> Vec<u8> {
+    assbin_quads_with_uv_scale(
+        &[("Front", 0., 1., 0., 0.), ("Back", 0., 1., 0.5, back_depth)],
+        [1., 0.5],
+        front_normal,
+    )
+}
+
 pub fn assbin_two_parts() -> Vec<u8> {
     assbin_quads(&[("Left", 0., 0.5, 0., 0.), ("Right", 0.5, 1., 0., 0.)])
 }
@@ -1259,6 +1358,14 @@ pub fn assbin_overlapping_charts(front_last: bool) -> Vec<u8> {
 }
 
 fn assbin_quads(parts: &[(&str, f32, f32, f32, f32)]) -> Vec<u8> {
+    assbin_quads_with_uv_scale(parts, [1.; 2], 1.)
+}
+
+fn assbin_quads_with_uv_scale(
+    parts: &[(&str, f32, f32, f32, f32)],
+    uv_scale: [f32; 2],
+    front_normal: f32,
+) -> Vec<u8> {
     let mut b = b"ASSIMP.binary-dump.test".to_vec();
     b.resize(524, 0);
     b.extend(4u32.to_le_bytes()); // node data length (counted from the length field itself)
@@ -1270,6 +1377,8 @@ fn assbin_quads(parts: &[(&str, f32, f32, f32, f32)]) -> Vec<u8> {
             uv_v,
             depth,
             if i == 0 { parts.len() as u32 } else { 0 },
+            uv_scale,
+            if i == 0 { front_normal } else { 1. },
         ));
     }
     b
@@ -1282,6 +1391,8 @@ fn assbin_quad_record(
     uv_v: f32,
     depth: f32,
     count: u32,
+    uv_scale: [f32; 2],
+    normal: f32,
 ) -> Vec<u8> {
     let mut rec = Vec::new();
     rec.extend(count.to_le_bytes()); // the first record starts with the mesh count
@@ -1307,9 +1418,10 @@ fn assbin_quad_record(
         }
     };
     floats(&mut rec, &corners.map(|[x, y, _]| [x, y, depth]));
-    floats(&mut rec, &[[0.0, 0.0, 1.0]; 4]);
+    floats(&mut rec, &[[(1. - normal * normal).sqrt(), 0., normal]; 4]);
     rec.extend(3u32.to_le_bytes());
-    floats(&mut rec, &corners.map(|[x, y, z]| [x, y + uv_v, z]));
+    let [sx, sy] = uv_scale;
+    floats(&mut rec, &corners.map(|[x, y, z]| [x * sx, y * sy + uv_v, z]));
     rec.extend(2u32.to_le_bytes());
     for t in [[0u32, 1, 2], [0, 2, 3]] {
         rec.extend(0u32.to_le_bytes());

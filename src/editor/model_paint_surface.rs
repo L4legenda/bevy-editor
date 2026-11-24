@@ -22,7 +22,7 @@ mod spp_polygon;
 pub(in crate::editor) use spp_polygon::PolygonReplay;
 #[path = "model_paint_spp_strokes.rs"]
 mod spp_strokes;
-pub(in crate::editor) use spp_strokes::{Stencil, StrokeCoverage};
+pub(in crate::editor) use spp_strokes::{Stencil, StencilCache, StrokeCoverage};
 
 pub(super) struct SurfaceTrace {
     bvh: Bvh,

@@ -235,6 +235,23 @@ impl Bvh {
     }
 
     pub(in crate::editor) fn triangles_in_box(&self, min: Vec3, max: Vec3, result: &mut Vec<usize>) {
+        self.triangles_where(|lo, hi| !hi.cmplt(min).any() && !lo.cmpgt(max).any(), result);
+    }
+
+    pub(in crate::editor) fn triangles_in_frustum(&self, planes: &[Vec4], result: &mut Vec<usize>) {
+        self.triangles_where(
+            |min, max| {
+                planes.iter().all(|plane| {
+                    let normal = plane.truncate();
+                    let far = Vec3::select(normal.cmpge(Vec3::ZERO), max, min);
+                    normal.dot(far) + plane.w >= 0.
+                })
+            },
+            result,
+        );
+    }
+
+    fn triangles_where(&self, intersects: impl Fn(Vec3, Vec3) -> bool, result: &mut Vec<usize>) {
         if self.nodes.is_empty() {
             return;
         }
@@ -243,7 +260,7 @@ impl Bvh {
         while len > 0 {
             len -= 1;
             let node = &self.nodes[stack[len]];
-            if node.max.cmplt(min).any() || node.min.cmpgt(max).any() {
+            if !intersects(node.min, node.max) {
                 continue;
             }
             if let Some((left, right)) = node.children {

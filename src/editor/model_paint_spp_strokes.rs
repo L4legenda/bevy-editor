@@ -3,7 +3,12 @@ use super::{Attributes, PolygonReplay, spp_polygon::ray};
 use crate::editor::model_paint_data::{mask::fbm, texture_fill::Bitmap};
 use crate::editor::ui::model_viewer::paint::tips::splatter_alpha;
 use bevy::{math::Mat2, prelude::*};
+use std::sync::Arc;
 use subcraft_spp::document::{BrushInfo, StrokeInfo};
+
+#[path = "model_paint_spp_perlin.rs"]
+mod perlin;
+pub(in crate::editor) use perlin::StencilCache;
 
 const MAX_SAMPLES: usize = 131_072;
 const MAX_TEXEL_TESTS: usize = 64 * 1024 * 1024;
@@ -11,11 +16,13 @@ const MAX_TEXEL_TESTS: usize = 64 * 1024 * 1024;
 pub(in crate::editor) struct Stencil<'a> {
     source: StencilSource<'a>,
     transform: Mat3,
+    repeat: [bool; 2],
 }
 
 enum StencilSource<'a> {
     Bitmap(&'a Bitmap),
     Splatter(Splatter),
+    Perlin(Arc<image::GrayImage>),
 }
 
 struct Splatter {
@@ -40,32 +47,41 @@ impl Splatter {
         }
     }
 
-    fn sample(&self, raster: Vec2) -> f32 {
+    fn sample(&self, raster: Vec2, repeat: [bool; 2]) -> f32 {
         let [x, y] = raster.to_array();
         let uv = Vec2::new(
             if self.flip[0] { 1. - x } else { x },
             if self.flip[1] { 1. - y } else { y },
         );
-        let value = sample_gray(self.alpha, uv).powf(self.exponent);
+        let value = sample_gray(self.alpha, uv, repeat).powf(self.exponent);
         if self.inverse { 1. - value } else { value }
     }
 }
 
 impl<'a> Stencil<'a> {
-    pub fn new(bitmap: &'a Bitmap, matrix: &[f32; 9]) -> Option<Self> {
-        Self::with_source(StencilSource::Bitmap(bitmap), matrix)
+    pub fn new(bitmap: &'a Bitmap, matrix: &[f32; 9], repeat: [bool; 2]) -> Option<Self> {
+        Self::with_source(StencilSource::Bitmap(bitmap), matrix, repeat)
     }
 
-    pub fn procedural(url: &str, tweaks: &[(String, Vec<f32>)], matrix: &[f32; 9]) -> Option<Self> {
+    pub fn procedural(
+        url: &str,
+        tweaks: &[(String, Vec<f32>)],
+        matrix: &[f32; 9],
+        repeat: [bool; 2],
+        cache: &mut StencilCache,
+    ) -> Option<Self> {
         let (path, query) = url.split_once('?')?;
         if !query
             .split('&')
             .any(|argument| argument.starts_with("version=") && argument.ends_with(".sbsar"))
-            || !path
-                .rsplit('/')
-                .next()?
-                .eq_ignore_ascii_case("drop_splatter")
         {
+            return None;
+        }
+        let graph = path.rsplit('/').next()?;
+        if graph.eq_ignore_ascii_case("3D_perlin_noise") {
+            return Self::with_source(StencilSource::Perlin(cache.perlin(tweaks)), matrix, repeat);
+        }
+        if !graph.eq_ignore_ascii_case("drop_splatter") {
             return None;
         }
         let value = |name: &str, default: f32| {
@@ -86,13 +102,14 @@ impl<'a> Stencil<'a> {
                 value("invert", 0.) >= 0.5,
             )),
             matrix,
+            repeat,
         )
     }
 
-    fn with_source(source: StencilSource<'a>, matrix: &[f32; 9]) -> Option<Self> {
+    fn with_source(source: StencilSource<'a>, matrix: &[f32; 9], repeat: [bool; 2]) -> Option<Self> {
         let transform = Mat3::from_cols_array(matrix);
         (transform.is_finite() && transform.determinant().abs() > 1e-12)
-            .then_some(Self { source, transform })
+            .then_some(Self { source, transform, repeat })
     }
 
     fn sample(&self, clip: Vec4) -> f32 {
@@ -105,18 +122,30 @@ impl<'a> Stencil<'a> {
             return 0.;
         }
         let uv = image.truncate() / image.z;
-        if uv.min_element() < 0. || uv.max_element() > 1. {
+        if !uv.is_finite() {
             return 0.;
         }
-        let raster = Vec2::new(uv.x, 1. - uv.y);
+        let mut raster = [uv.x, 1. - uv.y];
+        for (coordinate, repeat) in raster.iter_mut().zip(self.repeat) {
+            if repeat {
+                *coordinate = coordinate.rem_euclid(1.);
+            } else if !(0. ..=1.).contains(coordinate) {
+                return 0.;
+            }
+        }
+        let raster = Vec2::from_array(raster);
         match &self.source {
             StencilSource::Bitmap(bitmap) => {
                 let (width, height) = bitmap.pixels().dimensions();
-                let margin = Vec2::splat(0.5) / Vec2::new(width as f32, height as f32);
+                let margin = Vec2::new(
+                    if self.repeat[0] { 0. } else { 0.5 / width as f32 },
+                    if self.repeat[1] { 0. } else { 0.5 / height as f32 },
+                );
                 let pixel = bitmap.sample(raster.clamp(margin, Vec2::ONE - margin), 0.);
                 pixel.truncate().dot(Vec3::new(0.2126, 0.7152, 0.0722)) * pixel.w
             }
-            StencilSource::Splatter(splatter) => splatter.sample(raster),
+            StencilSource::Splatter(splatter) => splatter.sample(raster, self.repeat),
+            StencilSource::Perlin(alpha) => sample_gray(alpha, raster, self.repeat),
         }
     }
 }
@@ -224,6 +253,12 @@ impl PolygonReplay {
             _ => 0.,
         };
         let cloudy = brush.tip == "dirt_cloudy";
+        let planar_projection = brush.alignment == 1;
+        let uv_projection = brush.alignment == 2;
+        let camera_projection = brush.alignment == 4;
+        let facing_limit = brush.culling.then(|| {
+            (brush.culling_angle.clamp(0., 1.) * std::f32::consts::PI).cos()
+        });
         coverage.partial = !matches!(
             brush.tip.as_str(),
             "" | "shape" | "shape_v2" | "RoundBrush" | "SquareBrush"
@@ -232,10 +267,11 @@ impl PolygonReplay {
             || (brush.tip_invert && !cloudy)
             || (brush.stencil.is_some()
                 && (stencil
-                    .is_none_or(|stencil| matches!(stencil.source, StencilSource::Splatter(_)))
+                    .is_none_or(|stencil| !matches!(stencil.source, StencilSource::Bitmap(_)))
                     || strokes.iter().any(|stroke| stroke.uv_space)))
             || brush.size_space != 1
-            || brush.alignment != 0;
+            || (planar_projection && strokes.iter().any(|stroke| !stroke.uv_space))
+            || !matches!(brush.alignment, 1..=4);
         let flow = brush.flow.clamp(0.01, 1.);
         let square = brush.tip == "SquareBrush";
         let cloud = (cloudy && tip.is_none()).then(|| cloudy_tip(brush, hardness));
@@ -251,8 +287,10 @@ impl PolygonReplay {
         let directional = square_bounds || cloud.is_some();
         let jitter = brush.rotation_jitter.clamp(0., std::f32::consts::PI);
         let scatter = brush.position_jitter.clamp(0., 1.);
-        // The spatial settings are preserved, using the editor's deterministic random sequence.
-        coverage.partial |= jitter > 0. || scatter > 0.;
+        let size_jitter = brush.size_jitter.clamp(0., 1.);
+        let flow_jitter = brush.flow_jitter.clamp(0., 1.);
+        // Substance's random sequence is approximated with a stable sequence per stroke.
+        coverage.partial |= jitter > 0. || scatter > 0. || size_jitter > 0. || flow_jitter > 0.;
         let extent = if square_bounds {
             3f32.sqrt()
         } else {
@@ -274,10 +312,10 @@ impl PolygonReplay {
                 };
             }
             if let Some(cloud) = &cloud {
-                return sample_gray(cloud, uv);
+                return sample_gray(cloud, uv, [false; 2]);
             }
             if let Some(splatter) = &splatter {
-                return splatter.sample(uv);
+                return splatter.sample(uv, [false; 2]);
             }
             let distance = if square {
                 offset.abs().max_element()
@@ -380,8 +418,8 @@ impl PolygonReplay {
                         return false;
                     }
                     remaining -= 1;
-                    let radius = 0.5 * diameter * pressure.x;
-                    let stamp_flow = flow * pressure.y;
+                    let radius = 0.5 * diameter * pressure.x * noise.reduce(size_jitter);
+                    let stamp_flow = flow * pressure.y * noise.reduce(flow_jitter);
                     if !point.is_finite() || !radius.is_finite() || radius <= 0. || stamp_flow <= 0.
                     {
                         return true;
@@ -452,11 +490,59 @@ impl PolygonReplay {
                         });
                         landed |=
                             bounds.min.cmplt(Vec2::ONE).all() && bounds.max.cmpgt(Vec2::ZERO).all();
+                    } else if camera_projection && let Some(owners) = owners {
+                        landed |= self.camera_dab(
+                            &mut coverage,
+                            (slot, owners),
+                            CameraDab {
+                                view_proj,
+                                inverse,
+                                point,
+                                radius: Vec2::splat(radius) / span,
+                                extent: axes.x_axis.abs() + axes.y_axis.abs(),
+                                facing_limit,
+                                paint_through: brush.paint_through,
+                            },
+                            &mut nearby,
+                            |offset| shape(local * offset) * stamp_flow,
+                            stencil,
+                        );
                     } else if let Some(owners) = owners
                         && let Some((origin, direction)) = ray(inverse, point)
-                        && let Some((center, normal, _, _)) =
+                        && let Some((center, normal, uv, density)) =
                             self.trace.hit(origin, direction, 0, slot, false)
                     {
+                        if uv_projection {
+                            let radius = radius * density;
+                            if !radius.is_finite() || radius <= 0. {
+                                return true;
+                            }
+                            let extent = axes.x_axis.abs() + axes.y_axis.abs();
+                            let bounds = Rect::from_center_size(uv, extent * (2. * radius));
+                            coverage.stamp(bounds, |sample, pixel| {
+                                let Some(triangle) = self.trace.attributes.get(owners[pixel] as usize)
+                                else {
+                                    return 0.;
+                                };
+                                let weight = shape(local * ((sample - uv) / radius)) * stamp_flow;
+                                if let Some(stencil) = stencil
+                                    && weight > 0.
+                                {
+                                    let Some(weights) =
+                                        super::super::projection::weights(sample, triangle.uv)
+                                    else {
+                                        return 0.;
+                                    };
+                                    let [a, b, c] = triangle.points;
+                                    let point = a * weights.x + b * weights.y + c * weights.z;
+                                    weight * stencil.sample(view_proj * point.extend(1.))
+                                } else {
+                                    weight
+                                }
+                            });
+                            landed = true;
+                            return true;
+                        }
                         landed = true;
                         nearby.clear();
                         let reach = Vec3::splat(radius * extent);
@@ -481,6 +567,8 @@ impl PolygonReplay {
                                         tangent,
                                         radius,
                                         extent,
+                                        planar: planar_projection,
+                                        facing_limit,
                                     },
                                     |offset| shape(local * offset) * stamp_flow,
                                     |point| {
@@ -529,13 +617,176 @@ impl PolygonReplay {
         }
         coverage
     }
+
+    fn camera_dab(
+        &self,
+        coverage: &mut StrokeCoverage,
+        (slot, owners): (usize, &[u32]),
+        dab: CameraDab,
+        nearby: &mut Vec<usize>,
+        falloff: impl Fn(Vec2) -> f32,
+        stencil: Option<&Stencil<'_>>,
+    ) -> bool {
+        let reach = dab.radius * dab.extent;
+        let min = ((dab.point - reach) * 2. - Vec2::ONE).max(-Vec2::ONE);
+        let max = ((dab.point + reach) * 2. - Vec2::ONE).min(Vec2::ONE);
+        if !min.cmplt(max).all() {
+            return false;
+        }
+        let planes = [
+            Vec4::new(1., 0., 0., -min.x),
+            Vec4::new(-1., 0., 0., max.x),
+            Vec4::new(0., 1., 0., -min.y),
+            Vec4::new(0., -1., 0., max.y),
+            Vec4::new(0., 0., 1., 1.),
+            Vec4::new(0., 0., -1., 1.),
+        ];
+        nearby.clear();
+        self.trace.bvh.triangles_in_frustum(
+            &planes.map(|plane| dab.view_proj.transpose() * plane),
+            nearby,
+        );
+        let mut polygon = Vec::with_capacity(9);
+        let mut scratch = Vec::with_capacity(9);
+        let mut landed = false;
+        for &index in nearby.iter() {
+            let triangle = &self.trace.attributes[index];
+            if triangle.slot != slot {
+                continue;
+            }
+            polygon.clear();
+            polygon.extend(
+                triangle.points.into_iter().zip(triangle.uv)
+                    .map(|(point, uv)| (dab.view_proj * point.extend(1.), uv)),
+            );
+            for plane in planes {
+                clip_stamp_polygon(&polygon, &mut scratch, plane);
+                std::mem::swap(&mut polygon, &mut scratch);
+            }
+            let bounds = polygon.iter().fold(
+                Rect { min: Vec2::splat(f32::INFINITY), max: Vec2::splat(f32::NEG_INFINITY) },
+                |bounds, &(_, uv)| Rect {
+                    min: bounds.min.min(uv),
+                    max: bounds.max.max(uv),
+                },
+            );
+            if !bounds.min.cmplt(bounds.max).all() {
+                continue;
+            }
+            landed = true;
+            coverage.stamp(bounds, |uv, pixel| {
+                if owners[pixel] != index as u32 {
+                    return 0.;
+                }
+                let Some(weights) = super::super::projection::weights(uv, triangle.uv) else {
+                    return 0.;
+                };
+                let [a, b, c] = triangle.points;
+                let point = a * weights.x + b * weights.y + c * weights.z;
+                let clip = dab.view_proj * point.extend(1.);
+                if !clip.is_finite() || clip.w <= 0. || clip.z.abs() > clip.w {
+                    return 0.;
+                }
+                let screen = clip.xy() / clip.w * 0.5 + Vec2::splat(0.5);
+                if screen.min_element() < 0. || screen.max_element() > 1. {
+                    return 0.;
+                }
+                let offset = (screen - dab.point) * Vec2::new(1., -1.) / dab.radius;
+                let weight = falloff(offset) * stencil.map_or(1., |stencil| stencil.sample(clip));
+                if weight <= 0. {
+                    return 0.;
+                }
+                let Some((origin, direction)) = ray(dab.inverse, screen) else {
+                    return 0.;
+                };
+                let [a, b, c] = triangle.normals;
+                let normal = (a * weights.x + b * weights.y + c * weights.z).normalize_or_zero();
+                let facing = stamp_facing(dab.facing_limit, normal.dot(-direction));
+                if facing == 0. {
+                    return 0.;
+                }
+                let limit = (point - origin).dot(direction) - self.visibility_tolerance;
+                if !dab.paint_through && limit > 0.
+                    && self.trace.bvh.cast_triangle_up_to(origin, direction, limit, |_| true).is_some()
+                {
+                    return 0.;
+                }
+                weight * facing
+            });
+            if coverage.budget == 0 {
+                break;
+            }
+        }
+        landed
+    }
 }
 
-fn sample_gray(image: &image::GrayImage, uv: Vec2) -> f32 {
+struct CameraDab {
+    view_proj: Mat4,
+    inverse: Mat4,
+    point: Vec2,
+    radius: Vec2,
+    extent: Vec2,
+    facing_limit: Option<f32>,
+    paint_through: bool,
+}
+
+fn clip_stamp_polygon(polygon: &[(Vec4, Vec2)], output: &mut Vec<(Vec4, Vec2)>, plane: Vec4) {
+    output.clear();
+    let Some(&last) = polygon.last() else {
+        return;
+    };
+    let mut start = last;
+    let mut distance = plane.dot(start.0);
+    for &end in polygon {
+        let next_distance = plane.dot(end.0);
+        if (distance < 0.) != (next_distance < 0.) {
+            let t = distance / (distance - next_distance);
+            output.push((start.0.lerp(end.0, t), start.1.lerp(end.1, t)));
+        }
+        if next_distance >= 0. {
+            output.push(end);
+        }
+        start = end;
+        distance = next_distance;
+    }
+}
+
+fn sample_gray(image: &image::GrayImage, uv: Vec2, repeat: [bool; 2]) -> f32 {
     let size = Vec2::new(image.width() as f32, image.height() as f32);
-    let at = (uv * size - Vec2::splat(0.5)).clamp(Vec2::ZERO, size - Vec2::ONE);
-    image::imageops::interpolate_bilinear(image, at.x, at.y)
-        .map_or(0., |alpha| f32::from(alpha[0]) / 255.)
+    let position = uv * size - Vec2::splat(0.5);
+    if repeat == [false; 2] {
+        let at = position.clamp(Vec2::ZERO, size - Vec2::ONE);
+        return image::imageops::interpolate_bilinear(image, at.x, at.y)
+            .map_or(0., |alpha| f32::from(alpha[0]) / 255.);
+    }
+    let cell = position.floor();
+    let fraction = position - cell;
+    let (x, y) = (cell.x as i32, cell.y as i32);
+    let index = |value: i32, side: u32, wrap: bool| {
+        if wrap {
+            value.rem_euclid(side as i32) as u32
+        } else {
+            value.clamp(0, side as i32 - 1) as u32
+        }
+    };
+    let at = |x, y| {
+        let px = index(x, image.width(), repeat[0]);
+        let py = index(y, image.height(), repeat[1]);
+        f32::from(image.get_pixel(px, py)[0])
+    };
+    let left = Vec2::new(at(x, y), at(x, y + 1));
+    let right = Vec2::new(at(x + 1, y), at(x + 1, y + 1));
+    left.lerp(right, fraction.x).dot(Vec2::new(1. - fraction.y, fraction.y)) / 255.
+}
+
+#[cfg(test)]
+#[test]
+fn procedural_stencil_blends_across_a_repeated_edge() {
+    let alpha = image::GrayImage::from_vec(2, 2, vec![0, 255, 0, 255]).unwrap();
+    let edge = Vec2::new(0., 0.5);
+    assert_eq!(sample_gray(&alpha, edge, [false, true]), 0.);
+    assert_eq!(sample_gray(&alpha, edge, [true, false]), 0.5);
 }
 
 #[cfg(test)]
@@ -548,7 +799,7 @@ fn procedural_splatter_stencil_respects_recorded_tweaks() {
             .iter()
             .map(|(name, value)| (name.to_string(), vec![*value]))
             .collect();
-        Stencil::procedural(url, &tweaks, &identity).unwrap()
+        Stencil::procedural(url, &tweaks, &identity, [false; 2], &mut StencilCache::default()).unwrap()
     };
     let sample = |stencil: &Stencil<'_>, x, y| stencil.sample(Vec4::new(x, y, 0., 1.));
     let base = stencil(&[]);
@@ -579,20 +830,31 @@ fn procedural_splatter_stencil_respects_recorded_tweaks() {
     }
     assert!(soft_edge && asymmetric == [true; 2]);
     assert_eq!(sample(&inverted, 1.5, 0.5), 0.);
-    assert!(Stencil::procedural("unlisted?version=test.sbsar", &[], &identity).is_none());
+    assert!(Stencil::procedural("unlisted?version=test.sbsar", &[], &identity, [false; 2], &mut StencilCache::default()).is_none());
 }
 
 struct StampNoise(u32);
 
 impl StampNoise {
+    fn reduce(&mut self, amount: f32) -> f32 {
+        if amount > 0. {
+            1. - amount * (self.signed() * 0.5 + 0.5)
+        } else {
+            1.
+        }
+    }
+
     fn signed(&mut self) -> f32 {
         self.0 = self.0.wrapping_add(0x9e3779b9);
-        let mut value = self.0;
-        value = (value ^ (value >> 16)).wrapping_mul(0x21f0aaad);
-        value = (value ^ (value >> 15)).wrapping_mul(0x735a2d97);
-        let value = (value ^ (value >> 15)) >> 8;
+        let value = stamp_hash(self.0) >> 8;
         value as f32 * (2. / 16_777_216.) - 1.
     }
+}
+
+fn stamp_hash(mut value: u32) -> u32 {
+    value = (value ^ (value >> 16)).wrapping_mul(0x21f0aaad);
+    value = (value ^ (value >> 15)).wrapping_mul(0x735a2d97);
+    value ^ (value >> 15)
 }
 
 fn cloudy_tip(brush: &BrushInfo, hardness: f32) -> image::GrayImage {
@@ -629,12 +891,23 @@ fn smoothstep(lo: f32, hi: f32, value: f32) -> f32 {
     t * t * (3. - 2. * t)
 }
 
+fn stamp_facing(limit: Option<f32>, cosine: f32) -> f32 {
+    match limit {
+        None => 1.,
+        Some(limit) if limit <= -1. => 1.,
+        Some(limit) if limit >= 1. => f32::from(u8::from(cosine >= 1.)),
+        Some(limit) => smoothstep(limit, (limit + 0.15).min(1.), cosine),
+    }
+}
+
 struct SurfaceDab {
     center: Vec3,
     normal: Vec3,
     tangent: Vec3,
     radius: f32,
     extent: f32,
+    planar: bool,
+    facing_limit: Option<f32>,
 }
 
 fn surface_dab(
@@ -651,6 +924,8 @@ fn surface_dab(
         tangent,
         radius,
         extent,
+        planar,
+        facing_limit,
     } = dab;
     let bitangent = normal.cross(tangent);
     let [a, b, c] = triangle.points;
@@ -685,14 +960,16 @@ fn surface_dab(
         };
         let point = a * weights.x + b * weights.y + c * weights.z;
         let offset = point - center;
-        let height = offset.dot(normal);
-        if height.abs() > radius {
+        let height = offset.dot(normal).abs() / radius;
+        if height > 1. {
             return 0.;
         }
         let [a, b, c] = triangle.normals;
         let face = (a * weights.x + b * weights.y + c * weights.z).normalize_or_zero();
+        let depth = if planar { 1. - smoothstep(0., 1., height) } else { 1. };
         falloff(Vec2::new(offset.dot(tangent), offset.dot(bitangent)) / radius)
-            * smoothstep(0., 0.15, face.dot(normal))
+            * stamp_facing(facing_limit, face.dot(normal))
+            * depth
             * stencil(point)
     });
 }

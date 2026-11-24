@@ -37,6 +37,7 @@ pub(super) use levels::Maps;
 
 pub(in crate::editor) use crate::editor::model_paint_data::map_fixes::BakeMap;
 use crate::editor::model_paint_data::map_fixes::Fixes;
+use crate::editor::model_paint_data::mask::{BakedInputs, Generator, GeneratorInput};
 impl BakeMap {
     pub(super) const OPTIONAL: [Self; 7] = [
         Self::Occlusion, Self::Cavity, Self::Thickness, Self::Sky,
@@ -116,6 +117,19 @@ pub(super) struct MapSelection(u8);
 impl MapSelection {
     pub const ALL: Self = Self(0b111_1111);
     pub const MINIMUM: Self = Self(0);
+    const GENERATOR_MAPS: [(BakeMap, GeneratorInput); 8] = {
+        use GeneratorInput as Input;
+        [
+            (BakeMap::Occlusion, Input::Occlusion),
+            (BakeMap::Cavity, Input::Cavity),
+            (BakeMap::Thickness, Input::Thin),
+            (BakeMap::Sky, Input::Sky),
+            (BakeMap::Curvature, Input::Convexity),
+            (BakeMap::Curvature, Input::Concavity),
+            (BakeMap::EdgeDistance, Input::Edges),
+            (BakeMap::CreaseDistance, Input::Creases),
+        ]
+    };
 
     fn bit(map: BakeMap) -> u8 {
         match map {
@@ -152,21 +166,50 @@ impl MapSelection {
     }
 
     fn disabled_inputs(self) -> u32 {
-        use crate::editor::model_paint_data::mask::GeneratorInput as Input;
-        [
-            (BakeMap::Occlusion, Input::Occlusion),
-            (BakeMap::Cavity, Input::Cavity),
-            (BakeMap::Thickness, Input::Thin),
-            (BakeMap::Sky, Input::Sky),
-            (BakeMap::Curvature, Input::Convexity),
-            (BakeMap::Curvature, Input::Concavity),
-            (BakeMap::EdgeDistance, Input::Edges),
-            (BakeMap::CreaseDistance, Input::Creases),
-        ]
-        .into_iter()
-        .filter(|&(map, _)| !self.contains(map))
-        .fold(0, |bits, (_, input)| bits | (1 << input as u32))
+        Self::GENERATOR_MAPS
+            .into_iter()
+            .filter(|&(map, _)| !self.contains(map))
+            .fold(0, |bits, (_, input)| bits | (1 << input as u32))
     }
+}
+
+/// Bake the inputs used by reconstructed procedural masks during background SPP import.
+pub(in crate::editor) fn import_generator_inputs(
+    object: &crate::editor::model_document::Object,
+    slot: usize,
+    size: u32,
+    generators: &[Generator],
+) -> Result<Arc<BakedInputs>, String> {
+    let maps = MapSelection::GENERATOR_MAPS
+        .into_iter()
+        .filter(|&(_, input)| {
+            generators.iter().any(|generator| generator.weight(input) != 0)
+        })
+        .fold(MapSelection::MINIMUM, |maps, (map, _)| {
+            MapSelection(maps.bits() | MapSelection::bit(map))
+        });
+    let settings = ProjectionSettings {
+        maps,
+        quality: Quality::Draft,
+        ..default()
+    };
+    let mut bake_object = object.clone();
+    for material in &mut bake_object.materials {
+        material.paint = None;
+    }
+    let maps = mesh::bake_on_device(
+        vec![bake_object],
+        object.id,
+        slot,
+        size,
+        &settings,
+        &Progress::default(),
+        None,
+    )?;
+    if maps.filled == 0 {
+        return Err("В наборе нет поверхности с UV-развёрткой".into());
+    }
+    Ok(maps.generator_inputs().clone())
 }
 
 pub(in crate::editor) use crate::editor::model_bake_settings::Quality;

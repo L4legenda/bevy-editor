@@ -1,14 +1,18 @@
 //! Import Substance Painter geometry and the cached appearance into an editable GLB.
 use super::{
-    model_document::{MaterialSlot, MeshData, Object, glb::Glb, udim::Tile},
+    model_document::{MaterialSlot, Object, glb::Glb, udim::Tile},
     model_mesh::{Corner, Face, Geometry},
-    model_paint_data::{Layer, LayerKind, Stack, Surface, solid},
-    ui::model_viewer::paint::{PolygonReplay, Stencil, StrokeCoverage},
+    model_paint_data::{
+        Layer, LayerKind, Stack, Surface,
+        mask::{Generator, INPUT_CHANNELS},
+        solid,
+    },
+    ui::model_viewer::paint::{PolygonReplay, Stencil, StencilCache, StrokeCoverage, import_generator_inputs},
 };
 use bevy::prelude::*;
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,6 +37,16 @@ const CHANNELS: [(u64, &str, CacheFormat); 7] = [
     (channel_bits::NORMAL, "нормали", CacheFormat::Rgba16f),
 ];
 const MAX_TEXTURE_BYTES: usize = 1024 * 1024 * 1024;
+const MIN_TEXTURE_SIZE: u32 = 128;
+const MAX_IMPORT_BAKE_SIZE: u32 = 512;
+
+fn surface_bytes(size: u32) -> usize {
+    size as usize * size as usize * 4 * (8 + CHANNELS.len())
+}
+
+fn generator_input_bytes(size: u32) -> usize {
+    size as usize * size as usize * (INPUT_CHANNELS + 3)
+}
 
 #[derive(Default)]
 struct Summary {
@@ -48,6 +62,8 @@ struct Summary {
     mesh_masks: usize,
     mask_effects: usize,
     baked_mask_filters: usize,
+    baked_mask_generators: usize,
+    baked_generator_sets: usize,
     anchor_references: usize,
     unrestored: usize,
     partial: usize,
@@ -95,6 +111,18 @@ impl Summary {
             summary.push_str(&format!(
                 " · фильтров сведено в основу маски: {}",
                 self.baked_mask_filters
+            ));
+        }
+        if self.baked_mask_generators > 0 {
+            summary.push_str(&format!(
+                " · генераторов сведено в основу маски: {}",
+                self.baked_mask_generators
+            ));
+        }
+        if self.baked_generator_sets > 0 {
+            summary.push_str(&format!(
+                " · наборов с запечёнными картами: {}",
+                self.baked_generator_sets
             ));
         }
         if self.anchor_references > 0 {
@@ -283,29 +311,54 @@ fn import(path: &Path, name: &str) -> io::Result<(Object, Summary)> {
         .flatten()
         .any(|set| needs_replay(&set.layers))
         .then(|| PolygonReplay::new(&object, parts));
-    let mut shared_surfaces = BTreeMap::new();
-    for (slot, (material, set)) in object.materials.iter_mut().zip(matched_sets).enumerate() {
-        if let Some(set) = set {
+    let surfaces: Vec<_> = object
+        .materials
+        .iter()
+        .zip(&matched_sets)
+        .enumerate()
+        .map(|(slot, (material, set))| {
+            let set = (*set)?;
             let tile = material.udim();
             if set.use_uv_tiles && tile.is_none() {
-                continue;
+                return None;
             }
-            let per_material = needs_replay(&set.layers);
-            material.paint = shared_surfaces
-                .entry((set.uid, tile, per_material.then_some(slot)))
+            let mut generators = Vec::new();
+            rebuild::mask_generators(&set.layers, &mut generators);
+            let per_material = !generators.is_empty() || needs_replay(&set.layers);
+            generators.retain(|generator| generator.needs_bake());
+            Some(((set.uid, tile, per_material.then_some(slot)), generators))
+        })
+        .collect();
+    let mut pending: BTreeSet<_> = surfaces.iter().flatten().map(|(key, _)| *key).collect();
+    let mut shared_surfaces = BTreeMap::new();
+    for (slot, (set, surface)) in matched_sets.into_iter().zip(surfaces).enumerate() {
+        if let (Some(set), Some((key, generators))) = (set, surface) {
+            let paint = shared_surfaces
+                .entry(key)
                 .or_insert_with(|| {
-                    decode_surface(
+                    pending.remove(&key);
+                    // Leave space for at least the smallest surface in each later texture set.
+                    let minimum =
+                        surface_bytes(MIN_TEXTURE_SIZE) + generator_input_bytes(MIN_TEXTURE_SIZE);
+                    let reserved = pending
+                        .len()
+                        .saturating_mul(minimum)
+                        .min(remaining.saturating_sub(minimum));
+                    let mut available = remaining - reserved;
+                    let surface = decode_surface(
                         &mut file,
                         set,
-                        material.authored.as_deref().unwrap(),
-                        &mut remaining,
+                        &mut available,
                         &mut summary,
-                        (&object.geometry, slot, polygon_replay.as_ref()),
-                        tile,
-                    )
-                    .map(Arc::new)
+                        (&object, slot, polygon_replay.as_ref()),
+                        key.1,
+                        &generators,
+                    );
+                    remaining = available + reserved;
+                    surface.map(Arc::new)
                 })
                 .clone();
+            object.materials[slot].paint = paint;
         }
     }
     Ok((object, summary))
@@ -404,11 +457,11 @@ fn needs_replay(layers: &[subcraft_spp::document::LayerInfo]) -> bool {
 fn decode_surface(
     file: &mut FileReader,
     set: &TextureSetInfo,
-    authored: &serde_json::Value,
     remaining: &mut usize,
     summary: &mut Summary,
-    geometry: (&MeshData, usize, Option<&PolygonReplay>),
+    (object, slot, replay): (&Object, usize, Option<&PolygonReplay>),
     tile: Option<Tile>,
+    generators: &[Generator],
 ) -> Option<Surface> {
     let scope = match tile {
         Some(tile) => format!("«{}» · UDIM {}", set.name, tile.number()),
@@ -423,15 +476,20 @@ fn decode_surface(
         .and_then(|info| info.resolution_log2)
         .unwrap_or([set.width_log2, set.height_log2]);
     let mut size = 1u32 << width.max(height).clamp(7, 12);
-    let budget = |size: u32| size as usize * size as usize * 4 * (8 + CHANNELS.len());
     let planes = rebuild::estimated_planes(&set.layers);
     let working = |size: u32| {
-        budget(size).saturating_add((size as usize * size as usize * 4).saturating_mul(planes))
+        surface_bytes(size)
+            .saturating_add((size as usize * size as usize * 4).saturating_mul(planes))
+            .saturating_add(if generators.is_empty() {
+                0
+            } else {
+                generator_input_bytes(size.min(MAX_IMPORT_BAKE_SIZE))
+            })
     };
-    while size > 128 && working(size) > *remaining {
+    while size > MIN_TEXTURE_SIZE && working(size) > *remaining {
         size /= 2;
     }
-    if budget(size) > *remaining {
+    if surface_bytes(size) > *remaining {
         summary.unrestored += rebuild::count(&set.layers);
         summary
             .notes
@@ -469,7 +527,32 @@ fn decode_surface(
     if !has_cache && set.layers.is_empty() {
         return None;
     }
-    *remaining -= budget(size);
+    *remaining -= surface_bytes(size);
+    let baked = if generators.is_empty() {
+        None
+    } else {
+        let mut bake_size = size.min(MAX_IMPORT_BAKE_SIZE);
+        while bake_size > MIN_TEXTURE_SIZE && generator_input_bytes(bake_size) > *remaining {
+            bake_size /= 2;
+        }
+        let bytes = generator_input_bytes(bake_size);
+        let result = if bytes <= *remaining {
+            import_generator_inputs(object, slot, bake_size, generators)
+        } else {
+            Err("исчерпан объём текстур при импорте".into())
+        };
+        match result {
+            Ok(inputs) => {
+                *remaining -= bytes;
+                summary.baked_generator_sets += 1;
+                Some(inputs)
+            }
+            Err(error) => {
+                summary.notes.push(format!("{scope} · карты генераторов: {error}"));
+                None
+            }
+        }
+    };
     let mut layers = Vec::new();
     if has_cache {
         layers.push(layer);
@@ -482,9 +565,10 @@ fn decode_surface(
         remaining,
         summary,
         &mut layers,
-        geometry,
+        (&object.geometry, slot, replay),
         tile,
         &scope,
+        baked.as_ref(),
     );
     let base = [
         [184, 189, 199, 255],
@@ -497,16 +581,25 @@ fn decode_surface(
         [128, 128, 128, 255],
     ]
     .map(|value| solid(size, value));
-    Some(Surface {
+    let mut surface = Surface {
         size,
         base,
         stack: Stack {
             selected: if has_cache { 0 } else { layers.len() - 1 },
             layers,
         },
-        material: authored.clone(),
-        baked: None,
-    })
+        material: object.materials[slot].authored.as_deref().unwrap().clone(),
+        baked,
+    };
+    if !has_cache {
+        surface.bind_generators(
+            &object.geometry,
+            slot,
+            object.uv_offset(slot),
+            object.transform,
+        );
+    }
+    Some(surface)
 }
 
 fn channel_pixels(cache: &CacheImage, size: u32, channel: usize) -> Vec<u8> {
@@ -714,6 +807,98 @@ mod tests {
         let index = |x, y| ((y * surface.size + x) * 4) as usize;
         assert_eq!(mask.pixels[index(192, 192)], 64);
         assert_eq!(mask.pixels[index(64, 64)], 191);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_applies_polygon_fill_over_a_generator_layer() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-procedural-polygon-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Procedural.spp");
+        fs::write(
+            &source,
+            fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad()),
+                (
+                    "paint/document.bin",
+                    fixture::document_with_generator_and_polygon_mask(
+                        "starter/fractal_noise/fractal_noise",
+                    ),
+                ),
+            ]),
+        )
+        .unwrap();
+        let (filename, report) = convert(&source, &root).unwrap();
+        assert!(report.overview.contains("заливок по геометрии: 1"));
+        assert!(
+            report
+                .overview
+                .contains("генераторов сведено в основу маски: 1"),
+            "{}",
+            report.overview
+        );
+        let glb = Glb::load(&root.join(filename)).unwrap();
+        let surface = glb
+            .paint_surface(&glb.json["meshes"][0]["primitives"][0])
+            .unwrap()
+            .unwrap();
+        let mask = surface
+            .stack
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Rust")
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap();
+        assert!(mask.layers.is_empty());
+        let value = |x, y| mask.pixels[((y * surface.size + x) * 4) as usize];
+        assert_eq!(value(192, 192), 64);
+        let remaining: std::collections::HashSet<_> = (32..96)
+            .map(|x| value(x, 64))
+            .collect();
+        assert!(remaining.len() > 2 && remaining.iter().all(|&v| v <= 128));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_bakes_dirt_before_replaying_a_polygon_fill() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-dirt-polygon-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Dirt.spp");
+        fs::write(
+            &source,
+            fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad()),
+                (
+                    "paint/document.bin",
+                    fixture::document_with_generator_and_polygon_mask("starter/mg_dirt/mg_dirt"),
+                ),
+            ]),
+        )
+        .unwrap();
+        let (object, summary) = import(&source, "Dirt").unwrap();
+        assert_eq!(summary.baked_generator_sets, 1);
+        assert_eq!(summary.baked_mask_generators, 1);
+        assert_eq!(summary.polygon_fills, 1);
+        let surface = object.materials[0].paint.as_ref().unwrap();
+        let mask = surface
+            .stack
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Rust")
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap();
+        assert!(mask.layers.is_empty());
+        assert_eq!(mask.pixels[((192 * surface.size + 192) * 4) as usize], 64);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1003,7 +1188,14 @@ mod tests {
         assert_eq!((coverage[32], coverage[96]), (255, 0));
         let imported = find("Scratches").mask.as_ref().unwrap();
         assert!(imported.affine);
-        assert_eq!(imported.generator.unwrap().kind, GeneratorKind::Dirt);
+        let generator = imported.generator.unwrap();
+        assert_eq!(generator.kind, GeneratorKind::Dirt);
+        assert!(status.contains("наборов с запечёнными картами: 1"), "{status}");
+        let baked = surface.baked.as_ref().unwrap();
+        assert_eq!(baked.size, surface.size);
+        assert_eq!(baked.texels.len(), (baked.size * baked.size) as usize);
+        assert!(!generator.missing_bake_inputs(Some(baked)));
+        assert!(Generator::new(GeneratorKind::ThinAreas).missing_bake_inputs(Some(baked)));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1256,6 +1448,125 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_places_uv_projected_3d_stamps_in_texture_space() {
+        use fixture::TipStroke;
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-uv-projection-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        for (name, projection, expected) in [
+            ("Surface", TipStroke::Plain, [0, 255]),
+            ("UV", TipStroke::UvProjection, [255, 0]),
+        ] {
+            let alpha = imported_stamp_alpha(
+                &root, name, fixture::assbin_quad_with_narrow_uv(), projection,
+            );
+            assert_eq!(alpha(16, 64), 255, "{name}");
+            assert_eq!([alpha(21, 64), alpha(16, 73)], expected, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_camera_projection_distinguishes_backfaces_and_occlusion() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-camera-projection-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        for (name, culling, paint_through, normal, angle, front_alpha, rear_alpha) in [
+            ("Visible", true, false, 1., 90, 255, 0),
+            ("Culled", true, false, -1., 90, 0, 0),
+            ("Unculled", false, false, -1., 90, 255, 0),
+            ("Through", true, true, 1., 90, 255, 255),
+            ("ThroughCulled", true, true, -1., 90, 0, 255),
+            ("Tight", true, false, 0.5, 48, 0, 0),
+            ("Wide", true, false, 0.5, 90, 255, 0),
+            ("FullAngle", true, false, -1., 180, 255, 0),
+        ] {
+            let alpha = imported_stamp_alpha(
+                &root, name, fixture::assbin_projection_layers(-0.5, normal),
+                fixture::TipStroke::Camera { culling, paint_through, angle },
+            );
+            assert_eq!(alpha(64, 192), front_alpha, "{name}");
+            assert_eq!(alpha(96, 32), rear_alpha, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_restores_size_and_flow_jitter_independently() {
+        use fixture::TipStroke;
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-size-flow-jitter-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let alpha = |name, projection| imported_stamp_alpha(&root, name, fixture::assbin_quad(), projection);
+        let plain = alpha("Plain", TipStroke::Plain);
+        let size = alpha("Size", TipStroke::SizeJitter);
+        let flow = alpha("Flow", TipStroke::FlowJitter);
+        let repeat = alpha("Repeat", TipStroke::FlowJitter);
+        assert_eq!([plain(64, 64), plain(74, 64)], [255, 255]);
+        assert_eq!([size(64, 64), size(74, 64)], [255, 0]);
+        assert!((150..180).contains(&flow(64, 64)));
+        assert_eq!(flow(64, 64), flow(74, 64));
+        assert_eq!(flow(64, 64), repeat(64, 64));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_planar_stamp_fades_away_from_the_tangent_plane() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-tangent-projection-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let layers = || fixture::assbin_projection_layers(-0.03, 1.);
+        let wrap = imported_stamp_alpha(&root, "Wrap", layers(), fixture::TipStroke::Plain);
+        let planar = imported_stamp_alpha(&root, "Planar", layers(), fixture::TipStroke::PlanarProjection);
+        assert_eq!(wrap(64, 160), 255);
+        assert_eq!(planar(64, 160), 255);
+        assert_eq!(wrap(64, 32), 255);
+        assert!((70..160).contains(&planar(64, 32)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn imported_stamp_alpha(
+        root: &Path,
+        name: &str,
+        model: Vec<u8>,
+        projection: fixture::TipStroke,
+    ) -> impl Fn(u32, u32) -> u8 {
+        let source = root.join(format!("{name}.spp"));
+        let key = "1234567890123456789012345678901234567890.image";
+        fs::write(
+            &source,
+            fixture::hdf5_file(&[
+                ("paint/scene.assbin", model),
+                (
+                    "paint/document.bin",
+                    fixture::document_with_directed_tip(&format!("White?version={key}"), projection),
+                ),
+                (&format!("resources/{key}"), fixture::bitmap_blob([255; 4])),
+            ]),
+        )
+        .unwrap();
+        let (filename, _) = convert(&source, root).unwrap();
+        let glb = Glb::load(&root.join(filename)).unwrap();
+        let surface = glb
+            .paint_surface(&glb.json["meshes"][0]["primitives"][0])
+            .unwrap()
+            .unwrap();
+        let pixels = surface.stack.layers.iter()
+            .find(|layer| layer.name == "Scratches")
+            .unwrap().channels[0].clone();
+        let size = surface.size;
+        move |x, y| pixels.as_ref().map_or(0, |pixels| pixels[((y * size + x) * 4 + 3) as usize])
+    }
+
+    #[test]
     fn spp_import_rotates_bitmap_brush_and_follows_recorded_path() {
         use fixture::TipStroke;
         let root = std::env::temp_dir().join(format!(
@@ -1331,7 +1642,8 @@ mod tests {
                         jittered = Some(pixels.clone());
                     }
                 }
-                TipStroke::Splatter { .. } => unreachable!(),
+                TipStroke::Splatter { .. } | TipStroke::UvProjection | TipStroke::Camera { .. }
+                | TipStroke::PlanarProjection | TipStroke::SizeJitter | TipStroke::FlowJitter => unreachable!(),
             }
         }
         fs::remove_dir_all(root).unwrap();
@@ -1344,43 +1656,48 @@ mod tests {
             bevy::asset::uuid::Uuid::new_v4(),
         ));
         fs::create_dir(&root).unwrap();
-        let source = root.join("UVStencil.spp");
         let key = "1234567890123456789012345678901234567890.image";
-        fs::write(
-            &source,
-            fixture::hdf5_file(&[
-                ("paint/scene.assbin", fixture::assbin_quad()),
-                (
-                    "paint/document.bin",
-                    fixture::document_with_uv_stencil(&format!("Stencil?version={key}")),
-                ),
-                (&format!("resources/{key}"), fixture::bitmap_blob([255; 4])),
-            ]),
-        )
-        .unwrap();
-        let (path, report) = convert(&source, &root).unwrap();
-        let status = report.label;
-        assert!(status.contains("действий кисти и ластика: 1"), "{status}");
-        let glb = Glb::load(&root.join(path)).unwrap();
-        let surface = glb
-            .paint_surface(&glb.json["meshes"][0]["primitives"][0])
-            .unwrap()
+        for (wrap, horizontal, vertical) in [
+            (None, false, false),
+            (Some(1), true, false),
+            (Some(2), false, true),
+            (Some(3), true, true),
+        ] {
+            let source = root.join(format!("UVStencil{}.spp", wrap.unwrap_or(0)));
+            fs::write(
+                &source,
+                fixture::hdf5_file(&[
+                    ("paint/scene.assbin", fixture::assbin_quad()),
+                    (
+                        "paint/document.bin",
+                        fixture::document_with_uv_stencil_wrap(&format!("Stencil?version={key}"), wrap),
+                    ),
+                    (&format!("resources/{key}"), fixture::bitmap_blob([255; 4])),
+                ]),
+            )
             .unwrap();
-        let layer = surface
-            .stack
-            .layers
-            .iter()
-            .find(|layer| layer.name == "Scratches")
-            .unwrap();
-        let pixels = layer.channels[0].as_ref().unwrap();
-        let alpha = |x, y| pixels[((y * surface.size + x) * 4 + 3) as usize];
-        let direct = alpha(190, 190);
-        assert!(direct > 140, "{direct}");
-        assert_eq!(alpha(65, 190), direct);
-        assert_eq!(alpha(193, 190), 0);
-        assert_eq!(alpha(62, 190), 0);
-        assert_eq!(alpha(190, 193), 0);
-        assert_eq!(alpha(65, 193), 0);
+            let (path, report) = convert(&source, &root).unwrap();
+            let status = report.label;
+            assert!(status.contains("действий кисти и ластика: 1"), "{status}");
+            let glb = Glb::load(&root.join(path)).unwrap();
+            let surface = glb
+                .paint_surface(&glb.json["meshes"][0]["primitives"][0])
+                .unwrap()
+                .unwrap();
+            let layer = surface.stack.layers.iter()
+                .find(|layer| layer.name == "Scratches")
+                .unwrap();
+            let pixels = layer.channels[0].as_ref().unwrap();
+            let alpha = |x, y| pixels[((y * surface.size + x) * 4 + 3) as usize];
+            let direct = alpha(190, 190);
+            assert!(direct > 140, "{direct}");
+            assert_eq!(alpha(65, 190), direct);
+            assert_eq!(alpha(193, 190) > 140, horizontal);
+            assert_eq!(alpha(62, 190), alpha(193, 190));
+            assert_eq!(alpha(190, 193) > 140, vertical);
+            assert_eq!(alpha(65, 193), alpha(190, 193));
+            assert_eq!(alpha(193, 193) > 140, horizontal && vertical);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1564,6 +1881,48 @@ mod tests {
             }
             if uv {
                 assert_eq!(alpha(64, 191), center);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_reconstructs_the_perlin_stencil_and_its_inverse() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-perlin-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        for uv in [false, true] {
+            let import_alpha = |inverted| {
+                let source = root.join(format!("Perlin-{uv}-{inverted}.spp"));
+                fs::write(
+                    &source,
+                    fixture::hdf5_file(&[
+                        ("paint/scene.assbin", fixture::assbin_quad()),
+                        ("paint/document.bin", fixture::document_with_perlin_stencil(uv, inverted)),
+                    ]),
+                )
+                .unwrap();
+                let (path, report) = convert(&source, &root).unwrap();
+                assert!(report.overview.contains("слоёв частично: 1"));
+                let glb = Glb::load(&root.join(path)).unwrap();
+                let surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0])
+                    .unwrap().unwrap();
+                let pixels = surface.stack.layers.iter().find(|layer| layer.name == "Scratches")
+                    .and_then(|layer| layer.channels[0].clone()).unwrap();
+                move |x, y| pixels[((y * surface.size + x) * 4 + 3) as usize]
+            };
+            let normal = import_alpha(false);
+            let inverse = import_alpha(true);
+            let center = if uv { 191 } else { 64 };
+            let (a, b) = (normal(center, center), inverse(center, center));
+            assert!((20..235).contains(&a) && (20..235).contains(&b), "{a}, {b}");
+            assert!(u16::from(a) + u16::from(b) > 200);
+            assert_eq!(normal(center + 20, center), 0);
+            if uv {
+                assert_eq!(normal(64, center), a);
+                assert_eq!(inverse(64, center), b);
             }
         }
         fs::remove_dir_all(root).unwrap();

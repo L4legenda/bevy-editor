@@ -1,9 +1,10 @@
 //! Convert the editable parts of a Painter layer stack.
-use super::{CHANNELS, MeshData, PolygonReplay, Stencil, StrokeCoverage, Summary, Tile};
+use super::{CHANNELS, PolygonReplay, Stencil, StencilCache, StrokeCoverage, Summary, Tile};
+use crate::editor::model_document::MeshData;
 use crate::editor::model_paint_data::{
     Blend, Layer, LayerKind, MAX_LAYER_DEPTH, MAX_LAYERS,
     mask::{
-        Filter, FilterKind, Generator, GeneratorKind, GeneratorSurface, MAX_FILTERS,
+        BakedInputs, Filter, FilterKind, Generator, GeneratorKind, GeneratorSurface, MAX_FILTERS,
         MAX_MASK_LAYERS, Mask, MaskBlend, MaskLayer,
     },
     over, solid,
@@ -71,6 +72,7 @@ pub(super) fn add(
     (mesh, slot, replay): (&MeshData, usize, Option<&PolygonReplay>),
     tile: Option<Tile>,
     scope: &str,
+    baked: Option<&Arc<BakedInputs>>,
 ) {
     if source.is_empty() {
         return;
@@ -88,7 +90,9 @@ pub(super) fn add(
         slot,
         tile,
         scope,
+        baked,
         generator_surface: None,
+        stencil_cache: StencilCache::default(),
         uv_owners: None,
         stroke_padding: None,
     };
@@ -118,7 +122,9 @@ struct Rebuild<'a> {
     slot: usize,
     tile: Option<Tile>,
     scope: &'a str,
+    baked: Option<&'a Arc<BakedInputs>>,
     generator_surface: Option<Arc<GeneratorSurface>>,
+    stencil_cache: StencilCache,
     uv_owners: Option<Vec<u32>>,
     stroke_padding: Option<Vec<u32>>,
 }
@@ -406,10 +412,12 @@ impl Rebuild<'_> {
             .as_ref()
             .and_then(|(url, _)| self.bitmap(url));
         let stencil = stroke.brush.stencil.as_ref().and_then(|(url, matrix)| {
+            let wrap = stroke.brush.stencil_wrap;
+            let repeats = [matches!(wrap, 1 | 3), matches!(wrap, 2 | 3)];
             if let Some(bitmap) = bitmap.as_deref() {
-                Stencil::new(bitmap, matrix)
+                Stencil::new(bitmap, matrix, repeats)
             } else {
-                Stencil::procedural(url, &stroke.brush.stencil_tweaks, matrix)
+                Stencil::procedural(url, &stroke.brush.stencil_tweaks, matrix, repeats, &mut self.stencil_cache)
             }
         });
         let tip = stroke
@@ -437,6 +445,8 @@ impl Rebuild<'_> {
             stencil.as_ref(),
             tip.as_deref(),
         );
+        coverage.partial |= stroke.brush.stencil.is_some()
+            && !(0..=3).contains(&stroke.brush.stencil_wrap);
         if model_stroke && self.uv_owners.is_some() && coverage.pixels(1.).next().is_some() {
             const PADDING: u32 = 2;
             if self.stroke_padding.is_none() && bytes * 2 <= *self.remaining && self.reserve(bytes)
@@ -871,7 +881,7 @@ impl Rebuild<'_> {
         if !self.anchors.pending(uid) {
             return true;
         }
-        if !self.reserve(mask.pixels.len()) {
+        if !self.can_evaluate_mask(mask) || !self.reserve(mask.pixels.len()) {
             return false;
         }
         let mut snapshot = mask.clone();
@@ -895,11 +905,25 @@ impl Rebuild<'_> {
                     self.size,
                     self.tile.map_or(Vec2::ZERO, Tile::offset),
                     Transform::IDENTITY,
-                    None,
+                    self.baked.cloned(),
                 ))
             });
             mask.bind(geometry.clone());
         }
+    }
+
+    fn can_evaluate_mask(&self, mask: &Mask) -> bool {
+        mask.generator
+            .into_iter()
+            .chain(mask.layers.iter().filter_map(|layer| layer.generator))
+            .all(|generator| !generator.missing_bake_inputs(self.baked.map(Arc::as_ref)))
+    }
+
+    fn flatten_mask(&mut self, mask: &mut Mask) {
+        self.summary.baked_mask_generators += usize::from(mask.generator.is_some())
+            + mask.layers.iter().filter(|layer| layer.generator.is_some()).count();
+        self.bind_import_mask(mask);
+        *mask = Mask::new(Arc::new(mask.effective().to_vec()), Vec::new());
     }
 
     fn geometry_mask(&mut self, mask: &mut Mask, default_on: bool, names: &[String]) -> bool {
@@ -1085,13 +1109,12 @@ impl Rebuild<'_> {
         if filters.is_empty() {
             return true;
         }
-        if !self.reserve(mask.pixels.len() * 2) {
+        if !self.can_evaluate_mask(mask) || !self.reserve(mask.pixels.len() * 2) {
             return false;
         }
         self.summary.baked_mask_filters += filters.len();
         *mask.edit_filters() = std::mem::take(filters);
-        self.bind_import_mask(mask);
-        *mask = Mask::new(Arc::new(mask.effective().to_vec()), Vec::new());
+        self.flatten_mask(mask);
         *base = None;
         true
     }
@@ -1105,7 +1128,7 @@ impl Rebuild<'_> {
         if !self.bake_mask_filters(mask, base, filters) {
             return false;
         }
-        if !mask.layers.is_empty() && mask.uses_geometry() {
+        if !mask.layers.is_empty() && !self.can_evaluate_mask(mask) {
             return false;
         }
         let planes = if !mask.layers.is_empty() {
@@ -1118,7 +1141,7 @@ impl Rebuild<'_> {
         }
         if !mask.layers.is_empty() {
             // Earlier fill effects become the mask underneath these brush actions.
-            *mask = Mask::new(Arc::new(mask.effective().to_vec()), Vec::new());
+            self.flatten_mask(mask);
             *base = None;
         }
         if base.is_none() {
@@ -1186,6 +1209,22 @@ fn apply_mask_value(pixel: &mut [u8], affine: bool, blend: MaskBlend, value: f32
         pixel[..3].fill(value);
     }
     pixel[3] = 255;
+}
+
+pub(super) fn mask_generators(layers: &[LayerInfo], generators: &mut Vec<Generator>) {
+    for layer in layers {
+        if layer.mask_enabled {
+            for action in layer.mask.iter().filter(|action| action.enabled) {
+                if let ActionKind::Fill { sources, .. } = &action.kind {
+                    generators.extend(sources.iter().filter_map(|source| match source {
+                        SourceInfo::Procedural { graph, .. } => generator(graph),
+                        _ => None,
+                    }));
+                }
+            }
+        }
+        mask_generators(&layer.children, generators);
+    }
 }
 
 fn generator(graph: &GraphRef) -> Option<Generator> {
