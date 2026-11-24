@@ -1014,11 +1014,7 @@ pub(in crate::editor) fn draw(
         if doc.mode == Mode::Edit && doc.active == Some(object.id) {
             let chosen = doc.selection.selected_vertices(&object.geometry);
             for (e, faces) in rendered.edges.iter() {
-                let selected = match doc.selection.kind {
-                    Element::Vertex => false,
-                    Element::Edge => doc.selection.edges.contains(e),
-                    Element::Face => faces.iter().any(|f| doc.selection.faces.contains(f)),
-                };
+                let selected = selection::highlighted(&doc.selection, *e, faces);
                 let a = object
                     .transform
                     .transform_point(object.geometry.positions[e.0]);
@@ -1039,14 +1035,6 @@ pub(in crate::editor) fn draw(
                     let p = object.transform.transform_point(*p);
                     if !chosen.contains(&i) {
                         dot!(p);
-                    }
-                }
-            }
-            if doc.selection.kind == Element::Face {
-                for (i, f) in object.geometry.faces.iter().enumerate() {
-                    let center = object.transform.transform_point(object.geometry.center(f));
-                    if !doc.selection.faces.contains(&i) {
-                        dot!(center);
                     }
                 }
             }

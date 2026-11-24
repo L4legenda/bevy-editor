@@ -5,6 +5,7 @@ mod projects;
 #[cfg(test)]
 mod tests;
 mod ui;
+mod update;
 
 use crate::{EditorProject, project::resolve_project_file};
 use bevy::{
@@ -39,6 +40,7 @@ enum Action {
     Reveal,
     Sort,
     ClearFilter,
+    UpdateEditor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -250,7 +252,10 @@ pub fn create_project_manager_app() -> Result<App, Box<dyn std::error::Error>> {
         }),
         ..default()
     }));
+    let mut updates = update::Updates::default();
+    updates.check();
     install(&mut app, manager);
+    app.insert_resource(updates);
     Ok(app)
 }
 
@@ -264,6 +269,7 @@ fn install(app: &mut App, manager: Manager) {
             crate::window_chrome::WindowChromePlugin,
         ))
         .init_resource::<native::Picker>()
+        .init_resource::<update::Updates>()
         .add_message::<Action>()
         .add_plugins(TabNavigationPlugin)
         .add_observer(ui::activate)
@@ -276,6 +282,8 @@ fn install(app: &mut App, manager: Manager) {
                 ui::context_input,
                 native::poll,
                 actions,
+                update::poll,
+                ui::update_status,
                 poll_editors,
                 ui::refresh,
                 ui::refresh_context,
@@ -292,9 +300,10 @@ fn actions(
     mut picker: ResMut<native::Picker>,
     time: Res<Time<Real>>,
     mut focus: ResMut<InputFocus>,
+    mut updates: ResMut<update::Updates>,
 ) {
     for action in messages.read() {
-        if manager.project_opened {
+        if manager.project_opened || updates.downloading {
             break;
         }
         if picker.busy() && !matches!(action, Action::Close | Action::DismissContext) {
@@ -314,6 +323,7 @@ fn actions(
                     | Action::Reveal
                     | Action::Sort
                     | Action::ClearFilter
+                    | Action::UpdateEditor
             )
         {
             continue;
@@ -436,6 +446,10 @@ fn actions(
                 manager.revision += 1;
             }
             Action::ClearFilter => manager.set_filter(String::new()),
+            Action::UpdateEditor if manager.context.is_none() && manager.running.is_empty() => {
+                updates.install(manager.executable.clone());
+            }
+            Action::UpdateEditor => {}
         }
         if !matches!(action, Action::Context(_, _)) {
             manager.context = None;

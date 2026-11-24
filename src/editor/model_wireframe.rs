@@ -8,41 +8,12 @@ use bevy::{
 };
 
 #[derive(Resource)]
-pub(in crate::editor) struct Materials {
-    dark: Handle<WireMaterial>,
-    light: Handle<WireMaterial>,
-}
+pub(in crate::editor) struct Materials(Handle<WireMaterial>);
+
 impl FromWorld for Materials {
     fn from_world(world: &mut World) -> Self {
         let mut materials = world.resource_mut::<Assets<WireMaterial>>();
-        Self {
-            dark: materials.add(WireMaterial::default()),
-            light: materials.add(WireMaterial::colored(Vec4::new(2.1, 1.35, 0.48, 1.0))),
-        }
-    }
-}
-
-impl Materials {
-    fn contrasting<'a>(
-        &self,
-        handles: impl Iterator<Item = &'a Handle<StandardMaterial>>,
-        materials: &Assets<StandardMaterial>,
-    ) -> Handle<WireMaterial> {
-        let (sum, count) = handles.filter_map(|handle| materials.get(handle)).fold(
-            (0.0, 0),
-            |(sum, count), material| {
-                let color = material.base_color.to_linear();
-                (
-                    sum + color.red * 0.2126 + color.green * 0.7152 + color.blue * 0.0722,
-                    count + 1,
-                )
-            },
-        );
-        if count > 0 && sum / (count as f32) < 0.18 {
-            self.light.clone()
-        } else {
-            self.dark.clone()
-        }
+        Self(materials.add(WireMaterial::colored(Vec4::new(2.1, 1.35, 0.48, 1.0))))
     }
 }
 
@@ -163,19 +134,14 @@ pub(in crate::editor) fn sync(
     viewer: Res<Viewer>,
     editor: Res<Editor>,
     state: Res<State>,
+    shading: Res<super::super::shading::Shading>,
     materials: Res<Materials>,
-    surfaces: Res<Assets<StandardMaterial>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut changes: MessageReader<AssetEvent<Mesh>>,
     children: Query<&Children>,
     owners: Query<&Owner>,
     sources: Query<
-        (
-            &Mesh3d,
-            Option<&SkinnedMesh>,
-            Option<Ref<MeshMorphWeights>>,
-            Option<&MeshMaterial3d<StandardMaterial>>,
-        ),
+        (&Mesh3d, Option<&SkinnedMesh>, Option<Ref<MeshMorphWeights>>),
         Without<Overlay>,
     >,
     mut overlays: Query<
@@ -195,14 +161,15 @@ pub(in crate::editor) fn sync(
             _ => None,
         })
         .collect();
+    let show_edges = shading.mode == super::super::shading::Mode::Wire;
     for (entity, overlay, mut visibility, weights) in &mut overlays {
-        visibility.set_if_neq(if state.wireframe {
+        visibility.set_if_neq(if show_edges {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         });
         if let Some(source) = overlay.source
-            && let Ok((_, _, Some(source_weights), _)) = sources.get(source)
+            && let Ok((_, _, Some(source_weights))) = sources.get(source)
             && source_weights.is_changed()
         {
             if let Some(mut weights) = weights {
@@ -215,7 +182,7 @@ pub(in crate::editor) fn sync(
     let (Some(index), Some(root)) = (editor.viewing_model, viewer.root) else {
         return;
     };
-    if !state.wireframe {
+    if !show_edges {
         return;
     }
     if state.documents.contains_key(&index) {
@@ -230,10 +197,7 @@ pub(in crate::editor) fn sync(
                 &mut commands,
                 object.entity,
                 meshes.add(polygon_mesh(object)),
-                materials.contrasting(
-                    object.materials.iter().map(|slot| &slot.material),
-                    &surfaces,
-                ),
+                materials.0.clone(),
                 None,
             );
             commands.entity(object.entity).insert(Owner {
@@ -243,7 +207,7 @@ pub(in crate::editor) fn sync(
         }
     } else {
         for entity in std::iter::once(root).chain(children.iter_descendants(root)) {
-            let Ok((handle, skin, weights, surface)) = sources.get(entity) else {
+            let Ok((handle, skin, weights)) = sources.get(entity) else {
                 continue;
             };
             let owner = owners.get(entity).ok();
@@ -263,7 +227,7 @@ pub(in crate::editor) fn sync(
                 &mut commands,
                 entity,
                 meshes.add(mesh),
-                materials.contrasting(surface.into_iter().map(|material| &material.0), &surfaces),
+                materials.0.clone(),
                 Some(entity),
             );
             if let Some(skin) = skin {

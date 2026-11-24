@@ -68,7 +68,6 @@ pub(in crate::editor) enum EditAction {
     Undo,
     Redo,
     Xray,
-    Wireframe,
     Local,
     Snap,
     SnapTarget(SnapTarget),
@@ -126,7 +125,6 @@ pub(in crate::editor) struct State {
     pub tool: Tool,
     pub(super) extrude_tool: bool,
     pub xray: bool,
-    pub wireframe: bool,
     pub local: bool,
     pub snap: bool,
     snap_target: SnapTarget,
@@ -163,7 +161,6 @@ impl Default for State {
             tool: Tool::Universal,
             extrude_tool: false,
             xray: false,
-            wireframe: false,
             local: false,
             snap: false,
             snap_target: SnapTarget::Step,
@@ -258,7 +255,6 @@ impl State {
             EditAction::ExtrudeTool => self.extrude_tool && self.mode(index) == Mode::Edit,
             EditAction::SelectObject(id) => doc.is_some_and(|d| d.selected.contains(&id)),
             EditAction::Xray => self.xray,
-            EditAction::Wireframe => self.wireframe,
             EditAction::Local => self.local,
             EditAction::Snap => self.snap,
             EditAction::SnapTarget(target) => self.snap_target == target,
@@ -286,10 +282,6 @@ impl State {
                 _ => false,
             };
         }
-        if action == EditAction::Wireframe {
-            // Topology can also be viewed for GLTFs protected from editing.
-            return index.is_some();
-        }
         if matches!(action, EditAction::Menu | EditAction::Mode(Mode::Object)) {
             return true;
         }
@@ -309,7 +301,6 @@ impl State {
                     | EditAction::SelectObject(_)
                     | EditAction::Focus
                     | EditAction::Cancel
-                    | EditAction::Wireframe
             )
         {
             return false;
@@ -919,7 +910,7 @@ pub(super) fn process_actions(
             continue;
         }
         if state.input_error.is_some()
-            && !matches!(action, EditAction::Cancel | EditAction::Wireframe)
+            && action != EditAction::Cancel
         {
             state.status = state.input_error.clone().unwrap();
             continue;
@@ -1053,7 +1044,6 @@ pub(super) fn process_actions(
                 state.clear_gesture(Some(index), true);
             }
             EditAction::Xray => state.xray = !state.xray,
-            EditAction::Wireframe => state.wireframe = !state.wireframe,
             EditAction::Local => state.local = !state.local,
             EditAction::Snap => state.snap = !state.snap,
             EditAction::SnapTarget(target) if state.available(action, Some(index)) => {

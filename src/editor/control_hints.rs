@@ -316,8 +316,6 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         },
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Xray)) =>
             "Alt+Z · X-Ray: полупрозрачная модель, скрытые вершины и рёбра, выделение сквозь геометрию.".into(),
-        Action::ModelView(ModelViewAction::Edit(ModelEditAction::Wireframe)) =>
-            "Показать сетку поверх всех объектов модели. Повторное нажатие скрывает сетку; исходный GLB не меняется.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::ExtrudeTool)) =>
             "Экструдировать · потяните ручку «+» над выделением. E сразу запускает вытягивание за курсором.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Element(kind))) => {

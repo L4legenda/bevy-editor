@@ -317,6 +317,11 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
             matches!(a, Action::ModelView(ModelViewAction::Uv(UvAction::Padding)))
         });
         assert_eq!(app.world().resource::<UvState>().padding, 16);
+        use super::super::super::shading::{Mode as ShadingMode, ShadingAction};
+        app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
+            ShadingAction::Set(ShadingMode::Rendered),
+        )));
+        warm(&mut app, 5);
         click(&mut app, window, |a| {
             matches!(
                 a,
@@ -324,6 +329,9 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
                     super::super::super::environment::EnvironmentAction::TogglePanel
                 ))
             )
+        });
+        click(&mut app, window, |a| {
+            matches!(a, Action::ModelView(ModelViewAction::Shading(ShadingAction::PreviewLighting)))
         });
         warm(&mut app, 5);
         assert!(

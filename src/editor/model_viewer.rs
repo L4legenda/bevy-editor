@@ -18,6 +18,8 @@ mod environment;
 mod navigation;
 #[path = "model_paint.rs"]
 mod paint;
+#[path = "model_shading.rs"]
+mod shading;
 
 #[path = "model_edit.rs"]
 pub(in crate::editor) mod editing;
@@ -28,6 +30,7 @@ pub(in crate::editor) enum ModelViewAction {
     Fit,
     Retry,
     Environment(environment::EnvironmentAction),
+    Shading(shading::ShadingAction),
     Edit(editing::EditAction),
     Uv(editing::uv::UvAction),
     Paint(paint::PaintAction),
@@ -99,6 +102,7 @@ impl Plugin for ModelViewerPlugin {
             .init_resource::<editing::xray::Materials>()
             .init_resource::<editing::wireframe::Materials>()
             .init_resource::<environment::Settings>()
+            .init_resource::<shading::Shading>()
             .add_systems(Startup, setup.after(super::setup))
             .add_systems(Startup, environment::setup.after(super::setup))
             .add_systems(Startup, paint::setup.after(setup).after(environment::setup))
@@ -160,6 +164,7 @@ impl Plugin for ModelViewerPlugin {
                 .chain()
                 .after(crate::editor::ui::refresh),
         );
+        app.add_systems(Update, shading::refresh.after(crate::editor::ui::refresh));
         app.add_systems(
             PostUpdate,
             editing::input::draw.after(bevy::transform::TransformSystems::Propagate),
@@ -310,6 +315,7 @@ fn actions(
     mut focus: ResMut<InputFocus>,
     controls: Query<(Entity, &Control)>,
     mut editing: ResMut<editing::State>,
+    mut shading: ResMut<shading::Shading>,
     mut previews: ResMut<crate::editor::thumbnails::Thumbnails>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -377,6 +383,13 @@ fn actions(
                         }
                     }
                     ModelViewAction::Environment(_) => {}
+                    ModelViewAction::Shading(action)
+                        if editor.viewing_image.is_none()
+                            && !editor.browser_popup && !editor.hdri_library_open =>
+                    {
+                        shading.apply(action);
+                    }
+                    ModelViewAction::Shading(_) => {}
                     ModelViewAction::Edit(editing::EditAction::Mode(_)) => {
                         focus.clear();
                     }
@@ -517,6 +530,7 @@ fn prepare(
     ready: On<WorldInstanceReady>,
     children: Query<&Children>,
     mut cameras: Query<&mut Camera>,
+    surfaces: Query<&MeshMaterial3d<StandardMaterial>, With<Mesh3d>>,
     mut commands: Commands,
 ) {
     for entity in std::iter::once(ready.entity).chain(children.iter_descendants(ready.entity)) {
@@ -524,6 +538,9 @@ fn prepare(
             .entity(entity)
             .insert(RenderLayers::layer(LAYER))
             .remove::<(PointLight, SpotLight, DirectionalLight, RectLight)>();
+        if let Ok(material) = surfaces.get(entity) {
+            commands.entity(entity).insert(editing::xray::SourceMaterial(material.0.clone()));
+        }
         if let Ok(mut camera) = cameras.get_mut(entity) {
             camera.is_active = false;
         }

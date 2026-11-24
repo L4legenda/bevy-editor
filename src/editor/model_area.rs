@@ -1,6 +1,7 @@
 //! Click and rectangle picking share the same visibility and X-Ray rules.
 use super::*;
 use crate::editor::area_selection::{self, Mode as AreaMode};
+use crate::editor::model_mesh::ComponentHit;
 use input::{project, ray, segment, visible};
 
 pub(super) fn click(
@@ -93,18 +94,14 @@ pub(super) fn click(
     if mode == AreaMode::Replace {
         doc.selection.clear();
     }
-    fn choose<T: Ord>(set: &mut BTreeSet<T>, hit: Option<T>, mode: AreaMode) {
-        if let Some(hit) = hit {
-            if mode == AreaMode::Subtract || (mode == AreaMode::Add && set.contains(&hit)) {
-                set.remove(&hit);
-            } else {
-                set.insert(hit);
-            }
-        }
+    if let Some(hit) = vertex
+        .map(ComponentHit::Vertex)
+        .or(edge.map(ComponentHit::Edge))
+        .or(face.map(ComponentHit::Face))
+    {
+        doc.selection
+            .click(hit, mode == AreaMode::Add, mode == AreaMode::Subtract);
     }
-    choose(&mut doc.selection.vertices, vertex, mode);
-    choose(&mut doc.selection.edges, edge, mode);
-    choose(&mut doc.selection.faces, face, mode);
     doc.ui_revision += 1;
 }
 
@@ -180,9 +177,18 @@ pub(super) fn select(
                 }
             }
         }
+        if mode == AreaMode::Replace {
+            doc.selection.history.clear();
+        }
         mode.apply(&mut doc.selection.vertices, hits.vertices);
         mode.apply(&mut doc.selection.edges, hits.edges);
         mode.apply(&mut doc.selection.faces, hits.faces);
+        let selection = &mut doc.selection;
+        selection.history.retain(|hit| match *hit {
+            ComponentHit::Vertex(i) => selection.vertices.contains(&i),
+            ComponentHit::Edge(e) => selection.edges.contains(&e),
+            ComponentHit::Face(i) => selection.faces.contains(&i),
+        });
     }
     doc.ui_revision += 1;
 }

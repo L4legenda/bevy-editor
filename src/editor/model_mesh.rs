@@ -93,18 +93,54 @@ pub(in crate::editor) enum Element {
     Face,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ComponentHit {
+    Vertex(usize),
+    Edge(Edge),
+    Face(usize),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Selection {
     pub kind: Element,
     pub vertices: BTreeSet<usize>,
     pub edges: BTreeSet<Edge>,
     pub faces: BTreeSet<usize>,
+    pub(super) history: Vec<ComponentHit>,
 }
 impl Selection {
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.edges.clear();
         self.faces.clear();
+        self.history.clear();
+    }
+    pub fn active(&self) -> Option<ComponentHit> {
+        self.history.iter().rev().copied().find(|hit| match *hit {
+            ComponentHit::Vertex(i) => self.kind == Element::Vertex && self.vertices.contains(&i),
+            ComponentHit::Edge(e) => self.kind == Element::Edge && self.edges.contains(&e),
+            ComponentHit::Face(i) => self.kind == Element::Face && self.faces.contains(&i),
+        })
+    }
+    pub fn click(&mut self, hit: ComponentHit, toggle: bool, subtract: bool) {
+        fn update<T: Ord>(set: &mut BTreeSet<T>, value: T, toggle: bool, subtract: bool) -> bool {
+            if subtract || (toggle && set.contains(&value)) {
+                set.remove(&value);
+                false
+            } else {
+                set.insert(value);
+                true
+            }
+        }
+        let selected = match hit {
+            ComponentHit::Vertex(i) => update(&mut self.vertices, i, toggle, subtract),
+            ComponentHit::Edge(e) => update(&mut self.edges, e, toggle, subtract),
+            ComponentHit::Face(i) => update(&mut self.faces, i, toggle, subtract),
+        };
+        self.history.retain(|item| *item != hit);
+        if selected {
+            self.history.push(hit);
+        }
     }
     pub fn all(&mut self, mesh: &Geometry) {
         self.clear();

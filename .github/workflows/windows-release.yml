@@ -82,6 +82,8 @@ jobs:
           key: windows-x64-release
 
       - name: Build the editor
+        env:
+          BEVY_EDITOR_RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin bevy-editor
 
       - name: Build the native Candle CUDA generator

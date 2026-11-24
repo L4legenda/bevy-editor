@@ -297,6 +297,7 @@ pub(super) fn materials(
         cache.checker = Some(materials.add(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: Some(images.add(image)),
+            unlit: true,
             perceptual_roughness: 0.8,
             double_sided: true,
             cull_mode: None,

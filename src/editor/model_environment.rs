@@ -167,12 +167,17 @@ impl Settings {
 #[derive(Component)]
 pub(super) struct KeyLight;
 #[derive(Component)]
-pub(super) struct Applied(Settings);
+pub(super) struct Applied {
+    mode: shading::Mode,
+    lighting: crate::SceneLighting,
+    backdrop: crate::hdri::EnvironmentBackdrop,
+}
 #[derive(Component)]
 pub(super) struct Panel;
 #[derive(Resource)]
 pub(super) struct PanelUi {
     body: Entity,
+    overrides: Entity,
     arrow: Entity,
     angle: f32,
     uv_open: bool,
@@ -192,6 +197,7 @@ pub(super) struct ControlValue {
 #[derive(Component)]
 pub(super) enum Caption {
     Panel,
+    Source,
     Background,
     Key,
     ToneMap,
@@ -246,14 +252,34 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
             ..column(6.)
         },
     );
+    let source = button(
+        &mut commands,
+        body,
+        font,
+        "Свет и окружение сцены",
+        Action::ModelView(ModelViewAction::Shading(
+            shading::ShadingAction::PreviewLighting,
+        )),
+        Look::Regular,
+    );
+    commands.entity(source).insert(Caption::Source);
+    let overrides = node(
+        &mut commands,
+        body,
+        Node {
+            width: percent(100),
+            ..column(6.0)
+        },
+    );
     commands.insert_resource(PanelUi {
         body,
+        overrides,
         arrow,
         angle: 0.,
         uv_open: false,
         model_open: true,
     });
-    let panel = body;
+    let panel = overrides;
     let presets = node(
         &mut commands,
         panel,
@@ -568,9 +594,13 @@ pub(super) fn actions(
 
 pub(super) fn synchronize(
     settings: Res<Settings>,
+    editor: Res<Editor>,
+    shading: Res<shading::Shading>,
     viewer: Res<Viewer>,
     mut commands: Commands,
     cameras: Query<(Entity, Option<&Applied>), With<ViewCamera>>,
+    scene_light_entities: Query<Entity, With<PreviewSceneLight>>,
+    mut scene_lights: Local<Option<(Entity, bool, Vec<crate::lighting::SceneLight>)>>,
     mut lights: Query<
         (
             Entity,
@@ -581,45 +611,134 @@ pub(super) fn synchronize(
         With<KeyLight>,
     >,
 ) {
-    let mut changed = false;
+    use shading::Mode;
+    let mode = shading.mode;
+    let preview_lighting = mode == Mode::Rendered && shading.preview_lighting;
+    let lighting = match mode {
+        Mode::Rendered if preview_lighting => settings.lighting.clone(),
+        Mode::Rendered => editor.environment().clone(),
+        Mode::Solid => crate::SceneLighting {
+            ambient_brightness: 420.0,
+            exposure_ev100: 8.0,
+            shadows: false,
+            ..default()
+        },
+        Mode::Material | Mode::Wire => crate::SceneLighting {
+            ambient_brightness: 0.0,
+            tonemapping: crate::ToneMap::Linear,
+            shadows: false,
+            ..default()
+        },
+    };
+    let backdrop = if preview_lighting {
+        crate::hdri::EnvironmentBackdrop {
+            brightness: settings.background_brightness,
+            blur: settings.blur,
+        }
+    } else {
+        crate::hdri::EnvironmentBackdrop {
+            brightness: 1.0,
+            blur: 0.0,
+        }
+    };
     for (entity, applied) in &cameras {
-        if applied.is_some_and(|applied| applied.0 == *settings) {
+        if applied.is_some_and(|applied| {
+            applied.mode == mode
+                && applied.lighting == lighting
+                && applied.backdrop.brightness == backdrop.brightness
+                && applied.backdrop.blur == backdrop.blur
+        }) {
             continue;
         }
         let mut camera = commands.entity(entity);
-        crate::lighting::apply_camera_lighting(&mut camera, &settings.lighting);
+        crate::lighting::apply_camera_lighting(&mut camera, &lighting);
         camera.insert((
-            crate::hdri::EnvironmentBackdrop {
-                brightness: settings.background_brightness,
-                blur: settings.blur,
+            backdrop,
+            Applied {
+                mode,
+                lighting: lighting.clone(),
+                backdrop,
             },
-            Applied(settings.clone()),
         ));
-        changed = true;
+    }
+    let desired_lights = viewer
+        .stage
+        .filter(|_| mode == Mode::Rendered && !preview_lighting)
+        .map(|stage| {
+            let lights = editor
+                .edits
+                .lights
+                .iter()
+                .filter(|light| light.enabled && !editor.object_hidden(Selection::Light(light.id)))
+                .collect::<Vec<_>>();
+            (stage, lights)
+        });
+    let lights_unchanged = match (&*scene_lights, &desired_lights) {
+        (Some((stage, shadows, current)), Some((desired_stage, desired))) => {
+            stage == desired_stage
+                && *shadows == lighting.shadows
+                && current.iter().eq(desired.iter().copied())
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !lights_unchanged {
+        for entity in &scene_light_entities {
+            commands.entity(entity).try_despawn();
+        }
+        *scene_lights = desired_lights.map(|(stage, lights)| {
+            let shadows = lighting.shadows;
+            for &light in &lights {
+                let mut effective = light.clone();
+                effective.shadows &= shadows;
+                effective.contact_shadows &= shadows;
+                let entity = crate::lighting::spawn_light(&mut commands, &effective);
+                commands.entity(entity).insert((
+                    PreviewSceneLight,
+                    RenderLayers::layer(LAYER),
+                    ChildOf(stage),
+                ));
+            }
+            (stage, shadows, lights.into_iter().cloned().collect())
+        });
     }
     for (entity, mut light, mut pose, cascades) in &mut lights {
-        if changed {
-            light.illuminance = if settings.key_enabled {
-                settings.key_intensity * LIGHT_SCALE
-            } else {
-                0.0
-            };
-            light.color = Color::linear_rgb(1.0, 0.96, 0.9);
-            light.shadow_maps_enabled = settings.key_enabled;
-            let azimuth = (settings.key_azimuth + settings.lighting.hdri_rotation).to_radians();
-            let elevation = settings.key_elevation.to_radians();
-            let direction = Vec3::new(
-                elevation.cos() * azimuth.sin(),
-                elevation.sin(),
-                elevation.cos() * azimuth.cos(),
-            );
-            let up = if direction.dot(Vec3::Y).abs() > 0.99 {
-                Vec3::Z
-            } else {
-                Vec3::Y
-            };
-            *pose = Transform::from_translation(direction).looking_at(Vec3::ZERO, up);
+        let (illuminance, color, shadows, azimuth, elevation) = match mode {
+            Mode::Rendered if preview_lighting => (
+                if settings.key_enabled {
+                    settings.key_intensity * LIGHT_SCALE
+                } else {
+                    0.0
+                },
+                Color::linear_rgb(1.0, 0.96, 0.9),
+                settings.key_enabled,
+                settings.key_azimuth + settings.lighting.hdri_rotation,
+                settings.key_elevation,
+            ),
+            Mode::Solid => (2400.0, Color::WHITE, false, 35.0, 55.0),
+            Mode::Rendered | Mode::Wire | Mode::Material => (0.0, Color::WHITE, false, 0.0, 45.0),
+        };
+        if light.illuminance != illuminance
+            || light.color != color
+            || light.shadow_maps_enabled != shadows
+        {
+            light.illuminance = illuminance;
+            light.color = color;
+            light.shadow_maps_enabled = shadows;
         }
+        let azimuth = azimuth.to_radians();
+        let elevation = elevation.to_radians();
+        let direction = Vec3::new(
+            elevation.cos() * azimuth.sin(),
+            elevation.sin(),
+            elevation.cos() * azimuth.cos(),
+        );
+        let up = if direction.dot(Vec3::Y).abs() > 0.99 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        pose.set_if_neq(Transform::from_translation(direction).looking_at(Vec3::ZERO, up));
         // Cascades follow the inspected model's scale, including zoomed-out views.
         let distance = viewer.distance + viewer.radius * 4.0;
         if viewer.fitted
@@ -638,9 +757,13 @@ pub(super) fn synchronize(
     }
 }
 
+#[derive(Component)]
+pub(super) struct PreviewSceneLight;
+
 pub(super) fn refresh(
     editor: Res<Editor>,
     settings: Res<Settings>,
+    shading: Res<shading::Shading>,
     mut ui: ResMut<PanelUi>,
     editing: Res<editing::State>,
     mut commands: Commands,
@@ -654,7 +777,7 @@ pub(super) fn refresh(
     mut transforms: Query<&mut UiTransform>,
     mut redraw: MessageWriter<bevy::window::RequestRedraw>,
 ) {
-    let shown = editor.viewing_model.is_some();
+    let shown = editor.viewing_model.is_some() && shading.mode == shading::Mode::Rendered;
     let open =
         ui.open(editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv);
     let target = if open {
@@ -674,8 +797,16 @@ pub(super) fn refresh(
     if let Ok(mut body) = nodes.get_mut(ui.body) {
         body.display = if open { Display::Flex } else { Display::None };
     }
+    if let Ok(mut overrides) = nodes.get_mut(ui.overrides) {
+        overrides.display = if shading.preview_lighting {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
     let enabled = shown
         && open
+        && shading.preview_lighting
         && editor.pending.is_none()
         && editor.viewing_image.is_none()
         && !editor.hdri_library_open;
@@ -706,6 +837,13 @@ pub(super) fn refresh(
     for (caption, children) in &captions {
         let value = match caption {
             Caption::Panel => "Окружение".into(),
+            Caption::Source => {
+                if shading.preview_lighting {
+                    "Свет и окружение просмотра".into()
+                } else {
+                    "Свет и окружение сцены".into()
+                }
+            }
             Caption::Background => {
                 if settings.lighting.hdri_background {
                     "Фон: окружение".into()

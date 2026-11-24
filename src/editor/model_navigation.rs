@@ -2,6 +2,7 @@
 use super::*;
 
 pub(super) fn background(
+    shading: Res<shading::Shading>,
     cameras: Query<(&Transform, &Projection, Option<&bevy::light::Skybox>), With<ViewCamera>>,
     images: Res<Assets<Image>>,
     mut backgrounds: Query<
@@ -16,7 +17,7 @@ pub(super) fn background(
         .and_then(|sky| sky.image.as_ref())
         .is_some_and(|image| images.contains(image));
     for (mut pose, mut visibility) in &mut backgrounds {
-        *visibility = if view.is_some() && !panorama {
+        *visibility = if view.is_some() && !panorama && shading.mode == shading::Mode::Rendered {
             Visibility::Visible
         } else {
             Visibility::Hidden
