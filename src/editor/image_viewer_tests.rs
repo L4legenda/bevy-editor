@@ -10,12 +10,16 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "image_brush_size_tests.rs"]
 mod brush_sizing;
+#[path = "image_color_drop_tests.rs"]
+mod color_dropping;
 #[path = "image_cursor_restore_tests.rs"]
 mod cursor_restoration;
 #[path = "image_edge_paint_tests.rs"]
 mod edge_painting;
 #[path = "image_eyedropper_tests.rs"]
 mod eyedropper;
+#[path = "image_gradient_tests.rs"]
+mod gradients;
 #[path = "image_layers_tests.rs"]
 mod image_layers;
 #[path = "image_layer_drag_tests.rs"]
@@ -28,6 +32,8 @@ mod layer_ux;
 mod painting;
 #[path = "image_panel_resize_tests.rs"]
 mod panel_sizing;
+#[path = "image_canvas_overview_tests.rs"]
+mod canvas_overview;
 #[path = "image_pen_tests.rs"]
 mod pen_pressure;
 #[path = "image_pencil_tests.rs"]
@@ -40,8 +46,6 @@ mod pixel_eraser;
 mod selections;
 #[path = "image_color_tests.rs"]
 mod tool_colors;
-#[path = "image_color_drop_tests.rs"]
-mod color_dropping;
 
 struct Fixture(PathBuf);
 

@@ -457,6 +457,7 @@ pub fn control_value(c: Control, fade_steps: u32, s: &StepInput) -> f32 {
         Control::Off | Control::InitialDirection | Control::Direction => 1.0,
         Control::Fade => 1.0 - (s.step as f32 / fade_steps.max(1) as f32).min(1.0),
         Control::PenPressure => p.pressure.clamp(0.0, 1.0),
+        Control::InversePenPressure => 1.0 - p.pressure.clamp(0.0, 1.0),
         // Upright pen = 1, flat pen = 0 (a mouse reports no tilt, so paints at full value).
         Control::PenTilt => 1.0 - (p.tilt_x.hypot(p.tilt_y) / 90.0).clamp(0.0, 1.0),
         Control::StylusWheel => p.wheel.clamp(0.0, 1.0),
@@ -470,7 +471,7 @@ pub fn dynamic_value(d: &Dynamic, s: &StepInput) -> f32 {
     let v = control_value(d.control, d.fade_steps, s);
     match d.control {
         Control::Off | Control::InitialDirection | Control::Direction => v,
-        Control::Fade | Control::PenPressure | Control::PenTilt | Control::StylusWheel | Control::Rotation => d.curve.eval(v),
+        Control::Fade | Control::PenPressure | Control::InversePenPressure | Control::PenTilt | Control::StylusWheel | Control::Rotation => d.curve.eval(v),
     }
 }
 
@@ -481,6 +482,7 @@ pub fn control_angle(c: Control, fade_steps: u32, s: &StepInput) -> f32 {
         Control::Off => 0.0,
         Control::Fade => 360.0 * (s.step as f32 / fade_steps.max(1) as f32).min(1.0),
         Control::PenPressure => 360.0 * p.pressure.clamp(0.0, 1.0),
+        Control::InversePenPressure => 360.0 * (1.0 - p.pressure.clamp(0.0, 1.0)),
         Control::PenTilt => {
             if p.tilt_x == 0.0 && p.tilt_y == 0.0 {
                 0.0
@@ -583,12 +585,14 @@ pub struct DabBuilder {
     pub seed: u64,
     /// Per-stroke colour (Color Dynamics with per-tip off), computed at the first step.
     stroke_color: Option<[f32; 4]>,
+    sample_previous: Option<Point>,
+    sample_position: f64,
     next_index: u64,
 }
 
 impl DabBuilder {
     pub fn new(brush: &BrushSettings) -> Self {
-        Self { brush: brush.clone(), seed: brush.seed, stroke_color: None, next_index: 0 }
+        Self { brush: brush.clone(), seed: brush.seed, stroke_color: None, sample_previous: None, sample_position: 0.0, next_index: 0 }
     }
 
     pub fn step_len(&self, p: &StrokePoint) -> f64 {
@@ -608,6 +612,15 @@ impl DabBuilder {
             1
         };
         let base_d = base_diameter(b, s);
+        if let Some(sample) = &b.stroke_sample {
+            let center = Point::new(s.point.x, s.point.y);
+            if let Some(previous) = self.sample_previous.replace(center) {
+                self.sample_position += (center.x - previous.x).hypot(center.y - previous.y);
+            } else {
+                let offset = crate::rng::hash2(center.x as i32, center.y as i32, seed);
+                self.sample_position = f64::from(offset * b.size) * f64::from(sample.width) / f64::from(sample.height.max(1));
+            }
+        }
         for _ in 0..count {
             let i = self.next_index;
             self.next_index += 1;
@@ -699,6 +712,7 @@ impl DabBuilder {
                 color,
                 depth,
                 index: i,
+                sample_position: self.sample_position,
                 proj_angle,
                 proj_scale,
                 wet,
@@ -754,6 +768,7 @@ impl DualBuilder {
                 color: [0.0, 0.0, 0.0, 1.0],
                 depth: 1.0,
                 index: i,
+                sample_position: 0.0,
                 proj_angle: 0.0,
                 proj_scale: 1.0,
                 wet: 1.0,

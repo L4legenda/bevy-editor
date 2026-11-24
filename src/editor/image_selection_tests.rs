@@ -76,6 +76,62 @@ fn coverage(app: &App, x: i32, y: i32) -> f32 {
 }
 
 #[test]
+fn selection_can_flip_both_axes_without_touching_outside_pixels() {
+    let fixture = Fixture::new();
+    let original = image::RgbaImage::from_fn(8, 7, |x, y| {
+        image::Rgba([((10 * y + x) * 3) as u8, 70, 120, 255])
+    });
+    original.save(fixture.0.join("flip.png")).unwrap();
+    let mut app = fixture.app();
+    let index = file(&app, "flip.png");
+    app.world_mut().write_message(Action::ViewImage(index));
+    wait_for_image(&mut app);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+    wait_for_edit(&mut app);
+    action(&mut app, Op::Tool(SelectionTool::Rectangle));
+    let pixels = |app: &App| {
+        let viewer = app.world().resource::<ImageViewer>();
+        viewer.edit.document(viewer.tab).unwrap().composite().pixels
+    };
+    action(&mut app, Op::FlipSelection(true));
+    assert_eq!(pixels(&app), original.as_raw().as_slice());
+    drag(&mut app, Vec2::new(1.0, 2.0), Vec2::new(6.0, 5.0));
+    let check = |app: &App, vertical| {
+        let actual = pixels(app);
+        for y in 0..7 {
+            for x in 0..8 {
+                let (sx, sy) = if (1..6).contains(&x) && (2..5).contains(&y) {
+                    (6 - x, if vertical { 6 - y } else { y })
+                } else {
+                    (x, y)
+                };
+                let offset = ((y * 8 + x) * 4) as usize;
+                assert_eq!(
+                    &actual[offset..offset + 4],
+                    &original.get_pixel(sx, sy).0,
+                    "pixel {x},{y}"
+                );
+            }
+        }
+    };
+    action(&mut app, Op::FlipSelection(true));
+    check(&app, false);
+    action(&mut app, Op::FlipSelection(false));
+    check(&app, true);
+    let viewer = app.world().resource::<ImageViewer>();
+    assert_eq!(
+        viewer.edit.tool,
+        PhotoTool::Select(SelectionTool::Rectangle)
+    );
+    assert!(viewer.edit.selection.transform.is_none());
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    app.update();
+    check(&app, false);
+}
+
+#[test]
 fn image_selection_gestures_map_zoom_and_support_shape_modes_and_shortcuts() {
     let (_fixture, mut app) = editing();
     action(&mut app, Op::Tool(SelectionTool::Rectangle));

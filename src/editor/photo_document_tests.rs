@@ -6,6 +6,34 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 mod selection;
 
 #[test]
+fn bucket_replaces_antialiased_stroke_without_repainting_neighboring_colors() {
+    let fixture = Fixture::new();
+    image::RgbaImage::from_fn(16, 8, |x, _| {
+        let c = match x {
+            4 | 9 => [192; 3],
+            5 | 8 => [64; 3],
+            6 | 7 => [0; 3],
+            12.. => [210, 50, 30],
+            _ => [255; 3],
+        };
+        image::Rgba([c[0], c[1], c[2], 255])
+    })
+    .save(&fixture.0)
+    .unwrap();
+    let mut doc = PhotoDocument::load(&fixture.0).unwrap();
+    let before = doc.composite().pixels;
+    assert!(doc.fill(6, 4, [1.0; 4]).unwrap());
+    let filled = doc.composite();
+    for row in filled.pixels.chunks_exact(16 * 4) {
+        assert!(row[..12 * 4].iter().all(|&value| value == 255), "{row:?}");
+        assert_eq!(&row[12 * 4..], &before[12 * 4..16 * 4]);
+    }
+    doc.undo();
+    assert_eq!(doc.composite().pixels, before);
+    assert!(!doc.can_undo());
+}
+
+#[test]
 fn shared_layer_libraries_preserve_pattern_pixels_styles_and_effect_defaults() {
     let fixture = Fixture::new();
     let mut source = PhotoDocument::load(&fixture.0).unwrap();
@@ -89,7 +117,7 @@ fn nested_layers_masks_and_effects_share_paint_history_and_roundtrip() {
     let fixture = Fixture::new();
     let mut doc = PhotoDocument::load(&fixture.0).unwrap();
     doc.add_layer();
-    doc.fill(0, 0, [1.0, 0.0, 0.0, 1.0]);
+    doc.fill(0, 0, [1.0, 0.0, 0.0, 1.0]).unwrap();
     let red = doc.active_id().unwrap();
     doc.layer_command("layer.layerMask.hideAll", json!({}))
         .unwrap();
@@ -149,7 +177,7 @@ fn smart_contents_return_to_parent_as_one_undoable_edit() {
         .unwrap();
     assert!(doc.editing_smart());
     assert_ne!(doc.document.id, parent);
-    doc.fill(2, 2, [1.0, 0.0, 0.0, 1.0]);
+    doc.fill(2, 2, [1.0, 0.0, 0.0, 1.0]).unwrap();
     doc.finish_smart().unwrap();
     assert!(!doc.editing_smart());
     assert_eq!(doc.document.id, parent);
@@ -261,7 +289,7 @@ fn every_layer_blend_and_effect_family_survives_native_save() {
     let fixture = Fixture::new();
     let mut doc = PhotoDocument::load(&fixture.0).unwrap();
     doc.add_layer();
-    doc.fill(0, 0, [0.9, 0.4, 0.1, 0.8]);
+    doc.fill(0, 0, [0.9, 0.4, 0.1, 0.8]).unwrap();
     for blend in photocraft_color::BlendMode::layer_modes() {
         doc.layer_command("layer.setProps", json!({"blend":blend.label()}))
             .unwrap();
@@ -449,7 +477,7 @@ fn layer_commands_and_undo_restore_pixels_order_and_saved_state() {
     let fixture = Fixture::new();
     let mut doc = PhotoDocument::load(&fixture.0).unwrap();
     doc.add_layer();
-    doc.fill(2, 2, [0.0, 1.0, 0.0, 1.0]);
+    doc.fill(2, 2, [0.0, 1.0, 0.0, 1.0]).unwrap();
     assert_eq!(doc.composite().pixels[..4], [0, 255, 0, 255]);
     doc.visibility(1);
     assert_eq!(doc.composite().pixels[..4], [30, 60, 90, 255]);
@@ -503,7 +531,7 @@ fn saving_keeps_the_source_format_for_every_supported_raster_type() {
                 .unwrap();
         }
         let mut doc = PhotoDocument::load(&source).unwrap();
-        doc.fill(2, 2, [0.0, 1.0, 0.0, 1.0]);
+        doc.fill(2, 2, [0.0, 1.0, 0.0, 1.0]).unwrap();
         save(&source, &doc.document).unwrap();
         let pixels = image::open(&source).unwrap().into_rgb8();
         let color = pixels.get_pixel(2, 2);

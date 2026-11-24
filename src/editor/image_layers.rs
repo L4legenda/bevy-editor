@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 mod effects;
 #[path = "image_layer_forms.rs"]
 mod forms;
+#[path = "image_mask_import.rs"]
+mod mask_import;
+pub(super) use mask_import::poll as poll_mask_import;
 #[path = "image_layer_ux.rs"]
 pub(in crate::editor) mod ux;
 pub(super) use forms::{FieldKind, Form};
@@ -19,12 +22,13 @@ pub(in crate::editor) enum LayerAction {
     Group,
     FieldNumber(usize, f64),
     FieldStep(usize, f64),
+    BalanceTone(usize),
     Advanced,
     Preview,
     PanelSection(PanelSection),
-    Menu,
     ContextMenu(f32),
     Category(&'static str),
+    ImportMask,
     Command(&'static str),
     Apply,
     Cancel,
@@ -92,7 +96,9 @@ impl ThumbnailSize {
 
 #[derive(Default)]
 pub(in crate::editor) struct LayerState {
+    mask_import: Option<mask_import::Import>,
     pub advanced: bool,
+    pub balance_tone: usize,
     pub preview_enabled: bool,
     pub preview: Option<FormPreview>,
     pub search_open: bool,
@@ -377,10 +383,14 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
         state.layers.fill_drag = false;
         return;
     }
+    if let ImportMask = action {
+        finish_preview(state, false);
+        mask_import::start(state, id);
+        return;
+    }
     if matches!(
         action,
         Cancel
-            | Menu
             | ContextMenu(_)
             | Category(_)
             | Command(_)
@@ -391,11 +401,13 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
     ) {
         finish_preview(state, false);
         state.layers.advanced = false;
+        state.layers.balance_tone = 1;
         state.layers.preview_enabled = true;
         state.error = None;
     }
     if let FieldNumber(index, value) | FieldStep(index, value) = action {
         if let Some(form) = state.layers.form.as_mut()
+            && let Some((min, max, _)) = ux::number(form, index)
             && let Some(field) = form.fields.get_mut(index)
         {
             let value = if matches!(action, FieldStep(..)) {
@@ -404,8 +416,6 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
                 value
             };
             if value.is_finite() {
-                let current = field.text.parse::<f64>().unwrap_or(0.0);
-                let (min, max, _) = ux::number(form.command, &field.key, current);
                 let value = value.clamp(min, max);
                 field.text = format!("{value:.4}")
                     .trim_end_matches('0')
@@ -473,9 +483,13 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
     let mut call = None;
     match action {
         FieldNumber(..) | FieldStep(..) | Preview => {}
+        ImportMask => unreachable!(),
+        BalanceTone(tone) => state.layers.balance_tone = tone.min(2),
         Advanced => state.layers.advanced ^= true,
         Quick(command) => {
-            if state.layers.context_menu_y.take().is_some() {
+            if state.layers.context_menu_y.take().is_some()
+                || state.layers.category == "Добавить маску"
+            {
                 state.layers.menu = false;
             }
             call = Some((command, json!({})));
@@ -546,14 +560,9 @@ pub(super) fn dispatch(state: &mut State, id: usize, action: LayerAction) {
             state.layers.menu = false;
             state.layers.context_menu_y = None;
         }
-        Menu | ContextMenu(_) => {
-            let anchor = match action {
-                ContextMenu(y) => Some(y),
-                _ => None,
-            };
-            state.layers.menu =
-                anchor.is_some() || !state.layers.menu || state.layers.context_menu_y.is_some();
-            state.layers.context_menu_y = anchor;
+        ContextMenu(y) => {
+            state.layers.menu = true;
+            state.layers.context_menu_y = Some(y);
             state.layers.form = None;
             state.layers.blend_menu = None;
             state.layers.category = "";

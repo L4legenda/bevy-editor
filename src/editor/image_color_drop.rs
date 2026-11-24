@@ -255,21 +255,8 @@ pub(in crate::editor) fn input(
     drop.blocked_source = Some(carry.source);
     if let Some(pixel) = target {
         let doc = &mut viewer.edit.sessions.get_mut(&carry.image).unwrap().doc;
-        let target = if doc.mask_target && doc.filter_target {
-            "filterMask"
-        } else if doc.mask_target {
-            "mask"
-        } else {
-            "pixels"
-        };
-        match doc.layer_command(
-            "paint.bucket",
-            serde_json::json!({
-                "x":pixel.x, "y":pixel.y, "color":carry.color, "tolerance":0,
-                "antiAlias":false, "target":target,
-            }),
-        ) {
-            Ok(_) => {
+        match doc.fill(pixel.x, pixel.y, carry.color) {
+            Ok(true) => {
                 drop.feedback = Some(Feedback::Land {
                     at: cursor,
                     color: carry.color,
@@ -278,6 +265,7 @@ pub(in crate::editor) fn input(
                 viewer.edit.error = None;
                 editor.status = "Область залита · Ctrl+Z — отменить".into();
             }
+            Ok(false) => {}
             Err(error) => {
                 viewer.edit.error = Some(error);
                 drop.feedback = Some(Feedback::Return {

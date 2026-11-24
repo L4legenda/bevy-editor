@@ -10,7 +10,7 @@ use bevy::{
 pub(super) const HANDLE: Handle<CanvasMaterial> =
     uuid_handle!("78d51f7a-a2c0-4a2b-bbcd-e7a1eb55b2ce");
 
-#[derive(Asset, TypePath, AsBindGroup, Debug, Clone, Default)]
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone, Default, PartialEq)]
 pub(in crate::editor) struct CanvasMaterial {
     #[texture(0)]
     #[sampler(1)]
@@ -68,6 +68,8 @@ impl Plugin for ImageCanvasPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "image_canvas.wesl");
         app.add_plugins(UiMaterialPlugin::<CanvasMaterial>::default());
+        app.add_plugins(super::gradient::GradientPlugin);
+        super::overview::install(app);
         app.add_systems(
             Update,
             super::tool_cursor::pencil::refresh

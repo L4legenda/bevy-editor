@@ -223,7 +223,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             super::ImageEditAction::Edit => "Редактировать изображение. Рядом создаётся проект слоёв .pcraft.".into(),
             super::ImageEditAction::Save => "Ctrl+S · Сохранить слои .pcraft и обновить исходное изображение.".into(),
             super::ImageEditAction::Undo => "Ctrl+Z · Отменить последнее изменение изображения.".into(),
-            super::ImageEditAction::SizeMenu => "Настройки кисти: размер, жёсткость и непрозрачность. Колесо или Shift + движение мыши — размер.".into(),
+            super::ImageEditAction::SizeMenu => "Библиотека кистей или параметры карандаша и ластика. Колесо или Shift + движение мыши меняют размер.".into(),
             super::ImageEditAction::Redo => "Ctrl+Shift+Z / Ctrl+Y · Повторить изменение изображения.".into(),
             super::ImageEditAction::ColorPicker(_) => "Выбрать цвет. Изменения применяются по ОК; Esc — отмена.".into(),
             super::ImageEditAction::SwapColors => "X · Поменять основной и фоновый цвета местами.".into(),
@@ -240,6 +240,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
                 crate::editor::photo_document::PhotoTool::Brush => "B · Кисть PhotoCraft со сглаживанием. Рисует в выбранном слое.".into(),
                 crate::editor::photo_document::PhotoTool::Eraser => "E · Стирать. Стрелка или ПКМ — выбрать обычный или пиксельный ластик.".into(),
                 crate::editor::photo_document::PhotoTool::Fill => "G · Заливка связанной области выбранным цветом.".into(),
+                crate::editor::photo_document::PhotoTool::Gradient => "U · Протяни градиент по холсту. Shift — шаг 45°, Esc — отмена.".into(),
                 crate::editor::photo_document::PhotoTool::Eyedropper => "I · Пипетка. Взять цвет изображения.".into(),
                 crate::editor::photo_document::PhotoTool::Move => "V · Перетащить содержимое выбранного слоя.".into(),
                 crate::editor::photo_document::PhotoTool::Hand => "H / Пробел · Перемещать изображение в окне.".into(),
@@ -247,6 +248,13 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
                 crate::editor::photo_document::PhotoTool::Transform => "Ctrl+T · Трансформация выделения или слоёв. Enter — применить, Esc — отменить.".into(),
             },
             super::ImageEditAction::AddLayer => "Создать прозрачный слой над выбранным.".into(),
+            super::ImageEditAction::Selection(super::image_viewer::edit::selection::SelectionAction::FlipSelection(horizontal)) => {
+                if horizontal {
+                    "Отразить выделенный фрагмент слева направо."
+                } else {
+                    "Отразить выделенный фрагмент сверху вниз."
+                }.into()
+            }
             super::ImageEditAction::DrawingTool => "B · Рисование. Стрелка рядом или ПКМ — выбрать кисть или карандаш. Shift+B — переключить инструмент.".into(),
             super::ImageEditAction::PaintMenu => "Выбрать кисть со сглаживанием или пиксельный карандаш. Shift+B — переключить инструмент.".into(),
             super::ImageEditAction::EraserMenu => "Выбрать обычный или пиксельный ластик.".into(),
@@ -404,15 +412,17 @@ pub(in crate::editor) fn update(
             let below = center.y + half.y + 7.0;
             let height = geometry
                 .get(hints.panel)
-                .map_or(150.0, |n| (n.size().y / scale).max(110.0));
-            let y = if below + height + 8.0 < window.height() {
-                below
+                .map_or(0.0, |n| n.size().y / scale);
+            let (top, bottom) = if height > 0.0 && below + height + 8.0 <= window.height() {
+                (px(below), Val::Auto)
             } else {
-                (center.y - half.y - height - 7.0).max(8.0)
+                // Anchor the tooltip by its bottom edge so wrapped text grows upward.
+                (Val::Auto, px(window.height() - (center.y - half.y) + 7.0))
             };
-            if panel.left != px(x) || panel.top != px(y) {
+            if panel.left != px(x) || panel.top != top || panel.bottom != bottom {
                 panel.left = px(x);
-                panel.top = px(y);
+                panel.top = top;
+                panel.bottom = bottom;
             }
         }
     }

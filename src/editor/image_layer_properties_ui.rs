@@ -46,7 +46,20 @@ pub(super) fn build(
             MUTED,
         );
     }
-    if !matches!(
+    if matches!(layer.content, LayerContent::Adjustment(_)) && !doc.mask_target {
+        let detail = photocraft_engine::inspect::layer_detail(layer);
+        let name = detail["adjustment"]["kind"].as_str().map_or_else(
+            || "Коррекция".into(),
+            |kind| title(&format!("layer.newAdjustmentLayer.{kind}")),
+        );
+        compact(
+            commands,
+            parent,
+            font,
+            &format!("Настроить: {name}"),
+            LayerAction::Properties,
+        );
+    } else if !matches!(
         layer.content,
         LayerContent::Raster(_) | LayerContent::Group(_)
     ) || doc.mask_target
@@ -112,7 +125,7 @@ pub(super) fn build(
             parent,
             font,
             "Добавить маску",
-            LayerAction::Quick("layer.layerMask.revealAll"),
+            LayerAction::Category("Добавить маску"),
         );
     }
     heading(commands, parent, font, "Эффекты");
@@ -195,7 +208,7 @@ pub(super) fn build(
         "Добавить эффект…",
         LayerAction::Category("Эффекты"),
     );
-    heading(commands, parent, font, "Дополнительно");
+    heading(commands, parent, font, "Свет и цвет");
     let extra = node(
         commands,
         parent,
@@ -209,7 +222,7 @@ pub(super) fn build(
         commands,
         extra,
         font,
-        "Коррекция света и цвета…",
+        "Добавить коррекцию…",
         LayerAction::Category("Коррекция"),
     );
     compact(

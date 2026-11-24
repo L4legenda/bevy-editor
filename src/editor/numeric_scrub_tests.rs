@@ -384,6 +384,12 @@ fn gpu_numeric_scrub_all_numeric_inputs_live_cancel_and_one_undo() {
             break;
         }
     }
+    send(
+        &mut app,
+        Action::ImageEdit(ImageEditAction::Tool(
+            crate::editor::photo_document::PhotoTool::Eraser,
+        )),
+    );
     send(&mut app, Action::ImageEdit(ImageEditAction::SizeMenu));
     let brush = find(&mut app, "Размер кисти · px · Shift + движение мыши");
     let original = app.world().resource::<ImageViewer>().edit.size;

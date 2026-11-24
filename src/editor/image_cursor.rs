@@ -335,7 +335,7 @@ pub(in crate::editor) fn cursor(
             });
             return cache.pipette(window.scale_factor(), &mut images);
         }
-        if matches!(viewer.edit.tool, PhotoTool::Select(_)) {
+        if matches!(viewer.edit.tool, PhotoTool::Select(_) | PhotoTool::Gradient) {
             return CursorIcon::from(SystemCursorIcon::Crosshair);
         }
         if matches!(viewer.edit.tool, PhotoTool::Move | PhotoTool::Transform) {
@@ -403,9 +403,7 @@ pub(in crate::editor) fn cursor(
         let (icon, full) = cache.cursor_with_overlay(
             tip,
             &mut images,
-            resize_center.is_some()
-                || viewer.pen_cursor.is_some()
-                || pixel_tool,
+            resize_center.is_some() || viewer.pen_cursor.is_some() || pixel_tool,
         );
         viewer.brush_cursor = Some(tip);
         viewer.brush_cursor_position = position;

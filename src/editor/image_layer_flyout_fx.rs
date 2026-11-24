@@ -30,6 +30,7 @@ pub(in crate::editor) struct LayerFlyoutFxPlugin;
 
 impl Plugin for LayerFlyoutFxPlugin {
     fn build(&self, app: &mut App) {
+        super::form_ui::install(app);
         embedded_asset!(app, "image_layer_flyout_fx.wesl");
         app.add_plugins(UiMaterialPlugin::<FlyoutMaterial>::default())
             .add_systems(

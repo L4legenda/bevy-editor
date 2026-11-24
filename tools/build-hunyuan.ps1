@@ -42,12 +42,22 @@ if (-not $cudaRoot -or -not (Test-Path (Join-Path $cudaRoot 'bin/nvcc.exe')) -or
     }
 }
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-$vsInstall = & $vswhere -latest -products '*' -property installationPath
-if (-not $vsInstall) { throw 'Install Visual Studio C++ build tools to compile Candle CUDA kernels' }
+if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+    throw 'Install Visual Studio Build Tools with the Desktop development with C++ workload.'
+}
+$vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if ($LASTEXITCODE -ne 0 -or -not $vsInstall) {
+    throw 'Install the Visual Studio x64 C++ build tools to compile Candle CUDA kernels.'
+}
 $dev = Join-Path $vsInstall 'Common7/Tools/VsDevCmd.bat'
-$environmentCommand = '"' + $dev + '" -arch=x64 -host_arch=x64 >nul && set'
-cmd /c $environmentCommand | ForEach-Object {
+$environmentCommand = 'call "' + $dev + '" -arch=x64 -host_arch=x64 >nul && set'
+$developerEnvironment = & cmd.exe /d /c $environmentCommand
+if ($LASTEXITCODE -ne 0) { throw "Could not initialize the x64 MSVC environment: $dev" }
+$developerEnvironment | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+}
+if (-not (Get-Command cl.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw "MSVC compiler cl.exe was not found after initializing $dev."
 }
 $env:CUDA_PATH = $cudaRoot
 $env:PATH = (Join-Path $cudaRoot 'bin') + ';' + $env:PATH

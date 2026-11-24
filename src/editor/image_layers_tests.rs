@@ -485,10 +485,7 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
         |_| true,
     );
     command(&mut app, LayerAction::MaskPreview(false));
-    click(&mut app, window, |a| matches!(a, LayerAction::Menu));
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::Category("Вид панели"))
-    });
+    command(&mut app, LayerAction::Category("Вид панели"));
     click(&mut app, window, |a| matches!(a, LayerAction::OnlySelected));
     command(&mut app, LayerAction::Thumbnail(ThumbnailSize::Large));
     capture_when(
@@ -553,10 +550,7 @@ fn gpu_image_layers_tree_properties_masks_and_save() {
         assert!(doc.mask_view.is_some_and(|view| view.filter));
         assert!(doc.paintable());
     }
-    click(&mut app, window, |a| matches!(a, LayerAction::Menu));
-    click(&mut app, window, |a| {
-        matches!(a, LayerAction::Category("Параметры слоя"))
-    });
+    command(&mut app, LayerAction::Category("Параметры слоя"));
     click(&mut app, window, |a| matches!(a, LayerAction::Properties));
     assert_eq!(
         app.world()

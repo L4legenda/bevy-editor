@@ -24,8 +24,8 @@ pub(in crate::editor) struct LayerUi {
     search_body: Entity,
     search_input: Entity,
     clear_filter: Entity,
-    heading: Entity,
     panel: Entity,
+    mask_button: Entity,
     popup: Entity,
     flyout: Option<(Entity, f64)>,
     signature: String,
@@ -35,6 +35,7 @@ pub(in crate::editor) struct LayerUi {
     results: Option<Entity>,
     popup_scroll: Option<Entity>,
     popup_context: String,
+    popup_opened: f64,
     search_signature: String,
     last_click: Option<(u64, std::time::Instant)>,
 }
@@ -197,7 +198,6 @@ pub(in crate::editor) fn setup(
     panel: Entity,
     root: Entity,
     font: &Handle<Font>,
-    heading: Entity,
 ) {
     let search_body = node(
         commands,
@@ -296,19 +296,20 @@ pub(in crate::editor) fn setup(
         add,
         "Создать прозрачный слой над выбранным. Рисуйте на новом слое, чтобы не менять исходное изображение.",
     );
-    for (glyph, label, action) in [
+    let [_, mask_button, _] = [
         (icons::Glyph::Folder, "Сгруппировать", LayerAction::Group),
         (
             icons::Glyph::Mask,
             "Добавить маску",
-            LayerAction::Quick("layer.layerMask.revealAll"),
+            LayerAction::Category("Добавить маску"),
         ),
         (
             icons::Glyph::Trash,
             "Удалить слой",
             LayerAction::Quick("layer.delete"),
         ),
-    ] {
+    ]
+    .map(|(glyph, label, action)| {
         if matches!(action, LayerAction::Quick("layer.delete")) {
             node(
                 commands,
@@ -328,7 +329,8 @@ pub(in crate::editor) fn setup(
             n.padding = UiRect::ZERO;
         });
         ux::help(commands, e, ux::action_help(action));
-    }
+        e
+    });
     let popup = node(
         commands,
         root,
@@ -354,8 +356,8 @@ pub(in crate::editor) fn setup(
         search_body,
         search_input: filter,
         clear_filter,
-        heading,
         panel,
+        mask_button,
         popup,
         flyout: None,
         signature: String::new(),
@@ -366,6 +368,7 @@ pub(in crate::editor) fn setup(
         results: None,
         popup_scroll: None,
         popup_context: String::new(),
+        popup_opened: 0.0,
         search_signature: String::new(),
     });
 }
@@ -497,8 +500,7 @@ pub(in crate::editor) fn input(
         *rename_confirm = None;
         return;
     }
-    if viewer.edit.layers.menu
-        && viewer.edit.layers.context_menu_y.is_some()
+    if is_flyout(&viewer.edit.layers)
         && (!window.focused
             || (mouse.any_just_pressed([
                 MouseButton::Left,
@@ -635,7 +637,6 @@ pub(in crate::editor) fn refresh(
     scroll_positions: Query<&ScrollPosition>,
     mut filters: Query<(Entity, &mut EditableText), With<LayerSearch>>,
     mut focus: ResMut<InputFocus>,
-    mut titles: Query<&mut Text>,
     mut uploads: ResMut<TextureUploads>,
     thumbnail_nodes: Query<&LayerThumbnail>,
     mut nodes: Query<&mut Node>,
@@ -655,17 +656,6 @@ pub(in crate::editor) fn refresh(
         }
     }
     let doc = viewer.edit.document(editor.viewing_image);
-    if let Ok(mut title) = titles.get_mut(ui.heading) {
-        title.set_if_neq(Text(if state.has_filter() {
-            format!(
-                "Слои · {}/{}",
-                doc.map_or(0, |d| tree_rows(d, state).len()),
-                doc.map_or(0, |d| d.document.layer_count())
-            )
-        } else {
-            format!("Слои · {}", doc.map_or(0, |d| d.document.layer_count()))
-        }));
-    }
     let editing = viewer.edit.editing(editor.viewing_image);
     for (entity, show) in [
         (ui.search_body, editing && state.search_open),
@@ -796,7 +786,8 @@ pub(in crate::editor) fn refresh(
                 .map(|f| (f.command, f.params.get("layer"))),
             state.category
         );
-        let previous = if ui.popup_context == context {
+        let same_context = ui.popup_context == context;
+        let previous = if same_context {
             ui.popup_scroll
                 .and_then(|e| scroll_positions.get(e).ok())
                 .map(|p| ScrollPosition(p.0))
@@ -804,6 +795,9 @@ pub(in crate::editor) fn refresh(
             None
         };
         ui.popup_context = context;
+        if !same_context {
+            ui.popup_opened = time.elapsed_secs_f64();
+        }
         let started = ui
             .flyout
             .map_or(time.elapsed_secs_f64(), |(_, started)| started);
@@ -838,7 +832,7 @@ pub(in crate::editor) fn refresh(
                 }
             });
         if show {
-            let flyout = state.menu && state.context_menu_y.is_some();
+            let flyout = is_flyout(state);
             let mut parent = commands.entity(ui.popup);
             if flyout {
                 parent
@@ -848,7 +842,7 @@ pub(in crate::editor) fn refresh(
                 parent.insert((
                     TabGroup::modal(),
                     Pickable::default(),
-                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.12)),
+                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.04)),
                 ));
             }
             let (sheet, results, scroll) = popup(
@@ -863,6 +857,9 @@ pub(in crate::editor) fn refresh(
             if flyout {
                 ui.flyout = Some((sheet, started));
                 flyout_fx::attach(&mut commands, sheet, results, started);
+            } else if state.form.is_some() || matches!(state.category, "Эффекты" | "Коррекция")
+            {
+                flyout_fx::attach(&mut commands, sheet, None, ui.popup_opened);
             }
             ui.results = results;
             ui.popup_scroll = scroll;
@@ -875,7 +872,23 @@ pub(in crate::editor) fn refresh(
         }
         ui.popup_signature = popup_signature;
     }
-    if let (Some((sheet, _)), Some(anchor)) = (ui.flyout, state.context_menu_y)
+    let mask_anchor = (|| {
+        if !is_mask_menu(state) || state.context_menu_y.is_some() {
+            return None;
+        }
+        let (button, transform) = geometry.get(ui.mask_button).ok()?;
+        let scale = button.inverse_scale_factor();
+        (!button.is_empty()).then(|| {
+            Rect::from_center_size(
+                transform.affine().translation * scale,
+                button.size() * scale,
+            )
+        })
+    })();
+    let anchor = state
+        .context_menu_y
+        .or_else(|| mask_anchor.map(|button| button.min.y - 6.0));
+    if let (Some((sheet, _)), Some(anchor)) = (ui.flyout, anchor)
         && let Ok((panel, transform)) = geometry.get(ui.panel)
     {
         let scale = panel.inverse_scale_factor();
@@ -884,7 +897,12 @@ pub(in crate::editor) fn refresh(
         let left = panel_pos.x - panel_size.x * 0.5;
         let top = (panel_pos.y - panel_size.y * 0.5 + 6.0).max(6.0);
         let bottom = (panel_pos.y + panel_size.y * 0.5 - 6.0).min(window.height() - 6.0);
-        let height_limit = (bottom - top).max(1.0);
+        let height_limit = (if mask_anchor.is_some() {
+            bottom.min(anchor)
+        } else {
+            bottom
+        } - top)
+            .max(1.0);
         let width = 250.0_f32.min((window.width() - 16.0).max(1.0));
         let height = geometry
             .get(sheet)
@@ -893,8 +911,18 @@ pub(in crate::editor) fn refresh(
             .filter(|height| *height > 0.0)
             .unwrap_or(405.0)
             .min(height_limit);
-        let x = (left - width - 8.0).max(8.0);
-        let y = (anchor - height * 0.5).clamp(top, top + height_limit - height);
+        let (x, y) = if let Some(button) = mask_anchor {
+            let max_x = (window.width() - width - 8.0).max(8.0);
+            (
+                (button.center().x - width * 0.5).clamp(8.0, max_x),
+                top + height_limit - height,
+            )
+        } else {
+            (
+                (left - width - 8.0).max(8.0),
+                (anchor - height * 0.5).clamp(top, top + height_limit - height),
+            )
+        };
         let position = [px(x), px(y), px(width), px(height_limit)];
         let update = move |mut node: Mut<Node>| {
             if [node.left, node.top, node.width, node.max_height] != position {
@@ -1517,6 +1545,14 @@ fn select_row(
     select(event, rows, keys, actions, viewer, ui, drag, window);
 }
 
+fn is_mask_menu(state: &LayerState) -> bool {
+    state.menu && state.form.is_none() && state.category == "Добавить маску"
+}
+
+fn is_flyout(state: &LayerState) -> bool {
+    state.menu && (state.context_menu_y.is_some() || is_mask_menu(state))
+}
+
 fn popup(
     commands: &mut Commands,
     parent: Entity,
@@ -1526,16 +1562,17 @@ fn popup(
     focus: &mut InputFocus,
     flyout: bool,
 ) -> (Entity, Option<Entity>, Option<Entity>) {
+    let add_mask = is_mask_menu(state);
     let sheet = surface(
         commands,
         parent,
         Node {
-            width: px(if state.form.is_some() { 420 } else { 380 }),
+            width: px(if state.form.is_some() { 388 } else { 350 }),
             position_type: PositionType::Absolute,
             right: px(16),
             top: px(105),
             max_width: percent(92),
-            max_height: percent(86),
+            max_height: percent(74),
             padding: UiRect::all(px(if flyout { 6 } else { 16 })),
             border: UiRect::all(px(1)),
             border_radius: BorderRadius::all(px(10)),
@@ -1545,9 +1582,17 @@ fn popup(
     );
     commands.entity(sheet).insert(BorderColor::all(EDGE));
     if flyout {
-        commands
-            .entity(sheet)
-            .insert((CanvasControl, AccessibleLabel("Меню слоя".into())));
+        commands.entity(sheet).insert((
+            CanvasControl,
+            AccessibleLabel(
+                if add_mask {
+                    "Меню масок"
+                } else {
+                    "Меню слоя"
+                }
+                .into(),
+            ),
+        ));
     } else {
         let header = node(
             commands,
@@ -1573,7 +1618,9 @@ fn popup(
             16.0,
             TEXT,
         );
-        compact(commands, header, font, "Закрыть · Esc", LayerAction::Cancel);
+        if state.form.is_none() {
+            compact(commands, header, font, "Закрыть · Esc", LayerAction::Cancel);
+        }
     }
     if let Some(form) = &state.form {
         let scroll = form_ui::build(commands, sheet, font, state, focus);
@@ -1614,17 +1661,28 @@ fn popup(
             },
         );
         if ux::can_preview(form.command) {
-            compact(
+            let compare = compact(
                 commands,
                 footer,
                 font,
                 if state.preview_enabled {
-                    "Предпросмотр: вкл."
+                    "Показать до"
                 } else {
-                    "Предпросмотр: выкл."
+                    "Показать после"
                 },
                 LayerAction::Preview,
             );
+            let eye = icons::themed(
+                commands,
+                compare,
+                if state.preview_enabled {
+                    icons::Glyph::Eye
+                } else {
+                    icons::Glyph::EyeOff
+                },
+                16.0,
+            );
+            commands.entity(compare).insert_children(0, &[eye]);
         }
         let actions = node(commands, footer, row(4.0));
         compact(commands, actions, font, "Отмена", LayerAction::Cancel);
@@ -1653,7 +1711,7 @@ fn popup(
             commands
                 .entity(search)
                 .insert((CommandSearch, EditableText::new(&state.search)));
-        } else if !state.category.is_empty() {
+        } else if !state.category.is_empty() && !add_mask {
             compact(
                 commands,
                 sheet,
@@ -1696,7 +1754,7 @@ fn command_results(
         return;
     }
     if state.category != "Дополнительно" && state.category != "Вид панели" {
-        for (label, action) in ux::menu(state.category) {
+        for (index, (label, action)) in ux::menu(state.category).into_iter().enumerate() {
             if flyout
                 && matches!(
                     action,
@@ -1704,6 +1762,27 @@ fn command_results(
                 )
             {
                 continue;
+            }
+            let category = match (state.category, index) {
+                ("Эффекты", 0) => Some(("Тени и свет", icons::Glyph::Sun)),
+                ("Эффекты", 5) => Some(("Контур и заливка", icons::Glyph::Layers)),
+                ("Коррекция", 0) => Some(("Свет", icons::Glyph::Sun)),
+                ("Коррекция", 4) => Some(("Цвет", icons::Glyph::Pipette)),
+                _ => None,
+            };
+            if let Some((title, glyph)) = category {
+                let group = node(
+                    commands,
+                    scroll,
+                    Node {
+                        width: percent(100),
+                        margin: UiRect::top(px(if index == 0 { 3 } else { 9 })),
+                        padding: UiRect::axes(px(6), px(4)),
+                        ..row(6.0)
+                    },
+                );
+                icons::spawn(commands, group, glyph, 14.0, FOCUS);
+                text(commands, group, font, title, 11.0, FOCUS);
             }
             let button = compact(commands, scroll, font, label, action);
             commands.entity(button).entry::<Node>().and_modify(|mut n| {

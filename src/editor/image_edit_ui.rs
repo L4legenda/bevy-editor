@@ -1,10 +1,13 @@
 //! Bevy-native controls using the editor's existing colors, buttons and icons.
 use super::*;
 use crate::editor::image_brush_rail_fx as rail_fx;
+#[path = "image_brush_library_ui.rs"]
+mod library_ui;
 use bevy::ui_widgets::{
     Slider, SliderDragState, SliderOrientation, SliderRange, SliderStep, SliderThumb, SliderValue,
     TrackClick, ValueChange,
 };
+use library_ui::BrushLibraryUi;
 
 #[derive(Clone, Copy, Component)]
 pub(super) enum Binding {
@@ -33,12 +36,14 @@ pub(in crate::editor) struct EditUi {
     paint_menu: Entity,
     panel: Entity,
     eraser_modes: Entity,
-    status: Entity,
+    error: Entity,
     size_group: Entity,
     brush_rail: Entity,
     size_button: Entity,
     size_value: Entity,
     size_menu: Entity,
+    size_settings: Entity,
+    library: BrushLibraryUi,
     size_title: Entity,
     hardness_group: Entity,
     pencil_shapes: Entity,
@@ -476,8 +481,10 @@ pub(in crate::editor) fn setup(
     canvas: Entity,
     root: Entity,
     font_handle: &Handle<Font>,
+    checker_image: &Handle<Image>,
 ) {
     let brush_rail = brush_rail(commands, canvas, font_handle);
+    gradient::setup(commands, toolbar, canvas, font_handle);
     let size_group = node(
         commands,
         toolbar,
@@ -503,7 +510,7 @@ pub(in crate::editor) fn setup(
     );
     commands
         .entity(size_button)
-        .insert(AccessibleLabel("Настройки кисти".into()));
+        .insert(AccessibleLabel("Библиотека кистей".into()));
     icons::themed(commands, size_button, icons::Glyph::Brush, 14.0);
     let size_value = text(commands, size_button, font_handle, "24 px", 12.0, TEXT);
     commands.entity(size_value).insert(Node {
@@ -530,11 +537,20 @@ pub(in crate::editor) fn setup(
     commands.entity(size_menu).insert((
         GlobalZIndex(50),
         TabGroup::modal(),
-        AccessibleLabel("Параметры кисти".into()),
+        AccessibleLabel("Выбор кисти или параметры инструмента".into()),
     ));
-    let size_header = node(
+    let library = BrushLibraryUi::setup(commands, size_menu, font_handle);
+    let size_settings = node(
         commands,
         size_menu,
+        Node {
+            width: percent(100),
+            ..column(10.0)
+        },
+    );
+    let size_header = node(
+        commands,
+        size_settings,
         Node {
             width: percent(100),
             ..row(6.0)
@@ -572,7 +588,7 @@ pub(in crate::editor) fn setup(
     text(commands, size_header, font_handle, "px", 11.0, MUTED);
     slider_track(
         commands,
-        size_menu,
+        size_settings,
         Binding::Size,
         (1.0, 256.0),
         size_input,
@@ -580,7 +596,7 @@ pub(in crate::editor) fn setup(
     );
     let pencil_shapes = node(
         commands,
-        size_menu,
+        size_settings,
         Node {
             width: percent(100),
             justify_content: JustifyContent::SpaceBetween,
@@ -625,7 +641,7 @@ pub(in crate::editor) fn setup(
     ] {
         let setting = node(
             commands,
-            size_menu,
+            size_settings,
             Node {
                 width: percent(100),
                 ..column(4.0)
@@ -828,6 +844,13 @@ pub(in crate::editor) fn setup(
         BorderColor::all(EDGE),
         AccessibleLabel("Инструменты рисования".into()),
     ));
+    tool_button(
+        commands,
+        tools,
+        icons::Glyph::Gradient,
+        "Градиент · U",
+        PhotoTool::Gradient,
+    );
     for (glyph, label, tool) in [
         (icons::Glyph::Brush, "Кисть", PhotoTool::Brush),
         (icons::Glyph::Pencil, "Карандаш", PhotoTool::Pencil),
@@ -913,30 +936,21 @@ pub(in crate::editor) fn setup(
     );
     commands.entity(panel).insert(Scroller);
     super::super::panel_resize::setup(commands, panel_root);
-    let save = button(
-        commands,
-        panel,
-        font_handle,
-        "Сохранить · Ctrl+S",
-        Action::ImageEdit(EditAction::Save),
-        Look::Primary,
-    );
-    commands
-        .entity(save)
-        .entry::<Node>()
-        .and_modify(|mut n| n.width = percent(100));
-    let status = text(commands, panel, font_handle, "", 11.0, MUTED);
-    commands.entity(status).insert(TextLayout::default());
+    let error = text(commands, panel, font_handle, "", 11.0, ERROR);
+    commands.entity(error).insert(Node {
+        display: Display::None,
+        ..default()
+    });
+    super::super::overview::setup(commands, panel, checker_image);
     let layer_header = node(
         commands,
         panel,
         Node {
             width: percent(100),
-            justify_content: JustifyContent::SpaceBetween,
+            justify_content: JustifyContent::FlexEnd,
             ..row(6.0)
         },
     );
-    let layer_title = text(commands, layer_header, font_handle, "Слои", 13.0, TEXT);
     let actions = node(commands, layer_header, row(2.0));
     for (glyph, label, action) in [(
         icons::Glyph::Search,
@@ -958,23 +972,6 @@ pub(in crate::editor) fn setup(
             n.height = px(25);
         });
     }
-    let layer_menu = button(
-        commands,
-        actions,
-        font_handle,
-        "•••",
-        Action::ImageEdit(EditAction::Layers(layers::LayerAction::Menu)),
-        Look::Regular,
-    );
-    commands
-        .entity(layer_menu)
-        .insert(AccessibleLabel("Операции со слоями".into()))
-        .entry::<Node>()
-        .and_modify(|mut n| {
-            n.width = px(25);
-            n.height = px(25);
-            n.padding = UiRect::ZERO;
-        });
     let layers = node(
         commands,
         panel,
@@ -985,7 +982,7 @@ pub(in crate::editor) fn setup(
             ..column(3.0)
         },
     );
-    layers::ui::setup(commands, layers, panel_root, root, font_handle, layer_title);
+    layers::ui::setup(commands, layers, panel_root, root, font_handle);
     let cursor = super::super::tool_cursor::Overlay::setup(commands, canvas, font_handle);
     commands.insert_resource(EditUi {
         mode_button,
@@ -999,12 +996,14 @@ pub(in crate::editor) fn setup(
         paint_menu,
         panel: panel_root,
         eraser_modes,
-        status,
+        error,
         size_group,
         brush_rail,
         size_button,
         size_value,
         size_menu,
+        size_settings,
+        library,
         size_title,
         hardness_group,
         pencil_shapes,
@@ -1223,7 +1222,7 @@ pub(in crate::editor) fn refresh(
     parents: Query<&ChildOf>,
     mut colors: Query<&mut BackgroundColor>,
     mut rails: Query<(&mut RailControl, &Hovered, &SliderDragState)>,
-    time: Res<Time>,
+    (time, mut images): (Res<Time>, ResMut<Assets<Image>>),
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
     commands
@@ -1259,14 +1258,41 @@ pub(in crate::editor) fn refresh(
         };
     }
     let size_shown = editing && viewer.edit.sizeable() && viewer.edit.size_menu;
+    let library_shown = size_shown && viewer.edit.tool == PhotoTool::Brush;
     if let Ok(mut menu) = nodes.get_mut(ui.size_menu) {
+        menu.width = px(if library_shown {
+            (window.width() - 165.0).clamp(250.0, 460.0)
+        } else {
+            264.0
+        });
+        menu.height = if library_shown {
+            px((window.height() - 115.0).clamp(140.0, 560.0))
+        } else {
+            Val::Auto
+        };
         menu.display = if size_shown {
             Display::Flex
         } else {
             Display::None
         };
     }
-    if size_shown && !ui.size_shown {
+    for (entity, visible) in [
+        (ui.library.root, library_shown),
+        (ui.size_settings, !library_shown),
+    ] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            node.display = if visible {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+    if library_shown {
+        ui.library
+            .show_category(&mut commands, &mut images, viewer.edit.brush_category);
+    }
+    if size_shown && !library_shown && !ui.size_shown {
         if let Ok(mut input) = inputs.get_mut(ui.size_input) {
             input.editor_mut().set_text(&size_label(viewer.edit.size));
         }
@@ -1286,10 +1312,18 @@ pub(in crate::editor) fn refresh(
     }
     ui.size_shown = size_shown;
     if let Ok(mut label) = labels.get_mut(ui.size_value) {
-        label.set_if_neq(Text(format!(
-            "{} px",
-            size_label((viewer.edit.size * 10.0).round() / 10.0)
-        )));
+        let size = size_label((viewer.edit.size * 10.0).round() / 10.0);
+        let title = if viewer.edit.tool == PhotoTool::Brush {
+            let name = viewer
+                .edit
+                .brush_preset
+                .and_then(|index| brush_library::library().presets.get(index))
+                .map_or("Кисти", |preset| preset.name.as_str());
+            format!("{name} · {size} px")
+        } else {
+            format!("{size} px")
+        };
+        label.set_if_neq(Text(title));
     }
     if let Ok(mut title) = labels.get_mut(ui.size_title) {
         title.set_if_neq(Text(
@@ -1380,18 +1414,21 @@ pub(in crate::editor) fn refresh(
         ));
     }
     let doc = viewer.edit.document(editor.viewing_image);
-    if let Ok(mut text) = labels.get_mut(ui.status) {
-        text.set_if_neq(Text(viewer.edit.error.clone().unwrap_or_else(|| {
-            if viewer.edit.busy() {
-                "Подождите…".into()
-            } else if references.pending_for(editor.viewing_image) {
-                "Рендер слоя-референса…".into()
-            } else if doc.is_some_and(PhotoDocument::dirty) {
-                "Есть несохранённые изменения".into()
-            } else {
-                "Слои сохранены · .pcraft".into()
-            }
-        })));
+    let message = viewer.edit.error.as_deref().or_else(|| {
+        references.pending_for(editor.viewing_image).then_some("Рендер слоя-референса…")
+    });
+    if let Ok(mut text) = labels.get_mut(ui.error) {
+        text.set_if_neq(Text(message.unwrap_or_default().into()));
+    }
+    if let Ok(mut node) = nodes.get_mut(ui.error) {
+        let display = if message.is_some() {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        if node.display != display {
+            node.display = display;
+        }
     }
     if let Some(doc) = doc {
         for (entity, slider, value, range, control, computed) in &sliders {

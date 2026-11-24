@@ -50,6 +50,7 @@ pub(in crate::editor) enum SelectionAction {
     Apply,
     Cancel,
     Flip(bool),
+    FlipSelection(bool),
     Rotate(f32),
     Linked,
     Nearest,
@@ -255,6 +256,24 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
                 preview(state, quad, false);
             }
         }
+        SelectionAction::FlipSelection(horizontal) => {
+            if !matches!(state.tool, PhotoTool::Select(_)) || state.selection.transform.is_some() {
+                return;
+            }
+            let Some(session) = state.sessions.get_mut(&id) else {
+                return;
+            };
+            if !can_flip_selection(&session.doc) {
+                return;
+            }
+            let command = if horizontal {
+                "edit.transform.flipHorizontal"
+            } else {
+                "edit.transform.flipVertical"
+            };
+            state.selection.draft = None;
+            state.error = session.doc.layer_command(command, json!({})).err();
+        }
         SelectionAction::Rotate(degrees) => {
             if state.selection.transform.is_none() {
                 dispatch(state, id, SelectionAction::Transform);
@@ -302,6 +321,10 @@ pub fn dispatch(state: &mut State, id: usize, action: SelectionAction) {
             }
         }
     }
+}
+
+pub(super) fn can_flip_selection(doc: &PhotoDocument) -> bool {
+    doc.document.selection.is_some() && !doc.mask_target && doc.paintable() && doc.movable()
 }
 
 pub fn frame_quad(frame: [f32; 4]) -> [Vec2; 4] {

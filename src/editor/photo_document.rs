@@ -47,6 +47,7 @@ pub(super) enum PhotoTool {
     Pencil,
     Eraser,
     Fill,
+    Gradient,
     Eyedropper,
     Select(SelectionTool),
     Transform,
@@ -427,16 +428,59 @@ impl PhotoDocument {
         }
         Ok(())
     }
-    pub fn fill(&mut self, x: i32, y: i32, color: [f32; 4]) {
+    pub fn fill(&mut self, x: i32, y: i32, color: [f32; 4]) -> Result<bool, String> {
         if !self.paintable()
             || x < 0
             || y < 0
             || x >= self.size().width as i32
             || y >= self.size().height as i32
         {
-            return;
+            return Ok(false);
         }
-        let _=self.layer_command("paint.bucket",serde_json::json!({"x":x,"y":y,"color":color,"tolerance":0,"antiAlias":false,"target":if self.mask_target && self.filter_target{"filterMask"}else if self.mask_target{"mask"}else{"pixels"}}));
+        let params = serde_json::json!({
+            "x": x, "y": y, "color": color, "tolerance": 0,
+            "antiAlias": false, "recolorEdges": true, "target": self.paint_target(),
+        });
+        self.layer_command("paint.bucket", params)
+            .map(|result| result["filled"].as_bool().unwrap_or(false))
+    }
+    pub fn paint_target(&self) -> &'static str {
+        if self.mask_target && self.filter_target {
+            "filterMask"
+        } else if self.mask_target {
+            "mask"
+        } else {
+            "pixels"
+        }
+    }
+    pub fn gradient_preview(
+        &self,
+        params: serde_json::Value,
+    ) -> impl FnOnce() -> Result<Rgba8Image, String> + Send + 'static {
+        // Copy-on-write tiles let the draft use the same engine command without
+        // changing the live layer, revision or undo history.
+        let mut draft = Self {
+            document: self.document.clone(),
+            active: self.active,
+            selected: self.selected.clone(),
+            mask_target: self.mask_target,
+            filter_target: self.filter_target,
+            mask_view: self.mask_view,
+            view_revision: 0,
+            tool_colors: self.tool_colors,
+            engine: None,
+            parents: Vec::new(),
+            revision: 1,
+            saved_revision: 1,
+            next_revision: 2,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            damage: None,
+        };
+        move || {
+            draft.layer_command("paint.gradient", params)?;
+            Ok(draft.preview())
+        }
     }
     #[cfg(test)]
     pub fn composite(&self) -> Rgba8Image {

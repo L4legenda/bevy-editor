@@ -23,6 +23,8 @@ use crate::rng::hash2;
 use crate::tile::{Mips, PatternImage};
 use crate::{Dab, StrokePoint, TipProfile};
 
+mod stroke_sample;
+
 /// Salt of the 8-bit dither's per-pixel noise.
 const DITHER_SALT: u64 = 0x0000_6469_7468_6572;
 
@@ -212,6 +214,7 @@ pub fn texture_combine(mode: MaskMode, v: f32, t: f32, d: f32) -> f32 {
 pub struct BrushContext {
     pub brush: BrushSettings,
     tip: Option<Arc<Mips>>,
+    stroke_sample: Option<Arc<Mips>>,
     dual_tip: Option<Arc<Mips>>,
     texture: Option<Arc<PatternImage>>,
 }
@@ -252,6 +255,7 @@ impl BrushContext {
         };
         Self {
             tip: mips(&brush.tip),
+            stroke_sample: brush.stroke_sample.as_ref().filter(|g| g.is_valid()).map(crate::mip_cache::tip_mips),
             dual_tip: if brush.dual_brush.enabled { mips(&brush.dual_brush.tip) } else { None },
             texture: prepare_pattern(&brush),
             brush,
@@ -275,6 +279,9 @@ impl BrushContext {
 
     /// Bounding rectangle of a dab (rotated sampled tips need the corner reach).
     pub fn dab_rect(&self, d: &Dab, dual: bool) -> Rect {
+        if !dual && self.stroke_sample.is_some() {
+            return rect_around(d, d.radius);
+        }
         let sampled = if dual { self.dual_tip.is_some() } else { self.tip.is_some() };
         let hardness = if dual { self.brush.dual_brush.hardness } else { self.brush.hardness };
         // A computed soft tip paints past its nominal radius (see `tip_shape`).
@@ -336,6 +343,10 @@ impl BrushContext {
         if let Some(dp) = depth.as_deref_mut() {
             dp.clear();
             dp.resize(w * h, 0.0);
+        }
+        if !dual && let Some(sample) = &self.stroke_sample {
+            stroke_sample::rasterize(sample, self.brush.size, self.brush.hardness, d, rect, out);
+            return;
         }
         let b = &self.brush;
         let (hardness, mips) = if dual { (b.dual_brush.hardness, self.dual_tip.as_deref()) } else { (b.hardness, self.tip.as_deref()) };
@@ -548,6 +559,10 @@ impl CoverageMap {
     /// (`c ← c + v·(ceil − c)`). `color` = native colour for per-dab colour. `depth` (Wet Edges, one
     /// value per pixel of `rect`) keeps the deepest any dab reaches each pixel.
     pub fn accumulate(&mut self, rect: Rect, vals: &[f32], ceil: f32, color: Option<&[f32]>, depth: Option<&[f32]>) {
+        self.accumulate_dab(rect, vals, ceil, color, depth, false);
+    }
+
+    fn accumulate_dab(&mut self, rect: Rect, vals: &[f32], ceil: f32, color: Option<&[f32]>, depth: Option<&[f32]>, measured: bool) {
         if rect.is_empty() {
             return;
         }
@@ -557,7 +572,7 @@ impl CoverageMap {
         let (t0x, t0y) = (rect.x0.div_euclid(COV_TILE), rect.y0.div_euclid(COV_TILE));
         let (t1x, t1y) = ((rect.x1 - 1).div_euclid(COV_TILE), (rect.y1 - 1).div_euclid(COV_TILE));
         let want_col = color.is_some() && nc > 0;
-        let dab = DabValues { vals, rect, w, ceil, color: if want_col { color } else { None }, depth, nc };
+        let dab = DabValues { vals, rect, w, ceil, color: if want_col { color } else { None }, depth, nc, measured };
         // Iterate directly for small dabs: no work-list allocations or removing existing tiles.
         let keys = (t0y..=t1y).flat_map(|ty| {
             (t0x..=t1x).map(move |tx| {
@@ -686,6 +701,7 @@ struct DabValues<'a> {
     rect: Rect,
     w: usize,
     ceil: f32,
+    measured: bool,
     color: Option<&'a [f32]>,
     depth: Option<&'a [f32]>,
     nc: usize,
@@ -712,7 +728,7 @@ impl DabValues<'_> {
     /// Adds the dab over `tr` (within tile `(tx, ty)`) to `tile`.
     #[inline(always)]
     fn tile(self, tr: Rect, (tx, ty): (i32, i32), tile: &mut CovTile) {
-        let DabValues { vals, rect, w, ceil, color, depth, nc } = self;
+        let DabValues { vals, rect, w, ceil, color, depth, nc, measured } = self;
         for y in tr.y0..tr.y1 {
             let row = (y - rect.y0) as usize * w;
             let trow = ((y - ty * COV_TILE) * COV_TILE) as usize;
@@ -726,7 +742,9 @@ impl DabValues<'_> {
                     *slot = slot.max(*dv);
                 }
                 let c = tile.cov[ti];
-                let nv = if ceil > c { c + v * (ceil - c) } else { c };
+                // A measured sample already includes overlapping source dabs. Its coverage
+                // is deposited once per stroke, including on the live preview's tail.
+                let nv = if measured { c.max(v * ceil) } else if ceil > c { c + v * (ceil - c) } else { c };
                 if nv <= c {
                     continue;
                 }
@@ -1018,7 +1036,7 @@ impl StrokeRenderer {
                 }
                 _ => None,
             };
-            self.cov.accumulate(rect, &self.scratch, d.opacity, col, wet.then_some(&self.depth_scratch[..]));
+            self.cov.accumulate_dab(rect, &self.scratch, d.opacity, col, wet.then_some(&self.depth_scratch[..]), self.ctx.stroke_sample.is_some());
             // Bounds track the full dab rectangle (even fully transparent parts), like the damage.
             self.cov.bounds = self.cov.bounds.union(&rect);
         }

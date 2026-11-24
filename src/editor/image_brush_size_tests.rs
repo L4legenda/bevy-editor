@@ -659,7 +659,7 @@ fn gpu_left_brush_sliders_change_size_and_opacity_without_painting() {
 }
 
 #[test]
-#[ignore = "requires GPU; changes size through the toolbar, typed decimals and Shift, checks cursor and untouched pixels"]
+#[ignore = "requires GPU; checks the brush library, typed eraser sizes, Shift resizing and untouched pixels"]
 fn gpu_brush_size_toolbar_and_shift_update_tip_without_painting() {
     let fixture = Fixture::new();
     let (mut app, window, target) = lighting_ui_render::fixture();
@@ -697,30 +697,7 @@ fn gpu_brush_size_toolbar_and_shift_update_tip_without_painting() {
     }
     let field = entity(&mut app, SIZE_FIELD);
     let slider = entity(&mut app, "Размер кисти");
-    let button = entity(&mut app, "Настройки кисти");
-    let settings = entity(&mut app, "Параметры кисти");
-    let hardness = entity(&mut app, "Жёсткость");
-    let opacity = entity(&mut app, "Непрозрачность кисти");
-    assert!(bounds(&mut app, hardness).is_empty());
-    assert!(bounds(&mut app, opacity).is_empty());
-    let button_rect = bounds(&mut app, button);
-    assert!(button_rect.min.y > IMAGE_TOP && button_rect.max.y <= IMAGE_TOP + 44.0);
-    assert!(
-        button_rect.width() <= 136.0,
-        "The toolbar control must stay compact"
-    );
-    open_size(&mut app);
-    assert!(bounds(&mut app, field).min.y > button_rect.max.y);
-    assert!(
-        bounds(&mut app, slider).width() >= 220.0,
-        "Use a wide slider in the popover"
-    );
-    let settings_rect = bounds(&mut app, settings);
-    for setting in [hardness, opacity] {
-        let setting_rect = bounds(&mut app, setting);
-        assert!(settings_rect.contains(setting_rect.min));
-        assert!(settings_rect.contains(setting_rect.max));
-    }
+    let button = entity(&mut app, "Библиотека кистей");
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/photo-brush-size-qa");
     std::fs::create_dir_all(&output).unwrap();
     let original = {
@@ -733,29 +710,51 @@ fn gpu_brush_size_toolbar_and_shift_update_tip_without_painting() {
             .clone()
             .unwrap()
     };
-    for setting in [hardness, opacity] {
-        let track = bounds(&mut app, setting);
-        let start = track.min + track.size() * Vec2::new(0.8, 0.5);
-        let end = track.min + track.size() * Vec2::new(0.4, 0.5);
-        pointer(&mut app, window, start, None);
-        pointer(&mut app, window, start, Some(ButtonState::Pressed));
-        pointer(&mut app, window, end, None);
-        pointer(&mut app, window, end, Some(ButtonState::Released));
-        assert!(
-            app.world().resource::<ImageViewer>().edit.size_menu,
-            "Brush settings must stay open while adjusting each slider"
-        );
-    }
-    {
-        let viewer = app.world().resource::<ImageViewer>();
-        assert!((0.3..0.5).contains(&viewer.edit.hardness));
-        assert!((0.3..0.5).contains(&viewer.edit.opacity));
-    }
-    key(&mut app, window, KeyCode::Escape, Key::Escape);
-    assert!(!app.world().resource::<ImageViewer>().edit.size_menu);
-    assert!(app.world().resource::<InputFocus>().get().is_none());
-    assert!(bounds(&mut app, hardness).is_empty());
-    assert!(bounds(&mut app, opacity).is_empty());
+    open_size(&mut app);
+    frame(&mut app);
+    assert!(bounds(&mut app, field).is_empty());
+    let markers = entity(&mut app, "Маркеры");
+    assert!(!bounds(&mut app, markers).is_empty());
+    let saltmallow = entity(&mut app, "Saltmallow");
+    assert!(!bounds(&mut app, saltmallow).is_empty());
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("00-brush-library.png"),
+        |_| true,
+    );
+    click_action(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ImageEdit(edit::EditAction::BrushCategory(1))
+        )
+    });
+    frame(&mut app);
+    let centurion = entity(&mut app, "Centurion");
+    assert!(!bounds(&mut app, centurion).is_empty());
+    click_action(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ImageEdit(edit::EditAction::BrushPreset(Some(10)))
+        )
+    });
+    let viewer = app.world().resource::<ImageViewer>();
+    assert!(
+        viewer
+            .edit
+            .active(edit::EditAction::BrushPreset(Some(10)), None)
+    );
+    assert!(!viewer.edit.size_menu);
+
+    // The eraser still provides the precise size input and Shift resizing.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Tool(
+            crate::editor::photo_document::PhotoTool::Eraser,
+        )));
+    frame(&mut app);
+    let button_rect = bounds(&mut app, button);
+    assert!(button_rect.min.y > IMAGE_TOP && button_rect.max.y <= IMAGE_TOP + 44.0);
+    assert!(button_rect.width() <= 136.0);
     type_size(&mut app, field, "45,84");
     assert!((app.world().resource::<ImageViewer>().edit.size - 45.84).abs() < 0.01);
     key(&mut app, window, KeyCode::Enter, Key::Enter);
