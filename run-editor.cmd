@@ -1,5 +1,5 @@
 @echo off
-cscript.exe //nologo "%~dp0run-editor.vbs" %*
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\run-editor.ps1" %*
 if errorlevel 1 (
     echo.
     echo Bevy Editor could not start. Check the build output above.

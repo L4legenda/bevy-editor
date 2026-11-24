@@ -36,7 +36,7 @@ neutral material, without texturing or automatic background removal.
 
 ## Build and distribution
 
-For a Windows source checkout, start `run-editor.vbs` or `run-editor.cmd`.
+For a Windows source checkout, start `run-editor.cmd`.
 They use `tools/build-editor.ps1` to build the editor and, when an NVIDIA driver
 is detected, prepare `bevy-hunyuan.exe` and all required CUDA DLLs in `target/debug`.
 Cargo checks the generator's freshness after a pull. First-time preparation can

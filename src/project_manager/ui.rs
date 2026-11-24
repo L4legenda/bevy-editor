@@ -129,7 +129,6 @@ fn button(
         Action::New => Some(Glyph::Plus),
         Action::Import
         | Action::Open(_)
-        | Action::OpenSelected
         | Action::PickOpen
         | Action::PickParent
         | Action::Reveal => Some(Glyph::FolderOpen),
@@ -495,23 +494,13 @@ pub(super) fn setup(
             ..default()
         },
     );
-    button(
+    text(
         &mut commands,
         status_bar,
         &font,
-        "Убрать из списка",
-        Action::Forget,
-        false,
-        false,
-    );
-    button(
-        &mut commands,
-        status_bar,
-        &font,
-        "Открыть проект",
-        Action::OpenSelected,
-        true,
-        false,
+        concat!("Версия ", env!("CARGO_PKG_VERSION")),
+        11.0,
+        MUTED,
     );
     commands.insert_resource(Interface {
         font,
@@ -1159,7 +1148,7 @@ pub(super) fn styles(
         let disabled = (!control.modal && manager.form.is_some())
             || (manager.context.is_some() && !menu_item)
             || (manager.selected.is_none()
-                && matches!(control.action, Action::OpenSelected | Action::Forget))
+                && matches!(control.action, Action::Forget))
             || (picker.busy() && !matches!(control.action, Action::Close));
         tab.0 = if disabled { -1 } else { 0 };
         if disabled {
