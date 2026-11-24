@@ -1,6 +1,38 @@
 use super::*;
 use std::path::PathBuf;
 
+#[test]
+fn udim_import_preference_persists_and_defaults_to_enabled() {
+    let dir = std::env::temp_dir().join(format!("bevy-model-import-{}", bevy::asset::uuid::Uuid::new_v4()));
+    let file = dir.join("model-import.json");
+    let mut prefs = ImportPreferences::open(Some(file.clone()));
+    assert!(prefs.udim_tiles);
+    prefs.toggle_udim().unwrap();
+    assert!(!prefs.udim_tiles);
+    let mut reopened = ImportPreferences::open(Some(file.clone()));
+    assert!(!reopened.udim_tiles);
+    assert_eq!(reopened.auto_unwrap, AutoUnwrap::Missing);
+    reopened.update(|prefs| {
+        prefs.auto_unwrap = AutoUnwrap::All;
+        prefs.texture_size = 2048;
+        prefs.bake_on_load = true;
+    }).unwrap();
+    assert_eq!(ImportPreferences::open(Some(file.clone())).auto_unwrap, AutoUnwrap::All);
+    reopened.toggle_udim().unwrap();
+    let reopened = ImportPreferences::open(Some(file.clone()));
+    assert!(reopened.udim_tiles);
+    assert_eq!(reopened.auto_unwrap, AutoUnwrap::All);
+    assert_eq!(reopened.texture_size, 2048);
+    assert!(reopened.bake_on_load);
+
+    std::fs::write(&file, "{}").unwrap();
+    assert!(ImportPreferences::open(Some(file.clone())).udim_tiles);
+    let mut invalid = ImportPreferences { path: Some(file.join("invalid")), ..default() };
+    assert!(invalid.toggle_udim().is_err());
+    assert!(invalid.udim_tiles);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn object() -> Object {
     let mut geometry = Geometry::default();
     document::from_mesh(&Mesh::from(Cuboid::from_size(Vec3::ONE)), &mut geometry, 0).unwrap();
@@ -40,6 +72,292 @@ fn output(input: &topology::Input) -> backend::Output {
         utilization: 0.5,
     }
 }
+#[test]
+fn uv_packs_udim_sets_independently_and_restores_their_offsets() {
+    use crate::editor::model_document::{MaterialSlot, udim};
+    use crate::editor::model_mesh::{Corner, Face};
+    let mut object = object();
+    let local = [
+        Vec2::splat(0.125),
+        Vec2::new(0.875, 0.125),
+        Vec2::new(0.125, 0.875),
+    ];
+    let offsets = [Vec2::ZERO, Vec2::new(2., -1.)];
+    let mut mesh = Geometry::default();
+    for (slot, offset) in offsets.into_iter().enumerate() {
+        mesh.positions
+            .extend(local.map(|point| point.extend(slot as f32)));
+        mesh.faces.push(Face {
+            material: 0,
+            smooth: false,
+            corners: local
+                .into_iter()
+                .enumerate()
+                .map(|(i, uv)| {
+                    let mut corner = Corner::new(slot * 3 + i);
+                    corner.uv = uv + offset;
+                    corner
+                })
+                .collect(),
+        });
+    }
+    object.geometry = mesh.into();
+    object.materials = vec![MaterialSlot {
+        bake_fixes: Default::default(),
+        authored: None,
+        paint: None,
+        material: default(),
+        source: serde_json::json!({}),
+    }];
+    udim::import(&mut object, true);
+    let mut input = topology::input(&object.geometry, 1.25, 512, 4).unwrap();
+    input.request.existing_uv = Some(vec![local.map(|uv| uv.to_array()); 2]);
+    let result = jobs::run_layout(
+        input.request,
+        vec![Some((0, 1001)), Some((1, 1013))],
+        Arc::new(backend::Progress::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        result.uv[0], result.uv[1],
+        "each set receives its own full tile"
+    );
+    let geometry = apply_layout(&object, &input.corners, &result).unwrap();
+    assert!(object.preserves_udim_assignment(&geometry));
+    for (slot, face) in geometry.faces.iter().enumerate() {
+        for (corner, uv) in face.corners.iter().zip(result.uv[slot]) {
+            assert!(
+                corner
+                    .uv
+                    .abs_diff_eq(Vec2::from_array(uv) + offsets[slot], 0.00001)
+            );
+        }
+    }
+    let mut invalid = geometry.clone();
+    invalid.faces[1].corners[0].uv += Vec2::X;
+    assert!(!object.preserves_udim_assignment(&invalid));
+    let atlas = topology::Atlas::with_offsets(&geometry, |slot| object.uv_offset(slot));
+    assert_eq!(atlas.outside, 0);
+}
+#[test]
+fn uv_moves_islands_between_udim_tiles_with_paint_and_history() {
+    use crate::editor::model_document::MaterialSlot;
+    use crate::editor::model_mesh::{Corner, Face};
+    use crate::editor::model_paint_data::{LayerKind, Stack, Surface, mask::Mask, solid};
+    let mut doc = document_fixture();
+    let mut object = object();
+    let mut geometry = Geometry::default();
+    let local = |x| {
+        [
+            Vec2::new(x, 0.25),
+            Vec2::new(x + 0.125, 0.25),
+            Vec2::new(x, 0.5),
+        ]
+    };
+    for (face, (slot, offset, x)) in [
+        (0, Vec2::ZERO, 0.125),
+        (0, Vec2::ZERO, 0.625),
+        (1, Vec2::X, 0.125),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        geometry
+            .positions
+            .extend(local(x).map(|uv| uv.extend(face as f32)));
+        geometry.faces.push(Face {
+            material: slot,
+            smooth: false,
+            corners: local(x)
+                .into_iter()
+                .enumerate()
+                .map(|(i, uv)| {
+                    let mut corner = Corner::new(face * 3 + i);
+                    corner.uv = uv + offset;
+                    corner.uv1 = uv;
+                    corner
+                })
+                .collect(),
+        });
+    }
+    let paint = |color| {
+        let mut stack = Stack::default();
+        assert_eq!(stack.layers[0].kind, LayerKind::Paint);
+        stack.layers[0].channels[0] = Some(solid(16, color));
+        stack.layers[0].mask = Some(Arc::new(Mask::new(solid(16, [120; 4]), vec![])));
+        Arc::new(Surface {
+            size: 16,
+            stack,
+            material: serde_json::Value::Null,
+            baked: None,
+            base: std::array::from_fn(|_| solid(16, [255; 4])),
+        })
+    };
+    let saved_paint = paint([34, 98, 170, 255]);
+    object.geometry = geometry.into();
+    object.materials = [saved_paint.clone(), paint([170, 18, 43, 255])]
+        .into_iter()
+        .enumerate()
+        .map(|(index, paint)| MaterialSlot {
+            bake_fixes: Default::default(),
+            material: default(),
+            source: serde_json::json!({"material":0, "extras":{"bevy_editor_udim":1001 + index}}),
+            paint: Some(paint),
+            authored: None,
+        })
+        .collect();
+    doc.objects = vec![object.clone()];
+    doc.mode = Mode::Uv;
+    let mut editing = State::default();
+    editing.documents.insert(0, doc);
+    let mut uv = UvState::default();
+    let drag = |doc: &Document, face: usize, start: Vec2| {
+        let active = doc.active().unwrap();
+        let atlas = topology::Atlas::with_offsets(&active.geometry, |slot| active.uv_offset(slot));
+        let selected = BTreeSet::from([atlas.islands[face]]);
+        Drag {
+            model: 0,
+            source: doc.source.path.clone(),
+            start,
+            snapshot: doc.snapshot(),
+            atlas,
+            selected,
+            changed: false,
+            tile_delta: None,
+        }
+    };
+    uv.drag = Some(drag(&editing.documents[&0], 0, Vec2::new(0.15, 0.3)));
+    input::finish_drag_for_test(&mut uv, &mut editing, Some(Vec2::new(1.75, 0.6)));
+    assert!(uv.error.is_empty(), "{}", uv.error);
+    let doc = editing.documents.get_mut(&0).unwrap();
+    let moved = doc.active().unwrap();
+    assert_eq!(moved.materials.len(), 3);
+    assert_eq!(moved.geometry.faces[0].material, 2);
+    assert_eq!(moved.materials[2].udim().unwrap().number(), 1002);
+    assert!(Arc::ptr_eq(
+        moved.materials[2].paint.as_ref().unwrap(),
+        &saved_paint
+    ));
+    assert_eq!(&moved.geometry.faces[1..], &object.geometry.faces[1..]);
+    for (a, b) in moved.geometry.faces[0]
+        .corners
+        .iter()
+        .zip(&object.geometry.faces[0].corners)
+    {
+        assert_eq!(a.uv, b.uv + Vec2::X);
+        assert_eq!(a.uv1, b.uv1);
+    }
+    assert!(moved.preserves_udim_assignment(&moved.geometry));
+    let path = doc.source.path.with_file_name("island.glb");
+    std::fs::write(
+        &path,
+        document::glb::Glb::new_asset(&[moved.clone()]).unwrap(),
+    )
+    .unwrap();
+    let glb = document::glb::Glb::load(&path).unwrap();
+    let primitive = &glb.json["meshes"][0]["primitives"][2];
+    assert_eq!(primitive["extras"]["bevy_editor_udim"], 1002);
+    let reopened = glb.paint_surface(primitive).unwrap().unwrap();
+    assert_eq!(
+        reopened.stack.layers[0].channels[0],
+        saved_paint.stack.layers[0].channels[0]
+    );
+    assert_eq!(
+        reopened.stack.layers[0].mask.as_ref().unwrap().pixels,
+        saved_paint.stack.layers[0].mask.as_ref().unwrap().pixels
+    );
+    assert_eq!(doc.undo.len(), 1);
+    doc.undo();
+    assert_eq!(doc.active().unwrap(), &object);
+    doc.redo();
+    assert_eq!(doc.active().unwrap().materials.len(), 3);
+
+    uv.drag = Some(drag(doc, 0, Vec2::new(1.15, 0.3)));
+    input::finish_drag_for_test(&mut uv, &mut editing, Some(Vec2::new(2.15, 0.3)));
+    let doc = &editing.documents[&0];
+    assert_eq!(
+        doc.active().unwrap().materials.len(),
+        3,
+        "moving a whole set reuses its slot"
+    );
+    assert_eq!(
+        doc.active().unwrap().materials[2].udim().unwrap().number(),
+        1003
+    );
+    let before_cancel = doc.active().unwrap().clone();
+    let mut invalid = drag(doc, 2, Vec2::new(1.15, 0.3));
+    invalid.selected.insert(invalid.atlas.islands[0]);
+    invalid.changed = true;
+    let doc = editing.documents.get_mut(&0).unwrap();
+    doc.active_mut().unwrap().geometry.faces[2].corners[0].uv.x += 0.01;
+    uv.drag = Some(invalid);
+    input::finish_drag_for_test(&mut uv, &mut editing, Some(Vec2::new(9.15, 0.3)));
+    assert!(uv.error.contains("выходит за пределы UDIM"), "{}", uv.error);
+    let doc = &editing.documents[&0];
+    assert_eq!(doc.undo.len(), 2);
+    assert_eq!(doc.active().unwrap(), &before_cancel);
+
+    // Move into an unused region of the same material on 1002.
+    let mut compatible = object.clone();
+    for corner in &mut compatible.geometry.faces[2].corners {
+        corner.uv.x += 0.5;
+    }
+    let destination = Arc::make_mut(compatible.materials[1].paint.as_mut().unwrap());
+    destination.stack.layers[0].mask = Some(Arc::new(Mask::new(solid(16, [210; 4]), vec![])));
+    destination.stack.layers[0].channels[1] = Some(solid(16, [22, 22, 22, 255]));
+    let original_destination = compatible.materials[1].paint.as_ref().unwrap().clone();
+    let mut doc = document_fixture();
+    doc.mode = Mode::Uv;
+    doc.objects = vec![compatible.clone()];
+    uv.drag = Some(drag(&doc, 0, Vec2::new(0.15, 0.3)));
+    editing.documents.insert(0, doc);
+    input::finish_drag_for_test(&mut uv, &mut editing, Some(Vec2::new(1.15, 0.3)));
+    let doc = editing.documents.get_mut(&0).unwrap();
+    let merged = doc.active().unwrap();
+    assert_eq!(doc.undo.len(), 1);
+    assert_eq!(merged.materials.len(), 2);
+    assert_eq!(merged.geometry.faces[0].material, 1);
+    assert_eq!(merged.geometry.faces[1].material, 0);
+    assert_eq!(merged.geometry.faces[2].material, 1);
+    assert!(Arc::ptr_eq(merged.materials[0].paint.as_ref().unwrap(), &saved_paint));
+    let surface = merged.materials[1].paint.as_ref().unwrap();
+    let left = (4 * 16 + 2) * 4;
+    let right = (4 * 16 + 10) * 4;
+    let layer = &surface.stack.layers[0];
+    assert_eq!(&layer.channels[0].as_ref().unwrap()[left..left + 4], &[34, 98, 170, 255]);
+    assert_eq!(&layer.channels[0].as_ref().unwrap()[right..right + 4], &[170, 18, 43, 255]);
+    let mask = &layer.mask.as_ref().unwrap().pixels;
+    assert_eq!([mask[left], mask[right]], [120, 210]);
+    let roughness = layer.channels[1].as_ref().unwrap();
+    assert_eq!([roughness[left + 3], roughness[right + 3]], [0, 255]);
+    for (offset, expected) in [(left, &saved_paint), (right, &original_destination)] {
+        for channel in [0, 1] {
+            assert_eq!(
+                surface.composite(channel)[offset..offset + 4],
+                expected.composite(channel)[offset..offset + 4],
+            );
+        }
+    }
+    std::fs::write(&path, document::glb::Glb::new_asset(&[merged.clone()]).unwrap()).unwrap();
+    let glb = document::glb::Glb::load(&path).unwrap();
+    let primitive = &glb.json["meshes"][0]["primitives"][1];
+    assert_eq!(primitive["extras"]["bevy_editor_udim"], 1002);
+    assert_eq!(*glb.paint_surface(primitive).unwrap().unwrap(), **surface);
+    doc.undo();
+    assert_eq!(doc.active().unwrap(), &compatible);
+    doc.redo();
+    assert_eq!(doc.active().unwrap().geometry.faces[0].material, 1);
+
+    // Moving the whole source into unused space removes its empty slot and remaps faces.
+    let mut whole = compatible.clone();
+    whole.geometry.faces.remove(1);
+    let whole = document::udim::relocate(&whole, &[0, 1], &BTreeSet::from([0]), Vec2::X).unwrap();
+    assert_eq!(whole.materials.len(), 1);
+    assert!(whole.geometry.faces.iter().all(|face| face.material == 0));
+    assert_eq!(whole.udim_tiles().next().unwrap().number(), 1002);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn uv_job_is_one_undoable_transaction_and_rejects_stale_geometry() {
     let mut state = State::default();
@@ -151,7 +469,11 @@ fn model_uv_manual_seam_separates_coplanar_faces_in_the_native_unwrap() {
     input.cut_manual_seams(&mesh.uv_seams);
     input.request.options.guide_seams = true;
     assert_eq!(input.request.positions.len(), 6);
-    let result = backend::run(input.request.clone(), Arc::new(backend::Progress::default())).unwrap();
+    let result = backend::run(
+        input.request.clone(),
+        Arc::new(backend::Progress::default()),
+    )
+    .unwrap();
     let unwrapped = topology::apply(&mesh, &input.corners, &result).unwrap();
     assert_eq!(unwrapped.positions, mesh.positions);
     assert_eq!(unwrapped.uv_seams, mesh.uv_seams);
@@ -351,6 +673,14 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
             |a| matches!(a, Action::ModelView(ModelViewAction::Uv(value)) if value == action),
         );
     }
+    assert!(app.world().resource::<UvState>().detect_udim_on_import());
+    uv_click(&mut app, window, UvAction::DetectUdim);
+    assert!(!app.world().resource::<UvState>().detect_udim_on_import());
+    assert_eq!(app.world().resource::<State>().documents[&0].objects, original);
+    assert!(!app.world().resource::<State>().documents[&0].dirty());
+    uv_click(&mut app, window, UvAction::DetectUdim);
+    assert!(app.world().resource::<UvState>().detect_udim_on_import());
+
     fn wait_for_proposal(app: &mut App) {
         let start = std::time::Instant::now();
         loop {

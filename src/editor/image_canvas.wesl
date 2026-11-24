@@ -109,6 +109,7 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
         let src=source_uv(in.uv);
         if all(src>=vec2<f32>(0.0)) && all(src<vec2<f32>(1.0)) {
             moving=moving_pixel(transform_source.xy+src*transform_source.zw);
+            moving.a *= transform_style.z;
         }
         let c=over(vec4<f32>(linear_rgb_to_srgb(above.rgb),above.a),
             over(moving,vec4<f32>(linear_rgb_to_srgb(under.rgb),under.a)));

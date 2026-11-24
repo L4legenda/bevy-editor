@@ -47,11 +47,10 @@ impl State {
         match self.trace {
             Some(Port::Output(from, choice)) => d
                 .node(from)
-                .and_then(|n| n.choices.get(choice))
-                .is_some_and(|c| c.target == Some(id)),
+                .is_some_and(|n| n.output_target(choice) == Some(id)),
             Some(Port::Input(target)) => d
                 .node(id)
-                .is_some_and(|n| n.choices.iter().any(|c| c.target == Some(target))),
+                .is_some_and(|n| n.output_targets().any(|(_, to)| to == target)),
             None => false,
         }
     }
@@ -60,14 +59,11 @@ impl State {
         match port {
             Port::Output(from, choice) => d
                 .node(from)
-                .and_then(|n| n.choices.get(choice))
-                .and_then(|c| c.target)
+                .and_then(|n| n.output_target(choice))
                 .is_some_and(|target| self.highlights_edge(from, choice, target)),
             Port::Input(target) => d.nodes.iter().any(|n| {
-                n.choices
-                    .iter()
-                    .enumerate()
-                    .any(|(i, c)| c.target == Some(target) && self.highlights_edge(n.id, i, target))
+                n.output_targets()
+                    .any(|(i, to)| to == target && self.highlights_edge(n.id, i, target))
             }),
         }
     }
@@ -162,15 +158,12 @@ pub(super) fn hover(
         })?
     });
     state.trace = pointed.filter(|port| match *port {
-        Port::Output(from, choice) => d
-            .node(from)
-            .and_then(|n| n.choices.get(choice))
-            .is_some_and(Choice::connected),
+        Port::Output(from, choice) => d.node(from).is_some_and(|n| n.output_connected(choice)),
         Port::Input(target) => {
             d.node(target).is_some()
                 && d.nodes
                     .iter()
-                    .any(|n| n.choices.iter().any(|c| c.target == Some(target)))
+                    .any(|n| n.output_targets().any(|(_, to)| to == target))
         }
     });
 }
@@ -181,16 +174,13 @@ pub(super) fn connect(doc: &mut Document, from: u32, choice: usize, target: u32)
     };
     if d.node(target).is_none_or(|n| n.kind == NodeKind::Start)
         || d.node(from)
-            .and_then(|n| n.choices.get(choice))
-            .is_none_or(|c| c.target == Some(target))
+            .is_none_or(|n| !n.output_exists(choice) || n.output_target(choice) == Some(target))
     {
         return false;
     }
     doc.checkpoint();
     if let Content::Dialogue(d) = &mut doc.content {
-        let choice = &mut d.node_mut(from).unwrap().choices[choice];
-        choice.target = Some(target);
-        choice.dialogue = None;
+        d.node_mut(from).unwrap().set_output(choice, Some(target));
     }
     true
 }
@@ -241,8 +231,7 @@ pub(super) fn input(
         drag.document != doc.id
             || drag.generation != ui.generation
             || d.node(drag.from)
-                .and_then(|n| n.choices.get(drag.choice))
-                .is_none()
+                .is_none_or(|n| !n.output_exists(drag.choice))
     }) {
         state.cancel(&mut ui);
     }
@@ -273,10 +262,7 @@ pub(super) fn input(
     if inside && mouse.just_pressed(MouseButton::Left) {
         state.ignore_click = None;
         if let Some((output, _)) = outputs.iter().find(|(_, hovered)| hovered.0) {
-            if d.node(output.0)
-                .and_then(|n| n.choices.get(output.1))
-                .is_some()
-            {
+            if d.node(output.0).is_some_and(|n| n.output_exists(output.1)) {
                 state.drag = Some(Drag {
                     document: doc.id,
                     generation: ui.generation,
@@ -366,13 +352,11 @@ pub(super) fn style(
                     .is_some_and(|drag| drag.moved && drag.target == Some(id)),
                 d.nodes
                     .iter()
-                    .any(|n| n.choices.iter().any(|c| c.target == Some(id))),
+                    .any(|n| n.output_targets().any(|(_, to)| to == id)),
             ),
             Port::Output(id, choice) => (
                 ui.linking == Some((id, choice)),
-                d.node(id)
-                    .and_then(|n| n.choices.get(choice))
-                    .is_some_and(Choice::connected),
+                d.node(id).is_some_and(|n| n.output_connected(choice)),
             ),
         };
         let pointed = match *port {
@@ -486,7 +470,11 @@ pub(super) fn socket(
         commands,
         parent,
         center,
-        format!("Связать ответ {} ноды #{}", choice + 1, id),
+        if choice == OTHERWISE {
+            format!("Связать «Иначе» ноды #{id}")
+        } else {
+            format!("Связать ответ {} ноды #{id}", choice + 1)
+        },
     );
     commands.entity(socket).insert(Output(id, choice)).observe(
         |event: On<Activate>,

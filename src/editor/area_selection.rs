@@ -24,12 +24,15 @@ pub(super) fn projected_bounds(
     min.is_finite().then_some(Rect::from_corners(min, max))
 }
 pub(super) fn segment_hits(area: Rect, a: Vec2, b: Vec2) -> bool {
+    clip_segment(area, a, b).is_some()
+}
+pub(super) fn clip_segment(area: Rect, a: Vec2, b: Vec2) -> Option<[Vec2; 2]> {
     let d = b - a;
     let (mut near, mut far) = (0.0_f32, 1.0_f32);
     for axis in 0..2 {
         if d[axis].abs() < 0.00001 {
             if a[axis] < area.min[axis] || a[axis] > area.max[axis] {
-                return false;
+                return None;
             }
         } else {
             let p = (area.min[axis] - a[axis]) / d[axis];
@@ -37,11 +40,11 @@ pub(super) fn segment_hits(area: Rect, a: Vec2, b: Vec2) -> bool {
             near = near.max(p.min(q));
             far = far.min(p.max(q));
             if near > far {
-                return false;
+                return None;
             }
         }
     }
-    true
+    Some([a + d * near, a + d * far])
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {

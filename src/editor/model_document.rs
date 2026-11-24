@@ -14,6 +14,8 @@ use std::{
 
 #[path = "model_glb.rs"]
 pub(super) mod glb;
+#[path = "model_udim.rs"]
+pub(super) mod udim;
 
 #[derive(Clone, Debug)]
 pub(super) struct MaterialSlot {
@@ -21,12 +23,21 @@ pub(super) struct MaterialSlot {
     pub source: serde_json::Value,
     pub paint: Option<Arc<super::model_paint_data::Surface>>,
     pub authored: Option<Arc<serde_json::Value>>,
+    pub bake_fixes: Arc<super::model_paint_data::map_fixes::Fixes>,
+}
+impl MaterialSlot {
+    pub fn name<'a>(&'a self, source: &'a serde_json::Value) -> Option<&'a str> {
+        self.source["name"].as_str()
+            .or_else(|| self.authored.as_deref().and_then(|material| material["name"].as_str()))
+            .or_else(|| source["materials"][self.source["material"].as_u64()? as usize]["name"].as_str())
+    }
 }
 impl PartialEq for MaterialSlot {
     fn eq(&self, other: &Self) -> bool {
         self.material == other.material
             && self.source == other.source
             && self.authored == other.authored
+            && self.bake_fixes == other.bake_fixes
             && match (&self.paint, &other.paint) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same(b),
@@ -66,6 +77,7 @@ impl MaterialDraft {
             ..default()
         });
         MaterialSlot {
+            bake_fixes: Default::default(),
             material,
             source: serde_json::json!({}),
             paint: None,
@@ -83,6 +95,11 @@ impl MaterialDraft {
 }
 #[derive(Clone, Debug)]
 pub(super) struct MeshData(Arc<Geometry>);
+impl MeshData {
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 impl From<Geometry> for MeshData {
     fn from(mesh: Geometry) -> Self {
         Self(Arc::new(mesh))
@@ -101,7 +118,7 @@ impl DerefMut for MeshData {
 }
 impl PartialEq for MeshData {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+        self.shares_storage_with(other) || self.0 == other.0
     }
 }
 
@@ -127,7 +144,10 @@ impl PartialEq for Object {
 }
 #[derive(Clone, Debug)]
 pub(super) struct Snapshot {
+    pub bake_settings: super::model_bake_settings::Settings,
+    pub cage_edits: Arc<super::model_cage_data::Edits>,
     pub objects: Vec<Object>,
+    pub custom_bakes: Arc<Vec<super::model_paint_data::custom::Recipe>>,
     pub active: Option<usize>,
     pub selected: BTreeSet<usize>,
     pub selection: Selection,
@@ -189,6 +209,12 @@ pub(super) struct Document {
     pub objects: Vec<Object>,
     pub original: Vec<Object>,
     pub saved: Vec<Object>,
+    pub custom_bakes: Arc<Vec<super::model_paint_data::custom::Recipe>>,
+    pub saved_custom_bakes: Arc<Vec<super::model_paint_data::custom::Recipe>>,
+    pub bake_settings: super::model_bake_settings::Settings,
+    pub saved_bake_settings: super::model_bake_settings::Settings,
+    pub cage_edits: Arc<super::model_cage_data::Edits>,
+    pub saved_cage_edits: Arc<super::model_cage_data::Edits>,
     pub active: Option<usize>,
     pub selected: BTreeSet<usize>,
     pub selection: Selection,
@@ -203,15 +229,29 @@ pub(super) struct Document {
     pub material_draft: MaterialDraft,
     pub paint_busy: bool,
     pub paint_pending: bool,
+    pub paint_default_size: u32,
+    pub auto_bake_pending: bool,
 }
 impl Document {
     pub fn new(source: glb::Glb, objects: Vec<Object>) -> Self {
         let active = objects.first().map(|o| o.id);
         let selected = active.into_iter().collect();
+        let custom_bakes = Arc::new(super::model_paint_data::custom::read_document(&source.json));
+        let bake_settings = super::model_bake_settings::read(&source.json, &source.path);
+        let cage_edits = Arc::new(objects.iter().filter_map(|object| {
+            let node = source.json["nodes"].get(object.source_node?)?;
+            super::model_cage_data::read(node, object).map(|edit| (object.id, edit))
+        }).collect::<super::model_cage_data::Edits>());
         Self {
             source,
             original: objects.clone(),
             saved: objects.clone(),
+            saved_custom_bakes: custom_bakes.clone(),
+            saved_bake_settings: bake_settings.clone(),
+            bake_settings,
+            saved_cage_edits: cage_edits.clone(),
+            cage_edits,
+            custom_bakes,
             objects,
             active,
             selected,
@@ -227,10 +267,18 @@ impl Document {
             material_draft: MaterialDraft::default(),
             paint_busy: false,
             paint_pending: false,
+            paint_default_size: super::model_paint_data::DEFAULT_SIZE,
+            auto_bake_pending: false,
         }
     }
+    pub fn paint_size(&self, material: &MaterialSlot) -> u32 {
+        material.paint.as_ref().map_or(self.paint_default_size, |surface| surface.size)
+    }
     pub fn dirty(&self) -> bool {
-        self.paint_pending || self.objects != self.saved
+        self.paint_pending || self.objects != self.saved || self.custom_bakes != self.saved_custom_bakes
+            || self.bake_settings != self.saved_bake_settings
+            || (!Arc::ptr_eq(&self.cage_edits, &self.saved_cage_edits)
+                && self.cage_edits != self.saved_cage_edits)
     }
     pub fn active(&self) -> Option<&Object> {
         let id = self.active?;
@@ -242,7 +290,10 @@ impl Document {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            bake_settings: self.bake_settings.clone(),
+            cage_edits: self.cage_edits.clone(),
             objects: self.objects.clone(),
+            custom_bakes: self.custom_bakes.clone(),
             active: self.active,
             selected: self.selected.clone(),
             selection: self.selection.clone(),
@@ -250,6 +301,9 @@ impl Document {
     }
     pub fn restore(&mut self, state: Snapshot) {
         self.objects = state.objects;
+        self.custom_bakes = state.custom_bakes;
+        self.bake_settings = state.bake_settings;
+        self.cage_edits = state.cage_edits;
         self.active = state.active;
         self.selected = state.selected;
         self.selection = state.selection;
@@ -257,7 +311,11 @@ impl Document {
         self.ui_revision += 1;
     }
     pub fn checkpoint(&mut self, before: Snapshot) {
-        if before.objects == self.objects {
+        if before.objects == self.objects && before.custom_bakes == self.custom_bakes
+            && before.bake_settings == self.bake_settings
+            && (Arc::ptr_eq(&before.cage_edits, &self.cage_edits)
+                || before.cage_edits == self.cage_edits)
+        {
             return;
         }
         self.undo.push(before);
@@ -290,6 +348,7 @@ impl Document {
         let object = self.active_mut().unwrap();
         if object.materials.is_empty() {
             object.materials.push(MaterialSlot {
+                bake_fixes: Default::default(),
                 material: fallback.clone(),
                 source: serde_json::json!({}),
                 paint: None,
@@ -470,8 +529,11 @@ impl Document {
     #[cfg(test)]
     pub fn save(&mut self) -> Result<(), String> {
         self.validate()?;
-        self.source.save(&self.objects, &self.original)?;
+        super::model_bake_settings::write(&mut self.source.json, &self.source.path, &self.bake_settings)?;
+        self.source.save_with_cage(&self.objects, &self.original, Some(&self.cage_edits))?;
         self.saved = self.objects.clone();
+        self.saved_bake_settings = self.bake_settings.clone();
+        self.saved_cage_edits = self.cage_edits.clone();
         self.ui_revision += 1;
         Ok(())
     }

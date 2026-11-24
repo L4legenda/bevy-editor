@@ -16,6 +16,22 @@ impl Editor {
             self.selection.into_iter().collect()
         }
     }
+    pub(super) fn multiple_selected(&self) -> bool {
+        self.selection_group
+            .as_ref()
+            .is_some_and(|(room, targets)| {
+                *room == self.room
+                    && targets.last().copied() == self.selection
+                    && targets
+                        .iter()
+                        .copied()
+                        .filter(|&t| self.pose(t).is_some())
+                        .take(2)
+                        .count()
+                        == 2
+            })
+    }
+
     pub(super) fn is_selected(&self, target: Selection) -> bool {
         self.selection == Some(target)
             || self
@@ -215,8 +231,9 @@ impl Editor {
                             light.name.chars().take(115).collect::<String>()
                         );
                         light.pose.position[0] += 0.5;
-                        self.add_light(light);
-                        copies.extend(self.selection);
+                        if let Some(id) = self.add_light(light) {
+                            copies.push(Selection::Light(id));
+                        }
                     }
                 }
                 _ => {}
@@ -238,6 +255,8 @@ mod tests {
         let mut editor = Editor::new(project, RoomEdits::default());
         for x in [-1.0, 1.0] {
             editor.add_model(PlacedModel {
+                selector: None,
+                uid: None,
                 id: 0,
                 asset: "models/block.glb".into(),
                 pose: Transform::from_xyz(x, 0.0, 0.0).into(),

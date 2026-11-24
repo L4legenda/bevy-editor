@@ -1,5 +1,8 @@
 //! Like Material Painter's stroke_region/scissor, emit only damaged channels and texels.
 use super::*;
+pub(super) const MASK_PREVIEW: usize = 9;
+pub(super) const SPECULAR_MATERIAL: usize = 10;
+pub(super) const IMAGE_COUNT: usize = SPECULAR_MATERIAL + 1;
 pub(super) type Dirty = [Option<URect>; 8];
 pub(super) struct Patch {
     pub rect: URect,
@@ -7,9 +10,8 @@ pub(super) struct Patch {
 }
 pub(super) struct Updates {
     // color/opacity, packed RM, normal, emission, then scalar preview textures.
-    pub textures: [Option<Patch>; 9],
+    pub textures: [Option<Patch>; IMAGE_COUNT],
     pub transparent: Option<bool>,
-    pub reflectance: Option<f32>,
 }
 pub(super) const PREVIEW: [usize; 8] = [0, 4, 5, 6, 7, 3, 2, 8];
 pub(super) fn union(a: Option<URect>, b: Option<URect>) -> Option<URect> {
@@ -26,7 +28,6 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty) -> Updates {
     let mut updates = Updates {
         textures: std::array::from_fn(|_| None),
         transparent: None,
-        reflectance: None,
     };
     let rects = [
         union(dirty[0], dirty[4]),
@@ -71,20 +72,19 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty) -> Updates {
             3 => surface.composite_rect(5, rect),
             _ => surface.composite_rect([1, 2, 3, 4, 7][target - 4], rect),
         };
+        if target == PREVIEW[7] {
+            let mut specular = rgba.clone();
+            for pixel in specular.chunks_exact_mut(4) {
+                // Match the source's linear F0 of 0.08 * level. Bevy squares
+                // the sampled alpha when material reflectance is set to 2.
+                pixel[3] = ((pixel[0] as f32 / 510.).sqrt() * 255.).round() as u8;
+            }
+            updates.textures[SPECULAR_MATERIAL] = Some(Patch { rect, rgba: specular });
+        }
         updates.textures[target] = Some(Patch { rect, rgba });
     }
     if dirty[4].is_some() {
         updates.transparent = Some(surface.composite(4).chunks_exact(4).any(|p| p[0] < 255));
-    }
-    if dirty[7].is_some() {
-        updates.reflectance = Some(
-            surface
-                .composite(7)
-                .chunks_exact(4)
-                .map(|p| p[0] as f32 / 255.)
-                .sum::<f32>()
-                / (surface.size * surface.size) as f32,
-        );
     }
     updates
 }

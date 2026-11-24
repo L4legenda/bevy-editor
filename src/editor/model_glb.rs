@@ -28,7 +28,11 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32, String> {
 }
 impl Glb {
     pub fn new_asset(objects: &[Object]) -> Result<Vec<u8>, String> {
-        let source = Self {
+        Self::new_asset_with_pngs(objects, &[])
+    }
+
+    pub(in crate::editor) fn new_asset_with_pngs(objects: &[Object], pngs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+        let mut source = Self {
             path: PathBuf::new(),
             json: json!({
                 "asset": {"version": "2.0", "generator": "Bevy Editor"},
@@ -49,6 +53,20 @@ impl Glb {
             extra: Vec::new(),
             expected: Vec::new(),
         };
+        if !pngs.is_empty() {
+            source.json["bufferViews"] = json!([]);
+            let mut images = Vec::with_capacity(pngs.len());
+            for png in pngs {
+                align(&mut source.bin, 0);
+                let start = source.bin.len();
+                source.bin.extend_from_slice(png);
+                let view = source.json["bufferViews"].as_array_mut().unwrap();
+                images.push(json!({"bufferView":view.len(), "mimeType":"image/png"}));
+                view.push(json!({"buffer":0, "byteOffset":start, "byteLength":png.len()}));
+            }
+            source.json["textures"] = json!((0..images.len()).map(|i| json!({"source":i})).collect::<Vec<_>>());
+            source.json["images"] = json!(images);
+        }
         source.encode(objects, &[])
     }
 
@@ -57,6 +75,10 @@ impl Glb {
     }
     pub fn paint_surface(&self, primitive: &Value) -> Result<Option<std::sync::Arc<crate::editor::model_paint_data::Surface>>, String> {
         paint_io::decode(&self.json, &self.bin, primitive)
+    }
+
+    pub(in crate::editor) fn bake_fixes(&self, primitive: &Value) -> Result<std::sync::Arc<crate::editor::model_paint_data::map_fixes::Fixes>, String> {
+        paint_io::decode_fixes(&self.json, &self.bin, primitive).map(std::sync::Arc::new)
     }
     pub fn load(path: &Path) -> Result<Self, String> {
         if !path
@@ -126,6 +148,15 @@ impl Glb {
         })
     }
     pub fn encode(&self, objects: &[Object], original: &[Object]) -> Result<Vec<u8>, String> {
+        self.encode_with_cage(objects, original, None)
+    }
+
+    fn encode_with_cage(
+        &self,
+        objects: &[Object],
+        original: &[Object],
+        cage_edits: Option<&crate::editor::model_cage_data::Edits>,
+    ) -> Result<Vec<u8>, String> {
         let mut root = self.json.clone();
         let mut bin = self.bin.clone();
         for name in ["nodes", "meshes", "bufferViews", "accessors"] {
@@ -222,6 +253,9 @@ impl Glb {
                 .fold(0.0, f32::max);
             let node_value = &mut root["nodes"][node];
             let map = node_value.as_object_mut().ok_or("Некорректный узел GLB")?;
+            if let Some(edits) = cage_edits {
+                crate::editor::model_cage_data::write(map, object, edits.get(&object.id))?;
+            }
             map.insert("name".into(), json!(object.name));
             map.remove("matrix");
             map.remove("translation");
@@ -252,10 +286,11 @@ impl Glb {
             }
             let mut primitives = Vec::new();
             let mut topology = Vec::new();
-            for (slot, buffers) in object.geometry.buffers() {
+            for (slot, mut buffers) in object.geometry.buffers() {
                 if buffers.indices.is_empty() {
                     continue;
                 }
+                buffers.localize_uv(object.uv_offset(slot));
                 let position =
                     append_vec::<3>(&mut root, &mut bin, &buffers.positions, "VEC3", true);
                 let normal = append_vec::<3>(&mut root, &mut bin, &buffers.normals, "VEC3", false);
@@ -290,7 +325,13 @@ impl Glb {
                     primitive["material"] = json!(index);
                 }
                 if let Some(surface) = object.materials.get(slot).and_then(|m| m.paint.as_deref()) {
-                    paint_io::encode(&mut root, &mut bin, &mut primitive, surface)?;
+                    let mut surface = surface.clone();
+                    surface.bind_texture_fills(&object.geometry, slot, object.uv_offset(slot), object.transform);
+                    surface.bind_generators(&object.geometry, slot, object.uv_offset(slot), object.transform);
+                    paint_io::encode(&mut root, &mut bin, &mut primitive, &surface)?;
+                }
+                if let Some(material) = object.materials.get(slot) {
+                    paint_io::encode_fixes(&mut root, &mut bin, &mut primitive, &material.bake_fixes)?;
                 }
                 let map = primitive
                     .as_object_mut()
@@ -353,11 +394,21 @@ impl Glb {
         }
         Ok(output)
     }
+    #[cfg(test)]
     pub fn save(&mut self, objects: &[Object], original: &[Object]) -> Result<(), String> {
+        self.save_with_cage(objects, original, None)
+    }
+
+    pub fn save_with_cage(
+        &mut self,
+        objects: &[Object],
+        original: &[Object],
+        cage_edits: Option<&crate::editor::model_cage_data::Edits>,
+    ) -> Result<(), String> {
         if fs::read(&self.path).map_err(|e| e.to_string())? != self.expected {
             return Err("GLB изменён другой программой. Сохранение отменено; ваши правки остались в памяти.".into());
         }
-        let bytes = self.encode(objects, original)?;
+        let bytes = self.encode_with_cage(objects, original, cage_edits)?;
         let parent = self.path.parent().ok_or("У файла нет родительской папки")?;
         let path = parent.join(format!(
             ".bevy-editor-model-{}.tmp",

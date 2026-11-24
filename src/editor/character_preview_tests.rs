@@ -30,6 +30,7 @@ impl Files {
             portraits: portraits
                 .iter()
                 .map(|path| Portrait {
+                    uid: None,
                     label: (*path).into(),
                     path: (*path).into(),
                 })

@@ -70,11 +70,30 @@ impl EditorProject {
         let path = resolve_project_file(path)?;
         let mut project: Self =
             serde_json::from_slice(&std::fs::read(&path)?).map_err(io::Error::other)?;
-        project.asset_root = path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(&project.asset_root)
-            .canonicalize()?;
+        let directory = path.parent().unwrap_or(Path::new("."));
+        project.asset_root = directory.join(&project.asset_root).canonicalize()?;
+        let index = crate::asset_registry::reopen(&project.asset_root)?;
+        for item in &mut project.catalog {
+            index.read_ref(&mut item.asset, &mut item.uid);
+        }
+        for scene in &mut project.scenes {
+            if let Some(play) = &mut scene.play {
+                if let Some(program) = &mut play.program
+                    && program.is_relative()
+                    && program.components().count() > 1
+                {
+                    *program = directory.join(&program);
+                }
+                if let Some(working) = &mut play.working_directory
+                    && working.is_relative()
+                {
+                    *working = directory.join(&working);
+                }
+            }
+            if !scene.asset.is_empty() {
+                index.read_ref(&mut scene.asset, &mut scene.uid);
+            }
+        }
         crate::asset_paths::apply_project_paths(&mut project)?;
         for scene in &mut project.scenes {
             if scene.is_native() {
@@ -101,7 +120,7 @@ impl EditorProject {
         for scene in &self.scenes {
             if (!scene.is_native()
                 && (!relative_path(&scene.asset, "glb")
-                    || !self.asset_root.join(&scene.asset).is_file()))
+                    || !present(&self.asset_root, &scene.asset, scene.uid.as_deref())))
                 || !crate::data::document_path(&scene.file)
                 || (relative_path(&scene.file, "scene") && !scene.asset.is_empty())
                 || !files.insert(&scene.file)
@@ -123,7 +142,7 @@ impl EditorProject {
         for item in &self.catalog {
             let direction = Vec3::from(item.preview_direction);
             if ModelFormat::from_path(&item.asset).is_none()
-                || !self.asset_root.join(&item.asset).is_file()
+                || !present(&self.asset_root, &item.asset, item.uid.as_deref())
                 || !direction.is_finite()
                 || direction.length_squared() < 1e-6
                 || direction.normalize().dot(Vec3::Y).abs() > 0.999
@@ -145,6 +164,8 @@ impl EditorProject {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SceneDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     #[serde(default)]
     pub label: String,
     #[serde(default)]
@@ -198,6 +219,9 @@ impl Serialize for SceneDefinition {
         if !self.is_native() {
             map.serialize_entry("label", &self.label)?;
             map.serialize_entry("asset", &self.asset)?;
+            if let Some(uid) = &self.uid {
+                map.serialize_entry("uid", uid)?;
+            }
             map.serialize_entry("groups", &self.groups)?;
             map.serialize_entry("excluded_nodes", &self.excluded_nodes)?;
             map.serialize_entry("node_policies", &self.node_policies)?;
@@ -236,6 +260,8 @@ impl Default for NodePolicy {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     pub label: String,
     pub asset: String,
     pub category: String,
@@ -244,6 +270,12 @@ pub struct CatalogItem {
     /// View direction from the model centre. Useful for wall-mounted meshes.
     #[serde(default = "preview_direction")]
     pub preview_direction: [f32; 3],
+}
+
+fn present(root: &Path, path: &str, uid: Option<&str>) -> bool {
+    root.join(path).is_file()
+        || crate::asset_registry::index(root)
+            .is_ok_and(|i| uid.or_else(|| i.uid(path)).is_some_and(|id| i.known(id)))
 }
 
 fn preview_direction() -> [f32; 3] {

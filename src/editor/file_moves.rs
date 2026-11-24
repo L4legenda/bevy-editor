@@ -89,11 +89,17 @@ fn remap_string(path: &mut String, from: &Path, to: &Path) {
 }
 
 fn remap_edits(edits: &mut RoomEdits, from: &Path, to: &Path) {
+    remap_edits_with(edits, &|s| remap_string(s, from, to));
+}
+fn remap_edits_with(edits: &mut RoomEdits, map: &impl Fn(&mut String)) {
+    if let Some(hdri) = edits.lighting.as_mut().and_then(|s| s.hdri_asset.as_mut()) {
+        map(&mut hdri.asset);
+    }
     if let Some(graph) = &mut edits.hierarchy {
-        std::sync::Arc::make_mut(graph).remap_paths(from, to);
+        std::sync::Arc::make_mut(graph).remap_paths_with(map);
     }
     for model in &mut edits.models {
-        remap_string(&mut model.asset, from, to);
+        map(&mut model.asset);
     }
 }
 
@@ -590,6 +596,52 @@ pub(super) fn move_no_replace(source: &Path, destination: &Path) -> io::Result<(
     Ok(())
 }
 
+/// Recover companions left behind when Explorer moves only the primary file.
+pub(super) fn recover_companions(root: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    if from.starts_with(".bevy-editor")
+        || to.starts_with(".bevy-editor")
+        || root.join(from).exists()
+    {
+        return Ok(());
+    }
+    let mut pairs = vec![(meta_path(from), meta_path(to))];
+    if super::browser::is_image(from) {
+        pairs.push((from.with_extension("pcraft"), to.with_extension("pcraft")));
+    }
+    for (old, new) in pairs {
+        if old == new || !root.join(&old).is_file() {
+            continue;
+        }
+        let mut rewrites = vec![];
+        if old.extension().is_some_and(|e| e == "pcraft") {
+            if from.parent().is_some_and(|p| root.join(p).is_dir())
+                && fs::read_dir(root.join(from.parent().unwrap_or(Path::new(""))))?
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        let path = entry.path();
+                        super::browser::is_image(&path) && path.file_stem() == from.file_stem()
+                    })
+            {
+                continue;
+            }
+            if from.file_name() != to.file_name() {
+                rewrites.push(image_name_rewrite(root, &old, to)?);
+            }
+        }
+        destination_available(&root.join(&new))?;
+        commit(
+            root,
+            &MovePlan {
+                from: old,
+                to: new,
+                companions: vec![],
+                rewrites,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Replace only the source-name manifest field. Tile/blob payloads, previews and
 /// unknown bundle entries retain their exact uncompressed bytes.
 fn image_name_rewrite(root: &Path, native: &Path, image: &Path) -> io::Result<Rewrite> {
@@ -916,32 +968,47 @@ pub(super) fn rename_entry(
 
 fn apply_plan(editor: &mut Editor, browser: &mut Browser, plan: MovePlan) -> io::Result<()> {
     commit(&editor.root, &plan)?;
-    for model in &mut editor.project.catalog {
-        if Path::new(&model.asset) == plan.from
-            && Some(model.label.as_str()) == plan.from.file_stem().and_then(|s| s.to_str())
-        {
-            model.label = plan
-                .to
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+    remap_open(editor, |p| {
+        p.strip_prefix(&plan.from)
+            .ok()
+            .map(|_| remap(p, &plan.from, &plan.to))
+    });
+    browser.refresh_after_move(&mut editor.project, &plan.from, &plan.to);
+    Ok(())
+}
+
+pub(super) fn remap_open(editor: &mut Editor, destination: impl Fn(&Path) -> Option<PathBuf>) {
+    let map = |s: &mut String| {
+        if let Some(p) = destination(Path::new(s)) {
+            *s = p.to_string_lossy().replace('\\', "/");
         }
-        remap_string(&mut model.asset, &plan.from, &plan.to);
+    };
+    for model in &mut editor.project.catalog {
+        let old = Path::new(&model.asset);
+        if let Some(to) = destination(old) {
+            if Some(model.label.as_str()) == old.file_stem().and_then(|s| s.to_str()) {
+                model.label = to
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            model.asset = to.to_string_lossy().replace('\\', "/");
+        }
     }
     for scene in &mut editor.project.scenes {
-        remap_string(&mut scene.asset, &plan.from, &plan.to);
-        remap_string(&mut scene.file, &plan.from, &plan.to);
+        map(&mut scene.asset);
+        map(&mut scene.file);
     }
-    remap_edits(&mut editor.edits, &plan.from, &plan.to);
-    remap_edits(&mut editor.saved, &plan.from, &plan.to);
+    remap_edits_with(&mut editor.edits, &map);
+    remap_edits_with(&mut editor.saved, &map);
     for edits in editor
         .undo
         .iter_mut()
         .chain(&mut editor.redo)
         .chain(&mut editor.camera_navigation)
     {
-        remap_edits(edits, &plan.from, &plan.to);
+        remap_edits_with(edits, &map);
     }
     for document in editor.documents.values_mut() {
         for edits in std::iter::once(&mut document.edits)
@@ -949,24 +1016,39 @@ fn apply_plan(editor: &mut Editor, browser: &mut Browser, plan: MovePlan) -> io:
             .chain(&mut document.undo)
             .chain(&mut document.redo)
         {
-            remap_edits(edits, &plan.from, &plan.to);
+            remap_edits_with(edits, &map);
         }
     }
     for tab in &mut editor.narrative.tabs {
-        tab.path = remap(&tab.path, &plan.from, &plan.to);
+        if let Some(path) = destination(&tab.path) {
+            tab.path = path;
+        }
         for content in std::iter::once(&mut tab.content)
             .chain(std::iter::once(&mut tab.saved))
             .chain(&mut tab.undo)
             .chain(&mut tab.redo)
         {
-            content.remap_character(&plan.from, &plan.to);
+            match content {
+                super::dialogue::Content::Character(c) => {
+                    for p in &mut c.portraits {
+                        map(&mut p.path);
+                    }
+                }
+                super::dialogue::Content::Dialogue(d) => {
+                    for n in &mut d.nodes {
+                        if let Some(path) = &mut n.speaker {
+                            map(path);
+                        }
+                    }
+                }
+            }
         }
     }
     for tab in &mut editor.image_tabs {
-        tab.path = remap(&tab.path, &plan.from, &plan.to);
+        if let Some(path) = destination(&tab.path) {
+            tab.path = path;
+        }
     }
-    browser.refresh_after_move(&mut editor.project, &plan.from, &plan.to);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1020,6 +1102,7 @@ mod tests {
         fn editor(&self) -> (Editor, Browser) {
             self.glb("scenes/room.glb", None);
             let scene = SceneDefinition {
+                uid: None,
                 label: "Room".into(),
                 asset: "scenes/room.glb".into(),
                 file: "levels/room.json".into(),
@@ -1078,6 +1161,25 @@ mod tests {
     }
 
     #[test]
+    fn asset_registry_keeps_both_metadata_files_on_conflict() {
+        let fixture = Fixture::new();
+        fixture.file("old.png.meta", b"original");
+        fixture.file("new.png", b"pixels");
+        fixture.file("new.png.meta", b"separate settings");
+        assert!(
+            recover_companions(&fixture.0, Path::new("old.png"), Path::new("new.png")).is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("new.png.meta")).unwrap(),
+            b"separate settings"
+        );
+        assert_eq!(
+            fs::read(fixture.0.join("old.png.meta")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
     fn moving_an_open_image_updates_its_tab_path_without_changing_its_identity() {
         let files = Fixture::new();
         files.file("images/photo.png", b"image");
@@ -1109,6 +1211,8 @@ mod tests {
     fn placements(asset: &str) -> RoomEdits {
         RoomEdits {
             models: vec![PlacedModel {
+                selector: None,
+                uid: None,
                 id: 1,
                 asset: asset.into(),
                 pose: Pose::from(Transform::IDENTITY),

@@ -63,6 +63,7 @@ pub(super) struct Progress {
     pub cancelled: AtomicBool,
     status: Mutex<Status>,
     child: Mutex<Option<Child>>,
+    tile: Mutex<Option<(usize, usize, Option<u32>)>>,
 }
 impl Progress {
     pub fn snapshot(&self) -> Status {
@@ -72,10 +73,21 @@ impl Progress {
             .clone()
     }
     pub fn set(&self, phase: impl Into<String>, fraction: f32) {
+        let mut phase = phase.into();
+        let mut fraction = fraction;
+        if let Some((index, total, tile)) = *self.tile.lock().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(tile) = tile {
+                phase = format!("UDIM {tile} · {phase}");
+            }
+            fraction = (index as f32 + fraction) / total as f32;
+        }
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) = Status {
-            phase: phase.into(),
+            phase,
             fraction,
         };
+    }
+    pub fn set_tile(&self, index: usize, total: usize, tile: Option<u32>) {
+        *self.tile.lock().unwrap_or_else(|e| e.into_inner()) = Some((index, total, tile));
     }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);

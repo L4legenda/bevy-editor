@@ -20,6 +20,16 @@ pub(in crate::editor) struct PhotoSlider {
     readout: Entity,
 }
 
+#[cfg(test)]
+pub(in crate::editor) fn model_handle_center(world: &World) -> Vec2 {
+    model_handle_geometry(world).0
+}
+
+#[cfg(test)]
+pub(in crate::editor) fn model_handle_geometry(world: &World) -> (Vec2, [f32; 4]) {
+    world.resource::<EditUi>().model_overlay.handle_geometry()
+}
+
 #[derive(Resource)]
 pub(in crate::editor) struct EditUi {
     mode_button: Entity,
@@ -35,6 +45,8 @@ pub(in crate::editor) struct EditUi {
     eraser_modes: Entity,
     status: Entity,
     size_group: Entity,
+    model_tools: Entity,
+    model_overlay: super::super::model_transform::Overlay,
     brush_rail: Entity,
     size_button: Entity,
     size_value: Entity,
@@ -389,7 +401,7 @@ fn slider_change(
     }
 }
 
-pub(super) fn input(
+pub(in crate::editor) fn input(
     commands: &mut Commands,
     parent: Entity,
     font_handle: &Handle<Font>,
@@ -478,6 +490,8 @@ pub(in crate::editor) fn setup(
     font_handle: &Handle<Font>,
 ) {
     let brush_rail = brush_rail(commands, canvas, font_handle);
+    let model_overlay =
+        super::super::model_transform::Overlay::setup(commands, canvas, font_handle);
     let size_group = node(
         commands,
         toolbar,
@@ -511,6 +525,13 @@ pub(in crate::editor) fn setup(
         ..default()
     });
     icons::themed(commands, size_button, icons::Glyph::ChevronDown, 12.0);
+    let model_tools = crate::editor::ui::tool_icons::group(commands, toolbar, true, |tool| {
+        Action::ImageEdit(EditAction::ModelTool(tool))
+    });
+    commands
+        .entity(model_tools)
+        .entry::<Node>()
+        .and_modify(|mut node| node.display = Display::None);
     let size_menu = surface(
         commands,
         size_group,
@@ -927,6 +948,7 @@ pub(in crate::editor) fn setup(
         .and_modify(|mut n| n.width = percent(100));
     let status = text(commands, panel, font_handle, "", 11.0, MUTED);
     commands.entity(status).insert(TextLayout::default());
+    super::super::model_fields::setup(commands, panel, font_handle);
     let layer_header = node(
         commands,
         panel,
@@ -1001,6 +1023,8 @@ pub(in crate::editor) fn setup(
         eraser_modes,
         status,
         size_group,
+        model_tools,
+        model_overlay,
         brush_rail,
         size_button,
         size_value,
@@ -1200,9 +1224,10 @@ pub(in crate::editor) fn color_pointer(
 pub(in crate::editor) fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
-    (viewer, references): (
+    (viewer, references, mut images): (
         Res<ImageViewer>,
         Res<crate::editor::image_reference::ReferenceRender>,
+        ResMut<Assets<Image>>,
     ),
     window: Single<&Window, With<PrimaryWindow>>,
     mut ui: ResMut<EditUi>,
@@ -1226,9 +1251,29 @@ pub(in crate::editor) fn refresh(
     time: Res<Time>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
-    commands
-        .entity(ui.brush_rail)
-        .insert(rail_fx::RevealTarget(editing && viewer.edit.sizeable()));
+    let model_active = editing && viewer.edit.model_reference(editor.viewing_image).is_some();
+    let model_manipulating = model_active && viewer.edit.model_tool.is_some();
+    if let Ok(mut node) = nodes.get_mut(ui.model_tools) {
+        node.display = if model_active {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    ui.model_overlay.refresh(
+        &editor,
+        &viewer,
+        &references,
+        super::super::canvas_rect(&canvas, &window),
+        window.cursor_position(),
+        window.scale_factor(),
+        &mut images,
+        &mut nodes,
+        &mut commands,
+    );
+    commands.entity(ui.brush_rail).insert(rail_fx::RevealTarget(
+        editing && viewer.edit.sizeable() && !model_manipulating,
+    ));
     for (entity, visible) in [
         (ui.hardness_group, !viewer.edit.pixel_tool()),
         (ui.pencil_shapes, viewer.edit.pixel_tool()),
@@ -1252,13 +1297,14 @@ pub(in crate::editor) fn refresh(
             .insert(AccessibleLabel(format!("Форма {tool} · {title}")));
     }
     if let Ok(mut group) = nodes.get_mut(ui.size_group) {
-        group.display = if editing && viewer.edit.sizeable() {
+        group.display = if editing && viewer.edit.sizeable() && !model_manipulating {
             Display::Flex
         } else {
             Display::None
         };
     }
-    let size_shown = editing && viewer.edit.sizeable() && viewer.edit.size_menu;
+    let size_shown =
+        editing && viewer.edit.sizeable() && viewer.edit.size_menu && !model_manipulating;
     if let Ok(mut menu) = nodes.get_mut(ui.size_menu) {
         menu.display = if size_shown {
             Display::Flex

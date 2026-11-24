@@ -1,7 +1,9 @@
 //! Model documents, kept alive across tabs and isolated from scene instances.
 use super::*;
 use crate::editor::{
-    model_document::{self as document, Document, MaterialSlot, Mode, Object, Operation, Pivot, Snapshot},
+    model_document::{
+        self as document, Document, MaterialSlot, Mode, Object, Operation, Pivot, Snapshot,
+    },
     model_mesh::{Edge, Element, Geometry, Selection as MeshSelection},
 };
 use bevy::{
@@ -16,8 +18,8 @@ use std::{
 
 #[path = "model_edit_snap.rs"]
 mod snapping;
-use snapping::SnapTarget;
 use input::{BevelControl, LoopCutControl};
+use snapping::SnapTarget;
 
 #[path = "model_area.rs"]
 pub(super) mod area;
@@ -61,6 +63,7 @@ pub(in crate::editor) enum EditAction {
     Grow,
     Shrink,
     SelectObject(usize),
+    RevertTransform(TransformProperty),
     Tool(Tool),
     Begin(Tool),
     Cancel,
@@ -95,9 +98,25 @@ pub(in crate::editor) fn toolbar_action(action: Action) -> Option<EditAction> {
     }
 }
 
+fn model_transform_revert(doc: &Document, property: TransformProperty) -> Option<Transform> {
+    let object = doc
+        .active()
+        .filter(|obj| !obj.hidden && doc.mode == Mode::Object)?;
+    let saved = doc
+        .saved
+        .iter()
+        .find(|saved| saved.id == object.id)
+        .map_or(Transform::IDENTITY, |saved| saved.transform);
+    let reverted = property.restore(object.transform, saved);
+    (reverted != object.transform).then_some(reverted)
+}
+
 struct Saving {
     index: usize,
     objects: Vec<Object>,
+    custom_bakes: Arc<Vec<crate::editor::model_paint_data::custom::Recipe>>,
+    bake_settings: crate::editor::model_bake_settings::Settings,
+    cage_edits: Arc<crate::editor::model_cage_data::Edits>,
     task: Task<Result<document::glb::Glb, String>>,
 }
 
@@ -105,7 +124,7 @@ struct Saving {
 struct RenderedObject {
     entity: Entity,
     geometry: document::MeshData,
-    materials: Vec<MaterialSlot>,
+    materials: Vec<(Handle<StandardMaterial>, Option<document::udim::Tile>)>,
     edges: Arc<BTreeMap<Edge, Vec<usize>>>,
 }
 
@@ -186,10 +205,18 @@ impl Default for State {
 }
 impl State {
     fn document_dirty(&self, index: usize, doc: &Document) -> bool {
-        self.gesture.as_ref()
+        self.gesture
+            .as_ref()
             .filter(|gesture| gesture.model == index)
             .and_then(input::Gesture::committed_bevel_state)
-            .map_or_else(|| doc.dirty(), |state| doc.paint_pending || state.objects != doc.saved)
+            .map_or_else(
+                || doc.dirty(),
+                |state| doc.paint_pending || state.objects != doc.saved
+                    || state.custom_bakes != doc.saved_custom_bakes
+                    || state.bake_settings != doc.saved_bake_settings
+                    || (!Arc::ptr_eq(&state.cage_edits, &doc.saved_cage_edits)
+                        && state.cage_edits != doc.saved_cage_edits),
+            )
     }
 
     pub(in crate::editor) fn saving_model(&self, index: usize) -> bool {
@@ -227,14 +254,28 @@ impl State {
             return;
         }
         let mut source = doc.source.clone();
+        let custom_bakes = doc.custom_bakes.clone();
+        let baked_recipes = custom_bakes.clone();
+        let bake_settings = doc.bake_settings.clone();
+        let settings = bake_settings.clone();
+        let cage_edits = doc.cage_edits.clone();
+        let cage = cage_edits.clone();
         let objects = doc.objects.clone();
         let original = doc.original.clone();
         let work = objects.clone();
+        let root = editor.root.clone();
         self.saving = Some(Saving {
             index,
             objects,
+            custom_bakes,
+            bake_settings,
+            cage_edits,
             task: AsyncComputeTaskPool::get().spawn(async move {
-                source.save(&work, &original)?;
+                crate::editor::model_paint_data::custom::write_document(&mut source.json, &baked_recipes)?;
+                crate::editor::model_bake_settings::write(&mut source.json, &source.path, &settings)?;
+                source.save_with_cage(&work, &original, Some(&cage))?;
+                crate::asset_registry::scan::record_save(&root, &source.path)
+                    .map_err(|e| format!("Модель сохранена, ошибка обновления реестра: {e}"))?;
                 Ok(source)
             }),
         });
@@ -248,9 +289,13 @@ impl State {
     pub fn active(&self, action: EditAction, index: Option<usize>) -> bool {
         let doc = index.and_then(|i| self.documents.get(&i));
         match action {
-            EditAction::Bevel(control) => self.gesture.as_ref()
+            EditAction::Bevel(control) => self
+                .gesture
+                .as_ref()
                 .is_some_and(|gesture| gesture.bevel_control_active(control)),
-            EditAction::LoopCut(control) => self.gesture.as_ref()
+            EditAction::LoopCut(control) => self
+                .gesture
+                .as_ref()
                 .is_some_and(|gesture| gesture.loop_control_active(control)),
             EditAction::Mode(mode) => self.mode(index) == mode,
             EditAction::Element(kind) => doc.is_some_and(|d| d.selection.kind == kind),
@@ -267,10 +312,21 @@ impl State {
             EditAction::Connected => self.connected,
             EditAction::BoxSelect => self.box_armed,
             EditAction::Bisect => self.bisect,
-            EditAction::BeginKnife { .. } => self.gesture.as_ref().is_some_and(input::Gesture::is_knifing),
+            EditAction::BeginKnife { .. } => self
+                .gesture
+                .as_ref()
+                .is_some_and(input::Gesture::is_knifing),
             _ => false,
         }
     }
+    pub(in crate::editor) fn transform_to_revert(
+        &self,
+        index: Option<usize>,
+        property: TransformProperty,
+    ) -> Option<Transform> {
+        model_transform_revert(self.documents.get(&index?)?, property)
+    }
+
     pub fn available(&self, action: EditAction, index: Option<usize>) -> bool {
         if let Some(gesture) = self.gesture.as_ref().filter(|g| g.is_beveling()) {
             return match action {
@@ -318,16 +374,26 @@ impl State {
             return false;
         }
         match action {
+            EditAction::RevertTransform(property) => {
+                model_transform_revert(doc, property).is_some()
+            }
             EditAction::Bevel(_) | EditAction::LoopCut(_) => false,
-            EditAction::BeginLoopCut => doc.mode == Mode::Edit && self.gesture.is_none()
-                && doc.active().is_some_and(|object| !object.hidden),
-            EditAction::AdjustLoopCut => index.and_then(|index| self.last_loop_cut.get(&index))
-                .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision)
-                && self.gesture.is_none(),
+            EditAction::BeginLoopCut => {
+                doc.mode == Mode::Edit
+                    && self.gesture.is_none()
+                    && doc.active().is_some_and(|object| !object.hidden)
+            }
+            EditAction::AdjustLoopCut => {
+                index
+                    .and_then(|index| self.last_loop_cut.get(&index))
+                    .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision)
+                    && self.gesture.is_none()
+            }
             EditAction::BeginBevel { .. } => {
                 self.gesture.is_none() && doc.mode == Mode::Edit && doc.selection_center().is_some()
             }
-            EditAction::AdjustBevel => index.and_then(|index| self.last_bevel.get(&index))
+            EditAction::AdjustBevel => index
+                .and_then(|index| self.last_bevel.get(&index))
                 .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision),
             EditAction::Undo => !doc.undo.is_empty() && self.gesture.is_none(),
             EditAction::Redo => !doc.redo.is_empty() && self.gesture.is_none(),
@@ -341,8 +407,10 @@ impl State {
             }
             EditAction::SelectEdgeLoop
             | EditAction::Operate(
-                Operation::SlideEdges { .. } | Operation::BevelEdges
-                | Operation::MarkUvSeam | Operation::ClearUvSeam,
+                Operation::SlideEdges { .. }
+                | Operation::BevelEdges
+                | Operation::MarkUvSeam
+                | Operation::ClearUvSeam,
             ) => {
                 doc.mode == Mode::Edit
                     && doc.selection.kind == Element::Edge
@@ -350,12 +418,15 @@ impl State {
                     && self.gesture.is_none()
             }
             EditAction::Bisect => doc.mode == Mode::Edit,
-            EditAction::BeginKnife { .. } => doc.mode == Mode::Edit && self.gesture.is_none()
-                && doc.active().is_some_and(|object| !object.hidden),
+            EditAction::BeginKnife { .. } => {
+                doc.mode == Mode::Edit
+                    && self.gesture.is_none()
+                    && doc.active().is_some_and(|object| !object.hidden)
+            }
             EditAction::ExtrudeTool => {
                 self.gesture.is_none()
                     && doc.mode == Mode::Edit
-                    && (self.extrude_tool || self.available(EditAction::BeginExtrude, index))
+                    && (self.extrude_tool || doc.active().is_some_and(|object| !object.hidden))
             }
             EditAction::BeginExtrude => {
                 self.available(EditAction::Operate(Operation::Extrude), index)
@@ -365,11 +436,12 @@ impl State {
                     doc.mode == Mode::Edit
                         && self.gesture.is_none()
                         && doc.active().is_some_and(|object| {
-                            !object.hidden && match doc.selection.kind {
-                                Element::Vertex => !doc.selection.vertices.is_empty(),
-                                Element::Edge => !doc.selection.edges.is_empty(),
-                                Element::Face => !doc.selection.faces.is_empty(),
-                            }
+                            !object.hidden
+                                && match doc.selection.kind {
+                                    Element::Vertex => !doc.selection.vertices.is_empty(),
+                                    Element::Edge => !doc.selection.edges.is_empty(),
+                                    Element::Face => !doc.selection.faces.is_empty(),
+                                }
                         })
                 }
                 Operation::Join | Operation::ApplyTransform | Operation::OriginToGeometry => {
@@ -412,6 +484,7 @@ pub(super) fn initialize(
     mut state: ResMut<State>,
     viewer: Res<Viewer>,
     editor: Res<Editor>,
+    uv: Res<uv::UvState>,
     gltfs: Res<Assets<Gltf>>,
     server: Res<AssetServer>,
     gltf_meshes: Res<Assets<GltfMesh>>,
@@ -472,6 +545,7 @@ pub(super) fn initialize(
             blob: &'a [u8],
             json: &'a serde_json::Value,
             source: &'a document::glb::Glb,
+            detect_udim: bool,
         }
         fn visit(
             node: bevy::gltf::gltf::Node,
@@ -525,7 +599,11 @@ pub(super) fn initialize(
                             PrimitiveTopology::TriangleStrip
                         }
                         bevy::gltf::gltf::mesh::Mode::Lines => PrimitiveTopology::LineList,
-                        _ => return Err("Правка поддерживает треугольные поверхности и рёбра".into()),
+                        _ => {
+                            return Err(
+                                "Правка поддерживает треугольные поверхности и рёбра".into()
+                            );
+                        }
                     };
                     let mut data = Mesh::new(topology, bevy::asset::RenderAssetUsages::MAIN_WORLD);
                     data.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
@@ -576,11 +654,13 @@ pub(super) fn initialize(
                     } else {
                         ctx.default.clone()
                     };
+                    let primitive = &ctx.json["meshes"][mesh.index()]["primitives"][i];
                     slots.push(MaterialSlot {
                         authored: None,
-                        paint: ctx.source.paint_surface(&ctx.json["meshes"][mesh.index()]["primitives"][i])?,
+                        paint: ctx.source.paint_surface(primitive)?,
+                        bake_fixes: ctx.source.bake_fixes(primitive)?,
                         material,
-                        source: ctx.json["meshes"][mesh.index()]["primitives"][i].clone(),
+                        source: primitive.clone(),
                     });
                 }
                 let topology = &ctx.json["meshes"][mesh.index()]["extras"]["bevy_editor_topology"];
@@ -588,7 +668,7 @@ pub(super) fn initialize(
                     geometry.restore_uv_seams(&topology["uv_seams"])?;
                 }
                 geometry.validate()?;
-                objects.push(Object {
+                let mut object = Object {
                     id: node.index(),
                     source_node: Some(node.index()),
                     name: node
@@ -600,7 +680,9 @@ pub(super) fn initialize(
                     transform,
                     materials: slots,
                     hidden: false,
-                });
+                };
+                document::udim::import(&mut object, ctx.detect_udim);
+                objects.push(object);
             }
             for child in node.children() {
                 visit(child, world, objects, ctx, depth + 1)?;
@@ -618,6 +700,7 @@ pub(super) fn initialize(
                 blob,
                 json: &source.json,
                 source: &source,
+                detect_udim: uv.detect_udim_on_import(),
             };
             let scene = parsed
                 .default_scene()
@@ -627,7 +710,9 @@ pub(super) fn initialize(
                 visit(root, Mat4::IDENTITY, &mut objects, &mut ctx, 0)?;
             }
         }
-        let doc = Document::new(source, objects);
+        let mut doc = Document::new(source, objects);
+        doc.paint_default_size = uv.texture_size_on_import();
+        doc.auto_bake_pending = uv.bake_on_load();
         doc.validate()?;
         Ok::<_, String>(doc)
     })();
@@ -702,10 +787,13 @@ pub(super) fn render(
         if uv_mode {
             object.geometry = uv.display_geometry(index, &object);
         }
+        let render_materials = object.materials.iter()
+            .map(|slot| (slot.material.clone(), slot.udim()))
+            .collect::<Vec<_>>();
         let old = previous.remove(&object.id);
         if let Some(old) = old
             .as_ref()
-            .filter(|old| old.geometry == object.geometry && old.materials == object.materials)
+            .filter(|old| old.geometry == object.geometry && old.materials == render_materials)
         {
             commands.entity(old.entity).try_insert((
                 Name::new(object.name),
@@ -735,7 +823,7 @@ pub(super) fn render(
         }
         let entity = commands
             .spawn((
-                Name::new(object.name),
+                Name::new(std::mem::take(&mut object.name)),
                 object.transform,
                 if object.hidden {
                     Visibility::Hidden
@@ -746,10 +834,11 @@ pub(super) fn render(
                 ChildOf(root),
             ))
             .id();
-        for (slot, buffers) in object.geometry.buffers() {
+        for (slot, mut buffers) in object.geometry.buffers() {
             if buffers.indices.is_empty() {
                 continue;
             }
+            buffers.localize_uv(object.uv_offset(slot));
             let handle = meshes.add(document::render_mesh(buffers));
             let material = object
                 .materials
@@ -759,13 +848,17 @@ pub(super) fn render(
                 Mesh3d(handle.clone()),
                 MeshMaterial3d(material.clone()),
                 xray::SourceMaterial(material),
+                super::paint::sets::SetPart(object.id, slot),
                 RenderLayers::layer(LAYER),
                 ChildOf(entity),
             ));
         }
         if !object.geometry.loose_edges.is_empty() {
             let positions = object.geometry.line_positions();
-            let mut mesh = Mesh::new(PrimitiveTopology::LineList, bevy::asset::RenderAssetUsages::default());
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::LineList,
+                bevy::asset::RenderAssetUsages::default(),
+            );
             mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0., 1., 0.]; positions.len()]);
             mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
             commands.spawn((
@@ -780,7 +873,7 @@ pub(super) fn render(
             RenderedObject {
                 entity,
                 geometry: object.geometry,
-                materials: object.materials,
+                materials: render_materials,
                 edges,
             },
         );
@@ -811,8 +904,10 @@ pub(super) fn process_actions(
     materials: &mut Assets<StandardMaterial>,
     shift: bool,
 ) {
-    if let Some((index, objects, result)) = state.saving.as_mut().and_then(|job| {
-        block_on(poll_once(&mut job.task)).map(|result| (job.index, job.objects.clone(), result))
+    if let Some((index, objects, custom_bakes, bake_settings, cage_edits, result)) = state.saving.as_mut().and_then(|job| {
+        block_on(poll_once(&mut job.task)).map(|result| {
+            (job.index, job.objects.clone(), job.custom_bakes.clone(), job.bake_settings.clone(), job.cage_edits.clone(), result)
+        })
     }) {
         state.saving = None;
         match result {
@@ -820,6 +915,9 @@ pub(super) fn process_actions(
                 if let Some(doc) = state.documents.get_mut(&index) {
                     doc.source = source;
                     doc.saved = objects;
+                    doc.saved_custom_bakes = custom_bakes;
+                    doc.saved_bake_settings = bake_settings;
+                    doc.saved_cage_edits = cage_edits;
                     doc.ui_revision += 1;
                 }
                 editor.status = "Модель сохранена в GLB".into();
@@ -854,12 +952,13 @@ pub(super) fn process_actions(
     }
     for &action in actions {
         if state.gesture.as_ref().is_some_and(|gesture| {
-            gesture.is_preview_tool() && match action {
-                Action::CloseModelTab(index) => gesture.model == index,
-                Action::ViewModel(index) => gesture.model != index,
-                Action::ModelView(ModelViewAction::Close | ModelViewAction::Retry) => true,
-                _ => false,
-            }
+            gesture.is_preview_tool()
+                && match action {
+                    Action::CloseModelTab(index) => gesture.model == index,
+                    Action::ViewModel(index) => gesture.model != index,
+                    Action::ModelView(ModelViewAction::Close | ModelViewAction::Retry) => true,
+                    _ => false,
+                }
         }) {
             state.clear_gesture(None, true);
         }
@@ -910,8 +1009,14 @@ pub(super) fn process_actions(
         let Some(index) = editor.viewing_model else {
             continue;
         };
-        if state.gesture.as_ref().is_some_and(input::Gesture::is_preview_tool)
-            && !matches!(action, EditAction::Cancel | EditAction::Bevel(_) | EditAction::LoopCut(_))
+        if state
+            .gesture
+            .as_ref()
+            .is_some_and(input::Gesture::is_preview_tool)
+            && !matches!(
+                action,
+                EditAction::Cancel | EditAction::Bevel(_) | EditAction::LoopCut(_)
+            )
         {
             continue;
         }
@@ -932,7 +1037,8 @@ pub(super) fn process_actions(
             }
             EditAction::Bevel(control) => {
                 if let Some(gesture) = state.gesture.as_mut().filter(|g| g.model == index) {
-                    let slots = state.documents[&index].active()
+                    let slots = state.documents[&index]
+                        .active()
                         .map_or(0, |o| o.materials.len());
                     gesture.set_bevel_control(control, slots);
                 }
@@ -973,7 +1079,7 @@ pub(super) fn process_actions(
             EditAction::BeginExtrude => {
                 if state.available(action, Some(index)) {
                     let doc = &state.documents[&index];
-                    state.gesture = input::Gesture::extrude(doc, index);
+                    state.gesture = input::Gesture::extrude(doc, index, &viewer);
                     state.box_start = None;
                     viewer.gesture = None;
                 } else {
@@ -987,7 +1093,9 @@ pub(super) fn process_actions(
                 }
                 let doc = &state.documents[&index];
                 state.gesture = match action {
-                    EditAction::BeginBevel { vertices } => input::Gesture::bevel(doc, index, vertices),
+                    EditAction::BeginBevel { vertices } => {
+                        input::Gesture::bevel(doc, index, vertices)
+                    }
                     _ => input::Gesture::adjust_bevel(doc, index, &state.last_bevel[&index]),
                 };
                 if state.gesture.is_some() {
@@ -1040,7 +1148,8 @@ pub(super) fn process_actions(
                 state.box_auto = false;
                 if let Some(doc) = state.documents.get(&index) {
                     if let Some(pivot) = doc.pivot() {
-                        state.gesture = Some(input::Gesture::new(tool, doc.snapshot(), index, pivot));
+                        state.gesture =
+                            Some(input::Gesture::new(tool, doc.snapshot(), index, pivot));
                         viewer.gesture = None;
                     }
                 }
@@ -1147,12 +1256,21 @@ pub(super) fn process_actions(
                             doc.assign_material(material, &state.default_material)?;
                         }
                         EditAction::AssignMaterial { object, slot } => {
-                            let material = doc.objects.iter()
+                            let material = doc
+                                .objects
+                                .iter()
                                 .find(|o| o.id == object)
                                 .and_then(|o| o.materials.get(slot))
                                 .cloned()
                                 .ok_or("Материал не найден")?;
                             doc.assign_material(material, &state.default_material)?;
+                        }
+                        EditAction::RevertTransform(property) => {
+                            if let Some(reverted) = model_transform_revert(doc, property) {
+                                let before = doc.snapshot();
+                                doc.active_mut().unwrap().transform = reverted;
+                                doc.checkpoint(before);
+                            }
                         }
                         EditAction::SelectAll
                         | EditAction::Deselect
@@ -1289,8 +1407,12 @@ pub(super) fn process_actions(
     state
         .drafts
         .retain(|index| editor.model_tabs.contains(index));
-    state.last_bevel.retain(|index, _| editor.model_tabs.contains(index));
-    state.last_loop_cut.retain(|index, _| editor.model_tabs.contains(index));
+    state
+        .last_bevel
+        .retain(|index, _| editor.model_tabs.contains(index));
+    state
+        .last_loop_cut
+        .retain(|index, _| editor.model_tabs.contains(index));
     editor.dirty_models = state
         .documents
         .iter()
@@ -1304,6 +1426,7 @@ pub(in crate::editor) fn shortcuts(
     keys: &ButtonInput<KeyCode>,
     state: Option<&State>,
     index: Option<usize>,
+    paint: Option<&super::paint::PaintState>,
     actions: &mut MessageWriter<Action>,
 ) -> bool {
     // Modal transforms own number, axis, confirmation and cancellation keys.
@@ -1347,24 +1470,11 @@ pub(in crate::editor) fn shortcuts(
                 actions.write(Action::ModelView(ModelViewAction::Edit(action)));
             }
         }
-        if mode == Mode::Paint {
-            let tool = if keys.just_pressed(KeyCode::KeyB) {
-                Some(super::paint::PaintTool::Brush)
-            } else if keys.just_pressed(KeyCode::KeyE) {
-                Some(super::paint::PaintTool::Eraser)
-            } else if keys.just_pressed(KeyCode::KeyI) {
-                Some(super::paint::PaintTool::Picker)
-            } else {
-                None
-            };
-            if let Some(tool) = tool {
-                actions.write(Action::ModelView(ModelViewAction::Paint(
-                    super::paint::PaintAction::Tool(tool),
-                )));
-            }
-            if keys.just_pressed(KeyCode::Home) {
-                actions.write(Action::ModelView(ModelViewAction::Fit));
-            }
+        if mode == Mode::Paint && edit.is_none() && !control && !shift
+            && !keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
+            && let Some(action) = paint.and_then(|paint| paint.viewport_shortcut(index, keys))
+        {
+            actions.write(Action::ModelView(action));
         }
         if mode == Mode::Uv && keys.just_pressed(KeyCode::Escape) {
             actions.write(Action::ModelView(ModelViewAction::Uv(uv::UvAction::Cancel)));
@@ -1410,9 +1520,14 @@ pub(in crate::editor) fn shortcuts(
             None
         }
     } else if keys.just_pressed(KeyCode::F9) && mode == Mode::Edit {
-        let loop_cut = state.zip(index)
+        let loop_cut = state
+            .zip(index)
             .is_some_and(|(state, index)| state.available(EditAction::AdjustLoopCut, Some(index)));
-        Some(if loop_cut { EditAction::AdjustLoopCut } else { EditAction::AdjustBevel })
+        Some(if loop_cut {
+            EditAction::AdjustLoopCut
+        } else {
+            EditAction::AdjustBevel
+        })
     } else if keys.just_pressed(KeyCode::Tab) {
         Some(if shift {
             EditAction::Snap
@@ -1468,7 +1583,9 @@ pub(in crate::editor) fn shortcuts(
     } else if keys.just_pressed(KeyCode::KeyB) {
         Some(EditAction::BoxSelect)
     } else if keys.just_pressed(KeyCode::KeyK) {
-        Some(EditAction::BeginKnife { only_selected: shift })
+        Some(EditAction::BeginKnife {
+            only_selected: shift,
+        })
     } else if keys.just_pressed(KeyCode::KeyO) {
         Some(if alt {
             EditAction::Connected

@@ -4,6 +4,7 @@
 //! instancing. Enable `editor` in a development executable for the native UI.
 
 pub mod asset_paths;
+mod asset_registry;
 pub mod data;
 pub mod hierarchy;
 pub mod lighting;

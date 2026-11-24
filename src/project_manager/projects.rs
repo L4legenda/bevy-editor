@@ -232,6 +232,7 @@ pub(super) fn create_project(
             title: title.into(),
             asset_root: "assets".into(),
             scenes: vec![SceneDefinition {
+                uid: None,
                 label: "Главная сцена".into(),
                 asset: String::new(),
                 file: "scenes/main.scene".into(),
@@ -251,6 +252,7 @@ pub(super) fn create_project(
                 play: None,
             }],
             catalog: vec![CatalogItem {
+                uid: None,
                 label: "Куб".into(),
                 asset: "models/cube.glb".into(),
                 category: "Примитивы".into(),
@@ -268,6 +270,8 @@ pub(super) fn create_project(
         edits.lighting = Some(crate::SceneLighting::editor_default());
         if template == Template::Starter {
             edits.models.push(crate::PlacedModel {
+                selector: None,
+                uid: None,
                 id: 1,
                 asset: "models/cube.glb".into(),
                 pose: Transform::from_xyz(0.0, 0.5, 0.0).into(),

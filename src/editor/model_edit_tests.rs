@@ -929,7 +929,7 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
         let (entity, _, node) = world
             .query::<(Entity, &AccessibleLabel, &ComputedNode)>()
             .iter(world)
-            .find(|(_, label, _)| label.0 == "Экструдировать · E")
+            .find(|(_, label, _)| label.0 == "Экструдировать вершины, рёбра и грани · E")
             .expect("The shared header must contain the extrusion button");
         assert_eq!(node.size(), Vec2::ZERO, "Hide extrusion in Object mode");
         entity
@@ -1117,7 +1117,7 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
     assert!(
         app.world()
             .get::<bevy::ui::InteractionDisabled>(extrude_button)
-            .is_some()
+            .is_none()
     );
     let rect = canvas_rect(&mut app);
     move_pointer(&mut app, window, rect.center());
@@ -1149,6 +1149,9 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
             .query::<(&Control, &ComputedNode, &UiGlobalTransform)>()
             .iter(world)
         {
+            if node.is_empty() {
+                continue;
+            }
             let center = transform.affine().translation * node.inverse_scale_factor();
             match control.action {
                 Action::Tool(Tool::Scale) => assert!(center.x < position.x),
@@ -1321,6 +1324,42 @@ fn gpu_model_edit_workflow_preserves_scene_and_saves_real_glb() {
             .x,
         2.5
     );
+    let active_x = |app: &App| {
+        app.world().resource::<State>().documents[&0]
+            .active()
+            .unwrap()
+            .transform
+            .translation
+            .x
+    };
+    let original_x = {
+        let doc = &app.world().resource::<State>().documents[&0];
+        doc.saved
+            .iter()
+            .find(|o| Some(o.id) == doc.active)
+            .unwrap()
+            .transform
+            .translation
+            .x
+    };
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("model-inspector.png"),
+        |_| true,
+    );
+    click_control(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ModelView(ModelViewAction::Edit(EditAction::RevertTransform(
+                TransformProperty::Position
+            )))
+        )
+    });
+    assert_eq!(active_x(&app), original_x);
+    send(&mut app, EditAction::Undo);
+    assert_eq!(active_x(&app), 2.5);
+
     edit_field(&mut app, controls::Field::Transform(6), "0");
     key(&mut app, window, KeyCode::Enter, Key::Enter);
     assert!(app.world().resource::<State>().input_error.is_some());
@@ -2454,12 +2493,37 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
     assert!(!app.world().resource::<State>().documents[&0].dirty());
     println!("Warped quad screenshot: {}", output.display());
     send(&mut app, EditAction::Element(Element::Vertex));
-    {
-        let mut state = app.world_mut().resource_mut::<State>();
-        let doc = state.documents.get_mut(&0).unwrap();
-        doc.selection.clear();
-        doc.selection.vertices.insert(0);
-    }
+    send(&mut app, EditAction::Deselect);
+    click_control(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ModelView(ModelViewAction::Edit(EditAction::ExtrudeTool))
+        )
+    });
+    let vertex_position = {
+        let state = app.world().resource::<State>();
+        assert!(state.extrude_tool && state.gesture.is_none());
+        let viewer = app.world().resource::<Viewer>();
+        let object = state.documents[&0].active().unwrap();
+        object
+            .geometry
+            .positions
+            .iter()
+            .find_map(|&local| {
+                let world = object.transform.transform_point(local);
+                let screen = input::project(viewer, rect, world)?;
+                (rect.contains(screen) && input::visible(&state.bvh, viewer, rect, world))
+                    .then_some(screen)
+            })
+            .unwrap()
+    };
+    move_pointer(&mut app, window, vertex_position);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(
+        app.world().resource::<State>().documents[&0].selection.vertices.len(),
+        1
+    );
     let handle = |app: &App| {
         let state = app.world().resource::<State>();
         let viewer = app.world().resource::<Viewer>();
@@ -2468,9 +2532,25 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
         (center, handle)
     };
     let (center, plus) = handle(&app);
+    let delta = (plus - center).perp() * 0.5;
+    move_pointer(&mut app, window, plus);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, plus + delta);
+    mouse(&mut app, window, ButtonState::Released);
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        assert_eq!(doc.active().unwrap().geometry.loose_edges.len(), 1);
+        let viewer = app.world().resource::<Viewer>();
+        let new_center = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+        assert!(new_center.distance(center + delta) < 1.0);
+    }
+    send(&mut app, EditAction::Undo);
+    let (center, plus) = handle(&app);
     move_pointer(&mut app, window, rect.center());
     key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
-    move_pointer(&mut app, window, rect.center() + (plus - center) * 0.5);
+    // E moves a point with the cursor even perpendicular to the handle.
+    let delta = (plus - center).perp() * 0.5;
+    move_pointer(&mut app, window, rect.center() + delta);
     key(&mut app, window, KeyCode::Enter, Key::Enter);
     let edge = {
         let state = app.world().resource::<State>();
@@ -2478,6 +2558,9 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
         let mesh = &doc.active().unwrap().geometry;
         assert_eq!(mesh.faces.len(), 6);
         assert_eq!(mesh.loose_edges.len(), 1);
+        let viewer = app.world().resource::<Viewer>();
+        let new_center = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+        assert!(new_center.distance(center + delta) < 1.0);
         *mesh.loose_edges.first().unwrap()
     };
     send(&mut app, EditAction::Element(Element::Edge));
@@ -2489,12 +2572,6 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
         .selection
         .edges
         .insert(edge);
-    click_control(&mut app, window, |action| {
-        matches!(
-            action,
-            Action::ModelView(ModelViewAction::Edit(EditAction::ExtrudeTool))
-        )
-    });
     let (center, plus) = handle(&app);
     move_pointer(&mut app, window, plus);
     mouse(&mut app, window, ButtonState::Pressed);
@@ -2516,6 +2593,140 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
             .len(),
         1
     );
+    send(&mut app, EditAction::Undo);
+    send(&mut app, EditAction::Element(Element::Edge));
+    let edge_position = {
+        let state = app.world().resource::<State>();
+        assert!(state.extrude_tool);
+        assert_eq!(state.tool, Tool::Move);
+        let viewer = app.world().resource::<Viewer>();
+        let object = state.documents[&0].active().unwrap();
+        object
+            .geometry
+            .edges()
+            .into_keys()
+            .find_map(|edge| {
+                let local = (object.geometry.positions[edge.0]
+                    + object.geometry.positions[edge.1])
+                    * 0.5;
+                let world = object.transform.transform_point(local);
+                let screen = input::project(viewer, rect, world)?;
+                (rect.contains(screen) && input::visible(&state.bvh, viewer, rect, world))
+                    .then_some(screen)
+            })
+            .unwrap()
+    };
+    move_pointer(&mut app, window, edge_position);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(
+        app.world().resource::<State>().documents[&0].selection.edges.len(),
+        1
+    );
+    let (pivot, normal, tangent) = {
+        let doc = &app.world().resource::<State>().documents[&0];
+        let object = doc.active().unwrap();
+        let mesh = &object.geometry;
+        let edge = doc.selection.edges.first().unwrap();
+        let edges = mesh.extrusion_edges(&doc.selection);
+        let local = mesh.extrusion_direction(&doc.selection, &edges).unwrap();
+        let transform = object.transform.to_matrix();
+        let normal = transform.transform_vector3(local).normalize();
+        let tangent = transform
+            .transform_vector3(mesh.positions[edge.1] - mesh.positions[edge.0])
+            .normalize();
+        (doc.selection_center().unwrap(), normal, tangent)
+    };
+    // Check both a depth-only extrusion and a strip where the normal would
+    // appear parallel to the edge on screen.
+    for view in [normal, (normal + tangent).normalize()] {
+        {
+            let mut viewer = app.world_mut().resource_mut::<Viewer>();
+            viewer.center = pivot;
+            viewer.yaw = view.x.atan2(view.z);
+            viewer.pitch = view.y.asin();
+            viewer.orthographic = true;
+        }
+        warm(&mut app, 5);
+        let (center, plus) = handle(&app);
+        let delta = (plus - center) * 0.5 + (plus - center).perp() * 0.4;
+        move_pointer(&mut app, window, plus);
+        mouse(&mut app, window, ButtonState::Pressed);
+        move_pointer(&mut app, window, plus + delta);
+        mouse(&mut app, window, ButtonState::Released);
+        {
+            let viewer = app.world().resource::<Viewer>();
+            let doc = &app.world().resource::<State>().documents[&0];
+            assert_eq!(doc.active().unwrap().geometry.faces.len(), 7);
+            assert_eq!(doc.selection.edges.len(), 1);
+            let new_center = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+            assert!(new_center.distance(center + delta) < 1.0);
+        }
+        send(&mut app, EditAction::Undo);
+        if view.dot(tangent).abs() < 0.001 {
+            let edge_along = {
+                let viewer = app.world().resource::<Viewer>();
+                (input::project(viewer, rect, pivot + tangent).unwrap() - center).normalize()
+            };
+            move_pointer(&mut app, window, plus);
+            mouse(&mut app, window, ButtonState::Pressed);
+            move_pointer(&mut app, window, plus + edge_along * 24.0);
+            mouse(&mut app, window, ButtonState::Released);
+            {
+                let state = app.world().resource::<State>();
+                let doc = &state.documents[&0];
+                let viewer = app.world().resource::<Viewer>();
+                assert_eq!(doc.active().unwrap().geometry.faces.len(), 7);
+                let moved = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+                assert!(edge_along.perp_dot(moved - center).abs() > 10.0);
+            }
+            send(&mut app, EditAction::Undo);
+        }
+        move_pointer(&mut app, window, rect.center());
+        key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
+        assert!(app.world().resource::<State>().gesture.as_ref().unwrap().is_extruding());
+        let edge_along = {
+            let viewer = app.world().resource::<Viewer>();
+            (input::project(viewer, rect, pivot + tangent).unwrap() - center).normalize()
+        };
+        if view.dot(tangent).abs() < 0.001 {
+            move_pointer(&mut app, window, rect.center() + edge_along * 24.0);
+            let state = app.world().resource::<State>();
+            let doc = &state.documents[&0];
+            assert_eq!(doc.active().unwrap().geometry.faces.len(), 7);
+            assert!(state.gesture.as_ref().unwrap().is_extruding());
+            let viewer = app.world().resource::<Viewer>();
+            let moved = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+            assert!(edge_along.perp_dot(moved - center).abs() > 10.0);
+        }
+        move_pointer(&mut app, window, rect.center() + delta);
+        key(&mut app, window, KeyCode::Enter, Key::Enter);
+        {
+            let viewer = app.world().resource::<Viewer>();
+            let doc = &app.world().resource::<State>().documents[&0];
+            assert_eq!(doc.active().unwrap().geometry.faces.len(), 7);
+            assert_eq!(doc.selection.edges.len(), 1);
+            let new_center = input::project(viewer, rect, doc.selection_center().unwrap()).unwrap();
+            assert!(new_center.distance(center + delta) < 1.0);
+            assert!(edge_along.perp_dot(new_center - center).abs() > 10.0);
+        }
+        send(&mut app, EditAction::Undo);
+    }
+    send(&mut app, EditAction::Element(Element::Vertex));
+    warm(&mut app, 3);
+    let (center, plus) = handle(&app);
+    move_pointer(&mut app, window, plus);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, plus + (plus - center) * 0.5);
+    mouse(&mut app, window, ButtonState::Released);
+    {
+        let doc = &app.world().resource::<State>().documents[&0];
+        let mesh = &doc.active().unwrap().geometry;
+        assert_eq!(mesh.faces.len(), 7);
+        assert_eq!(doc.selection.kind, Element::Vertex);
+        assert_eq!(doc.selection.vertices.len(), 2);
+        assert!(mesh.loose_edges.is_empty());
+    }
     drop(app);
     std::fs::remove_dir_all(directory).unwrap();
 }

@@ -423,6 +423,7 @@ pub(super) fn create(
         geometry: primitive.geometry(parameters)?.into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            bake_fixes: Default::default(),
             authored: None,
             paint: None,
             material: default(),

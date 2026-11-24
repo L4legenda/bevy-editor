@@ -231,7 +231,7 @@ pub(in crate::editor) fn sync(
                 object.entity,
                 meshes.add(polygon_mesh(object)),
                 materials.contrasting(
-                    object.materials.iter().map(|slot| &slot.material),
+                    object.materials.iter().map(|(material, _)| material),
                     &surfaces,
                 ),
                 None,

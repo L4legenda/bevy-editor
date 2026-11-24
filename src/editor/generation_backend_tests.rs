@@ -45,6 +45,7 @@ fn model(path: &Path) -> ResultModel {
             .into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            bake_fixes: Default::default(),
             authored: None,
             paint: None,
             material: default(),

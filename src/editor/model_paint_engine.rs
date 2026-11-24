@@ -7,6 +7,7 @@ use crate::editor::{
 };
 use bevy::{
     asset::RenderAssetUsages,
+    ecs::system::SystemParam,
     input_focus::InputFocus,
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
     ui_widgets::TextInput,
@@ -17,14 +18,52 @@ type Key = (usize, usize, usize);
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct TextureCanvas;
 #[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct TextureViewport;
+#[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct BrushCursor;
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct Runtime {
     lives: HashMap<Key, Live>,
-    gesture: Option<(Key, bool, Vec2)>,
-    mapping: Option<Arc<Mapping>>,
-    map_cache: Option<((Key, u64, Transform, Rect, bool), Arc<Mapping>)>,
+    gesture: Option<Gesture>,
+    brush_adjustment: Option<BrushAdjustment>,
+    uv_panning: bool,
+    line_anchor: Option<LineAnchor>,
+    map_cache: Option<((Key, GeometryVersion, CameraMap, bool), Arc<Mapping>)>,
     deferred_save: HashMap<usize, bool>,
+    fix: fix_brush::Runtime,
+    picker: picker::Runtime,
+}
+#[path = "model_paint_uv_navigation.rs"]
+pub(in crate::editor::ui::model_viewer) mod uv_navigation;
+struct BrushAdjustment {
+    model: usize,
+    origin: Vec2,
+    size: f32,
+    hardness: f32,
+}
+struct Gesture {
+    key: Key,
+    mapping: Arc<Mapping>,
+    path: stroke::Path,
+    fill_drag: Option<fill_drag::Drag>,
+    records_anchor: bool,
+}
+struct LineAnchor {
+    key: Key,
+    uv: bool,
+    camera: CameraMap,
+    point: Vec2,
+}
+impl LineAnchor {
+    fn matches(&self, key: Key, map: &Mapping) -> bool {
+        self.key == key
+            && self.uv == map.uv
+            && self.camera.rect == map.camera.rect
+            && (map.uv
+                || (self.camera.pose == map.camera.pose
+                    && self.camera.ortho == map.camera.ortho
+                    && (!map.camera.ortho || self.camera.height == map.camera.height)))
+    }
 }
 struct Live {
     work: Option<Work>,
@@ -33,9 +72,45 @@ struct Live {
     gpu: Option<Gpu>,
     published: Option<Arc<Surface>>,
     origin: crate::editor::model_document::MaterialSlot,
-    preview_needed: bool,
+    source_mesh: crate::editor::model_document::MeshData,
+    resizing: bool,
     ui_stack: Stack,
     controller: gpu_control::Controller,
+    path: path_editor::EditPath,
+}
+impl Live {
+    fn new(
+        doc: &Document,
+        object: &Object,
+        slot: usize,
+        images: &Assets<Image>,
+        materials: &Assets<StandardMaterial>,
+    ) -> Self {
+        let origin = object.materials[slot].clone();
+        Self {
+            work: None,
+            task: Some(initial(doc, object, slot, images, materials)),
+            queue: VecDeque::new(),
+            gpu: None,
+            published: origin.paint.clone(),
+            ui_stack: origin.paint.as_ref().map_or_else(Stack::default, |surface| surface.stack.clone()),
+            origin,
+            source_mesh: object.geometry.clone(),
+            resizing: false,
+            controller: Default::default(),
+            path: Default::default(),
+        }
+    }
+
+    fn enqueue_stamps(&mut self, points: Vec<Stamp>, mapping: Arc<Mapping>) {
+        if let Some(Event::Points(batch, previous)) = self.queue.back_mut()
+            && Arc::ptr_eq(previous, &mapping)
+        {
+            batch.extend(points);
+        } else {
+            self.queue.push_back(Event::Points(points, mapping));
+        }
+    }
 }
 struct Work {
     surface: Surface,
@@ -58,8 +133,9 @@ struct Batch {
 }
 struct Gpu {
     material: Handle<StandardMaterial>,
-    images: [Handle<Image>; 9],
+    images: [Handle<Image>; composite::IMAGE_COUNT],
     preview: [Handle<Image>; 8],
+    trace_revision: u64,
 }
 #[cfg(test)]
 struct Stroke {
@@ -73,23 +149,91 @@ struct Stroke {
 struct Brush {
     channel: usize,
     color: [u8; 3],
+    material: Option<BrushMaterial>,
     radius: f32,
     hardness: f32,
     flow: f32,
     opacity: f32,
     erase: bool,
     fill: bool,
+    fill_mode: FillMode,
+    fill_angle: f32,
+    fill_padding: f32,
+    variation: stroke::Variation,
+    tip: Option<BrushTip>,
+    grain: Option<BrushGrain>,
+    mirror: [f32; 4],
+    projection: BrushProjection,
+    paint_through: bool,
+    facing_limit: f32,
+}
+#[derive(Clone, Copy)]
+struct BrushMaterial {
+    channels: u8,
+    colors: [[u8; 3]; data::CHANNEL_COUNT],
+}
+impl Brush {
+    fn channels(self) -> u16 {
+        self.material.map_or(1 << self.channel, |material| u16::from(material.channels))
+    }
+
+    fn for_channel(mut self, channel: usize) -> Self {
+        if let Some(material) = self.material {
+            self.color = material.colors[channel];
+        }
+        self.channel = channel;
+        self
+    }
+}
+fn channels_in(mask: u16) -> impl Iterator<Item = usize> {
+    (0..=data::MASK_TARGET).filter(move |&channel| mask & (1 << channel) != 0)
+}
+#[derive(Clone, Copy)]
+struct BrushTip {
+    image: bevy::asset::AssetId<Image>,
+    angle: f32,
+    follow: bool,
+}
+#[derive(Clone, Copy, PartialEq)]
+struct BrushGrain {
+    image: bevy::asset::AssetId<Image>,
+    strength: f32,
+    repeat: f32,
+    angle: f32,
+    invert: bool,
+    uv: bool,
 }
 enum Event {
     Begin(Brush),
-    Points(Vec<Vec2>, Arc<Mapping>),
+    Points(Vec<Stamp>, Arc<Mapping>),
+    Region(fill_drag::Region, Arc<Mapping>),
     End,
 }
+#[path = "model_paint_fill_drag.rs"]
+mod fill_drag;
+#[path = "model_paint_fix_brush.rs"]
+mod fix_brush;
+#[path = "model_paint_picker.rs"]
+mod picker;
+#[path = "model_paint_fill_preview.rs"]
+pub(in crate::editor::ui::model_viewer) mod fill_preview;
+#[path = "model_paint_live_mask.rs"]
+pub(in crate::editor::ui::model_viewer) mod live_mask;
+#[path = "model_paint_path.rs"]
+mod path_editor;
 #[path = "model_paint_projection.rs"]
-mod projection;
+pub(super) mod projection;
 use projection::*;
+pub(super) use projection::weights as uv_weights;
+#[path = "model_paint_import_uv.rs"]
+mod import_uv;
+#[path = "model_paint_stroke.rs"]
+mod stroke;
+use stroke::Stamp;
 #[path = "model_paint_composite.rs"]
 mod composite;
+#[path = "model_paint_surface.rs"]
+pub(in crate::editor) mod surface;
 #[cfg(test)]
 use composite::Dirty;
 use composite::Updates;
@@ -98,7 +242,7 @@ pub(in crate::editor::ui::model_viewer) mod gpu;
 #[path = "model_paint_gpu_control.rs"]
 mod gpu_control;
 #[cfg(test)]
-fn paint_points(work: &mut Work, points: &[Vec2], map: &Mapping) -> Option<URect> {
+fn paint_points(work: &mut Work, points: &[Stamp], map: &Mapping) -> Option<URect> {
     let stroke = work.stroke.as_mut()?;
     let brush = stroke.brush;
     let layer = work
@@ -110,7 +254,8 @@ fn paint_points(work: &mut Work, points: &[Vec2], map: &Mapping) -> Option<URect
     let geometry = map.geometry();
     let samples = points
         .iter()
-        .filter_map(|&p| {
+        .filter_map(|&stamp| {
+            let p = stamp.point;
             let face = if map.uv {
                 if brush.fill {
                     let uv = (p - map.camera.rect.min) / map.camera.rect.size();
@@ -132,16 +277,17 @@ fn paint_points(work: &mut Work, points: &[Vec2], map: &Mapping) -> Option<URect
                 }
                 Some(face)
             };
-            Some((p, face))
+            Some((stamp, face))
         })
         .collect::<Vec<_>>();
     if samples.is_empty() {
         return None;
     }
-    let mut bounds = Rect::from_center_size(samples[0].0, Vec2::splat(brush.radius * 2.));
-    for (p, _) in &samples {
-        bounds.min = bounds.min.min(*p - Vec2::splat(brush.radius));
-        bounds.max = bounds.max.max(*p + Vec2::splat(brush.radius));
+    let mut bounds = Rect::from_center_size(samples[0].0.point, Vec2::ZERO);
+    for (stamp, _) in &samples {
+        let radius = Vec2::splat(brush.radius * stamp.radius);
+        bounds.min = bounds.min.min(stamp.point - radius);
+        bounds.max = bounds.max.max(stamp.point + radius);
     }
     let candidates = if brush.fill {
         (0..geometry.triangles.len())
@@ -232,13 +378,22 @@ fn paint_points(work: &mut Work, points: &[Vec2], map: &Mapping) -> Option<URect
                     p
                 };
                 let mut keep = 1.;
-                for (point, face) in &samples {
+                for (stamp, face) in &samples {
                     let fall = if brush.fill {
                         if *face == Some(triangle.face) { 1. } else { 0. }
                     } else {
-                        data::coverage(projected.distance(*point) / brush.radius, brush.hardness)
+                        data::coverage(
+                            projected.distance(stamp.point)
+                                / (brush.radius * stamp.radius).max(0.5),
+                            brush.hardness,
+                        )
                     };
-                    keep *= 1. - if brush.fill { fall } else { fall * brush.flow };
+                    keep *= 1.
+                        - if brush.fill {
+                            fall
+                        } else {
+                            fall * brush.flow * stamp.flow
+                        };
                 }
                 if keep >= 1. {
                     continue;
@@ -348,6 +503,7 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
                     }
                 }
             }
+            Event::Region(_, _) => unreachable!("Region fill uses the GPU stroke path"),
         }
     }
     let maps = dirty
@@ -388,57 +544,169 @@ fn take_events(queue: &mut VecDeque<Event>) -> Vec<Event> {
     events
 }
 fn compose(work: Work) -> Batch {
-    let rect = URect {
-        min: UVec2::ZERO,
-        max: UVec2::splat(work.surface.size),
-    };
-    let maps = Some(composite::prepare(&work.surface, [Some(rect); 8]));
+    let maps = compose_maps(&work.surface);
     Batch {
         work,
-        maps,
+        maps: Some(maps),
         history: Vec::new(),
     }
 }
 
-fn image_pixels(
-    images: &Assets<Image>,
-    handle: Option<&Handle<Image>>,
-    size: u32,
-    default: [u8; 4],
-) -> Vec<u8> {
-    handle
-        .and_then(|h| images.get(h))
-        .and_then(|i| i.clone().try_into_dynamic().ok())
-        .map(|i| {
-            image::imageops::resize(
-                &i.to_rgba8(),
-                size,
-                size,
-                image::imageops::FilterType::Triangle,
-            )
-            .into_raw()
-        })
-        .unwrap_or_else(|| default.repeat((size * size) as usize))
+fn compose_maps(surface: &Surface) -> Updates {
+    let rect = URect {
+        min: UVec2::ZERO,
+        max: UVec2::splat(surface.size),
+    };
+    let mut maps = composite::prepare(surface, [Some(rect); 8]);
+    let mask = surface.stack
+        .layers
+        .get(surface.stack.selected)
+        .and_then(|layer| layer.mask.as_ref());
+    maps.textures[composite::MASK_PREVIEW] = Some(composite::Patch {
+        rect,
+        rgba: mask.map_or_else(
+            || vec![255; (surface.size as usize).pow(2) * 4],
+            |mask| mask.effective().to_vec(),
+        ),
+    });
+    maps
 }
+
+pub(in crate::editor::ui::model_viewer) struct SurfacePreview(Updates);
+
+impl SurfacePreview {
+    pub fn prepare(surface: &Surface) -> Self {
+        Self(compose_maps(surface))
+    }
+
+    pub fn upload(
+        self,
+        slot: &mut crate::editor::model_document::MaterialSlot,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+        uploads: &mut crate::editor::image_texture::TextureUploads,
+    ) {
+        let mut gpu = None;
+        upload_textures(&mut gpu, self.0, &slot.material, images, materials, uploads);
+        slot.material = gpu.unwrap().material;
+    }
+}
+
 fn initial(
     doc: &Document,
     object: &Object,
     slot: usize,
     images: &Assets<Image>,
     materials: &Assets<StandardMaterial>,
-) -> Surface {
-    if let Some(surface) = object.materials.get(slot).and_then(|m| m.paint.as_ref()) {
-        return surface.as_ref().clone();
+) -> Task<Batch> {
+    let source = surface_source(doc, object, slot, images, materials, &mut HashMap::new());
+    let mesh = object.geometry.clone();
+    let uv_offset = object.uv_offset(slot);
+    let transform = object.transform;
+    AsyncComputeTaskPool::get().spawn(async move {
+        let mut surface = source.build();
+        surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
+        surface.bind_generators(&mesh, slot, uv_offset, transform);
+        compose(Work::new(surface))
+    })
+}
+
+pub(super) enum SurfaceSource {
+    Saved(Arc<Surface>),
+    Import(Box<SurfaceImport>),
+}
+
+pub(super) struct SurfaceImport {
+    size: u32,
+    mesh: crate::editor::model_document::MeshData,
+    slot: usize,
+    uv_offset: Vec2,
+    material: StandardMaterial,
+    definition: serde_json::Value,
+    textures: [Option<Arc<Image>>; 5],
+}
+
+impl SurfaceSource {
+    pub(super) fn build(self) -> Surface {
+        match self {
+            Self::Saved(surface) => (*surface).clone(),
+            Self::Import(source) => imported_surface(
+                &source.mesh,
+                source.slot,
+                source.uv_offset,
+                source.material,
+                source.definition,
+                source.textures.map(|image| image.map(Arc::unwrap_or_clone)),
+                source.size,
+            ),
+        }
     }
-    let m = object
-        .materials
-        .get(slot)
-        .and_then(|s| materials.get(&s.material))
+}
+
+pub(super) fn surface_source(
+    doc: &Document,
+    object: &Object,
+    slot: usize,
+    images: &Assets<Image>,
+    materials: &Assets<StandardMaterial>,
+    snapshots: &mut HashMap<bevy::asset::AssetId<Image>, Arc<Image>>,
+) -> SurfaceSource {
+    let slot_material = &object.materials[slot];
+    if let Some(surface) = slot_material.paint.clone() {
+        return SurfaceSource::Saved(surface);
+    }
+    let m = materials
+        .get(&slot_material.material)
         .cloned()
         .unwrap_or_default();
-    let size = 1024;
+    let material = slot_material
+        .authored
+        .as_deref()
+        .or_else(|| {
+            let index = slot_material.source["material"].as_u64()? as usize;
+            doc.source.json["materials"].get(index)
+        })
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"doubleSided":true}));
+    let textures = [
+        &m.base_color_texture,
+        &m.metallic_roughness_texture,
+        &m.emissive_texture,
+        &m.normal_map_texture,
+        &m.specular_texture,
+    ]
+    .map(|texture| {
+        let handle = texture.as_ref()?;
+        let image = images.get(handle)?;
+        Some(snapshots.entry(handle.id()).or_insert_with(|| Arc::new(image.clone())).clone())
+    });
+    SurfaceSource::Import(Box::new(SurfaceImport {
+        size: doc.paint_default_size,
+        mesh: object.geometry.clone(),
+        slot,
+        uv_offset: object.uv_offset(slot),
+        material: m,
+        definition: material,
+        textures,
+    }))
+}
+
+fn imported_surface(
+    mesh: &crate::editor::model_mesh::Geometry,
+    slot: usize,
+    uv_offset: Vec2,
+    m: StandardMaterial,
+    material: serde_json::Value,
+    [color, rm, emission, normal, specular_texture]: [Option<Image>; 5],
+    size: u32,
+) -> Surface {
+    let mut layout = import_uv::Layout::new(mesh, slot, size, uv_offset);
+    let pbr = &material["pbrMetallicRoughness"];
+    let mut pixels = |image, info, channel, default| {
+        layout.pixels(image, info, channel, m.uv_transform, default)
+    };
     let factor = m.base_color.to_srgba().to_f32_array();
-    let mut color = image_pixels(images, m.base_color_texture.as_ref(), size, [255; 4]);
+    let mut color = pixels(color, &pbr["baseColorTexture"], m.base_color_channel, [255; 4]);
     let mut opacity = vec![255; size as usize * size as usize * 4];
     for (p, a) in color.chunks_exact_mut(4).zip(opacity.chunks_exact_mut(4)) {
         for c in 0..4 {
@@ -449,10 +717,10 @@ fn initial(
         a[2] = p[3];
         p[3] = 255;
     }
-    let rm = image_pixels(
-        images,
-        m.metallic_roughness_texture.as_ref(),
-        size,
+    let rm = pixels(
+        rm,
+        &pbr["metallicRoughnessTexture"],
+        m.metallic_roughness_channel,
         [255; 4],
     );
     let mut rough = rm.clone();
@@ -471,7 +739,7 @@ fn initial(
         p[2] = v;
         p[3] = 255;
     }
-    let mut emission = image_pixels(images, m.emissive_texture.as_ref(), size, [255; 4]);
+    let mut emission = pixels(emission, &material["emissiveTexture"], m.emissive_channel, [255; 4]);
     let ef = m.emissive.to_f32_array();
     for p in emission.chunks_exact_mut(4) {
         for c in 0..3 {
@@ -479,27 +747,31 @@ fn initial(
         }
         p[3] = 255;
     }
-    let normal = image_pixels(
-        images,
-        m.normal_map_texture.as_ref(),
-        size,
+    let normal = pixels(
+        normal,
+        &material["normalTexture"],
+        m.normal_map_channel,
         [128, 128, 255, 255],
     );
-    let material = object
-        .materials
-        .get(slot)
-        .and_then(|slot| {
-            slot.authored.as_deref().or_else(|| {
-                let index = slot.source["material"].as_u64()? as usize;
-                doc.source.json["materials"].get(index)
-            })
-        })
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({"doubleSided":true}));
+    let specular = &material["extensions"]["KHR_materials_specular"];
+    let level = if specular.is_object() {
+        let factor = specular["specularFactor"].as_f64().unwrap_or(1.) as f32;
+        factor * data::dielectric_f0(&material) / data::SPECULAR_MAX_F0
+    } else {
+        0.16 * m.reflectance.powi(2) / data::SPECULAR_MAX_F0
+    };
+    let mut specular_map = pixels(
+        specular_texture, &specular["specularTexture"], m.specular_channel, [255; 4],
+    );
+    for pixel in specular_map.chunks_exact_mut(4) {
+        let value = (pixel[3] as f32 * level).clamp(0., 255.).round() as u8;
+        pixel.copy_from_slice(&[value, value, value, 255]);
+    }
     Surface {
         size,
         stack: Stack::default(),
         material,
+        baked: None,
         base: [
             Arc::new(color),
             Arc::new(rough),
@@ -508,50 +780,70 @@ fn initial(
             Arc::new(opacity),
             Arc::new(emission),
             Arc::new(normal),
-            data::solid(size, [(m.reflectance * 255.).round() as u8; 4]),
+            Arc::new(specular_map),
         ],
     }
 }
 fn upload(
     live: &mut Live,
-    mut updates: Updates,
+    updates: Updates,
     slot: &mut crate::editor::model_document::MaterialSlot,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     uploads: &mut crate::editor::image_texture::TextureUploads,
 ) {
-    let fresh = live.gpu.is_none();
+    upload_textures(&mut live.gpu, updates, &slot.material, images, materials, uploads);
+    slot.material = live.gpu.as_ref().unwrap().material.clone();
+}
+
+fn upload_textures(
+    output: &mut Option<Gpu>,
+    mut updates: Updates,
+    template: &Handle<StandardMaterial>,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
+    uploads: &mut crate::editor::image_texture::TextureUploads,
+) {
+    let fresh = output.is_none();
     if fresh {
-        let textures: [Handle<Image>; 9] = std::array::from_fn(|i| {
+        let textures: [Handle<Image>; composite::IMAGE_COUNT] = std::array::from_fn(|i| {
             let patch = updates.textures[i]
                 .take()
                 .expect("first paint upload initializes every texture");
-            images.add(Image::from_dynamic(
+            let mut image = Image::from_dynamic(
                 image::DynamicImage::ImageRgba8(
                     image::RgbaImage::from_raw(patch.rect.width(), patch.rect.height(), patch.rgba)
                         .unwrap(),
                 ),
-                i == 0 || i == 3,
+                i == 0 || i == 3 || i == composite::MASK_PREVIEW,
                 RenderAssetUsages::default(),
-            ))
+            );
+            if i < 2 || (cfg!(test) && i == composite::SPECULAR_MATERIAL) {
+                image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+            }
+            images.add(image)
         });
-        let material = materials.add(materials.get(&slot.material).cloned().unwrap_or_default());
+        let material = materials.add(materials.get(template).cloned().unwrap_or_default());
         let preview = std::array::from_fn(|c| textures[composite::PREVIEW[c]].clone());
-        live.gpu = Some(Gpu {
+        *output = Some(Gpu {
             material,
             images: textures,
             preview,
+            trace_revision: 0,
         });
     } else {
-        let gpu = live.gpu.as_ref().unwrap();
+        let gpu = output.as_mut().unwrap();
+        if updates.textures.iter().any(Option::is_some) {
+            gpu.trace_revision += 1;
+        }
         for (i, patch) in updates.textures.into_iter().enumerate() {
             if let Some(p) = patch {
                 uploads.patch(gpu.images[i].id(), p.rect.min, p.rect.size(), p.rgba);
             }
         }
     }
-    let gpu = live.gpu.as_ref().unwrap();
-    if fresh || updates.transparent.is_some() || updates.reflectance.is_some() {
+    let gpu = output.as_ref().unwrap();
+    if fresh || updates.transparent.is_some() {
         if let Some(mut m) = materials.get_mut(&gpu.material) {
             if fresh {
                 m.base_color = Color::WHITE;
@@ -563,6 +855,10 @@ fn upload(
                 m.flip_normal_map_y = false;
                 m.emissive = LinearRgba::WHITE;
                 m.emissive_texture = Some(gpu.images[3].clone());
+                m.reflectance = 2.;
+                m.specular_texture = Some(gpu.images[composite::SPECULAR_MATERIAL].clone());
+                m.specular_channel = bevy::mesh::UvChannel::Uv0;
+                m.uv_transform = bevy::math::Affine2::IDENTITY;
                 m.base_color_channel = bevy::mesh::UvChannel::Uv0;
                 m.normal_map_channel = bevy::mesh::UvChannel::Uv0;
                 m.metallic_roughness_channel = bevy::mesh::UvChannel::Uv0;
@@ -575,12 +871,8 @@ fn upload(
                     AlphaMode::Opaque
                 };
             }
-            if let Some(spec) = updates.reflectance {
-                m.reflectance = spec;
-            }
         }
     }
-    slot.material = gpu.material.clone();
 }
 
 pub(in crate::editor::ui::model_viewer) fn update(
@@ -592,12 +884,26 @@ pub(in crate::editor::ui::model_viewer) fn update(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut uploads: ResMut<crate::editor::image_texture::TextureUploads>,
     mut gpu_queue: ResMut<gpu::Queue>,
+    mut baked: ResMut<bake::State>,
     mut messages: ParamSet<(MessageReader<Action>, MessageWriter<Action>)>,
 ) {
     let replies = std::mem::take(&mut *gpu_queue.replies.lock().unwrap());
-    for gpu::Reply::Layer { id, stroke, pixels } in replies {
-        if let Some(live) = runtime.lives.values_mut().find(|l| l.controller.owns(id)) {
-            live.controller.reply(id, stroke, pixels);
+    for reply in replies {
+        match reply {
+            gpu::Reply::Layer { id, stroke, pixels } => {
+                if let Some(live) = runtime.lives.values_mut().find(|l| l.controller.owns(id)) {
+                    live.controller.reply(id, stroke, pixels);
+                } else {
+                    runtime.fix.reply(id, stroke, pixels.and_then(|mut channels| {
+                        if channels.len() == 1 {
+                            Ok(channels.pop().unwrap())
+                        } else {
+                            Err("Некорректное число каналов исправления".into())
+                        }
+                    }));
+                }
+            }
+            gpu::Reply::Pick { id, sample } => runtime.picker.reply(id, sample),
         }
     }
     for action in messages.p0().read() {
@@ -630,7 +936,9 @@ pub(in crate::editor::ui::model_viewer) fn update(
             .get(&index)
             .filter(|d| d.mode == Mode::Paint)
         {
-            let session = paint.sessions.entry(index).or_default();
+            paint.activate(index);
+            let session = paint.sessions.get_mut(&index).unwrap();
+            session.set_appearance.count(doc);
             let target = doc
                 .objects
                 .iter()
@@ -639,6 +947,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
             if let Some((object, slot)) = target {
                 let key = (index, object.id, slot);
                 if session.binding != Some((object.id, slot)) {
+                    session.editing_mask = false;
+                    session.show_mask = false;
                     if let Some(old) = session.binding {
                         session.histories.insert(
                             old,
@@ -659,24 +969,31 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         .paint
                         .as_ref()
                         .map_or_else(Stack::default, |s| s.stack.clone());
+                    // Keep the saved graph result when opening a set. A new bake
+                    // or a subsequent mesh change will refresh the generated maps.
+                    if !runtime.lives.contains_key(&key)
+                        && let Some(source) = super::material_graph::surface::Source::capture(
+                            doc, (object.id, slot),
+                        )
+                    {
+                        session.graph_surfaces.insert((object.id, slot), Arc::new(source));
+                    }
+                    session.texture_size = doc.paint_size(&object.materials[slot]);
                     session.revision += 1;
                 }
-                runtime.lives.entry(key).or_insert_with(|| {
-                    let surface = initial(doc, object, slot, &images, &materials);
-                    session.stack = surface.stack.clone();
-                    session.texture_size = surface.size;
-                    Live {
-                        work: Some(Work::new(surface.clone())),
-                        task: None,
-                        queue: VecDeque::new(),
-                        gpu: None,
-                        published: object.materials[slot].paint.clone(),
-                        origin: object.materials[slot].clone(),
-                        ui_stack: surface.stack.clone(),
-                        preview_needed: true,
-                        controller: Default::default(),
-                    }
-                });
+                runtime.lives.entry(key).or_insert_with(|| Live::new(doc, object, slot, &images, &materials));
+            }
+            if session.diagnostic_channel().is_some()
+                && !runtime.lives.iter().any(|((model, _, _), live)| *model == index && live.task.is_some())
+                && let Some((object, slot)) = doc.objects.iter()
+                    .flat_map(|object| (0..object.materials.len()).map(move |slot| (object, slot)))
+                    .find(|(object, slot)| {
+                        !object.hidden && session.set_appearance.visibility.shown(object.id, *slot)
+                            && !runtime.lives.contains_key(&(index, object.id, *slot))
+                            && has_uv(object, *slot)
+                    })
+            {
+                runtime.lives.insert((index, object.id, slot), Live::new(doc, object, slot, &images, &materials));
             }
         }
     }
@@ -691,16 +1008,22 @@ pub(in crate::editor::ui::model_viewer) fn update(
         if let Some(error) = live.controller.take_error() {
             editor.status = format!("Не удалось завершить GPU-мазок · {error}");
         }
-        let current = doc
-            .objects
-            .iter()
-            .find(|o| o.id == object)
-            .and_then(|o| o.materials.get(slot));
-        let Some(current) = current else {
+        let Some(source) = doc.objects.iter().find(|o| o.id == object) else {
+            continue;
+        };
+        let Some(current) = source.materials.get(slot) else {
             continue;
         };
         let same = match (&current.paint, &live.published) {
-            (None, None) => true,
+            (None, None) if !bound || doc.mode != Mode::Paint => true,
+            (None, None) => {
+                let own_gpu = live.gpu.as_ref().is_some_and(|gpu| current.material == gpu.material);
+                (own_gpu || current.material == live.origin.material)
+                    && current.authored == live.origin.authored
+                    && current.source["material"] == live.origin.source["material"]
+                    && current.udim() == live.origin.udim()
+                    && source.geometry.shares_storage_with(&live.source_mesh)
+            }
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         };
@@ -712,21 +1035,26 @@ pub(in crate::editor::ui::model_viewer) fn update(
             live.queue.clear();
             live.published = current.paint.clone();
             live.origin = current.clone();
-            live.preview_needed = true;
+            live.source_mesh = source.geometry.clone();
+            live.resizing = false;
             live.gpu = None;
-            let object = doc.objects.iter().find(|o| o.id == object).unwrap();
-            let surface = initial(doc, object, slot, &images, &materials);
+            let surface = current.paint.as_deref();
+            let stack = surface.map_or_else(Stack::default, |surface| surface.stack.clone());
             if bound {
-                session.stack = surface.stack.clone();
+                session.stack = stack.clone();
+                session.texture_size = doc.paint_size(current);
+                session.resize_request = None;
                 session.undo.clear();
                 session.redo.clear();
                 session.revision += 1;
             }
-            live.ui_stack = surface.stack.clone();
-            live.work = Some(Work::new(surface));
+            live.ui_stack = stack;
+            live.work = None;
+            live.task = Some(initial(doc, source, slot, &images, &materials));
         }
         if let Some(result) = live.task.as_mut().and_then(|job| block_on(poll_once(job))) {
             live.task = None;
+            live.resizing = false;
             let finished = true;
             let history_changed = !result.history.is_empty();
             if bound {
@@ -739,6 +1067,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
                 if finished {
                     session.stack = result.work.surface.stack.clone();
+                    session.texture_size = result.work.surface.size;
                     live.ui_stack = session.stack.clone();
                 }
                 if finished || history_changed {
@@ -769,12 +1098,19 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         .as_ref()
                         .map_or_else(Stack::default, |s| s.stack.clone());
                     origin_stack.selected = result.work.surface.stack.selected;
-                    if !data::same_stack(&result.work.surface.stack, &origin_stack) {
+                    let origin_size = live.origin.paint.as_ref().map_or(doc.paint_default_size, |s| s.size);
+                    if result.work.surface.size != origin_size
+                        || !data::same_stack(&result.work.surface.stack, &origin_stack)
+                        || result.work.surface.has_texture_fills()
+                        || (result.work.surface.needs_bake()
+                            && !result.work.surface.same_bake(live.origin.paint.as_deref()))
+                    {
                         let surface = Arc::new(result.work.surface.clone());
                         material.paint = Some(surface.clone());
                         live.published = Some(surface);
                     } else if !live.controller.busy() && live.queue.is_empty() {
-                        *material = live.origin.clone();
+                        material.material = live.origin.material.clone();
+                        material.paint = live.origin.paint.clone();
                         live.published = material.paint.clone();
                     }
                     doc.ui_revision += 1;
@@ -787,7 +1123,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         }
         if live.task.is_none() {
             if let Some(work) = live.work.take() {
-                match live.controller.archive(work) {
+                match live.controller.archive(work, &mut gpu_queue) {
                     Ok(work) => live.work = Some(work),
                     Err(job) => live.task = Some(job),
                 }
@@ -795,6 +1131,27 @@ pub(in crate::editor::ui::model_viewer) fn update(
         }
         if live.task.is_none() {
             if bound && live.queue.is_empty() && !live.controller.busy() {
+                if let Some(size) = session.resize_request.take() {
+                    let mut work = live.work.take().unwrap();
+                    let source = doc.objects.iter().find(|o| o.id == object).unwrap();
+                    let mesh = source.geometry.clone();
+                    let uv_offset = source.uv_offset(slot);
+                    let transform = source.transform;
+                    live.controller.invalidate(&mut gpu_queue);
+                    live.gpu = None;
+                    live.resizing = true;
+                    session.undo.clear();
+                    session.redo.clear();
+                    session.queued.clear();
+                    session.busy = true;
+                    live.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+                        work.surface.resize(size);
+                        work.surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
+                        work.surface.bind_generators(&mesh, slot, uv_offset, transform);
+                        compose(work)
+                    }));
+                    continue;
+                }
                 session.busy = false;
                 while let Some(action) = session.queued.pop_front() {
                     session.edit(action);
@@ -802,18 +1159,54 @@ pub(in crate::editor::ui::model_viewer) fn update(
             }
             let work = live.work.as_mut().unwrap();
             let stack_changed = bound && !data::same_stack(&session.stack, &live.ui_stack);
+            let composite_changed = stack_changed
+                && (session.stack.selected != live.ui_stack.selected
+                    || !data::same_composite(&session.stack, &live.ui_stack));
             if stack_changed {
                 work.surface.stack = session.stack.clone();
                 live.ui_stack = session.stack.clone();
             }
-            if stack_changed || live.preview_needed {
-                if stack_changed {
+            let source = doc
+                .objects
+                .iter()
+                .find(|candidate| candidate.id == object);
+            let bake_changed = work.surface.needs_bake()
+                .then(|| baked.maps(index, doc, (object, slot), work.surface.size))
+                .flatten()
+                .filter(|maps| !maps.has_generator_inputs(work.surface.baked.as_ref()))
+                .cloned();
+            let generators_changed = source.is_some_and(|object| {
+                work.surface.bind_generators(&object.geometry, slot, object.uv_offset(slot), object.transform)
+            });
+            let textures_changed = source.is_some_and(|object| {
+                work.surface.texture_fills_need_binding(&object.geometry, slot, object.uv_offset(slot), object.transform)
+            });
+            let recompose = composite_changed || generators_changed || textures_changed || bake_changed.is_some();
+            if stack_changed || recompose {
+                if stack_changed || bake_changed.is_some() {
                     doc.paint_pending = true;
                 }
-                let work = live.work.take().unwrap();
-                live.controller.invalidate(&mut gpu_queue);
-                live.preview_needed = false;
-                live.task = Some(AsyncComputeTaskPool::get().spawn(async move { compose(work) }));
+                let mut work = live.work.take().unwrap();
+                let geometry = if recompose {
+                    live.controller.invalidate(&mut gpu_queue);
+                    source.map(|object| (object.geometry.clone(), object.uv_offset(slot), object.transform))
+                } else {
+                    None
+                };
+                live.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+                    if let Some((mesh, uv_offset, transform)) = geometry {
+                        if let Some(maps) = bake_changed {
+                            work.surface.baked = Some(maps.generator_inputs().clone());
+                            work.surface.bind_generators(&mesh, slot, uv_offset, transform);
+                        }
+                        work.surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
+                    }
+                    if recompose {
+                        compose(work)
+                    } else {
+                        Batch { work, maps: None, history: Vec::new() }
+                    }
+                }));
             }
         }
         if let Some(gpu) = live.gpu.as_ref() {
@@ -835,7 +1228,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         doc.revision += 1;
                     }
                 }
-                if session.channel == 4
+                if live.controller.affects_opacity()
                     && materials
                         .get(&gpu.material)
                         .is_some_and(|m| m.alpha_mode != AlphaMode::Blend)
@@ -850,8 +1243,16 @@ pub(in crate::editor::ui::model_viewer) fn update(
             session.busy = live.task.is_some() || !live.queue.is_empty() || live.controller.busy();
         }
     }
+    runtime.fix.update(&mut state.documents, &mut baked, &mut images, &mut gpu_queue, &mut editor.status);
+    let runtime = &mut *runtime;
+    runtime.picker.update(&runtime.lives, &state.documents, &mut paint, &mut editor, &images, &materials, &mut gpu_queue);
     for (&index, doc) in &mut state.documents {
-        doc.paint_busy = runtime.lives.iter().any(|((i, _, _), l)| {
+        if runtime.fix.busy(index) && let Some(session) = paint.sessions.get_mut(&index) {
+            session.busy = true;
+        }
+        doc.paint_busy = paint.sessions.get(&index).is_some_and(|s| s.resize_request.is_some())
+            || runtime.fix.busy(index)
+            || runtime.lives.iter().any(|((i, _, _), l)| {
             *i == index && (l.task.is_some() || !l.queue.is_empty() || l.controller.busy())
         });
         doc.paint_pending &= doc.paint_busy;
@@ -875,7 +1276,132 @@ pub(in crate::editor::ui::model_viewer) fn update(
     }
 }
 
-fn node_rect(node: &ComputedNode, transform: &UiGlobalTransform) -> Option<Rect> {
+fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool, erase: bool) -> Brush {
+    let masking = session.editing_mask && session.has_mask();
+    let channel = session.stroke_channels().trailing_zeros() as usize;
+    let percent_byte = |value: f32| (value * 2.55).round() as u8;
+    let material = (!masking && session.multi_channel_brush).then(|| BrushMaterial {
+        channels: session.brush_channels,
+        colors: [
+            session.brush_color(),
+            [percent_byte(session.roughness); 3],
+            [percent_byte(session.metallic); 3],
+            [percent_byte(session.brush_height); 3],
+            [percent_byte(session.brush_alpha); 3],
+            session.brush_emission.map(percent_byte),
+            [128, 128, 255],
+            [percent_byte(session.brush_specular); 3],
+        ],
+    });
+    let scalar = match session.channel {
+        1 => session.roughness,
+        2 => session.metallic,
+        _ => session.opacity,
+    };
+    let color = if matches!(session.channel, 1 | 2 | 3 | 4 | 7) {
+        [(scalar * 2.55).round() as u8; 3]
+    } else if session.channel == 6 {
+        [128, 128, 255]
+    } else {
+        session.brush_color()
+    };
+    let texture = session
+        .grain
+        .and_then(|i| tips.grains.get(i))
+        .filter(|_| session.grain_strength > 0. && session.tool != PaintTool::Fill);
+    let projection = if uv || session.tool == PaintTool::Fill {
+        BrushProjection::Screen
+    } else {
+        session.projection
+    };
+    let grain_uv = session.grain_uv || projection == BrushProjection::Uv;
+    let symmetry = !uv && session.symmetry != Symmetry::Off && session.tool != PaintTool::Fill;
+    let mut mirror = [0.; 4];
+    let mut extent = 1.;
+    if symmetry || texture.is_some() {
+        let (min, max) = object.geometry.positions.iter().fold(
+            (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+            |(min, max), &p| (min.min(p), max.max(p)),
+        );
+        extent = ((max - min) * object.transform.scale.abs())
+            .max_element()
+            .max(1e-6);
+        if symmetry {
+            let normal = object.transform.rotation * session.symmetry.normal();
+            let center = object.transform.transform_point((min + max) * 0.5);
+            mirror = normal.extend(normal.dot(center)).to_array();
+        }
+    }
+    Brush {
+        channel,
+        material,
+        color: if masking {
+            [if erase {
+                0
+            } else {
+                session.mask_value
+            }; 3]
+        } else {
+            material.map_or(color, |material| material.colors[channel])
+        },
+        radius: (session.size * 0.5).max(0.5),
+        hardness: session.hardness / 100.,
+        flow: session.flow / 100.,
+        opacity: if channel == 4 && material.is_none() {
+            1.
+        } else {
+            session.opacity / 100.
+        },
+        erase: erase
+            && (!masking
+                || session.stack.layers[session.stack.selected]
+                    .mask
+                    .as_ref()
+                    .is_some_and(|m| m.affine)),
+        fill: session.tool == PaintTool::Fill,
+        fill_mode: session.fill_mode,
+        fill_angle: session.fill_angle,
+        fill_padding: session.fill_padding,
+        variation: stroke::Variation {
+            scatter: session.brush_scatter / 100.,
+            size: session.brush_size_jitter / 100.,
+            angle: session.brush_angle_jitter / 100.,
+        },
+        tip: if session.tool == PaintTool::Fill {
+            None
+        } else {
+            session
+                .tip
+                .and_then(|i| tips.entries.get(i))
+                .map(|tip| BrushTip {
+                    image: tip.image.id(),
+                    angle: session.tip_angle.to_radians(),
+                    follow: session.follow_stroke,
+                })
+        },
+        grain: texture.map(|image| BrushGrain {
+            image: image.image.id(),
+            strength: session.grain_strength / 100.,
+            repeat: if grain_uv {
+                session.grain_scale
+            } else {
+                session.grain_scale / extent
+            },
+            angle: session.grain_angle.to_radians(),
+            invert: session.grain_invert,
+            uv: grain_uv,
+        }),
+        mirror,
+        projection,
+        paint_through: !uv
+            && session.tool != PaintTool::Fill
+            && projection == BrushProjection::Screen
+            && session.paint_through,
+        facing_limit: session.angle_limit.to_radians().cos(),
+    }
+}
+
+pub(super) fn node_rect(node: &ComputedNode, transform: &UiGlobalTransform) -> Option<Rect> {
     let size = node.size() * node.inverse_scale_factor();
     (size.min_element() > 2.).then(|| {
         Rect::from_center_size(
@@ -884,6 +1410,28 @@ fn node_rect(node: &ComputedNode, transform: &UiGlobalTransform) -> Option<Rect>
         )
     })
 }
+
+#[derive(SystemParam)]
+pub(in crate::editor::ui::model_viewer) struct UvCanvas<'w, 's> {
+    image: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<TextureCanvas>>,
+    viewport: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<TextureViewport>>,
+}
+
+impl UvCanvas<'_, '_> {
+    fn viewport_rect(&self) -> Option<Rect> {
+        let (node, transform) = self.viewport.single().ok()?;
+        node_rect(node, transform)
+    }
+
+    fn camera(&self, viewer: &Viewer) -> Option<CameraMap> {
+        let (node, transform) = self.image.single().ok()?;
+        let rect = node_rect(node, transform)?;
+        let clip = rect.intersect(self.viewport_rect()?);
+        (clip.size().min_element() > 0.).then(|| CameraMap { clip, ..camera_map(viewer, rect) })
+    }
+}
+use super::super::super::image_viewer::paint_input::{PointerFrame, Sample};
+
 pub(in crate::editor::ui::model_viewer) fn input(
     mut runtime: ResMut<Runtime>,
     mut paint: ResMut<PaintState>,
@@ -896,14 +1444,27 @@ pub(in crate::editor::ui::model_viewer) fn input(
     focus: Res<InputFocus>,
     inputs: Query<(), With<TextInput>>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
-    texture: Query<(&ComputedNode, &UiGlobalTransform), With<TextureCanvas>>,
+    texture: UvCanvas,
     controls: Query<(&ComputedNode, &UiGlobalTransform), With<Control>>,
     drawer: Res<DrawerMotion>,
+    pointer: Res<PointerFrame>,
+    baked: Res<bake::State>,
 ) {
     let active = editor
         .viewing_model
         .filter(|i| state.mode(Some(*i)) == Mode::Paint);
+    let session = active.and_then(|index| paint.sessions.get(&index));
+    let tool = session.map(|session| session.tool);
+    let fill_tool = tool == Some(PaintTool::Fill);
+    let path_tool = tool == Some(PaintTool::Path);
+    let fix_map = session.and_then(Session::active_bake_fix);
+    let uv_view = session.filter(|s| s.view != View::Three)
+        .and_then(|_| texture.camera(&viewer));
+    let control = keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]);
     let blocked = active.is_none()
+        || session.is_some_and(|session| session.cage_brush_active()
+            || session.custom_gizmo_active() || session.graph_canvas_open() || session.panel == Panel::Shader)
+        || editor.viewing_image.is_some()
         || editor.pending.is_some()
         || editor.browser_popup
         || editor.hdri_library_open
@@ -913,192 +1474,444 @@ pub(in crate::editor::ui::model_viewer) fn input(
         || keys.any_pressed([
             KeyCode::AltLeft,
             KeyCode::AltRight,
-            KeyCode::ControlLeft,
-            KeyCode::ControlRight,
             KeyCode::SuperLeft,
             KeyCode::SuperRight,
         ])
-        || mouse.pressed(MouseButton::Right)
         || mouse.pressed(MouseButton::Middle);
-    if blocked || !mouse.pressed(MouseButton::Left) {
-        if let Some((key, _, _)) = runtime.gesture.take() {
-            if let Some(live) = runtime.lives.get_mut(&key) {
-                live.queue.push_back(Event::End);
+    let brush_tool = matches!(tool, Some(PaintTool::Brush | PaintTool::Eraser));
+    let bake_read_only = session.is_some_and(Session::paint_blocked_by_bake);
+    let cursor = window.cursor_position();
+    let set_brush_value = |session: &mut Session, parameter: Parameter, value: f32| {
+        let (min, max) = parameter.bounds();
+        session.set_value(parameter, value.clamp(min as f32, max as f32));
+    };
+    if let Some(adjustment) = runtime.brush_adjustment.take() {
+        if !blocked && brush_tool && active == Some(adjustment.model) {
+            let session = paint.sessions.get_mut(&adjustment.model).unwrap();
+            if keys.just_pressed(KeyCode::Escape) {
+                set_brush_value(session, Parameter::Size, adjustment.size);
+                set_brush_value(session, Parameter::Hardness, adjustment.hardness);
+            } else if control && mouse.pressed(MouseButton::Right) {
+                if let Some(point) = cursor {
+                    let delta = point - adjustment.origin;
+                    set_brush_value(session, Parameter::Size, adjustment.size + delta.x);
+                    set_brush_value(
+                        session,
+                        Parameter::Hardness,
+                        adjustment.hardness - delta.y * 0.5,
+                    );
+                }
+                runtime.brush_adjustment = Some(adjustment);
             }
         }
-        runtime.mapping = None;
         return;
     }
-    let Some(cursor) = window.cursor_position() else {
+    let start_adjustment = control && mouse.just_pressed(MouseButton::Right);
+    let grow = keys.just_pressed(KeyCode::BracketRight);
+    let shrink = keys.just_pressed(KeyCode::BracketLeft);
+    let resize_by_key = grow != shrink
+        && !control
+        && !mouse.pressed(MouseButton::Right)
+        && !keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    if (start_adjustment || resize_by_key)
+        && !blocked
+        && !bake_read_only
+        && brush_tool
+        && runtime.gesture.is_none()
+        && !runtime.fix.drawing()
+        && !mouse.pressed(MouseButton::Left)
+        && let Some(index) = active
+        && let Some(point) = cursor
+        && !drawer.covers(point, &window)
+    {
+        let session = paint.sessions.get_mut(&index).unwrap();
+        let contains = |(node, transform)| {
+            node_rect(node, transform).is_some_and(|rect| rect.contains(point))
+        };
+        let over_uv = uv_view.is_some_and(|camera| camera.clip.contains(point));
+        let over_model = session.view != View::Two
+            && (!session.showing_bake() || session.showing_map_on_model())
+            && canvas.single().ok().is_some_and(contains);
+        if (over_uv || over_model) && !controls.iter().any(contains) {
+            if start_adjustment {
+                runtime.brush_adjustment = Some(BrushAdjustment {
+                    model: index,
+                    origin: point,
+                    size: session.size,
+                    hardness: session.hardness,
+                });
+                return;
+            }
+            let factor = if grow { 1.15 } else { 1. / 1.15 };
+            set_brush_value(session, Parameter::Size, session.size * factor);
+        }
+    }
+    let blocked = blocked || runtime.uv_panning
+        || (control && !fill_tool)
+        || (!path_tool && mouse.pressed(MouseButton::Right));
+    if bake_read_only && !blocked && let Some(index) = active {
+        let session = paint.sessions.get_mut(&index).unwrap();
+        session.path_command = None;
+        let model = (session.view != View::Two).then(|| canvas.single().ok()
+            .and_then(|(node, transform)| node_rect(node, transform))).flatten();
+        if pointer.samples.iter().any(|sample| matches!(sample, Sample::Down(point)
+            if (model.is_some_and(|rect| rect.contains(*point))
+                || uv_view.is_some_and(|camera| camera.clip.contains(*point)))
+                && !drawer.covers(*point, &window)
+                && !controls.iter().any(|(node, transform)| node_rect(node, transform)
+                    .is_some_and(|rect| rect.contains(*point)))))
+        {
+            editor.status = "Запечённая карта открыта для просмотра. Для рисования вернитесь к материалу или включите кисть исправлений.".into();
+        }
+    }
+    if runtime.fix.drawing() && keys.just_pressed(KeyCode::Escape) {
+        runtime.fix.request_cancel();
         return;
-    };
+    }
+    if blocked || bake_read_only
+        || (keys.just_pressed(KeyCode::Escape)
+            && runtime.gesture.as_ref().is_some_and(|g| g.fill_drag.is_some()))
+    {
+        runtime.end_stroke();
+        runtime.fix.finish();
+        if let Some(index) = active
+            && let Some((object, slot)) = paint.sessions.get(&index).and_then(|s| s.binding)
+            && let Some(live) = runtime.lives.get_mut(&(index, object, slot))
+        {
+            live.path.cancel_pointer();
+        }
+        if active.is_none() {
+            runtime.line_anchor = None;
+        }
+        return;
+    }
     let index = active.unwrap();
     let Some(doc) = state.documents.get(&index) else {
         return;
     };
+    let paint = &mut *paint;
     let Some(session) = paint.sessions.get_mut(&index) else {
         return;
     };
     let Some((object, slot)) = session.binding else {
+        runtime.end_stroke();
         return;
     };
     let Some(object) = doc.objects.iter().find(|o| o.id == object) else {
         return;
     };
-    let over_control = controls
-        .iter()
-        .any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(cursor)));
-    if over_control || drawer.covers(cursor, &window) {
-        return;
-    }
-    let uv_rect = texture.single().ok().and_then(|(n, t)| node_rect(n, t));
     let model_rect = canvas.single().ok().and_then(|(n, t)| node_rect(n, t));
-    let (uv, rect) = if let Some(r) =
-        uv_rect.filter(|r| r.contains(cursor) && session.view != View::Three)
-    {
-        (true, r)
-    } else if let Some(r) = model_rect.filter(|r| r.contains(cursor) && session.view != View::Two) {
-        (false, r)
-    } else {
-        return;
-    };
     let key = (index, object.id, slot);
-    if !has_uv(object, slot) {
-        if mouse.just_pressed(MouseButton::Left) {
-            editor.status =
-                "Для рисования нужна UV-развёртка. Откройте режим UV и создайте развёртку.".into();
+    runtime.fix.finish_unless(key, fix_map);
+    let visibility = session.set_appearance.visibility.clone();
+    if !visibility.shown(object.id, slot) && tool != Some(PaintTool::Picker) {
+        runtime.end_stroke();
+        runtime.fix.finish();
+        if pointer.samples.iter().any(|sample| matches!(sample, Sample::Down(_))) {
+            editor.status = "Покажите набор текстур, чтобы рисовать по нему.".into();
         }
         return;
     }
-    if mouse.just_pressed(MouseButton::Left) {
-        let Some(live) = runtime.lives.get_mut(&key) else {
-            return;
+    if session.resize_request.is_some() || runtime.lives.get(&key).is_some_and(|live| live.resizing) {
+        runtime.end_stroke();
+        runtime.fix.finish();
+        return;
+    }
+    if let Some(map) = fix_map {
+        runtime.end_stroke();
+        let mut pressure = 1.;
+        let mut started = false;
+        for &sample in &pointer.samples {
+            let point = match sample {
+                Sample::Pressure(value) => {
+                    pressure = value;
+                    continue;
+                }
+                Sample::Move(point) | Sample::Up(point) => {
+                    runtime.fix.move_to(point, pressure);
+                    if matches!(sample, Sample::Up(_)) {
+                        runtime.fix.finish();
+                        pressure = 1.;
+                    }
+                    continue;
+                }
+                Sample::Down(point) => point,
+            };
+            if drawer.covers(point, &window)
+                || controls.iter().any(|(node, transform)| {
+                    node_rect(node, transform).is_some_and(|rect| rect.contains(point))
+                })
+            {
+                continue;
+            }
+            let target = uv_view.filter(|camera| camera.clip.contains(point))
+                .map(|camera| (true, camera))
+                .or_else(|| model_rect.filter(|rect| session.showing_map_on_model() && rect.contains(point))
+                    .map(|rect| (false, camera_map(&viewer, rect))));
+            let Some((uv, camera)) = target else { continue };
+            let Some(source) = baked.maps(index, doc, (object.id, slot), session.texture_size)
+                .filter(|maps| maps.has_map(map)) else { continue };
+            if !has_uv(object, slot) {
+                continue;
+            }
+            let erase = session.tool == PaintTool::Eraser;
+            let mut brush = brush_for(session, &paint.tips, object, uv, erase);
+            brush.channel = 1;
+            brush.material = None;
+            brush.color = [(session.bake_fix_value as f32 * 2.55).round() as u8; 3];
+            brush.opacity = session.opacity / 100.;
+            brush.erase = erase;
+            brush.fill = false;
+            brush.grain = None;
+            let path = stroke::Path::new(
+                point, pressure, session.size * session.spacing / 100.,
+                session.stabilizer, session.pressure_size, session.pressure_flow,
+            );
+            started |= runtime.fix.begin(
+                key, map, source.clone(), Arc::new(Mapping::for_camera(doc, object, slot, camera, uv, &visibility)),
+                object.materials[slot].bake_fixes.clone(), brush, path,
+            );
+        }
+        if started && let Some(doc) = state.documents.get_mut(&index) {
+            doc.paint_busy = true;
+            doc.paint_pending = true;
+        }
+        return;
+    }
+    if path_tool {
+        runtime.end_stroke();
+        let Some(live) = runtime.lives.get_mut(&key) else { return };
+        let views = path_editor::Views {
+            model: model_rect.filter(|_| session.view != View::Two).map(|r| camera_map(&viewer, r)),
+            uv: uv_view,
+        };
+        let input = path_editor::Input {
+            doc,
+            object,
+            visibility: &visibility,
+            slot,
+            views,
+            samples: &pointer.samples,
+            cursor: pointer.pen_cursor().or_else(|| window.cursor_position()),
+            keys: &keys,
+            mouse: &mouse,
+            can_start: &|point| {
+                !drawer.covers(point, &window)
+                    && !controls.iter().any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(point)))
+            },
+        };
+        match path_editor::edit(live, session, &paint.tips, input) {
+            path_editor::Outcome::Idle => {}
+            path_editor::Outcome::Applied => {
+                let doc = state.documents.get_mut(&index).unwrap();
+                doc.paint_busy = true;
+                doc.paint_pending = true;
+            }
+            path_editor::Outcome::Status(text) => editor.status = text.into(),
+        }
+        return;
+    }
+    session.path_command = None;
+    if let Some(live) = runtime.lives.get_mut(&key) {
+        live.path.cancel_pointer();
+    }
+    if runtime
+        .gesture
+        .as_ref()
+        .is_some_and(|gesture| {
+            gesture.key != key || gesture.fill_drag.as_ref().is_some_and(|drag| {
+                gesture.mapping.revision != doc.revision
+                    || session.tool != PaintTool::Fill
+                    || session.stack.selected != drag.layer
+                    || session.stroke_channels() != drag.brush.channels()
+                    || !session.can_paint_layer()
+            })
+        })
+    {
+        runtime.end_stroke();
+    }
+    let mut pressure = 1.;
+    let mut enqueued = false;
+    for &sample in &pointer.samples {
+        let cursor = match sample {
+            Sample::Pressure(value) => {
+                pressure = value;
+                continue;
+            }
+            Sample::Move(point) | Sample::Up(point) => {
+                if let Some(gesture) = runtime.gesture.as_mut()
+                    && let Some(drag) = &mut gesture.fill_drag
+                {
+                    drag.advance(point, gesture.mapping.camera.clip);
+                    if matches!(sample, Sample::Up(_)) {
+                        enqueued |= runtime.finish_fill_selection();
+                        pressure = 1.;
+                    }
+                    continue;
+                }
+                if let Some(gesture) = runtime.gesture.as_mut()
+                    && gesture.mapping.camera.clip.contains(point)
+                {
+                    let points = gesture.path.advance(point, pressure);
+                    if !points.is_empty() {
+                        let map = gesture.mapping.clone();
+                        if let Some(live) = runtime.lives.get_mut(&key) {
+                            live.enqueue_stamps(points, map);
+                            enqueued = true;
+                        }
+                    }
+                }
+                if matches!(sample, Sample::Up(_)) {
+                    runtime.end_stroke();
+                    pressure = 1.;
+                }
+                continue;
+            }
+            Sample::Down(point) => {
+                runtime.end_stroke();
+                point
+            }
+        };
+        let over_control = controls
+            .iter()
+            .any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(cursor)));
+        if over_control || drawer.covers(cursor, &window) {
+            continue;
+        }
+        let (uv, camera) = if let Some(camera) =
+            uv_view.filter(|camera| camera.clip.contains(cursor))
+        {
+            (true, camera)
+        } else if let Some(r) =
+            model_rect.filter(|r| r.contains(cursor) && session.view != View::Two)
+        {
+            (false, camera_map(&viewer, r))
+        } else {
+            continue;
         };
         if session.tool == PaintTool::Picker {
-            let map = mapping(doc, object, slot, &viewer, rect, uv);
-            let at = if uv {
-                Some((cursor - rect.min) / rect.size())
-            } else {
-                let (o, d) = map.camera.ray(cursor);
-                map.geometry()
-                    .bvh
-                    .cast(o, d, None)
-                    .filter(|(id, _, _)| *id == object.id)
-                    .and_then(|(_, face, distance)| {
-                        map.geometry()
-                            .triangles
-                            .iter()
-                            .filter(|t| t.face == face)
-                            .find_map(|t| {
-                                let p = o + d * distance;
-                                let a = t.points[1] - t.points[0];
-                                let b = t.points[2] - t.points[0];
-                                let v = p - t.points[0];
-                                let denom = a.dot(a) * b.dot(b) - a.dot(b).powi(2);
-                                if denom.abs() < 1.0e-12 {
-                                    return None;
-                                }
-                                let u = (b.dot(b) * v.dot(a) - a.dot(b) * v.dot(b)) / denom;
-                                let w = (a.dot(a) * v.dot(b) - a.dot(b) * v.dot(a)) / denom;
-                                (u >= -0.001 && w >= -0.001 && u + w <= 1.001)
-                                    .then(|| t.uv[0] * (1. - u - w) + t.uv[1] * u + t.uv[2] * w)
-                            })
-                    })
-            };
-            if let (Some(at), Some(work)) = (at, live.work.as_ref()) {
-                let p = (at.clamp(Vec2::ZERO, Vec2::splat(0.999999)) * work.surface.size as f32)
-                    .as_uvec2();
-                let pixels = work.surface.composite_rect(
-                    0,
-                    URect {
-                        min: p,
-                        max: p + UVec2::ONE,
-                    },
-                );
-                session.picked = Some(pixels[..3].try_into().unwrap());
-                session.tool = PaintTool::Brush;
-                session.revision += 1;
-            }
-            return;
+            runtime.picker.begin(index, doc, session, &viewer, (uv, camera.rect), cursor);
+            continue;
         }
-        if session.tool == PaintTool::Path {
-            editor.status = "Контур пока недоступен; выберите кисть, ластик или заливку.".into();
-            return;
+        if !has_uv(object, slot) {
+            editor.status =
+                "Для рисования нужна UV-развёртка. Откройте режим UV и создайте развёртку.".into();
+            continue;
         }
-        if !session
-            .stack
-            .layers
-            .get(session.stack.selected)
-            .is_some_and(|l| l.visible && l.kind == LayerKind::Paint)
-        {
+        if !runtime.lives.contains_key(&key) {
+            continue;
+        }
+        if !session.can_paint_layer() {
             editor.status = "Выберите видимый слой краски или добавьте новый слой.".into();
-            return;
+            continue;
         }
-        let scalar = match session.channel {
-            1 => session.roughness,
-            2 => session.metallic,
-            _ => session.opacity,
-        };
-        let color = if matches!(session.channel, 1 | 2 | 3 | 4 | 7) {
-            [(scalar * 2.55).round() as u8; 3]
-        } else if session.channel == 6 {
-            [128, 128, 255]
-        } else {
-            session.brush_color()
-        };
-        let brush = Brush {
-            channel: session.channel,
-            color,
-            radius: (session.size * 0.5).max(0.5),
-            hardness: session.hardness / 100.,
-            flow: session.flow / 100.,
-            opacity: if session.channel == 4 {
-                1.
-            } else {
-                session.opacity / 100.
-            },
-            erase: session.tool == PaintTool::Eraser,
-            fill: session.tool == PaintTool::Fill,
-        };
-        live.queue.push_back(Event::Begin(brush));
-        runtime.gesture = Some((key, uv, cursor));
-        let cache_key = (key, doc.revision, view_pose(&viewer), rect, uv);
+        let erase = session.tool == PaintTool::Eraser || (fill_tool && (session.fill_erase != control));
+        let brush = brush_for(session, &paint.tips, object, uv, erase);
+        let cache_key = (key, (doc.revision, visibility.revision), camera, uv);
         let map = runtime
             .map_cache
             .as_ref()
             .filter(|(key, _)| *key == cache_key)
             .map(|(_, m)| m.clone())
-            .unwrap_or_else(|| Arc::new(mapping(doc, object, slot, &viewer, rect, uv)));
+            .unwrap_or_else(|| Arc::new(Mapping::for_camera(doc, object, slot, camera, uv, &visibility)));
         runtime.map_cache = Some((cache_key, map.clone()));
-        runtime.mapping = Some(map);
+        let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        let anchor = runtime.line_anchor.as_ref()
+            .filter(|anchor| shift && !brush.fill && anchor.matches(key, &map))
+            .map(|anchor| anchor.point);
+        let mut path = stroke::Path::new(
+            anchor.unwrap_or(cursor),
+            pressure,
+            session.size * session.spacing / 100.,
+            session.stabilizer,
+            !brush.fill && session.pressure_size,
+            !brush.fill && session.pressure_flow,
+        );
+        let fill_drag = (brush.fill && shift)
+            .then(|| fill_drag::Drag::new(
+                brush, session.stack.selected, cursor, session.fill_lasso, session.fill_through, erase,
+            ));
+        if fill_drag.is_none()
+            && let Some(live) = runtime.lives.get_mut(&key)
+        {
+            live.queue.push_back(Event::Begin(brush));
+            let mut points = vec![path.first()];
+            if anchor.is_some() {
+                points.extend(path.line_to(cursor, pressure));
+            }
+            live.enqueue_stamps(points, map.clone());
+            enqueued = true;
+        }
+        runtime.gesture = Some(Gesture {
+            key,
+            mapping: map,
+            path,
+            fill_drag,
+            records_anchor: !brush.fill,
+        });
     }
-    let Some((gesture, was_uv, previous)) = runtime.gesture else {
-        return;
-    };
-    if gesture != key || was_uv != uv {
-        return;
-    }
-    let step = (session.size * session.spacing / 100.).max(1.);
-    if !mouse.just_pressed(MouseButton::Left) && previous.distance(cursor) < step {
-        return;
-    }
-    let count = (previous.distance(cursor) / step).ceil().max(1.) as usize;
-    let points = (1..=count.min(512))
-        .map(|i| previous.lerp(cursor, i as f32 / count.min(512) as f32))
-        .collect();
-    let Some(map) = runtime.mapping.clone() else {
-        return;
-    };
-    if let Some(live) = runtime.lives.get_mut(&key) {
-        live.queue.push_back(Event::Points(points, map));
-    }
-    runtime.gesture = Some((key, uv, cursor));
-    if let Some(doc) = state.documents.get_mut(&index) {
+    if enqueued && let Some(doc) = state.documents.get_mut(&index) {
         doc.paint_busy = true;
         doc.paint_pending = true;
     }
 }
 impl Runtime {
+    pub(in crate::editor::ui::model_viewer) fn stroke_active(&self) -> bool {
+        self.gesture.is_some() || self.fix.drawing()
+    }
+
+    pub(super) fn trace_maps(
+        &self,
+        model: usize,
+        object: usize,
+        slot: usize,
+    ) -> Option<([bevy::asset::AssetId<Image>; 5], u64)> {
+        let gpu = self.lives.get(&(model, object, slot))?.gpu.as_ref()?;
+        Some((
+            [0, 1, 2, 3, composite::PREVIEW[7]].map(|index| gpu.images[index].id()),
+            gpu.trace_revision,
+        ))
+    }
+
+    pub(in crate::editor::ui::model_viewer) fn working_material(
+        &self,
+        model: usize,
+        object: usize,
+        slot: usize,
+    ) -> Option<&Handle<StandardMaterial>> {
+        self.lives.get(&(model, object, slot))?.gpu.as_ref().map(|gpu| &gpu.material)
+    }
+
+    fn finish_fill_selection(&mut self) -> bool {
+        let Some(gesture) = self.gesture.take() else { return false };
+        let Some(drag) = gesture.fill_drag else { return false };
+        let Some(live) = self.lives.get_mut(&gesture.key) else { return false };
+        live.queue.push_back(Event::Begin(drag.brush));
+        if let Some(region) = drag.region() {
+            live.queue.push_back(Event::Region(region, gesture.mapping));
+        } else {
+            live.enqueue_stamps(vec![Stamp::from(drag.start)], gesture.mapping);
+        }
+        live.queue.push_back(Event::End);
+        true
+    }
+
+    fn end_stroke(&mut self) {
+        if let Some(gesture) = self.gesture.take()
+            && gesture.fill_drag.is_none()
+            && let Some(live) = self.lives.get_mut(&gesture.key)
+        {
+            live.queue.push_back(Event::End);
+            if gesture.records_anchor {
+                self.line_anchor = Some(LineAnchor {
+                    key: gesture.key,
+                    uv: gesture.mapping.uv,
+                    camera: gesture.mapping.camera,
+                    point: gesture.path.end(),
+                });
+            }
+        }
+    }
     #[cfg(test)]
     pub(super) fn worker_idle(&self, index: usize) -> bool {
         self.lives
@@ -1114,7 +1927,7 @@ impl Runtime {
             .flat_map(|(_, l)| l.gpu.iter().flat_map(|g| g.images.iter().map(Handle::id)))
             .collect()
     }
-    pub(super) fn preview(
+    pub(in crate::editor::ui::model_viewer) fn preview(
         &self,
         index: usize,
         object: usize,
@@ -1125,7 +1938,13 @@ impl Runtime {
             .get(&(index, object, slot))?
             .gpu
             .as_ref()
-            .map(|gpu| gpu.preview[channel].clone())
+            .map(|gpu| {
+                if channel == data::MASK_TARGET {
+                    gpu.images[composite::MASK_PREVIEW].clone()
+                } else {
+                    gpu.preview[channel].clone()
+                }
+            })
     }
 }
 pub(in crate::editor::ui::model_viewer) fn cursor(
@@ -1138,9 +1957,12 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
     mouse: Res<ButtonInput<MouseButton>>,
     drawer: Res<DrawerMotion>,
     geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
-    canvases: Query<Entity, Or<(With<Canvas>, With<TextureCanvas>)>>,
+    canvases: Query<(Entity, Has<TextureCanvas>), Or<(With<Canvas>, With<TextureCanvas>)>>,
+    texture: UvCanvas,
     controls: Query<Entity, With<Control>>,
     mut cursor: Query<(&mut Node, &mut Visibility), With<BrushCursor>>,
+    pointer: Res<PointerFrame>,
+    runtime: Res<Runtime>,
 ) {
     let Ok((mut node, mut visible)) = cursor.single_mut() else {
         return;
@@ -1155,20 +1977,44 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
         let Some(session) = paint.sessions.get(&index) else {
             return None;
         };
-        let Some(point) = window.cursor_position() else {
+        if session.paint_blocked_by_bake()
+            || session.cage_brush_active() || session.custom_gizmo_active()
+            || session.graph_canvas_open() || session.panel == Panel::Shader {
+            return None;
+        }
+        if session.binding.is_none_or(|(object, slot)| !session.set_appearance.visibility.shown(object, slot)) {
+            return None;
+        }
+        let adjustment = runtime
+            .brush_adjustment
+            .as_ref()
+            .filter(|state| state.model == index);
+        let Some(point) = adjustment
+            .map(|state| state.origin)
+            .or_else(|| pointer.pen_cursor())
+            .or_else(|| window.cursor_position())
+        else {
             return None;
         };
         if !window.focused
             || editor.pending.is_some()
             || editor.browser_popup
             || drawer.covers(point, &window)
-            || mouse.pressed(MouseButton::Right)
+            || (adjustment.is_none() && mouse.pressed(MouseButton::Right))
             || mouse.pressed(MouseButton::Middle)
             || keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
         {
             return None;
         }
-        let over = canvases.iter().any(|e| {
+        let over = canvases.iter().any(|(e, uv)| {
+            let visible = if uv {
+                texture.viewport_rect().is_some_and(|r| r.contains(point))
+            } else {
+                session.view != View::Two
+            };
+            if !visible || (uv && session.view == View::Three) {
+                return false;
+            }
             geometry
                 .get(e)
                 .ok()
@@ -1192,12 +2038,16 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
         else {
             return None;
         };
+        let gesture = runtime
+            .gesture
+            .as_ref()
+            .filter(|g| g.mapping.camera.clip.contains(point));
         let size = if matches!(session.tool, PaintTool::Brush | PaintTool::Eraser) {
-            session.size
+            session.size * gesture.map_or(1., |g| g.path.first().radius)
         } else {
             10.
         };
-        let p = point - overlay.min - Vec2::splat(size * 0.5);
+        let p = gesture.map_or(point, |g| g.path.lazy) - overlay.min - Vec2::splat(size * 0.5);
         Some((p, size))
     })();
     let Some((p, size)) = placement else {
@@ -1263,6 +2113,7 @@ mod tests {
             geometry: mesh.into(),
             transform: Transform::IDENTITY,
             materials: vec![MaterialSlot {
+                bake_fixes: Default::default(),
                 authored: None,
                 material: default(),
                 source: serde_json::json!({"material":0}),
@@ -1290,12 +2141,14 @@ mod tests {
             &viewer,
             Rect::from_corners(Vec2::ZERO, Vec2::splat(512.)),
             false,
+            &sets::SetVisibility::default(),
         );
         let surface = Surface {
             size: 64,
             base: std::array::from_fn(|_| data::solid(64, [255; 4])),
             stack: Stack::default(),
             material: serde_json::json!({}),
+            baked: None,
         };
         (
             Work {
@@ -1310,12 +2163,23 @@ mod tests {
         Brush {
             channel: 0,
             color: [220, 20, 30],
+            material: None,
             radius: 48.,
             hardness: 1.,
             flow: 1.,
             opacity: 1.,
             erase: false,
             fill: false,
+            fill_mode: FillMode::default(),
+            fill_angle: 30.,
+            fill_padding: 0.,
+            variation: stroke::Variation::default(),
+            tip: None,
+            grain: None,
+            mirror: [0.; 4],
+            projection: BrushProjection::Screen,
+            paint_through: false,
+            facing_limit: 85_f32.to_radians().cos(),
         }
     }
     #[test]
@@ -1328,7 +2192,7 @@ mod tests {
             work,
             vec![
                 Event::Begin(brush),
-                Event::Points(vec![Vec2::splat(256.); 8], map),
+                Event::Points(vec![Stamp::from(Vec2::splat(256.)); 8], map),
                 Event::End,
             ],
             false,
@@ -1353,7 +2217,7 @@ mod tests {
             work,
             vec![
                 Event::Begin(b),
-                Event::Points(vec![Vec2::new(128., 256.)], map.clone()),
+                Event::Points(vec![Stamp::from(Vec2::new(128., 256.))], map.clone()),
                 Event::End,
             ],
             false,
@@ -1372,7 +2236,7 @@ mod tests {
             painted.work,
             vec![
                 Event::Begin(b),
-                Event::Points(vec![Vec2::new(128., 256.)], map),
+                Event::Points(vec![Stamp::from(Vec2::new(128., 256.))], map),
                 Event::End,
             ],
             false,

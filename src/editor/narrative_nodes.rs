@@ -58,6 +58,9 @@ pub(super) fn height(n: &DialogueNode) -> f32 {
         }
 }
 fn output_y(n: &DialogueNode, choice: usize) -> f32 {
+    if choice == OTHERWISE {
+        return EDGE_WIDTH + HEADER + body_height(n) - 23.0;
+    }
     if n.kind == NodeKind::Start && choice == 0 {
         return EDGE_WIDTH + HEADER + 12.0 + START_LABEL_HEIGHT + 8.0 + 18.0;
     }
@@ -270,8 +273,8 @@ pub(super) fn connections(
     materials: &mut Assets<connection_paint::Material>,
 ) {
     for n in &d.nodes {
-        for (i, c) in n.choices.iter().enumerate() {
-            if let Some(next) = c.target.and_then(|id| d.node(id)) {
+        for (i, target) in n.output_targets() {
+            if let Some(next) = d.node(target) {
                 let a = (Vec2::from_array(n.position) + output_position(n, i)) * doc.zoom + doc.pan;
                 let b = (Vec2::from_array(next.position) + input_position()) * doc.zoom + doc.pan;
                 let wire = connection_paint::wire(
@@ -332,6 +335,7 @@ pub(super) fn spawn(
     _linking: Option<(u32, usize)>,
     server: &AssetServer,
     answers: &answers::State,
+    catalog: &crate::editor::dialogue::conditions::Catalog,
 ) {
     for n in &d.nodes {
         let card = surface(
@@ -397,6 +401,9 @@ pub(super) fn spawn(
             text(commands, head, font, "●", 10.0, accent(n));
         }
         text(commands, head, font, caption, 11.0, accent(n));
+        if matches!(n.kind, NodeKind::Start | NodeKind::Line) {
+            condition_ui::trigger(commands, header, font, n.id, None, &n.condition, catalog);
+        }
         if n.kind != NodeKind::Start {
             let delete = icons::button(
                 commands,
@@ -625,8 +632,24 @@ pub(super) fn spawn(
                 );
             }
         }
+        if n.has_otherwise() {
+            let label = text(commands, card, font, "Иначе", 11.0, AMBER);
+            commands.entity(label).insert(Node {
+                position_type: PositionType::Absolute,
+                right: px(16),
+                top: px(output_y(n, OTHERWISE) - EDGE_WIDTH - 7.),
+                ..default()
+            });
+            links::socket(
+                commands,
+                card,
+                n.id,
+                OTHERWISE,
+                output_position(n, OTHERWISE) - Vec2::splat(EDGE_WIDTH),
+            );
+        }
         if n.kind == NodeKind::Line {
-            answers::spawn(commands, card, font, n, answers);
+            answers::spawn(commands, card, font, n, answers, catalog);
         }
         for (i, _) in n.choices.iter().enumerate() {
             if n.kind == NodeKind::Line || n.kind == NodeKind::Start && i == 0 {
@@ -738,15 +761,18 @@ pub(super) fn hint(
             commands,
             hint,
             font,
-            format!("Выход {} ноды #{} → выберите вход ноды", choice + 1, from),
+            if choice == OTHERWISE {
+                format!("«Иначе» ноды #{from} → выберите вход ноды")
+            } else {
+                format!("Выход {} ноды #{from} → выберите вход ноды", choice + 1)
+            },
             12.0,
             FOCUS,
         );
         let row = node(commands, hint, row(6.0));
         if dialogue
             .node(from)
-            .and_then(|n| n.choices.get(choice))
-            .is_some_and(Choice::connected)
+            .is_some_and(|n| n.output_connected(choice))
         {
             act(
                 commands,

@@ -123,28 +123,20 @@ impl<'de> Deserialize<'de> for SceneHierarchy {
     }
 }
 impl SceneHierarchy {
+    pub(crate) fn into_source(self) -> Scene {
+        self.source
+    }
     pub fn source(&self) -> &Scene {
         &self.source
     }
     #[cfg(feature = "editor")]
-    pub(crate) fn remap_paths(&mut self, from: &Path, to: &Path) {
-        let remap = |value: &mut String| {
-            if let Ok(suffix) = Path::new(value).strip_prefix(from) {
-                *value = if suffix.as_os_str().is_empty() {
-                    to.to_path_buf()
-                } else {
-                    to.join(suffix)
-                }
-                .to_string_lossy()
-                .replace('\\', "/");
-            }
-        };
-        crate::scene_io::remap_scene_paths(&mut self.source, from, to);
+    pub(crate) fn remap_paths_with(&mut self, remap: &impl Fn(&mut String)) {
+        crate::scene_io::remap_scene_with(&mut self.source, remap);
         self.dependencies = std::mem::take(&mut self.dependencies)
             .into_iter()
             .map(|(mut path, mut source)| {
                 remap(&mut path);
-                crate::scene_io::remap_scene_paths(Arc::make_mut(&mut source), from, to);
+                crate::scene_io::remap_scene_with(Arc::make_mut(&mut source), remap);
                 (path, source)
             })
             .collect();
@@ -199,6 +191,89 @@ impl SceneHierarchy {
             .and_then(|e| e.instance.as_ref())
             .is_some_and(|i| !i.overrides.is_empty())
     }
+    // Resolve a single property from the mounted source and its inner
+    // overrides, leaving the current document's instance override out.
+    fn inherited_value<'a, T>(
+        &'a self,
+        key: u32,
+        from_patch: impl Fn(&'a EntityPatch) -> Option<T>,
+        from_entity: impl Fn(&'a SceneEntity) -> Option<T>,
+    ) -> Option<T> {
+        let id = &self.node(key)?.entity.id;
+        let (owner, mut path) = id.split_once('/')?;
+        let instance = self
+            .source
+            .entities
+            .iter()
+            .find(|e| e.id == owner)?
+            .instance
+            .as_ref()?;
+        let mut scene = self.instance_source(&self.source, instance)?;
+        while let Some((mount, child)) = path.split_once('/') {
+            let instance = scene
+                .entities
+                .iter()
+                .find(|e| e.id == mount)?
+                .instance
+                .as_ref()?;
+            if let Some(value) = instance.overrides.get(child).and_then(&from_patch) {
+                return Some(value);
+            }
+            scene = self.instance_source(scene, instance)?;
+            path = child;
+        }
+        from_entity(scene.entities.iter().find(|entity| entity.id == path)?)
+    }
+
+    fn instance_source<'a>(&'a self, scene: &Scene, instance: &Instance) -> Option<&'a Scene> {
+        let path = scene.resources.get(&instance.resource)?.path.as_deref()?;
+        self.dependencies.get(path).map(Arc::as_ref)
+    }
+
+    pub(crate) fn inherited_pose(&self, key: u32) -> Option<Pose> {
+        let transform = self.inherited_value(key, |p| p.transform, |e| Some(e.transform))?;
+        Some(crate::scene_io::pose(transform))
+    }
+
+    fn inherited_camera(&self, key: u32) -> Option<&Value> {
+        self.inherited_value(
+            key,
+            |patch| {
+                patch.components.get("camera").map(Some).or_else(|| {
+                    patch
+                        .remove_components
+                        .iter()
+                        .any(|name| name == "camera")
+                        .then_some(None)
+                })
+            },
+            |entity| Some(entity.components.get("camera")),
+        )
+        .flatten()
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn inherited_lens(&self, key: u32) -> Option<f32> {
+        Some(self.inherited_camera(key)?.get("lens")?.as_f64()? as f32)
+    }
+
+    fn trim_instance_patch(&mut self, id: &str, trim: impl FnOnce(&mut EntityPatch)) {
+        if let Some((owner, child)) = id.split_once('/')
+            && let Some(instance) = self
+                .source
+                .entities
+                .iter_mut()
+                .find(|e| e.id == owner)
+                .and_then(|entity| entity.instance.as_mut())
+            && let Some(patch) = instance.overrides.get_mut(child)
+        {
+            trim(patch);
+            if *patch == EntityPatch::default() {
+                instance.overrides.remove(child);
+            }
+        }
+    }
+
     pub fn load(source: Scene, root: &Path) -> io::Result<Self> {
         let mut result = Self {
             source,
@@ -271,7 +346,9 @@ impl SceneHierarchy {
                 )
                 .map_err(invalid)?;
                 if crate::scene_io::modern(&bytes)? {
-                    Scene::from_slice(&bytes).map_err(invalid)
+                    let mut scene = Scene::from_slice(&bytes).map_err(invalid)?;
+                    crate::asset_registry::index(root)?.scene(&mut scene, false);
+                    Ok(scene)
                 } else {
                     let edits: LevelEdits = serde_json::from_slice(&bytes).map_err(invalid)?;
                     Scene::from_slice(&crate::scene_io::encode(&edits, None)?).map_err(invalid)
@@ -577,7 +654,20 @@ impl SceneHierarchy {
         }
         Ok(())
     }
-    pub fn set_local(&mut self, key: u32, mut pose: Pose) -> io::Result<()> {
+    pub fn set_local(&mut self, key: u32, pose: Pose) -> io::Result<()> {
+        self.patch_local(key, pose)?;
+        self.update_world_transforms()
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn set_locals(&mut self, poses: &[(u32, Pose)]) -> io::Result<()> {
+        for &(key, pose) in poses {
+            self.patch_local(key, pose)?;
+        }
+        self.update_world_transforms()
+    }
+
+    fn patch_local(&mut self, key: u32, mut pose: Pose) -> io::Result<()> {
         if !pose.valid() {
             return Err(invalid("Invalid local transform"));
         }
@@ -604,6 +694,20 @@ impl SceneHierarchy {
                 components.insert("camera".into(), camera);
             }
         }
+        let inherited_pose = self.inherited_pose(key).filter(|source| {
+            let source = source.transform();
+            let current = pose.transform();
+            source.translation.abs_diff_eq(current.translation, 1e-6)
+                && source.scale.abs_diff_eq(current.scale, 1e-6)
+                && (source.rotation.abs_diff_eq(current.rotation, 1e-6)
+                    || source.rotation.abs_diff_eq(-current.rotation, 1e-6))
+        });
+        if let Some(source) = inherited_pose {
+            pose = source;
+        }
+        let same_camera = components
+            .get("camera")
+            .is_some_and(|camera| self.inherited_camera(key) == Some(camera));
         self.patch(
             &id,
             EntityPatch {
@@ -612,6 +716,16 @@ impl SceneHierarchy {
                 ..Default::default()
             },
         )?;
+        if inherited_pose.is_some() || same_camera {
+            self.trim_instance_patch(&id, |patch| {
+                if inherited_pose.is_some() {
+                    patch.transform = None;
+                }
+                if same_camera {
+                    patch.components.remove("camera");
+                }
+            });
+        }
         self.nodes
             .iter_mut()
             .find(|n| n.key == key)
@@ -622,6 +736,10 @@ impl SceneHierarchy {
             .entity
             .components
             .extend(components);
+        Ok(())
+    }
+
+    fn update_world_transforms(&mut self) -> io::Result<()> {
         // Recompute just matrices: transform drags never reload or expand dependencies.
         let mut worlds: HashMap<String, Affine3A> = HashMap::new();
         for node in &self.nodes {
@@ -732,6 +850,11 @@ impl SceneHierarchy {
                 ..Default::default()
             },
         )?;
+        if self.inherited_camera(key) == Some(&value) {
+            self.trim_instance_patch(&id, |patch| {
+                patch.components.remove("camera");
+            });
+        }
         self.nodes
             .iter_mut()
             .find(|n| n.key == key)
@@ -766,7 +889,7 @@ impl SceneHierarchy {
     pub fn add_group(&mut self, parent: Option<u32>) -> io::Result<u32> {
         let id = self.new_id("group");
         let mut entity = SceneEntity::new(&id);
-        entity.name = Some("Группа".into());
+        entity.name = Some("Папка".into());
         entity.parent = parent
             .and_then(|k| self.node(k))
             .map(|n| n.entity.id.clone());
@@ -781,9 +904,10 @@ impl SceneHierarchy {
     ) -> io::Result<u32> {
         let id = self.new_id("model");
         let resource = unique_key(&self.source.resources, "model");
-        self.source
-            .resources
-            .insert(resource.clone(), Resource::external("model", model.asset));
+        let mut external = Resource::external("model", model.asset);
+        external.uid = model.uid;
+        external.selector = model.selector;
+        self.source.resources.insert(resource.clone(), external);
         let mut e = SceneEntity::new(&id);
         e.name = name;
         e.model = Some(resource);
@@ -1298,11 +1422,12 @@ impl SceneHierarchy {
                     self.set_world(node.key, model.pose)?;
                     changed = true;
                 }
-                if model.asset != old.asset {
+                if model.asset != old.asset || model.selector != old.selector {
                     let key = unique_key(&self.source.resources, "model");
-                    self.source
-                        .resources
-                        .insert(key.clone(), Resource::external("model", &model.asset));
+                    let mut resource = Resource::external("model", &model.asset);
+                    resource.selector = model.selector.clone();
+                    resource.uid = model.uid.clone();
+                    self.source.resources.insert(key.clone(), resource);
                     patch.model = Some(key);
                 }
                 if model.bounds != old.bounds {

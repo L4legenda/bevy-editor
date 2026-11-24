@@ -1,6 +1,7 @@
 //! Native project launcher. Each editor owns its own window and event loop.
 mod effects;
 mod native;
+pub(crate) use native::{choose_folder, choose_folder_in, reveal as reveal_folder};
 mod projects;
 #[cfg(test)]
 mod tests;

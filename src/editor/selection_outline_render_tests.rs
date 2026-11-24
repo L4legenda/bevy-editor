@@ -342,6 +342,8 @@ fn fixture() -> (App, Entity) {
     editor.ready = true;
     editor.reload = false;
     editor.edits.models.push(PlacedModel {
+        selector: None,
+        uid: None,
         id: 1,
         asset: asset.clone(),
         pose: Transform::from_translation(model_position).into(),

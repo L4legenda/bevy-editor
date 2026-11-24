@@ -8,6 +8,8 @@ fn fixture() -> (App, Entity, Entity) {
         let mut editor = app.world_mut().resource_mut::<Editor>();
         let asset = editor.project.catalog[0].asset.clone();
         editor.edits.models.push(PlacedModel {
+            selector: None,
+            uid: None,
             id: 42,
             asset,
             pose: Transform::from_xyz(8.0, 1.0, -6.0).into(),

@@ -18,6 +18,101 @@ mod loader;
 pub(crate) use loader::validate_panorama;
 use loader::{PanoramaLoader, PanoramaMaps};
 
+// The editor embeds these maps. External game hosts receive only the selected pair.
+macro_rules! maps {
+    ($name:literal) => {
+        (
+            $name,
+            include_bytes!(concat!("../assets/hdri/", $name, ".diffuse.ktx2")) as &'static [u8],
+            include_bytes!(concat!("../assets/hdri/", $name, ".specular.ktx2")) as &'static [u8],
+        )
+    };
+}
+const BUILTIN_MAPS: &[(&str, &[u8], &[u8])] = &[
+    maps!("studio_small_09"),
+    maps!("brown_photostudio_02"),
+    maps!("christmas_photo_studio_07"),
+    maps!("empty_warehouse_01"),
+    maps!("lebombo"),
+    maps!("kloofendal_48d_partly_cloudy_puresky"),
+    maps!("venice_sunset"),
+    maps!("industrial_sunset_02_puresky"),
+    maps!("phalzer_forest_01"),
+    maps!("moonless_golf"),
+];
+
+#[cfg(feature = "editor")]
+pub(crate) fn export_preset(root: &Path, settings: Option<&SceneLighting>) -> std::io::Result<()> {
+    use bevy_scene_format::{Revision, atomic_write};
+    let Some(preset) = settings
+        .filter(|settings| settings.hdri_asset.is_none())
+        .and_then(|settings| settings.hdri)
+    else {
+        return Ok(());
+    };
+    let (name, diffuse, specular) = BUILTIN_MAPS
+        .iter()
+        .find(|(name, _, _)| *name == preset.asset_name())
+        .expect("all HDRI presets have bundled maps");
+    for (name, bytes) in [
+        (format!("{name}.diffuse.ktx2"), *diffuse),
+        (format!("{name}.specular.ktx2"), *specular),
+        (
+            "LICENSE.txt".into(),
+            include_bytes!("../assets/hdri/LICENSE.txt").as_slice(),
+        ),
+    ] {
+        let logical = format!("hdri/editor/{name}");
+        let path = root.join(crate::asset_paths::resolve_asset_path(root, &logical)?);
+        let previous = Revision::read(&path)?;
+        if previous != Revision::of(bytes) {
+            atomic_write(&path, bytes, previous)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "editor"))]
+#[test]
+fn exports_only_the_selected_builtin_environment_for_external_games() {
+    let root = std::env::temp_dir().join(format!(
+        "bevy-editor-hdri-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let settings = SceneLighting {
+        hdri: Some(EnvironmentPreset::Cloudy),
+        ..default()
+    };
+    export_preset(&root, Some(&settings)).unwrap();
+    export_preset(&root, Some(&settings)).unwrap();
+    let folder = root.join("hdri/editor");
+    let (_, diffuse, specular) = BUILTIN_MAPS
+        .iter()
+        .find(|(name, _, _)| *name == EnvironmentPreset::Cloudy.asset_name())
+        .unwrap();
+    assert_eq!(
+        std::fs::read(folder.join("kloofendal_48d_partly_cloudy_puresky.diffuse.ktx2")).unwrap(),
+        *diffuse
+    );
+    assert_eq!(
+        std::fs::read(folder.join("kloofendal_48d_partly_cloudy_puresky.specular.ktx2")).unwrap(),
+        *specular
+    );
+    assert!(folder.join("LICENSE.txt").is_file());
+    assert_eq!(
+        std::fs::read_dir(folder)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_file())
+            .count(),
+        3,
+    );
+}
+
 /// Registers the bundled CC0 environments. Add after Bevy's `DefaultPlugins`
 /// when using `apply_camera_lighting` in a game. The editor adds it automatically.
 pub struct HdriPlugin;
@@ -25,30 +120,15 @@ pub struct HdriPlugin;
 impl Plugin for HdriPlugin {
     fn build(&self, app: &mut App) {
         let registry = app.world_mut().resource_mut::<EmbeddedAssetRegistry>();
-        macro_rules! embed {
-            ($name:literal) => {
+        for (name, diffuse, specular) in BUILTIN_MAPS {
+            for (kind, bytes) in [("diffuse", *diffuse), ("specular", *specular)] {
                 registry.insert_asset(
                     PathBuf::new(),
-                    Path::new(concat!("bevy_editor/hdri/", $name, ".diffuse.ktx2")),
-                    include_bytes!(concat!("../assets/hdri/", $name, ".diffuse.ktx2")),
+                    Path::new(&format!("bevy_editor/hdri/{name}.{kind}.ktx2")),
+                    bytes,
                 );
-                registry.insert_asset(
-                    PathBuf::new(),
-                    Path::new(concat!("bevy_editor/hdri/", $name, ".specular.ktx2")),
-                    include_bytes!(concat!("../assets/hdri/", $name, ".specular.ktx2")),
-                );
-            };
+            }
         }
-        embed!("studio_small_09");
-        embed!("brown_photostudio_02");
-        embed!("christmas_photo_studio_07");
-        embed!("empty_warehouse_01");
-        embed!("lebombo");
-        embed!("kloofendal_48d_partly_cloudy_puresky");
-        embed!("venice_sunset");
-        embed!("industrial_sunset_02_puresky");
-        embed!("phalzer_forest_01");
-        embed!("moonless_golf");
         app.init_asset::<PanoramaMaps>()
             .init_asset_loader::<PanoramaLoader>()
             .init_resource::<EnvironmentImages>()

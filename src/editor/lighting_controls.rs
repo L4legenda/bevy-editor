@@ -442,6 +442,7 @@ pub(super) fn scalar(
             ..column(0.0)
         },
     );
+    inspector::searchable(commands, line, label);
     let header = node(
         commands,
         line,
@@ -492,6 +493,7 @@ pub(super) fn color_editor(
         Swatch::Ambient => "Цвет фонового света",
         Swatch::Fog => "Цвет тумана",
     };
+    inspector::searchable(commands, group, &format!("{label} color rgb hex"));
     let image = images.add(plane_image(0.0));
     let area = commands
         .spawn((

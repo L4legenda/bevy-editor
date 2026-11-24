@@ -64,11 +64,21 @@ pub(super) fn render(
     view: Transform,
     projection: Projection,
 ) -> image::RgbaImage {
+    render_transformed(&parts, Affine3A::IDENTITY, view, projection)
+}
+
+pub(super) fn render_transformed(
+    parts: &[Part],
+    transform: Affine3A,
+    view: Transform,
+    projection: Projection,
+) -> image::RgbaImage {
     let view_projection = projection.get_clip_from_view() * view.to_matrix().inverse();
     let light = (*view.back() * 0.55 - *view.right() * 0.55 + *view.up()).normalize();
     let mut image = image::RgbaImage::new(SIDE, SIDE);
     let mut depth = vec![f32::NEG_INFINITY; (SIDE * SIDE) as usize];
     for part in parts {
+        let world_transform = transform * part.transform;
         let Ok(attribute) = part.mesh.try_attribute(Mesh::ATTRIBUTE_POSITION) else {
             continue;
         };
@@ -88,7 +98,7 @@ pub(super) fn render(
             .iter()
             .enumerate()
             .map(|(index, &position)| {
-                let world = part.transform.transform_point3(Vec3::from_array(position));
+                let world = world_transform.transform_point3(Vec3::from_array(position));
                 let clip = view_projection * world.extend(1.0);
                 let ndc = clip.truncate() / clip.w;
                 Vertex {
@@ -108,6 +118,7 @@ pub(super) fn render(
         };
         let texture = part
             .texture
+            .clone()
             .and_then(|texture| texture.try_into_dynamic().ok())
             .map(|texture| texture.into_rgba8());
         let mut draw = |indices: [usize; 3]| {

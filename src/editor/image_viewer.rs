@@ -17,9 +17,13 @@ use std::{collections::HashMap, path::PathBuf};
 mod canvas_material;
 #[path = "image_edit.rs"]
 pub(in crate::editor) mod edit;
+#[path = "image_model_fields.rs"]
+pub(in crate::editor) mod model_fields;
+#[path = "image_model_transform.rs"]
+mod model_transform;
 pub(in crate::editor) use canvas_material::{CanvasMaterial, ImageCanvasPlugin};
 #[path = "image_paint_input.rs"]
-mod paint_input;
+pub(super) mod paint_input;
 #[path = "image_panel_resize.rs"]
 mod panel_resize;
 #[cfg(target_os = "windows")]
@@ -89,6 +93,11 @@ struct SavedView {
 #[derive(Resource, Default)]
 pub(in crate::editor) struct ImageViewer {
     pub edit: edit::State,
+    model_drag: Option<model_transform::Drag>,
+    pub(in crate::editor) layer_preview: Option<model_transform::LayerPreview>,
+    model_preview: Option<(usize, u64)>,
+    released_model: Option<(model_transform::Binding, crate::Pose)>,
+    save_after_render: std::collections::BTreeSet<usize>,
     panel: panel_resize::Panel,
     tab: Option<usize>,
     path: Option<PathBuf>,
@@ -182,7 +191,22 @@ impl ImageViewer {
         self.zoom = saved.map_or(Zoom::Fit, |view| view.zoom);
         self.pan = saved.map_or(Vec2::ZERO, |view| view.pan);
         self.gesture = None;
+        self.released_model = None;
+        self.layer_preview = None;
+        self.model_drag = None;
+        self.clear_model_preview();
         self.last_click = None;
+    }
+
+    fn clear_model_preview(&mut self) {
+        if let Some((tab, revision)) = self.model_preview.take()
+            && self
+                .edit
+                .document(Some(tab))
+                .is_some_and(|doc| doc.revision == revision)
+        {
+            self.edit.clear_model_preview(tab);
+        }
     }
 
     fn zoom_at(&mut self, factor: f32, anchor: Vec2, viewport: Vec2) {
@@ -577,9 +601,10 @@ pub(in crate::editor) fn update(
     mut browser: ResMut<Browser>,
     mut viewer: ResMut<ImageViewer>,
     previews: Res<ImagePreviews>,
-    (mut images, mut uploads): (
+    (mut images, mut uploads, mut references): (
         ResMut<Assets<Image>>,
         Option<ResMut<crate::editor::image_texture::TextureUploads>>,
+        Option<ResMut<crate::editor::image_reference::ReferenceRender>>,
     ),
     window: Single<(Entity, &mut Window), With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -592,21 +617,11 @@ pub(in crate::editor) fn update(
     mut focus: ResMut<InputFocus>,
     mut browser_ui: Option<ResMut<drawer::BrowserUi>>,
     drawer: Option<Res<DrawerMotion>>,
-    (keys, mut strokes, mut events, _window_thread): (
-        Res<ButtonInput<KeyCode>>,
-        Local<paint_input::Samples>,
-        MessageReader<bevy::window::WindowEvent>,
-        bevy::ecs::system::NonSendMarker,
-    ),
+    (keys, strokes): (Res<ButtonInput<KeyCode>>, Res<paint_input::PointerFrame>),
     inputs: Query<(), With<TextInput>>,
 ) {
-    let (window_entity, mut window) = window.into_inner();
-    let mut samples = strokes.collect(
-        events.read(),
-        window_entity,
-        window.cursor_position(),
-        &mouse,
-    );
+    let (_, mut window) = window.into_inner();
+    let mut samples = strokes.samples.clone();
     viewer.pen_cursor = strokes.pen_cursor();
     let pressed_controls = samples.iter().any(|sample| {
         matches!(sample, paint_input::Sample::Down(point) if over_controls(&controls, *point))
@@ -709,6 +724,30 @@ pub(in crate::editor) fn update(
     if edit_tab.is_some() && edit_tab == editor.viewing_image {
         actions.push(Action::ImageEdit(edit::EditAction::Edit));
     }
+    if let Some(tab) = editor.viewing_image
+        && references
+            .as_deref()
+            .is_some_and(|render| render.pending_for(Some(tab)))
+        && actions
+            .iter()
+            .any(|a| matches!(a, Action::ImageEdit(edit::EditAction::Save)))
+    {
+        actions.retain(|a| !matches!(a, Action::ImageEdit(edit::EditAction::Save)));
+        viewer.save_after_render.insert(tab);
+    }
+    viewer
+        .save_after_render
+        .retain(|id| editor.image_tab(*id).is_some());
+    if !viewer.edit.busy()
+        && let Some(id) = viewer.save_after_render.iter().copied().find(|id| {
+            references
+                .as_deref()
+                .is_none_or(|render| !render.pending_for(Some(*id)))
+        })
+    {
+        viewer.save_after_render.remove(&id);
+        viewer.edit.save(id, &mut editor);
+    }
     edit::update(&actions, &mut editor, &mut viewer, &mut browser);
     viewer.views.retain(|id, _| editor.image_tab(*id).is_some());
     let active = editor
@@ -719,6 +758,9 @@ pub(in crate::editor) fn update(
         .and_then(|(_, path)| browser.files.iter().position(|file| file.path == *path));
     if let Some((id, path)) = &active {
         if viewer.tab != Some(*id) || viewer.path.as_ref() != Some(path) {
+            if let Some(render) = references.as_deref_mut() {
+                render.live.reset();
+            }
             viewer.reset(
                 *id,
                 path.clone(),
@@ -731,12 +773,21 @@ pub(in crate::editor) fn update(
             viewer.error = None;
         }
     } else {
+        if viewer.tab.is_some()
+            && let Some(render) = references.as_deref_mut()
+        {
+            render.live.reset();
+        }
         viewer.tab = None;
         viewer.path = None;
         viewer.image = None;
         viewer.dimensions = None;
         viewer.error = None;
         viewer.gesture = None;
+        viewer.released_model = None;
+        viewer.layer_preview = None;
+        viewer.model_drag = None;
+        viewer.clear_model_preview();
     }
     // A single decoder remains bounded even when rapidly switching document tabs.
     let finished = viewer.pending.as_mut().and_then(|job| {
@@ -782,10 +833,20 @@ pub(in crate::editor) fn update(
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
     if viewer.edit.color_dragging || viewer.edit.layers.context_menu_dismissed {
         viewer.gesture = None;
+        viewer.released_model = None;
+        viewer.layer_preview = None;
+        viewer.model_drag = None;
+        viewer.clear_model_preview();
+        if let Some(render) = references.as_deref_mut() {
+            render.live.reset();
+        }
         return;
     }
-    let adjusting_size = (viewer.edit.resizing_brush()
-        || (!hovering_controls && !pressed_controls && !viewer.edit.mode_menu_dismissed))
+    let model_manipulating = viewer.edit.model_tool.is_some()
+        && viewer.edit.model_reference(editor.viewing_image).is_some();
+    let adjusting_size = !model_manipulating
+        && (viewer.edit.resizing_brush()
+            || (!hovering_controls && !pressed_controls && !viewer.edit.mode_menu_dismissed))
         && edit::resize_brush(
             &mut viewer,
             &editor,
@@ -801,10 +862,24 @@ pub(in crate::editor) fn update(
         || editor.hdri_library_open
         || viewer.error.is_some()
     {
+        viewer.released_model = None;
+        viewer.layer_preview = None;
+        viewer.model_drag = None;
+        viewer.clear_model_preview();
+        if let Some(render) = references.as_deref_mut() {
+            render.live.reset();
+        }
         viewer.gesture = None;
         return;
     }
     if !window.focused {
+        viewer.released_model = None;
+        viewer.layer_preview = None;
+        viewer.model_drag = None;
+        viewer.clear_model_preview();
+        if let Some(render) = references.as_deref_mut() {
+            render.live.reset();
+        }
         viewer.gesture = None;
         viewer.last_click = None;
         return;
@@ -817,16 +892,30 @@ pub(in crate::editor) fn update(
     if strokes.pen_down() {
         drawing_mouse.press(MouseButton::Left);
     }
-    let edit_pointer = edit::pointer(
-        &mut viewer,
-        &mut editor,
-        rect,
-        input_rect,
-        &drawing_mouse,
-        &keys,
-        &mut focus,
-        &samples,
-    );
+    let model_pointer = references.as_deref_mut().is_some_and(|references| {
+        model_transform::pointer(
+            &mut viewer,
+            &mut editor,
+            references,
+            rect,
+            input_rect,
+            &window,
+            &mouse,
+            &keys,
+            hovering_controls || pressed_controls,
+        )
+    });
+    let edit_pointer = model_pointer
+        || edit::pointer(
+            &mut viewer,
+            &mut editor,
+            rect,
+            input_rect,
+            &drawing_mouse,
+            &keys,
+            &mut focus,
+            &samples,
+        );
     // Present this batch, including its live interpolation tail, in the frame that received it.
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
     if viewer.panel.blocks_canvas() || viewer.edit.color_picker.is_some() || viewer.edit.size_menu {

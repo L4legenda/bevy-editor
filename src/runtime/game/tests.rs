@@ -209,6 +209,8 @@ fn gpu_fbx_game_level_spawns_and_renders_a_document_model() {
     let mut pose: crate::Pose = Transform::IDENTITY.into();
     pose.position[0] = 0.25;
     level.edits.models = vec![crate::PlacedModel {
+        selector: None,
+        uid: None,
         id,
         asset: "embedded/props_embedded.fbx".into(),
         pose,
@@ -265,6 +267,7 @@ fn gpu_game_level_applies_imported_world_edits_and_removals() {
     );
     edits.deleted_nodes.insert("Block 2".into());
     let level = GameLevel {
+        uid: None,
         title: "Imported test".into(),
         asset: source["asset"].as_str().unwrap().into(),
         groups: serde_json::from_value(source["groups"].clone()).unwrap(),
@@ -290,4 +293,31 @@ fn gpu_game_level_applies_imported_world_edits_and_removals() {
             .iter(world)
             .any(|(name, _)| name.as_str() == "Block 2")
     );
+}
+
+#[cfg(feature = "editor")]
+#[test]
+#[ignore = "renders a moved model through the native game loader"]
+fn gpu_asset_registry_game_loads_the_original_when_the_old_path_is_reused() {
+    let folder = std::env::temp_dir().join(format!(
+        "bevy-uid-game-{}",
+        bevy::asset::uuid::Uuid::new_v4()
+    ));
+    let project = crate::project_manager::create_test_project(&folder).unwrap();
+    let root = &project.asset_root;
+    let mut scanner = crate::asset_registry::scan::Scanner::new(root).unwrap();
+    scanner.run(None).unwrap();
+    let scene = &project.scenes[0].file;
+    let level = GameLevel::read(root, scene).unwrap();
+    level.edits.write(root, scene).unwrap();
+    let original = root.join(&level.edits.models[0].asset);
+    fs::rename(&original, root.join("moved.glb")).unwrap();
+    fs::write(original, b"this is not a GLB").unwrap();
+    scanner.run(None).unwrap();
+    let reopened = GameLevel::read(root, scene).unwrap();
+    assert_eq!(reopened.edits.models[0].asset, "moved.glb");
+    let (mut app, _) = headless(root, reopened);
+    wait_ready(&mut app);
+    drop(app);
+    fs::remove_dir_all(folder).unwrap();
 }

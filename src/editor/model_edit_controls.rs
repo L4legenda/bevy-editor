@@ -79,7 +79,7 @@ pub(in crate::editor::ui) fn geometry_toolbar(commands: &mut Commands, parent: E
         commands,
         section,
         icons::Glyph::Extrude,
-        "Экструдировать · E",
+        "Экструдировать вершины, рёбра и грани · E",
         self::action(action),
         Look::Regular,
     );
@@ -101,7 +101,24 @@ fn entry(
             ..row(5.0)
         },
     );
+    inspector::searchable(commands, row, label);
     text(commands, row, font, label, 12.0, MUTED);
+    entry_input(commands, row, font, field, label)
+}
+
+fn entry_input(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    field: Field,
+    label: &str,
+) -> Entity {
+    let accessible = if let Field::Transform(index) = field {
+        let group = ["Позиция", "Поворот", "Масштаб"][index / 3];
+        format!("Модель: {group} {label}")
+    } else {
+        format!("Модель: {label}")
+    };
     let entity = commands
         .spawn((
             field,
@@ -109,26 +126,27 @@ fn entry(
             EditableText::new(""),
             crate::ui_theme::text_cursor_style(),
             SelectAllOnFocus,
-            AccessibleLabel(format!("Модель: {label}")),
+            AccessibleLabel(accessible),
             TabIndex(0),
             TextFont {
                 font: font.clone().into(),
-                font_size: FontSize::Px(13.0),
+                font_size: FontSize::Px(12.0),
                 ..default()
             },
             TextColor(TEXT),
             Node {
-                min_width: px(30),
+                min_width: px(0),
                 flex_grow: 1.0,
-                height: px(28),
-                padding: UiRect::axes(px(7), px(5)),
+                height: px(26),
+                padding: UiRect::axes(px(5), px(3)),
                 border: UiRect::all(px(1)),
                 border_radius: BorderRadius::all(px(5)),
+                overflow: Overflow::clip(),
                 ..default()
             },
             BackgroundColor(WELL),
             BorderColor::all(EDGE),
-            ChildOf(row),
+            ChildOf(parent),
         ))
         .id();
     let number = match field {
@@ -380,16 +398,101 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             ..column(6.0)
         },
     );
-    text(&mut commands, panel, &interface.font, "МОДЕЛЬ", 11.0, MUTED);
-    let stats = text(&mut commands, panel, &interface.font, "", 12.0, MUTED);
-    commands.entity(stats).insert(TextLayout::default());
-    let commands_row = node(
+    let font = &interface.font;
+    let transform = inspector::section(
         &mut commands,
         panel,
+        font,
+        "Трансформация",
+        "transform trs",
+        true,
+    );
+    entry(&mut commands, transform.body, font, Field::Name, "Имя");
+    for (group, property, label, keywords) in [
+        (
+            0,
+            TransformProperty::Position,
+            "Позиция · м",
+            "позиция position location",
+        ),
+        (
+            1,
+            TransformProperty::Rotation,
+            "Поворот · °",
+            "поворот вращение rotation euler",
+        ),
+        (2, TransformProperty::Scale, "Масштаб", "масштаб scale"),
+    ] {
+        let scope = node(&mut commands, transform.body, column(0.0));
+        if group > 0 {
+            commands.entity(scope).insert(Group(false));
+        }
+        let pane = node(&mut commands, scope, column(2.0));
+        inspector::searchable(&mut commands, pane, keywords);
+        let caption = node(
+            &mut commands,
+            pane,
+            Node {
+                height: px(20),
+                ..row(0.0)
+            },
+        );
+        let title = text(&mut commands, caption, font, label, 12.0, TEXT);
+        commands
+            .entity(title)
+            .entry::<Node>()
+            .and_modify(|mut n| n.flex_grow = 1.0);
+        let action = EditAction::RevertTransform(property);
+        let reset = inspector::icon_button(
+            &mut commands,
+            caption,
+            icons::Glyph::Undo,
+            "Вернуть сохранённое значение",
+            self::action(action),
+        );
+        commands.entity(reset).insert(EditButton(action));
+        control_hints::attach(&mut commands, reset, "Вернуть сохранённое значение");
+        let line = inspector::vector_row(&mut commands, pane);
+        for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+            let cell = inspector::axis_cell(&mut commands, line, font, axis);
+            entry_input(
+                &mut commands,
+                cell,
+                font,
+                Field::Transform(group * 3 + axis),
+                name,
+            );
+        }
+    }
+    let file = inspector::section(
+        &mut commands,
+        panel,
+        font,
+        "Документ",
+        "file save undo redo",
+        true,
+    )
+    .body;
+    let stats = text(&mut commands, file, font, "", 12.0, MUTED);
+    commands.entity(stats).insert(TextLayout::default());
+    inspector::searchable(
+        &mut commands,
+        stats,
+        "геометрия вершин граней статистика stats",
+    );
+    let commands_row = node(
+        &mut commands,
+        file,
         Node {
             flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3),
             ..row(3.0)
         },
+    );
+    inspector::searchable(
+        &mut commands,
+        commands_row,
+        "сохранить отмена повтор добавить save undo redo add",
     );
     for (label, a) in [
         ("Сохранить", EditAction::Save),
@@ -397,11 +500,11 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Повтор", EditAction::Redo),
         ("Добавить…", EditAction::AddMenu),
     ] {
-        control(&mut commands, commands_row, &interface.font, label, a);
+        control(&mut commands, commands_row, font, label, a);
     }
     let add = surface(
         &mut commands,
-        panel,
+        file,
         Node {
             display: Display::None,
             padding: UiRect::all(px(5)),
@@ -409,47 +512,40 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         },
         WELL,
     );
+    let primitives = node(&mut commands, add, column(3.0));
+    inspector::searchable(
+        &mut commands,
+        primitives,
+        "добавить куб сфера плоскость цилиндр cube sphere plane cylinder",
+    );
     for (i, label) in ["Куб", "Сфера", "Плоскость", "Цилиндр"]
         .into_iter()
         .enumerate()
     {
-        control(
-            &mut commands,
-            add,
-            &interface.font,
-            label,
-            EditAction::Add(i),
-        );
+        control(&mut commands, primitives, font, label, EditAction::Add(i));
     }
-    entry(&mut commands, panel, &interface.font, Field::Name, "Имя");
-    for (group, label) in [
-        (0, "ПОЗИЦИЯ · МИРОВАЯ"),
-        (1, "ВРАЩЕНИЕ · ГРАДУСЫ"),
-        (2, "МАСШТАБ"),
-    ] {
-        let pane = node(&mut commands, panel, column(3.0));
-        if group > 0 {
-            commands.entity(pane).insert(Group(false));
-        }
-        text(&mut commands, pane, &interface.font, label, 11.0, MUTED);
-        for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-            entry(
-                &mut commands,
-                pane,
-                &interface.font,
-                Field::Transform(group * 3 + axis),
-                name,
-            );
-        }
-    }
-    let settings = node(
+    let settings_panel = inspector::section(
         &mut commands,
         panel,
+        font,
+        "Настройки манипулятора",
+        "gizmo pivot snap пропорциональное",
+        false,
+    )
+    .body;
+    let settings = node(
+        &mut commands,
+        settings_panel,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
             ..row(3.0)
         },
+    );
+    inspector::searchable(
+        &mut commands,
+        settings,
+        "пропорции связанные connected proportional",
     );
     for (label, a) in [
         ("Пропорции", EditAction::Proportional),
@@ -457,15 +553,27 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     ] {
         control(&mut commands, settings, &interface.font, label, a);
     }
-    text(&mut commands, panel, &interface.font, "ЦЕНТР ТРАНСФОРМАЦИИ", 11.0, MUTED);
+    text(
+        &mut commands,
+        settings_panel,
+        &interface.font,
+        "ЦЕНТР ТРАНСФОРМАЦИИ",
+        11.0,
+        MUTED,
+    );
     let pivots = node(
         &mut commands,
-        panel,
+        settings_panel,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
             ..row(3.0)
         },
+    );
+    inspector::searchable(
+        &mut commands,
+        pivots,
+        "центр трансформации средняя точка границы начало мира pivot",
     );
     for (label, mode) in [
         ("Средняя точка", Pivot::Median),
@@ -475,15 +583,27 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     ] {
         control(&mut commands, pivots, &interface.font, label, EditAction::Pivot(mode));
     }
-    text(&mut commands, panel, &interface.font, "ПРИВЯЗКА", 11.0, MUTED);
+    text(
+        &mut commands,
+        settings_panel,
+        &interface.font,
+        "ПРИВЯЗКА",
+        11.0,
+        MUTED,
+    );
     let snap_targets = node(
         &mut commands,
-        panel,
+        settings_panel,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
             ..row(3.0)
         },
+    );
+    inspector::searchable(
+        &mut commands,
+        snap_targets,
+        "привязка шаг вершина ребро поверхность snap",
     );
     for (label, target) in [
         ("Шаг", SnapTarget::Step),
@@ -495,23 +615,32 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     }
     let edit = node(&mut commands, panel, column(6.0));
     commands.entity(edit).insert(Group(true));
-    entry(
+    let parameters = inspector::section(
         &mut commands,
         edit,
+        font,
+        "Параметры операций",
+        "mesh operation",
+        false,
+    )
+    .body;
+    entry(
+        &mut commands,
+        parameters,
         &interface.font,
         Field::Amount,
         "Шаг операции",
     );
     entry(
         &mut commands,
-        edit,
+        parameters,
         &interface.font,
         Field::SlidePercent,
         "Скольжение · %",
     );
     for (title, buttons) in [
         (
-            "ГЕОМЕТРИЯ",
+            "Геометрия",
             vec![
                 ("Выдавить · E", Operation::Extrude),
                 ("Inset · I", Operation::Inset),
@@ -538,7 +667,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             ],
         ),
         (
-            "НОРМАЛИ И UV",
+            "Нормали и UV",
             vec![
                 ("Пересчитать нормали", Operation::RecalculateNormals),
                 ("Развернуть нормали", Operation::FlipNormals),
@@ -549,10 +678,10 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             ],
         ),
     ] {
-        text(&mut commands, edit, &interface.font, title, 11.0, MUTED);
+        let section = inspector::section(&mut commands, edit, font, title, "", false);
         let group = node(
             &mut commands,
-            edit,
+            section.body,
             Node {
                 flex_wrap: FlexWrap::Wrap,
                 row_gap: px(3),
@@ -560,9 +689,11 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             },
         );
         for (label, op) in buttons {
+            let item = node(&mut commands, group, row(0.0));
+            inspector::searchable(&mut commands, item, label);
             control(
                 &mut commands,
-                group,
+                item,
                 &interface.font,
                 label,
                 match op {
@@ -575,10 +706,18 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             );
         }
     }
-    text(&mut commands, edit, &interface.font, "МАТЕРИАЛЫ ГРАНЕЙ", 11.0, MUTED);
-    let materials = node(
+    let material_panel = inspector::section(
         &mut commands,
         edit,
+        font,
+        "Материалы граней",
+        "material material slots shader",
+        false,
+    )
+    .body;
+    let materials = node(
+        &mut commands,
+        material_panel,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
@@ -591,18 +730,27 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         (Field::MaterialRoughness, "Шероховатость"),
         (Field::MaterialMetallic, "Металличность"),
     ] {
-        entry(&mut commands, edit, &interface.font, field, label);
+        entry(&mut commands, material_panel, &interface.font, field, label);
     }
     control(
         &mut commands,
-        edit,
+        material_panel,
         &interface.font,
         "Создать и назначить",
         EditAction::CreateMaterial,
     );
-    let select = node(
+    let selection_panel = inspector::section(
         &mut commands,
         panel,
+        font,
+        "Выделение",
+        "selection select",
+        false,
+    )
+    .body;
+    let select = node(
+        &mut commands,
+        selection_panel,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
@@ -621,19 +769,15 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Нож · K", EditAction::BeginKnife { only_selected: false }),
         ("Сечение плоскостью", EditAction::Bisect),
     ] {
-        control(&mut commands, select, &interface.font, label, a);
+        let item = node(&mut commands, select, row(0.0));
+        inspector::searchable(&mut commands, item, label);
+        control(&mut commands, item, &interface.font, label, a);
     }
-    text(
-        &mut commands,
-        panel,
-        &interface.font,
-        "ОПЕРАЦИИ",
-        11.0,
-        MUTED,
-    );
+    let operations =
+        inspector::section(&mut commands, panel, font, "Операции", "operations", false).body;
     let group = node(
         &mut commands,
-        panel,
+        operations,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3),
@@ -653,9 +797,11 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Применить R/S", Operation::ApplyTransform),
         ("Центр по геометрии", Operation::OriginToGeometry),
     ] {
+        let item = node(&mut commands, group, row(0.0));
+        inspector::searchable(&mut commands, item, label);
         control(
             &mut commands,
-            group,
+            item,
             &interface.font,
             label,
             EditAction::Operate(op),
@@ -663,12 +809,13 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     }
     let row = node(
         &mut commands,
-        panel,
+        operations,
         Node {
             flex_wrap: FlexWrap::Wrap,
             ..row(3.0)
         },
     );
+    inspector::searchable(&mut commands, row, "скрыть показать visibility hide reveal");
     control(
         &mut commands,
         row,
@@ -727,7 +874,8 @@ fn value(doc: &Document, field: Field) -> String {
                     _ => o.transform.scale[index % 3],
                 })
             };
-            format!("{v:.4}")
+            let display = if v.abs() < 0.00005 { 0.0 } else { v };
+            format!("{display:.4}")
         }
     }
 }
@@ -1005,7 +1153,7 @@ pub(in crate::editor) fn refresh(
             let faces: usize = doc.objects.iter().map(|o| o.geometry.faces.len()).sum();
             let chosen = state.selection_label(index).unwrap_or_default();
             format!(
-                "{} объектов · {vertices} вершин · {faces} граней{}{}",
+                "Объекты {} · Вершины {vertices} · Грани {faces}{}{}",
                 doc.objects.len(),
                 if editing {
                     format!("\n{chosen}")
@@ -1086,9 +1234,11 @@ pub(in crate::editor) fn refresh(
                     .filter(|name| !name.is_empty())
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("{} · {}", object.name, slot + 1));
+                let item = node(&mut commands, ui.materials, row(0.0));
+                inspector::searchable(&mut commands, item, &name);
                 control(
                     &mut commands,
-                    ui.materials,
+                    item,
                     &interface.font,
                     &name,
                     EditAction::AssignMaterial { object: id, slot },

@@ -23,10 +23,12 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
         description: "Навигатор".into(),
         portraits: vec![
             Portrait {
+                uid: None,
                 label: "Спокойствие".into(),
                 path: "portraits/calm.png".into(),
             },
             Portrait {
+                uid: None,
                 label: "Тревога".into(),
                 path: "portraits/worried.png".into(),
             },
@@ -49,6 +51,10 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
     );
     let path = create(&root, Path::new(""), false).unwrap();
     let mut d = Dialogue::new("Прибытие".into());
+    d.extensions.insert(
+        "clinic".into(),
+        serde_json::json!({"lines": {"1": {"id": "arrival", "sound": "audio/arrival.ogg"}}}),
+    );
     let first = d.add(NodeKind::Line, 0);
     let n = d.node_mut(first).unwrap();
     n.speaker = Some(c.to_string_lossy().into_owned());
@@ -58,6 +64,7 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
     d.node_mut(first).unwrap().choices.push(Choice {
         text: "Повторить".into(),
         target: Some(first),
+        condition: Default::default(),
         dialogue: None,
     });
     assert!(d.warnings().is_empty());
@@ -123,6 +130,7 @@ fn malformed_documents_are_rejected_without_changing_active_tab() {
             name: "Unsafe".into(),
             description: String::new(),
             portraits: vec![Portrait {
+                uid: None,
                 label: "x".into(),
                 path: "../private.png".into()
             }]
@@ -385,5 +393,39 @@ fn legacy_dialogue_link_loads_as_a_connected_jump_node() {
     assert_eq!(jump.kind, NodeKind::Jump);
     assert_eq!(jump.dialogue.as_deref(), Some("Дальше.dialog"));
     assert!(migrated.warnings().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn asset_registry_preserves_portrait_after_old_filename_is_reused() {
+    let root = lab();
+    fs::write(root.join("face#1.png"), b"portrait").unwrap();
+    let character = create(&root, Path::new(""), true).unwrap();
+    let mut scan = crate::asset_registry::scan::Scanner::new(&root).unwrap();
+    scan.run(None).unwrap();
+    Content::Character(Character {
+        version: VERSION,
+        name: "Nina".into(),
+        description: String::new(),
+        portraits: vec![Portrait {
+            uid: None,
+            label: "Portrait".into(),
+            path: "face#1.png".into(),
+        }],
+    })
+    .save(&root, &character)
+    .unwrap();
+    let bytes = fs::read(root.join(&character)).unwrap();
+    let saved: Character = serde_json::from_slice(&bytes).unwrap();
+    assert!(saved.portraits[0].uid.is_some());
+    fs::rename(root.join("face#1.png"), root.join("new#2.png")).unwrap();
+    fs::write(root.join("face#1.png"), b"other face").unwrap();
+    scan.run(None).unwrap();
+    let Content::Character(loaded) = Content::read(&root, &character).unwrap() else {
+        panic!()
+    };
+    assert_eq!(loaded.portraits[0].path, "new#2.png");
+    assert_eq!(loaded.portraits[0].uid, saved.portraits[0].uid);
+    assert_eq!(fs::read(root.join(&character)).unwrap(), bytes);
     fs::remove_dir_all(root).unwrap();
 }

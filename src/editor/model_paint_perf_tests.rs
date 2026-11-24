@@ -30,7 +30,7 @@ fn model_paint_noop_strokes_preserve_snapshot_identity() {
         work,
         vec![
             Event::Begin(brush),
-            Event::Points(vec![Vec2::splat(256.)], map.clone()),
+            Event::Points(vec![Stamp::from(Vec2::splat(256.))], map.clone()),
             Event::End,
         ],
         false,
@@ -51,7 +51,7 @@ fn model_paint_noop_strokes_preserve_snapshot_identity() {
         work,
         vec![
             Event::Begin(eraser),
-            Event::Points(vec![Vec2::splat(256.)], map),
+            Event::Points(vec![Stamp::from(Vec2::splat(256.))], map),
             Event::End,
         ],
         false,
@@ -65,7 +65,9 @@ fn model_paint_noop_strokes_preserve_snapshot_identity() {
 fn model_paint_bounded_batches_preserve_samples_and_stroke_boundaries() {
     let (_, map, folder) = super::tests::paint_fixture();
     let map = Arc::new(map);
-    let points = (0..100).map(|i| Vec2::splat(i as f32)).collect::<Vec<_>>();
+    let points = (0..100)
+        .map(|i| Stamp::from(Vec2::splat(i as f32)))
+        .collect::<Vec<_>>();
     let mut queue = VecDeque::from([
         Event::Begin(super::tests::brush()),
         Event::Points(points.clone(), map),
@@ -161,7 +163,11 @@ fn model_paint_benchmark_40k_triangles() {
             surface,
             stroke: None,
         },
-        vec![Event::Begin(brush), Event::Points(points, map), Event::End],
+        vec![
+            Event::Begin(brush),
+            Event::Points(points.into_iter().map(Stamp::from).collect(), map),
+            Event::End,
+        ],
         false,
     );
     let new_ms = start.elapsed().as_secs_f64() * 1000.;
@@ -197,6 +203,7 @@ fn model_paint_incremental_composite_matches_full_for_all_channels() {
     let (mut work, _, folder) = super::tests::paint_fixture();
     let surface = &mut work.surface;
     let mut layer = Layer::new("Test".into(), LayerKind::Paint);
+    layer.blend = data::Blend::Overlay;
     for c in 0..8 {
         let mut p = vec![0; 64 * 64 * 4];
         for (i, p) in p.chunks_exact_mut(4).enumerate() {

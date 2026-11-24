@@ -48,7 +48,6 @@ pub(crate) struct LightingUi {
     tooltip: Entity,
     tooltip_label: Entity,
     menu_open: bool,
-    advanced: bool,
     pointer_consumed: bool,
     controls: controls::State,
     name_draft: Option<NameDraft>,
@@ -80,9 +79,6 @@ impl LightingUi {
 pub(crate) struct NameInput;
 
 #[derive(Component)]
-pub(in crate::editor) struct AdvancedIcon(bool);
-
-#[derive(Component)]
 pub(crate) struct Help(&'static str);
 
 #[derive(Clone, Copy, Component)]
@@ -97,10 +93,7 @@ pub(crate) enum VisibleWhen {
     NonRect,
     Temperature,
     Fog,
-    AdvancedEnvironment,
-    AdvancedNonRect,
-    AdvancedLocal,
-    AdvancedDirectional,
+    Directional,
 }
 
 #[derive(Clone, Copy, Component)]
@@ -116,7 +109,6 @@ pub(crate) enum Choice {
     GlobalShadows,
     Fog,
     Resolution(u32),
-    Advanced,
     Menu,
     Gizmos,
 }
@@ -131,7 +123,6 @@ pub(crate) enum DynamicLabel {
     Imported,
     GlobalShadows,
     Fog,
-    Advanced,
     ToneMap,
     Intensity,
     Gizmos,
@@ -178,9 +169,11 @@ fn dynamic_button(
     dynamic: DynamicLabel,
     hint: &'static str,
 ) {
+    let item = node(commands, parent, column(0.0));
+    inspector::searchable(commands, item, label);
     let button = control(
         commands,
-        parent,
+        item,
         Action::Lighting(action),
         Look::Regular,
         Node {
@@ -485,7 +478,16 @@ pub(crate) fn setup(
             ..column(6.0)
         },
     );
-    let light = pane(commands, panel, VisibleWhen::Light);
+    let light_scope = pane(commands, panel, VisibleWhen::Light);
+    let light = inspector::section(
+        commands,
+        light_scope,
+        font_handle,
+        "Источник света",
+        "light intensity",
+        true,
+    )
+    .body;
     let name = commands
         .spawn((
             NameInput,
@@ -512,7 +514,13 @@ pub(crate) fn setup(
             },
         ))
         .id();
+    inspector::searchable(commands, name, "имя источника name");
     let kinds = wrap(commands, light, 3.0);
+    inspector::searchable(
+        commands,
+        kinds,
+        "тип точка конус прожектор солнце панель point spot sun directional rect type",
+    );
     for (label, kind) in [
         ("Точка", LightKind::Point),
         ("Конус", LightKind::Spot),
@@ -557,7 +565,15 @@ pub(crate) fn setup(
         Field::Light(LightField::Range),
         "м",
     );
-    section(commands, light, font_handle, "ЦВЕТ");
+    let light = inspector::section(
+        commands,
+        light_scope,
+        font_handle,
+        "Цвет",
+        "color rgb kelvin",
+        true,
+    )
+    .body;
     color_editor(commands, light, font_handle, Swatch::Light, images);
     palette(commands, light);
     dynamic_button(
@@ -580,6 +596,7 @@ pub(crate) fn setup(
         "K",
     );
     let kelvin = wrap(commands, temperature, 3.0);
+    inspector::searchable(commands, kelvin, "температура kelvin");
     for (label, value) in [("2700 K", 2700.0), ("4000 K", 4000.0), ("6500 K", 6500.0)] {
         light_button(
             commands,
@@ -590,6 +607,15 @@ pub(crate) fn setup(
             "Быстро задать цветовую температуру выбранного источника.",
         );
     }
+    let light = inspector::section(
+        commands,
+        light_scope,
+        font_handle,
+        "Форма и тени",
+        "shape shadows",
+        true,
+    )
+    .body;
     let radius = pane(commands, light, VisibleWhen::Radius);
     scalar(
         commands,
@@ -654,6 +680,7 @@ pub(crate) fn setup(
         "Включить тени для выбранного источника. Тени требуют дополнительного времени GPU.",
     );
     let placement = wrap(commands, light, 4.0);
+    inspector::searchable(commands, placement, "из вида направить положение alignment");
     light_button(
         commands,
         placement,
@@ -671,17 +698,32 @@ pub(crate) fn setup(
         "Скопировать направление свободной камеры, сохранив позицию источника.",
     );
 
-    let environment = pane(commands, panel, VisibleWhen::Environment);
-    section(commands, environment, font_handle, "HDRI · ОКРУЖЕНИЕ");
+    let environment_scope = pane(commands, panel, VisibleWhen::Environment);
+    let environment = inspector::section(
+        commands,
+        environment_scope,
+        font_handle,
+        "HDRI",
+        "окружение panorama панорама",
+        true,
+    )
+    .body;
+    let library = node(commands, environment, column(0.0));
+    inspector::searchable(commands, library, "скачать загрузить каталог download hdri");
     button(
         commands,
-        environment,
+        library,
         font_handle,
         "Скачать HDRI…",
         Action::HdriLibrary(super::HdriAction::Open),
         Look::Regular,
     );
     let environments = wrap(commands, environment, 4.0);
+    inspector::searchable(
+        commands,
+        environments,
+        "панорама предустановки пресеты presets",
+    );
     for preset in std::iter::once(None).chain(EnvironmentPreset::ALL.into_iter().map(Some)) {
         let label = preset.map_or("Выкл.", EnvironmentPreset::label);
         let choice = light_button(
@@ -705,6 +747,7 @@ pub(crate) fn setup(
             ..column(4.0)
         },
     );
+    inspector::searchable(commands, downloaded, "загруженные downloaded hdri");
     commands
         .entity(downloaded)
         .insert(super::hdri_library::DownloadedList);
@@ -735,7 +778,15 @@ pub(crate) fn setup(
         Field::Environment(EnvironmentField::HdriRotation),
         "°",
     );
-    section(commands, environment, font_handle, "ФОНОВЫЙ СВЕТ");
+    let environment = inspector::section(
+        commands,
+        environment_scope,
+        font_handle,
+        "Фоновый свет",
+        "ambient фон",
+        true,
+    )
+    .body;
     color_editor(commands, environment, font_handle, Swatch::Ambient, images);
     palette(commands, environment);
     scalar(
@@ -746,7 +797,15 @@ pub(crate) fn setup(
         Field::Environment(EnvironmentField::AmbientBrightness),
         "",
     );
-    section(commands, environment, font_handle, "КАМЕРА");
+    let environment = inspector::section(
+        commands,
+        environment_scope,
+        font_handle,
+        "Экспозиция и тонмаппинг",
+        "camera камера exposure color",
+        true,
+    )
+    .body;
     scalar(
         commands,
         environment,
@@ -756,6 +815,11 @@ pub(crate) fn setup(
         "EV",
     );
     let exposures = wrap(commands, environment, 4.0);
+    inspector::searchable(
+        commands,
+        exposures,
+        "экспозиция presets интерьер день солнце",
+    );
     for (label, value) in [("Интерьер", 8.0), ("День", 12.0), ("Солнце", 15.0)] {
         light_button(
             commands,
@@ -766,9 +830,11 @@ pub(crate) fn setup(
             "Задать экспозицию камеры. Большее EV делает изображение темнее.",
         );
     }
+    let tonemap_row = node(commands, environment, column(0.0));
+    inspector::searchable(commands, tonemap_row, "тонмаппинг tone mapping agx");
     let tonemap = control(
         commands,
-        environment,
+        tonemap_row,
         Action::Lighting(LightingAction::CycleToneMapping),
         Look::Regular,
         Node {
@@ -797,7 +863,15 @@ pub(crate) fn setup(
     commands
         .entity(tonemap_caption)
         .insert(DynamicLabel::ToneMap);
-    section(commands, environment, font_handle, "СЦЕНА");
+    let environment = inspector::section(
+        commands,
+        environment_scope,
+        font_handle,
+        "Свет сцены и туман",
+        "scene fog shadows",
+        true,
+    )
+    .body;
     dynamic_button(
         commands,
         environment,
@@ -847,44 +921,16 @@ pub(crate) fn setup(
         "м",
     );
 
-    let advanced_button = control(
+    let shadow_scope = pane(commands, light_scope, VisibleWhen::NonRect);
+    let advanced_light = inspector::section(
         commands,
-        panel,
-        Action::LightAdvanced,
-        Look::Regular,
-        Node {
-            width: percent(100),
-            height: px(29),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(5)),
-            ..row(8.0)
-        },
-    );
-    commands.entity(advanced_button).insert((
-        AccessibleLabel("Дополнительно".into()),
-        Choice::Advanced,
-        Help("Раскрыть дополнительные настройки теней и качества освещения."),
-    ));
-    let advanced_icon = icons::spawn(
-        commands,
-        advanced_button,
-        icons::Glyph::ChevronDown,
-        14.0,
-        MUTED,
-    );
-    commands.entity(advanced_icon).insert(AdvancedIcon(false));
-    let advanced_label = text(
-        commands,
-        advanced_button,
+        shadow_scope,
         font_handle,
-        "Дополнительно",
-        12.0,
-        MUTED,
-    );
-    commands
-        .entity(advanced_label)
-        .insert(DynamicLabel::Advanced);
-    let advanced_light = pane(commands, panel, VisibleWhen::AdvancedNonRect);
+        "Тени · дополнительно",
+        "shadow bias",
+        false,
+    )
+    .body;
     dynamic_button(
         commands,
         advanced_light,
@@ -911,7 +957,7 @@ pub(crate) fn setup(
         Field::Light(LightField::ShadowNormalBias),
         "",
     );
-    let advanced_local = pane(commands, advanced_light, VisibleWhen::AdvancedLocal);
+    let advanced_local = pane(commands, advanced_light, VisibleWhen::Local);
     scalar(
         commands,
         advanced_local,
@@ -920,7 +966,7 @@ pub(crate) fn setup(
         Field::Light(LightField::ShadowNear),
         "м",
     );
-    let advanced_directional = pane(commands, advanced_light, VisibleWhen::AdvancedDirectional);
+    let advanced_directional = pane(commands, advanced_light, VisibleWhen::Directional);
     scalar(
         commands,
         advanced_directional,
@@ -929,9 +975,17 @@ pub(crate) fn setup(
         Field::Light(LightField::ShadowDistance),
         "м",
     );
-    let advanced_env = pane(commands, panel, VisibleWhen::AdvancedEnvironment);
-    section(commands, advanced_env, font_handle, "РАЗРЕШЕНИЕ ТЕНЕЙ");
+    let advanced_env = inspector::section(
+        commands,
+        environment_scope,
+        font_handle,
+        "Качество теней",
+        "shadow resolution разрешение теней дополнительно",
+        false,
+    )
+    .body;
     let resolutions = wrap(commands, advanced_env, 4.0);
+    inspector::searchable(commands, resolutions, "разрешение 512 1024 2048 4096");
     for resolution in [512, 1024, 2048, 4096] {
         let choice = light_button(
             commands,
@@ -945,9 +999,11 @@ pub(crate) fn setup(
             .entity(choice)
             .insert(Choice::Resolution(resolution));
     }
+    let reset = node(commands, advanced_env, column(0.0));
+    inspector::searchable(commands, reset, "сбросить окружение reset");
     light_button(
         commands,
-        advanced_env,
+        reset,
         font_handle,
         "Сбросить окружение",
         LightingAction::ResetEnvironment,
@@ -982,7 +1038,6 @@ pub(crate) fn setup(
         tooltip,
         tooltip_label,
         menu_open: false,
-        advanced: false,
         pointer_consumed: false,
         controls: controls::State::default(),
         name_draft: None,
@@ -1024,9 +1079,6 @@ pub(crate) fn edit_name(
         match *action {
             Action::LightMenu => {
                 ui.menu_open = !ui.menu_open;
-            }
-            Action::LightAdvanced => {
-                ui.advanced = !ui.advanced;
             }
             Action::Lighting(LightingAction::Add(_) | LightingAction::ApplyPreset(_))
             | Action::Select(Selection::Environment) => {
@@ -1154,7 +1206,6 @@ pub(crate) fn edit_name(
 }
 
 pub(crate) fn refresh(
-    mut commands: Commands,
     editor: Res<Editor>,
     mut ui: ResMut<LightingUi>,
     time: Res<Time>,
@@ -1169,22 +1220,7 @@ pub(crate) fn refresh(
     >,
     hints: Query<(Entity, &Help, &Hovered)>,
     geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
-    mut advanced_icons: Query<(Entity, &mut AdvancedIcon)>,
 ) {
-    for (entity, mut icon) in &mut advanced_icons {
-        if icon.0 != ui.advanced {
-            icon.0 = ui.advanced;
-            icons::set_glyph(
-                &mut commands,
-                entity,
-                if ui.advanced {
-                    icons::Glyph::ChevronUp
-                } else {
-                    icons::Glyph::ChevronDown
-                },
-            );
-        }
-    }
     let light = match editor.selection {
         Some(Selection::Light(id)) => editor.light(id),
         _ => None,
@@ -1193,6 +1229,7 @@ pub(crate) fn refresh(
         editor.has_scene() && editor.selection == Some(Selection::Environment);
     let environment = editor.environment();
     let show = editor.has_scene()
+        && !editor.multiple_selected()
         && editor.viewing_model.is_none()
         && (light.is_some() || environment_selected);
     if let Ok(mut panel) = nodes.get_mut(ui.inspector) {
@@ -1228,18 +1265,8 @@ pub(crate) fn refresh(
             VisibleWhen::NonRect => light.is_some_and(|light| light.kind != LightKind::Rect),
             VisibleWhen::Temperature => light.is_some_and(|light| light.temperature.is_some()),
             VisibleWhen::Fog => environment_selected && environment.fog.is_some(),
-            VisibleWhen::AdvancedEnvironment => ui.advanced && environment_selected,
-            VisibleWhen::AdvancedNonRect => {
-                ui.advanced && light.is_some_and(|light| light.kind != LightKind::Rect)
-            }
-            VisibleWhen::AdvancedLocal => {
-                ui.advanced
-                    && light.is_some_and(|light| {
-                        matches!(light.kind, LightKind::Point | LightKind::Spot)
-                    })
-            }
-            VisibleWhen::AdvancedDirectional => {
-                ui.advanced && light.is_some_and(|light| light.kind == LightKind::Directional)
+            VisibleWhen::Directional => {
+                light.is_some_and(|light| light.kind == LightKind::Directional)
             }
         };
         if let Ok(mut node) = nodes.get_mut(entity) {
@@ -1305,7 +1332,6 @@ pub(crate) fn refresh(
                 "Туман: выкл."
             }
             .into(),
-            DynamicLabel::Advanced => "Дополнительно".into(),
             DynamicLabel::ToneMap => format!("Тонмаппинг: {}", environment.tonemapping.label()),
             DynamicLabel::Gizmos => if editor.show_lights {
                 "Значки света: вкл."
@@ -1342,7 +1368,6 @@ pub(crate) fn refresh(
                 Choice::GlobalShadows => environment.shadows,
                 Choice::Fog => environment.fog.is_some(),
                 Choice::Resolution(value) => environment.shadow_resolution == value,
-                Choice::Advanced => ui.advanced,
                 Choice::Menu => ui.menu_open,
                 Choice::Gizmos => editor.show_lights,
             };
@@ -1447,7 +1472,6 @@ mod tests {
                 tooltip: panel,
                 tooltip_label: panel,
                 menu_open: false,
-                advanced: false,
                 pointer_consumed: false,
                 controls: controls::State::default(),
                 name_draft: None,

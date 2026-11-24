@@ -38,6 +38,7 @@ fn fixture() -> (Glb, Object) {
         geometry: geometry.into(),
         transform: Transform::from_xyz(1., 2., 3.),
         materials: vec![MaterialSlot {
+            bake_fixes: Default::default(),
             authored: None,
             paint: None,
             material: default(),
@@ -46,6 +47,165 @@ fn fixture() -> (Glb, Object) {
         hidden: false,
     };
     (source, object)
+}
+
+#[test]
+fn bake_settings_survive_glb_reopen_move_and_document_undo() {
+    use crate::editor::model_bake_settings::{self as bake, Quality, Settings};
+
+    let (source, object) = fixture();
+    let model = source.path.clone();
+    let parent = model.parent().unwrap();
+    let external_cage = parent.parent().unwrap().join("cage.fbx");
+    let mut doc = Document::new(source, vec![object]);
+    assert_eq!(doc.bake_settings, Settings::default());
+    let before = doc.snapshot();
+    let settings = Settings {
+        high_poly: Some(parent.join("source/high.obj")),
+        cage: Some(external_cage.clone()),
+        quality: Quality::Ultra,
+        map_bits: 9,
+        front: 12,
+        rear: 37,
+        match_names: false,
+        fill_misses: false,
+        auto_fit: true,
+    };
+    doc.bake_settings = settings.clone();
+    doc.checkpoint(before);
+    assert!(doc.dirty());
+    doc.undo();
+    assert!(!doc.dirty());
+    doc.redo();
+    assert_eq!(doc.bake_settings, settings);
+
+    doc.source.json["extras"] = json!({"keep": 7});
+    doc.save().unwrap();
+    assert!(!doc.dirty());
+    let read = Glb::load(&model).unwrap();
+    assert_eq!(read.json["extras"]["keep"], 7);
+    let path = read.json["extras"]["bevy_editor_bake_settings"]["high_poly"].as_str().unwrap();
+    assert_eq!(Path::new(path), Path::new("source").join("high.obj"));
+    let bytes = fs::read(&model).unwrap();
+    let reopened = Document::new(read, doc.objects.clone());
+    assert_eq!(reopened.bake_settings, settings);
+    assert!(!reopened.dirty());
+
+    let moved = parent.join("moved/model.glb");
+    let moved = Glb::parse(moved.clone(), bytes).unwrap();
+    let mut restored = bake::read(&moved.json, &moved.path);
+    assert_eq!(restored.high_poly.take(), Some(parent.join("moved/source/high.obj")));
+    assert_eq!(restored.cage, Some(external_cage));
+    fs::remove_dir_all(parent).unwrap();
+}
+
+#[test]
+fn cage_paint_round_trips_across_material_vertex_reordering() {
+    use crate::editor::model_cage_data::{self as cage_data, Edit, Scales};
+    use std::sync::Arc;
+
+    let (source, mut object) = fixture();
+    let folder = source.path.parent().unwrap().to_owned();
+    object.geometry.positions.push(Vec3::new(1., 1., 0.));
+    object.geometry.faces[0].material = 1;
+    object.geometry.faces.push(Face {
+        corners: [2, 1, 3].map(Corner::new).to_vec(),
+        material: 0,
+        smooth: false,
+    });
+    object.materials.push(object.materials[0].clone());
+    let mut doc = Document::new(source, vec![object.clone()]);
+    // The synthetic source node has no mesh until the first encode.
+    doc.original.clear();
+    let before = doc.snapshot();
+    Arc::make_mut(&mut doc.cage_edits).insert(object.id, Edit {
+        mesh: object.geometry.clone(),
+        scales: Scales { values: Arc::new(vec![1.2, 0.8, 1., 2.]) },
+    });
+    doc.checkpoint(before);
+    assert!(doc.dirty());
+    doc.undo();
+    assert!(doc.cage_edits.is_empty());
+    assert!(!doc.dirty());
+    doc.redo();
+    doc.save().unwrap();
+
+    let saved = Glb::load(&doc.source.path).unwrap();
+    assert_eq!(saved.json["nodes"][0]["extras"]["script"], 42);
+    let mut reopened = object.clone();
+    reopened.geometry = import_geometry(&saved).unwrap().into();
+    assert_ne!(reopened.geometry.positions, object.geometry.positions);
+    let mut reopened = Document::new(saved, vec![reopened]);
+    let scales = &reopened.cage_edits[&object.id].scales.values;
+    for (point, scale) in reopened.objects[0].geometry.positions.iter().zip(scales.iter()) {
+        let original = object.geometry.positions.iter().position(|p| p == point).unwrap();
+        assert_eq!(*scale, [1.2, 0.8, 1., 2.][original]);
+    }
+    let mut changed = reopened.objects[0].clone();
+    changed.geometry.positions[0].x += 0.125;
+    assert!(cage_data::read(&reopened.source.json["nodes"][0], &changed).is_none());
+    let before = reopened.snapshot();
+    Arc::make_mut(&mut reopened.cage_edits).clear();
+    reopened.checkpoint(before);
+    assert!(reopened.dirty());
+    reopened.save().unwrap();
+    let saved = Glb::load(&reopened.source.path).unwrap();
+    assert!(cage_data::read(&saved.json["nodes"][0], &reopened.objects[0]).is_none());
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn mesh_map_levels_are_saved_with_their_material_slots() {
+    let (source, mut object) = fixture();
+    let path = source.path.clone();
+    let original = json!({"black": 12, "white": 90, "gamma": 110});
+    object.materials[0].source["extras"]["bevy_editor_bake_levels"] =
+        json!([["occlusion", original]]);
+    let mut doc = Document::new(source, vec![object]);
+    doc.original.clear();
+    doc.save().unwrap();
+    let reopened = Glb::load(&path).unwrap();
+    let primitive = &reopened.json["meshes"][0]["primitives"][0];
+    assert_eq!(primitive["extras"]["bevy_editor_bake_levels"][0][1], original);
+    assert_eq!(primitive["extras"]["keep"], true);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn mesh_map_fixes_round_trip_and_can_be_removed_independently_of_levels() {
+    use crate::editor::model_paint_data::map_fixes::{BakeMap, Plane, EXTRAS};
+    use std::sync::Arc;
+
+    let (source, mut object) = fixture();
+    let path = source.path.clone();
+    let fixes = Arc::new(vec![(BakeMap::Occlusion, Arc::new(Plane {
+        size: 2,
+        pixels: vec![0, 0, 64, 128, 13, 127, 61, 255],
+    }))]);
+    object.materials[0].bake_fixes = fixes.clone();
+    let mut doc = Document::new(source, vec![object]);
+    doc.original.clear();
+    doc.save().unwrap();
+    let saved = Glb::load(&path).unwrap();
+    let mesh = saved.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let primitive = &saved.json["meshes"][mesh]["primitives"][0];
+    assert_eq!(saved.bake_fixes(primitive).unwrap(), fixes);
+    assert_eq!(primitive["extras"]["keep"], true);
+
+    doc.objects[0].materials[0].source = primitive.clone();
+    doc.objects[0].materials[0].source["extras"]["bevy_editor_bake_levels"] =
+        json!([["occlusion", {"black": 0, "white": 90, "gamma": 100}]]);
+    let before = doc.snapshot();
+    doc.objects[0].materials[0].bake_fixes = Arc::default();
+    doc.checkpoint(before);
+    doc.save().unwrap();
+    let saved = Glb::load(&path).unwrap();
+    let mesh = saved.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let primitive = &saved.json["meshes"][mesh]["primitives"][0];
+    assert!(primitive["extras"].get(EXTRAS).is_none());
+    assert!(primitive["extras"]["bevy_editor_bake_levels"].is_array());
+    assert_eq!(primitive["extras"]["keep"], true);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -96,15 +256,137 @@ fn model_glb_assigns_translucent_material_to_only_selected_faces_and_keeps_it_on
 }
 
 #[test]
+fn model_glb_udim_preserves_local_texture_coordinates_and_global_islands() {
+    use crate::editor::model_document::udim;
+    let (source, mut object) = fixture();
+    let bounds = [Vec2::splat(0.125), Vec2::new(0.875, 0.125), Vec2::new(0.125, 0.875)];
+    let make_face = |offset: Vec2| {
+        let mut face = object.geometry.faces[0].clone();
+        for (corner, point) in face.corners.iter_mut().zip(bounds) {
+            corner.uv = point + offset;
+        }
+        face
+    };
+    let repeated = make_face(Vec2::new(0.5, 0.));
+    object.geometry.faces = vec![make_face(Vec2::ZERO), make_face(Vec2::X), make_face(Vec2::new(2., -1.))];
+    let mut conventional = object.clone();
+    conventional.geometry.faces.push(repeated);
+    udim::import(&mut conventional, true);
+    assert_eq!(conventional.materials.len(), 1);
+    assert!(conventional.materials[0].udim().is_none());
+
+    let mut tiled = object.clone();
+    udim::import(&mut tiled, false);
+    assert_eq!(tiled, object, "opted-out repeating UVs must be preserved verbatim");
+    udim::import(&mut object, true);
+    let tiles = object.materials.iter().map(|m| m.udim().unwrap().number()).collect::<Vec<_>>();
+    assert_eq!(tiles, [1001, 1002, 1013]);
+    let bytes = source.encode(&[object.clone()], &[]).unwrap();
+    let glb = Glb::parse(source.path.clone(), bytes.clone()).unwrap();
+    let parsed = bevy::gltf::gltf::Gltf::from_slice(&bytes).unwrap();
+    let gltf_mesh = parsed.nodes().next().unwrap().mesh().unwrap();
+    let mut reopened = object.clone();
+    for primitive in gltf_mesh.primitives() {
+        let slot = primitive.index();
+        let meta = &glb.json["meshes"][gltf_mesh.index()]["primitives"][slot];
+        assert_eq!(meta["extras"]["bevy_editor_udim"], tiles[slot]);
+        assert_eq!(meta["extras"]["keep"], true);
+        reopened.materials[slot].source = meta.clone();
+        let reader = primitive.reader(|_| parsed.blob.as_deref());
+        let written = reader.read_tex_coords(0).unwrap().into_f32().map(Vec2::from_array).collect::<Vec<_>>();
+        assert!(written.iter().all(|uv| uv.min_element() >= 0. && uv.max_element() <= 1.));
+        for index in 0..3 {
+            reopened.geometry.faces[slot].corners[index].uv = written[index];
+        }
+    }
+    udim::import(&mut reopened, false);
+    assert_eq!(reopened.geometry, object.geometry);
+    assert_eq!(reopened.udim_tiles().map(udim::Tile::number).collect::<Vec<_>>(), tiles);
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn model_glb_texture_fill_reopens_source_images_and_projection() {
+    use crate::editor::model_paint_data::{Layer, LayerKind, Stack, Surface, solid, texture_fill};
+    use image::ImageEncoder;
+    use std::sync::Arc;
+
+    let (mut source, mut object) = fixture();
+    for (corner, uv) in object.geometry.faces[0].corners.iter_mut().zip([Vec2::ZERO, Vec2::X, Vec2::Y]) {
+        corner.uv = uv;
+    }
+    let mut bytes = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
+        &[255, 0, 20, 255, 0, 80, 200, 255, 12, 5, 27, 255, 190, 133, 20, 255],
+        2, 2, image::ExtendedColorType::Rgba8,
+    ).unwrap();
+    let mut layer = Layer::new("Текстура".into(), LayerKind::Fill);
+    let mut fill = texture_fill::Fill::default();
+    fill.settings.projection = texture_fill::Projection::Triplanar;
+    fill.settings.rotation = 45.;
+    fill.settings.height_strength = 0.2;
+    fill.settings.variation = texture_fill::Variation {
+        color: 0.65, roughness: 0.3, height: 0.4, seed: 23., ..Default::default()
+    };
+    let bitmap = Arc::new(texture_fill::Bitmap::decode("pattern.png".into(), &bytes).unwrap());
+    fill.images[0] = Some(bitmap.clone());
+    fill.images[1] = Some(bitmap.clone());
+    fill.images[3] = Some(bitmap);
+    layer.texture_fill = Some(Arc::new(fill));
+    let mut surface = Surface {
+        size: 16, base: std::array::from_fn(|_| solid(16, [255; 4])),
+        stack: Stack { layers: vec![layer], selected: 0 },
+        material: serde_json::Value::Null, baked: None,
+    };
+    surface.bind_texture_fills(&object.geometry, 0, Vec2::ZERO, object.transform);
+    assert!(surface.composite(0).chunks_exact(4).any(|p| p[0] != p[2]));
+    object.materials[0].paint = Some(Arc::new(surface.clone()));
+    source.save(std::slice::from_ref(&object), &[]).unwrap();
+    let reopened = Glb::load(&source.path).unwrap();
+    let primitive = &reopened.json["meshes"][0]["primitives"][0];
+    let mut restored = (*reopened.paint_surface(primitive).unwrap().unwrap()).clone();
+    let fill = restored.stack.layers[0].texture_fill.as_ref().unwrap();
+    assert_eq!(fill.settings.projection, texture_fill::Projection::Triplanar);
+    assert_eq!(fill.settings.rotation, 45.);
+    assert_eq!(fill.settings.height_strength, 0.2);
+    assert_eq!(fill.settings.variation.seed, 23.);
+    assert_eq!(fill.settings.variation.height, 0.4);
+    assert_eq!(fill.images[0].as_ref().unwrap().bytes, bytes);
+    assert_eq!(fill.images[1].as_ref().unwrap().bytes, bytes);
+    restored.bind_texture_fills(&object.geometry, 0, Vec2::ZERO, object.transform);
+    assert_eq!(restored.composite(0), surface.composite(0));
+    assert_eq!(restored.composite(1), surface.composite(1));
+    assert_eq!(restored.composite(3), surface.composite(3));
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn model_glb_paint_round_trip_keeps_layers_and_flattened_standard_material() {
     use crate::editor::model_paint_data::{Surface, Stack, Layer, LayerKind, solid};
     use std::sync::Arc;
     let (mut source, mut object) = fixture();
     let mut red = Layer::new("Красный".into(),LayerKind::Paint);
     red.channels[0]=Some(solid(16,[255,0,0,255]));
+    let mut specular = [32, 32, 32, 255].repeat(16 * 16);
+    for row in specular.chunks_exact_mut(16 * 4) {
+        for texel in row[8 * 4..].chunks_exact_mut(4) {
+            texel.copy_from_slice(&[224, 224, 224, 255]);
+        }
+    }
+    red.channels[7] = Some(Arc::new(specular));
+    source.json["materials"][0]["extensions"]["KHR_materials_specular"] =
+        serde_json::json!({"specularFactor":0.3,"specularColorFactor":[0.8,0.9,1.0]});
     let mut blue=Layer::new("Синий".into(),LayerKind::Paint);
     blue.channels[0]=Some(solid(16,[0,0,255,255]));blue.opacity=50.;
-    let surface=Arc::new(Surface{size:16,base:std::array::from_fn(|_|solid(16,[255;4])),stack:Stack{layers:vec![red,blue],selected:1},material:source.json["materials"][0].clone()});
+    blue.depth = 1;
+    let mut group = Layer::new("Финишный цвет".into(), LayerKind::Folder);
+    group.collapsed = true;
+    group.graph_id = Some(425);
+    group.folder_graph = Some(Arc::new(serde_json::json!({
+        "name": "Финишный цвет",
+        "nodes": [{"id": 1, "def": "layer", "pos": [123.0, -456.0]}],
+    })));
+    let surface=Arc::new(Surface{size:16,base:std::array::from_fn(|_|solid(16,[255;4])),stack:Stack{layers:vec![red,blue,group],selected:2},material:source.json["materials"][0].clone(),baked:None});
     object.materials[0].paint=Some(surface.clone());
     source.save(&[object],&[]).unwrap();
     let loaded=Glb::load(&source.path).unwrap();
@@ -112,6 +394,8 @@ fn model_glb_paint_round_trip_keeps_layers_and_flattened_standard_material() {
     let primitive=&loaded.json["meshes"][mesh]["primitives"][0];
     let restored=loaded.paint_surface(primitive).unwrap().unwrap();
     assert_eq!(*restored,*surface);
+    assert!(!restored.stack.listed(1));
+    assert!(restored.stack.shown(1));
     assert_eq!(&restored.composite(0)[..4],&[128,0,128,255]);
     let mat=primitive["material"].as_u64().unwrap()as usize;
     let tex=loaded.json["materials"][mat]["pbrMetallicRoughness"]["baseColorTexture"]["index"].as_u64().unwrap()as usize;
@@ -121,9 +405,150 @@ fn model_glb_paint_round_trip_keeps_layers_and_flattened_standard_material() {
     let len=loaded.json["bufferViews"][view]["byteLength"].as_u64().unwrap()as usize;
     let png=image::load_from_memory(&loaded.bin[start..start+len]).unwrap().to_rgba8();
     assert_eq!(png.get_pixel(4,4).0,[128,0,128,255]);
-    assert!(bevy::gltf::gltf::Gltf::from_slice(loaded.data()).is_ok());
+    let parsed = bevy::gltf::gltf::Gltf::from_slice(loaded.data()).unwrap();
+    let specular = parsed.materials().nth(mat).unwrap().specular().unwrap();
+    assert_eq!(specular.specular_factor(), 1.0);
+    assert_eq!(specular.specular_color_factor(), [0.8, 0.9, 1.0]);
+    let specular_image = specular.specular_texture().unwrap().texture().source();
+    let bevy::gltf::gltf::image::Source::View { view, .. } = specular_image.source() else {
+        panic!("flattened specular texture is embedded");
+    };
+    let specular = image::load_from_memory(&loaded.bin[view.offset()..view.offset() + view.length()])
+        .unwrap()
+        .into_rgba8();
+    assert_eq!(specular.get_pixel(4, 4)[3], 64);
+    assert_eq!(specular.get_pixel(12, 4)[3], 255);
     fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
+#[test]
+fn model_glb_baked_generators_keep_inputs_and_editable_masks() {
+    use crate::editor::model_paint_data::{
+        Layer, LayerKind, Stack, Surface,
+        mask::{BakedInputs, Generator, GeneratorInput, GeneratorKind, Mask, MaskLayer, PartIds},
+        solid,
+    };
+    use std::sync::Arc;
+    let (mut source, mut object) = fixture();
+    for (corner, uv) in object.geometry.faces[0].corners.iter_mut().zip([Vec2::ZERO, Vec2::X, Vec2::Y]) {
+        corner.uv = uv;
+    }
+    let left_id = [120, 40, 30];
+    let right_id = [144, 40, 30];
+    let mut recipe = crate::editor::model_paint_data::custom::Recipe::new(
+        crate::editor::model_paint_data::custom::Kind::Flow, &[],
+    );
+    recipe.adjust(crate::editor::model_paint_data::custom::Field::Strength, 1);
+    recipe.adjust(crate::editor::model_paint_data::custom::Field::Wander, -1);
+    let custom_id = recipe.id;
+    let copy = recipe.duplicate(std::slice::from_ref(&recipe));
+    let mut renamed = recipe.clone();
+    renamed.name = "Потёки на корпусе".into();
+    let recipes = vec![copy, renamed];
+    crate::editor::model_paint_data::custom::write_document(&mut source.json, &recipes).unwrap();
+    let baked = Arc::new(BakedInputs {
+        size: 16,
+        edge_reach: 0.2,
+        disabled_inputs: 1 << GeneratorInput::Thin as u32,
+        texels: (0..256).map(|i| {
+            let cavity = if i % 16 < 8 { 0 } else { 255 };
+            [255, cavity, 255, 255, 128, 128, 255, 128, 255, 255]
+        }).collect(),
+        part_ids: Some(PartIds::new(
+            (0..256).map(|i| if i % 16 < 8 { left_id } else { right_id }).collect(),
+        )),
+        custom: vec![crate::editor::model_paint_data::custom::Plane {
+            recipe: recipe.clone(),
+            values: Arc::new((0..256).map(|i| if i % 16 < 8 { 0 } else { 255 }).collect()),
+        }],
+    });
+    let mut mask = Mask::new(solid(16, [255; 4]), vec![]);
+    mask.use_affine();
+    let mut generator = Generator::new(GeneratorKind::CavityGrime);
+    generator.values[3] = 0.;
+    *mask.edit_generator() = Some(generator);
+    let mut id_mask = Generator::new(GeneratorKind::IdMask);
+    id_mask.id_color = Some(right_id);
+    id_mask.id_tolerance = 5;
+    mask.edit_layers().push(MaskLayer {
+        enabled: false,
+        generator: Some(id_mask),
+        ..default()
+    });
+    let mut mixed = id_mask;
+    mixed.set_weight(GeneratorInput::Id, -100);
+    mixed.set_weight(GeneratorInput::Cavity, 100);
+    mixed.edge_width = 80;
+    mask.edit_layers().push(MaskLayer {
+        enabled: false,
+        generator: Some(mixed),
+        ..default()
+    });
+    let mut custom = Generator::new(GeneratorKind::CustomMap);
+    custom.values[3] = 0.;
+    custom.custom[0] = crate::editor::model_paint_data::custom::Input { id: custom_id, weight: 100 };
+    mask.edit_layers().push(MaskLayer {
+        enabled: false,
+        generator: Some(custom),
+        ..default()
+    });
+    let mut layer = Layer::new("Грязь".into(), LayerKind::Paint);
+    layer.channels[0] = Some(solid(16, [0, 0, 0, 255]));
+    layer.mask = Some(Arc::new(mask));
+    let mut surface = Surface {
+        size: 16,
+        base: std::array::from_fn(|_| solid(16, [255; 4])),
+        stack: Stack { layers: vec![layer], selected: 0 },
+        material: source.json["materials"][0].clone(),
+        baked: Some(baked.clone()),
+    };
+    surface.bind_generators(&object.geometry, 0, Vec2::ZERO, object.transform);
+    let expected = surface.composite(0);
+    assert_eq!((expected[(2 * 16 + 2) * 4], expected[(16 + 12) * 4]), (0, 255));
+    object.materials[0].paint = Some(Arc::new(surface));
+    source.save(&[object.clone()], &[]).unwrap();
+    let loaded = Glb::load(&source.path).unwrap();
+    assert_eq!(crate::editor::model_paint_data::custom::read_document(&loaded.json), recipes);
+    bevy::gltf::gltf::Gltf::from_slice(loaded.data()).unwrap();
+    let mesh = loaded.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let primitive = &loaded.json["meshes"][mesh]["primitives"][0];
+    let mut restored = (*loaded.paint_surface(primitive).unwrap().unwrap()).clone();
+    assert_eq!(restored.baked.as_deref(), Some(baked.as_ref()));
+    restored.bind_generators(&object.geometry, 0, Vec2::ZERO, object.transform);
+    assert_eq!(restored.composite(0), expected);
+    let mask = Arc::make_mut(restored.stack.layers[0].mask.as_mut().unwrap());
+    mask.edit_generator().as_mut().unwrap().invert = true;
+    let changed = restored.composite(0);
+    assert_eq!((changed[(2 * 16 + 2) * 4], changed[(16 + 12) * 4]), (255, 0));
+    let mask = Arc::make_mut(restored.stack.layers[0].mask.as_mut().unwrap());
+    assert_eq!(mask.layers[0].generator, Some(id_mask));
+    assert_eq!(mask.context.as_ref().unwrap().id_palette(), &[left_id, right_id]);
+    *mask.edit_generator() = Some(id_mask);
+    let by_id = restored.composite(0);
+    assert_eq!((by_id[(2 * 16 + 2) * 4], by_id[(16 + 12) * 4]), (255, 0));
+    let mask = Arc::make_mut(restored.stack.layers[0].mask.as_mut().unwrap());
+    mask.edit_generator().as_mut().unwrap().id_tolerance = 30;
+    let wide = restored.composite(0);
+    assert_eq!((wide[(2 * 16 + 2) * 4], wide[(16 + 12) * 4]), (0, 0));
+    let mask = Arc::make_mut(restored.stack.layers[0].mask.as_mut().unwrap());
+    assert_eq!(mask.layers[1].generator, Some(mixed));
+    *mask.edit_generator() = Some(mixed);
+    let by_mix = restored.composite(0);
+    assert_eq!((by_mix[(2 * 16 + 2) * 4], by_mix[(16 + 12) * 4]), (0, 255));
+    let mask = Arc::make_mut(restored.stack.layers[0].mask.as_mut().unwrap());
+    assert_eq!(mask.layers[2].generator, Some(custom));
+    *mask.edit_generator() = Some(custom);
+    let by_custom = restored.composite(0);
+    assert_eq!((by_custom[(2 * 16 + 2) * 4], by_custom[(16 + 12) * 4]), (255, 0));
+    let mut legacy = primitive.clone();
+    legacy["extras"]["bevy_editor_paint"]["baked_inputs"]
+        .as_object_mut().unwrap().remove("part_ids");
+    let mut legacy = (*loaded.paint_surface(&legacy).unwrap().unwrap()).clone();
+    assert!(legacy.baked.as_ref().unwrap().part_ids.is_none());
+    legacy.bind_generators(&object.geometry, 0, Vec2::ZERO, object.transform);
+    assert_eq!(legacy.composite(0), expected);
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
+}
+
 #[test]
 fn model_glb_round_trip_keeps_extruded_edge() {
     use crate::editor::{

@@ -18,6 +18,7 @@ pub(in crate::editor) use scrub::{
 struct Draft {
     room: usize,
     selection: Selection,
+    targets: Vec<Selection>,
     local_space: bool,
     field: Field,
     original_text: String,
@@ -30,6 +31,9 @@ impl Draft {
         editor.room == self.room
             && editor.selection == Some(self.selection)
             && editor.local_space == self.local_space
+            && editor
+                .inspector_targets(self.field)
+                .eq(self.targets.iter().copied())
     }
 
     fn update_changed(&mut self, text: &str) {
@@ -52,6 +56,7 @@ impl NumericInput {
             self.drafts.entry(entity).or_insert_with(|| Draft {
                 room: editor.room,
                 selection,
+                targets: editor.inspector_targets(field).collect(),
                 local_space: editor.local_space,
                 field,
                 original_text: display_value(editor, field),
@@ -88,7 +93,7 @@ impl NumericInput {
         let Some(draft) = self.drafts.get_mut(&entity) else {
             return;
         };
-        if !draft.belongs_to(editor) || !editor.field_allowed(draft.selection, draft.field) {
+        if !draft.belongs_to(editor) || !editor.inspector_field_allowed(draft.field) {
             self.drafts.remove(&entity);
             return;
         }
@@ -104,7 +109,7 @@ impl NumericInput {
                 let selection = draft.selection;
                 editor.finish_camera_navigation();
                 let before = editor.edits.clone();
-                editor.set_field(field, value);
+                editor.set_inspector_field(field, value);
                 let changed = before != editor.edits;
                 editor.finish_edit(before);
                 restore_value(input, editor, field);
@@ -127,11 +132,15 @@ fn restore_value(input: &mut EditableText, editor: &Editor, field: Field) {
     input.editor_mut().set_text(&display_value(editor, field));
 }
 
-fn display_value(editor: &Editor, field: Field) -> String {
-    let value = editor
-        .selection
-        .and_then(|selection| editor.field_value(selection, field));
-    value.map_or_else(|| "—".into(), |value| format!("{value:.2}"))
+pub(super) fn display_value(editor: &Editor, field: Field) -> String {
+    let value = editor.inspector_field_value(field);
+    value.map_or_else(
+        || "—".into(),
+        |value| {
+            let display = if value.abs() < 0.005 { 0.0 } else { value };
+            format!("{display:.2}")
+        },
+    )
 }
 
 fn parse_value(editor: &Editor, draft: &Draft, text: &str) -> Result<f32, &'static str> {
@@ -220,11 +229,9 @@ pub(in crate::editor) fn update(
     }
 
     let active = focus.get().filter(|&entity| {
-        fields.get(entity).is_ok_and(|(_, &field, _)| {
-            editor
-                .selection
-                .is_some_and(|selection| editor.field_allowed(selection, field))
-        })
+        fields
+            .get(entity)
+            .is_ok_and(|(_, &field, _)| editor.inspector_field_allowed(field))
     });
     if state.active != active {
         if let Some(previous) = state.active

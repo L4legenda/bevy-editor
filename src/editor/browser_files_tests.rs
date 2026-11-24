@@ -1,7 +1,17 @@
 use super::*;
+use crate::editor::model_import_mesh::AutoUnwrap;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn import_files(root: &Path, parent: &Path, sources: Vec<PathBuf>) -> ImportReport {
+    super::import_files(root, parent, sources, AutoUnwrap::default())
+}
+
+fn import_editable_files(root: &Path, parent: &Path, sources: Vec<PathBuf>) -> ImportReport {
+    super::import_editable_files(root, parent, sources, AutoUnwrap::default())
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -28,6 +38,175 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn obj_import_writes_an_editable_glb_with_local_materials_and_embedded_color() {
+    use crate::editor::model_document::glb::Glb;
+    let fixture = Fixture::new();
+    let texture = image::RgbaImage::from_pixel(2, 2, image::Rgba([11, 80, 190, 120]));
+    fs::create_dir(fixture.0.join("external/materials")).unwrap();
+    texture
+        .save(fixture.0.join("external/materials/paint.png"))
+        .unwrap();
+    fixture.source(
+        "materials/palette.mtl",
+        b"newmtl Cloth\nKd 0.8 0.3 0.2\nmap_Kd paint.png\nnewmtl Metal\nKd 0.3 0.5 0.7\nPm 0.6\n",
+    );
+    let source = fixture.source("Panel.OBJ", b"mtllib materials/palette.mtl\no Panel\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 2 0 0\nv 2 1 0\nvt 0 0\nvt 0.5 0\nvt 0.5 1\nvt 0 1\nvt 1 0\nvt 1 1\nvn 0 0 1\nusemtl Cloth\nf 1/1/1 2/2/1 3/3/1 4/4/1\nusemtl Metal\nf 2/2/1 5/5/1 6/6/1 3/3/1\n");
+    let root = fixture.assets();
+    fs::write(root.join("Panel.glb"), b"existing").unwrap();
+    let report = import_files(&root, Path::new(""), vec![source.clone(), source]);
+    assert_eq!(report.imported, [PathBuf::from("Panel (2).glb")]);
+    assert_eq!(report.skipped, 1);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(fs::read(root.join("Panel.glb")).unwrap(), b"existing");
+    let glb = Glb::load(&root.join(&report.imported[0])).unwrap();
+    let mesh = &glb.json["meshes"][0];
+    let primitives = mesh["primitives"].as_array().unwrap();
+    assert_eq!(primitives.len(), 2);
+    let cloth = primitives
+        .iter()
+        .find(|p| {
+            glb.json["materials"][p["material"].as_u64().unwrap() as usize]["name"] == "Cloth"
+        })
+        .unwrap();
+    let uvs = obj_test_uvs(&glb, cloth);
+    let bytes = glb.data();
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let bin_start = 28 + json_len;
+    for corner in [[0., 1.], [0.5, 1.], [0.5, 0.], [0., 0.]] {
+        assert!(uvs.contains(&corner), "{uvs:?}");
+    }
+    let cloth = &glb.json["materials"][cloth["material"].as_u64().unwrap() as usize];
+    assert_eq!(cloth["alphaMode"], "BLEND");
+    assert_eq!(
+        cloth["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+        0
+    );
+    assert_eq!(
+        mesh["extras"]["bevy_editor_topology"]["primitives"][0][0]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let png =
+        &glb.json["bufferViews"][glb.json["images"][0]["bufferView"].as_u64().unwrap() as usize];
+    let start = bin_start + png["byteOffset"].as_u64().unwrap() as usize;
+    let end = start + png["byteLength"].as_u64().unwrap() as usize;
+    assert_eq!(
+        image::load_from_memory(&bytes[start..end])
+            .unwrap()
+            .into_rgba8(),
+        texture
+    );
+}
+
+fn obj_test_uvs(
+    glb: &crate::editor::model_document::glb::Glb,
+    primitive: &serde_json::Value,
+) -> Vec<[f32; 2]> {
+    let uv =
+        &glb.json["accessors"][primitive["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize];
+    let view = &glb.json["bufferViews"][uv["bufferView"].as_u64().unwrap() as usize];
+    let bytes = glb.data();
+    let bin = 28 + u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let start = bin + view["byteOffset"].as_u64().unwrap() as usize;
+    let end = start + view["byteLength"].as_u64().unwrap() as usize;
+    bytes[start..end]
+        .chunks_exact(8)
+        .map(|uv| {
+            [
+                f32::from_le_bytes(uv[..4].try_into().unwrap()),
+                f32::from_le_bytes(uv[4..].try_into().unwrap()),
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn obj_import_unwraps_missing_material_sets_and_keeps_authored_uvs() {
+    use crate::editor::model_document::glb::Glb;
+    let fixture = Fixture::new();
+    fixture.source(
+        "Mixed.mtl",
+        b"newmtl Keep\nKd 1 0 0\nnewmtl Blank\nKd 0 1 0\nnewmtl Other\nKd 0 0 1\n",
+    );
+    let source = fixture.source(
+        "Mixed.obj",
+        b"mtllib Mixed.mtl\no Mixed\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 2 0 0\nv 2 1 0\nv 3 0 0\nv 3 1 0\nvt 0.125 0.125\nvt 0.375 0.125\nvt 0.375 0.375\nvt 0.125 0.375\nusemtl Keep\nf 1/1 2/2 3/3 4/4\nusemtl Blank\nf 2 5 6 3\no NoUv\nusemtl Other\nf 5 7 8 6\n",
+    );
+    let root = fixture.assets();
+    let off = super::import_files(&root, Path::new(""), vec![source.clone()], AutoUnwrap::Off);
+    assert!(off.imported.is_empty());
+    assert_eq!(off.mesh_unwrapped_sets, 0);
+    assert!(off.status().contains("отсутствуют UV"), "{}", off.status());
+    assert!(!root.join("Mixed.glb").exists());
+    let report = import_files(&root, Path::new(""), vec![source.clone()]);
+    assert_eq!(report.imported, [PathBuf::from("Mixed.glb")]);
+    assert_eq!(report.mesh_unwrapped_sets, 2, "{}", report.status());
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let glb = Glb::load(&root.join(&report.imported[0])).unwrap();
+    let sets: HashMap<_, _> = glb.json["meshes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().unwrap())
+        .map(|primitive| {
+            let material = &glb.json["materials"][primitive["material"].as_u64().unwrap() as usize];
+            (
+                material["name"].as_str().unwrap(),
+                obj_test_uvs(&glb, primitive),
+            )
+        })
+        .collect();
+    assert_eq!(sets.len(), 3);
+    let authored = &sets["Keep"];
+    assert_eq!(authored.len(), 4);
+    for uv in [
+        [0.125, 0.875],
+        [0.375, 0.875],
+        [0.375, 0.625],
+        [0.125, 0.625],
+    ] {
+        assert!(authored.contains(&uv), "{authored:?}");
+    }
+    let all = super::import_editable_files(&root, Path::new(""), vec![source], AutoUnwrap::All);
+    assert!(all.errors.is_empty(), "{}", all.status());
+    assert_eq!(all.mesh_unwrapped_sets, 3);
+    let glb = Glb::load(&root.join(&all.imported[0])).unwrap();
+    let keep = glb.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().unwrap())
+        .find(|primitive| {
+            let slot = primitive["material"].as_u64().unwrap() as usize;
+            glb.json["materials"][slot]["name"] == "Keep"
+        })
+        .unwrap();
+    let rebuilt = obj_test_uvs(&glb, keep);
+    assert_ne!(&rebuilt, authored);
+    assert!(rebuilt.iter().all(|uv| uv.iter().all(|v| (0. ..=1.).contains(v))));
+    for name in ["Blank", "Other"] {
+        let uvs = &sets[name];
+        assert!(
+            uvs.iter()
+                .flatten()
+                .all(|coordinate| (0. ..=1.).contains(coordinate))
+        );
+        let [a, b, c] = [uvs[0], uvs[1], uvs[2]].map(bevy::math::Vec2::from_array);
+        assert!((b - a).perp_dot(c - a).abs() > 0.01, "{name}: {uvs:?}");
+    }
+}
+
+#[test]
+fn obj_import_with_no_surfaces_does_not_publish_a_glb() {
+    let fixture = Fixture::new();
+    let source = fixture.source("Empty.obj", b"v 0 0 0\nv 1 0 0\nl 1 2\n");
+    let root = fixture.assets();
+    let report = import_files(&root, Path::new(""), vec![source]);
+    assert!(report.imported.is_empty());
+    assert_eq!(report.errors.len(), 1);
+    assert!(!root.join("Empty.glb").exists());
 }
 
 #[test]
@@ -144,6 +323,101 @@ fn browser_import_copies_multiple_images_and_preserves_sources_and_existing_file
             .iter()
             .all(|path| path.starts_with("textures"))
     );
+}
+
+#[test]
+fn editable_fbx_import_keeps_static_objects_and_embeds_both_texture_sources() {
+    use crate::editor::model_document::glb::Glb;
+    let fixture = Fixture::new();
+    let external = include_bytes!("../../tests/fixtures/fbx/props_external.FBX");
+    let embedded = include_bytes!("../../tests/fixtures/fbx/embedded/props_embedded.fbx");
+    let texture = include_bytes!("../../tests/fixtures/fbx/textures/checker.png");
+    fs::create_dir_all(fixture.0.join("external/textures")).unwrap();
+    fixture.source("textures/checker.png", texture);
+    let root = fixture.assets();
+    let report = import_editable_files(
+        &root,
+        Path::new(""),
+        vec![
+            fixture.source("External.FBX", external),
+            fixture.source("Embedded.fbx", embedded),
+        ],
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        report.imported,
+        [PathBuf::from("External.glb"), PathBuf::from("Embedded.glb")]
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("external/External.FBX")).unwrap(),
+        external
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("external/Embedded.fbx")).unwrap(),
+        embedded
+    );
+    let expected = image::load_from_memory(texture).unwrap().into_rgba8();
+    for path in report.imported {
+        let glb = Glb::load(&root.join(path)).unwrap();
+        let meshes = glb.json["meshes"].as_array().unwrap();
+        assert_eq!(meshes.len(), 2, "{}", glb.path.display());
+        let primitives: Vec<_> = meshes
+            .iter()
+            .flat_map(|mesh| mesh["primitives"].as_array().unwrap())
+            .collect();
+        assert_eq!(primitives.len(), 3);
+        let textured: Vec<_> = primitives
+            .iter()
+            .filter_map(|primitive| {
+                let material = &glb.json["materials"][primitive["material"].as_u64()? as usize];
+                material["pbrMetallicRoughness"]["baseColorTexture"]["index"].as_u64()
+            })
+            .collect();
+        assert!(!textured.is_empty(), "{}", glb.path.display());
+        let bytes = glb.data();
+        let bin = 28 + u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        for index in textured {
+            let image = glb.json["textures"][index as usize]["source"]
+                .as_u64()
+                .unwrap() as usize;
+            let view = glb.json["images"][image]["bufferView"].as_u64().unwrap() as usize;
+            let view = &glb.json["bufferViews"][view];
+            let start = bin + view["byteOffset"].as_u64().unwrap() as usize;
+            let end = start + view["byteLength"].as_u64().unwrap() as usize;
+            let pixels = image::load_from_memory(&bytes[start..end])
+                .unwrap()
+                .into_rgba8();
+            assert_eq!(pixels, expected, "{}", glb.path.display());
+        }
+    }
+}
+
+#[test]
+fn editable_fbx_import_uses_scene_units_and_keeps_uvs() {
+    use crate::editor::model_document::glb::Glb;
+    let fixture = Fixture::new();
+    let model = fixture.source(
+        "Panel.fbx",
+        include_bytes!("../../tests/fixtures/fbx/panel_ascii.fbx"),
+    );
+    let root = fixture.assets();
+    let report = import_editable_files(&root, Path::new(""), vec![model]);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let glb = Glb::load(&root.join(&report.imported[0])).unwrap();
+    let primitive = &glb.json["meshes"][0]["primitives"][0];
+    let accessor =
+        &glb.json["accessors"][primitive["attributes"]["POSITION"].as_u64().unwrap() as usize];
+    for (label, expected) in [("min", [0.25, 0.5, 0.]), ("max", [1.25, 1.5, 0.])] {
+        for (component, expected) in accessor[label].as_array().unwrap().iter().zip(expected) {
+            assert!(
+                (component.as_f64().unwrap() - expected).abs() < 1e-4,
+                "{accessor:?}"
+            );
+        }
+    }
+    let uvs = obj_test_uvs(&glb, primitive);
+    assert!(uvs.iter().any(|uv| uv[0] > 0.9));
+    assert!(uvs.iter().any(|uv| uv[1] > 0.9));
 }
 
 #[test]

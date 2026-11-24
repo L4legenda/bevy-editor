@@ -14,6 +14,19 @@ pub(super) use loop_cut::{LoopCut, LoopCutOptions};
 mod knife;
 pub(super) use knife::KnifeSegment;
 
+pub(super) fn uv_weights(p: Vec2, t: [Vec2; 3]) -> Option<Vec3> {
+    let a = t[1] - t[0];
+    let b = t[2] - t[0];
+    let d = a.perp_dot(b);
+    if d.abs() < 1.0e-10 {
+        return None;
+    }
+    let q = p - t[0];
+    let u = q.perp_dot(b) / d;
+    let v = a.perp_dot(q) / d;
+    Some(Vec3::new(1. - u - v, u, v))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Edge(pub usize, pub usize);
 impl Edge {
@@ -83,6 +96,15 @@ pub(super) struct Buffers {
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     pub polygons: Vec<Vec<u32>>,
+}
+impl Buffers {
+    pub fn localize_uv(&mut self, offset: Vec2) {
+        if offset != Vec2::ZERO {
+            for uv in &mut self.uv {
+                *uv = (Vec2::from_array(*uv) - offset).to_array();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -236,6 +258,26 @@ impl Selection {
 }
 
 impl Geometry {
+    pub(super) fn vertex_components(&self) -> Vec<usize> {
+        fn root(parents: &mut [usize], mut vertex: usize) -> usize {
+            while parents[vertex] != vertex {
+                parents[vertex] = parents[parents[vertex]];
+                vertex = parents[vertex];
+            }
+            vertex
+        }
+        let mut parents: Vec<_> = (0..self.positions.len()).collect();
+        for face in &self.faces {
+            let Some(first) = face.corners.first() else { continue };
+            for corner in &face.corners[1..] {
+                let a = root(&mut parents, first.vertex);
+                let b = root(&mut parents, corner.vertex);
+                parents[a.max(b)] = a.min(b);
+            }
+        }
+        (0..parents.len()).map(|i| root(&mut parents, i)).collect()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.positions.len() > 1_000_000 || self.faces.len() > 1_000_000 {
             return Err("Лимит: 1 000 000 вершин или граней на объект".into());
@@ -394,6 +436,46 @@ impl Geometry {
             .map(|v| self.positions[v].to_array())
             .collect()
     }
+    pub fn uv_coverage<'a>(
+        &self,
+        faces: impl IntoIterator<Item = &'a Face>,
+        offset: Vec2,
+        size: u32,
+    ) -> (Vec<bool>, bool) {
+        let mut complete = true;
+        let extent = Vec2::splat(size as f32);
+        let mut covered = vec![false; (size * size) as usize];
+        for face in faces {
+            let mut face_covered = false;
+            for triangle in self.triangles(face) {
+                let uv = triangle.map(|i| (face.corners[i].uv - offset) * extent);
+                let min = uv[0]
+                    .min(uv[1])
+                    .min(uv[2])
+                    .floor()
+                    .clamp(Vec2::ZERO, extent)
+                    .as_uvec2();
+                let max = uv[0]
+                    .max(uv[1])
+                    .max(uv[2])
+                    .ceil()
+                    .clamp(Vec2::ZERO, extent)
+                    .as_uvec2();
+                for y in min.y..max.y {
+                    for x in min.x..max.x {
+                        let point = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                        if uv_weights(point, uv).is_some_and(|w| w.min_element() >= -1e-6) {
+                            covered[(y * size + x) as usize] = true;
+                            face_covered = true;
+                        }
+                    }
+                }
+            }
+            complete &= face_covered;
+        }
+        (covered, complete)
+    }
+
     pub fn triangles(&self, face: &Face) -> Vec<[usize; 3]> {
         let n = self.normal(face).abs();
         let axis = if n.x > n.y && n.x > n.z {
@@ -601,7 +683,27 @@ impl Geometry {
         self.select_faces(selection, selected);
         Ok(motion)
     }
-    pub fn extrusion_direction(&self, selection: &Selection) -> Option<Vec3> {
+    pub fn extrusion_edges(&self, selection: &Selection) -> BTreeSet<Edge> {
+        match selection.kind {
+            Element::Edge => selection.edges.clone(),
+            Element::Vertex if selection.vertices.len() > 1 => self
+                .faces
+                .iter()
+                .flat_map(|face| face.edges().map(|(a, b)| Edge::new(a, b)))
+                .chain(self.loose_edges.iter().copied())
+                .filter(|edge| {
+                    selection.vertices.contains(&edge.0) && selection.vertices.contains(&edge.1)
+                })
+                .collect(),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    pub fn extrusion_direction(
+        &self,
+        selection: &Selection,
+        edges: &BTreeSet<Edge>,
+    ) -> Option<Vec3> {
         let vertices = selection.selected_vertices(self);
         if vertices.is_empty() {
             return None;
@@ -623,54 +725,78 @@ impl Geometry {
             .try_normalize()
             .or_else(|| first.try_normalize())
             .unwrap_or(Vec3::Y);
-        let tangent = if selection.kind == Element::Edge {
-            selection.edges.first().map(|e| [e.0, e.1])
-        } else if selection.kind == Element::Vertex {
-            self.loose_edges
+        if !edges.is_empty() {
+            let clearance = |direction| self.edge_extrusion_clearance(edges, direction);
+            if clearance(normal) >= 1.0e-4 {
+                return Some(normal);
+            }
+            // A single direction keeps the new strip connected. Test it against
+            // every selected edge so the new faces do not collapse along it.
+            return [
+                Vec3::X,
+                Vec3::Y,
+                Vec3::Z,
+                Vec3::new(1.0, 1.0, 1.0).normalize(),
+                Vec3::new(1.0, -1.0, 1.0).normalize(),
+                Vec3::new(-1.0, 1.0, 1.0).normalize(),
+                Vec3::new(1.0, 1.0, -1.0).normalize(),
+            ]
+            .into_iter()
+            .max_by(|&a, &b| clearance(a).total_cmp(&clearance(b)))
+            .map(|direction| if direction.dot(normal) < 0.0 { -direction } else { direction });
+        }
+        if selection.kind == Element::Vertex
+            && let Some(direction) = self.loose_edges
                 .iter()
                 .rev()
                 .find(|e| vertices.contains(&e.0) || vertices.contains(&e.1))
-                .map(|e| [e.0, e.1])
-        } else {
-            None
-        };
-        let Some([a, b]) =
-            tangent.filter(|&[a, b]| a < self.positions.len() && b < self.positions.len())
-        else {
-            return Some(normal);
-        };
-        let tangent = (self.positions[b] - self.positions[a]).normalize_or_zero();
-        if selection.kind == Element::Vertex && first == Vec3::ZERO && tangent != Vec3::ZERO {
-            return Some(tangent);
+                .and_then(|edge| {
+                    let direction = self.edge_tangent(edge)?;
+                    Some(if vertices.contains(&edge.1) { direction } else { -direction })
+                })
+        {
+            if first == Vec3::ZERO {
+                return Some(direction);
+            }
+            if normal.cross(direction).length_squared() < 1.0e-4 {
+                return Some(direction.any_orthonormal_vector());
+            }
         }
-        if normal.cross(tangent).length_squared() < 1.0e-4 && tangent != Vec3::ZERO {
-            Some(tangent.any_orthonormal_vector())
-        } else {
-            Some(normal)
-        }
+        Some(normal)
     }
+
+    fn edge_tangent(&self, edge: &Edge) -> Option<Vec3> {
+        let a = self.positions.get(edge.0)?;
+        let b = self.positions.get(edge.1)?;
+        (*b - *a).try_normalize()
+    }
+
+    pub fn edge_extrusion_clearance(&self, edges: &BTreeSet<Edge>, direction: Vec3) -> f32 {
+        edges
+            .iter()
+            .filter_map(|edge| self.edge_tangent(edge))
+            .map(|tangent| direction.cross(tangent).length_squared())
+            .fold(1.0, f32::min)
+    }
+
     fn extrude_elements(
         &mut self,
         selection: &mut Selection,
     ) -> Result<Vec<(usize, Vec3, Vec3)>, String> {
-        let adjacency = if selection.kind == Element::Edge {
-            self.edges()
-        } else {
+        let mut edges = self.extrusion_edges(selection);
+        let adjacency = if edges.is_empty() {
             BTreeMap::new()
+        } else {
+            self.edges()
         };
-        let edges: Vec<_> = selection
-            .edges
-            .iter()
-            .copied()
-            .filter(|e| adjacency.contains_key(e))
-            .collect();
+        edges.retain(|edge| adjacency.contains_key(edge));
         let vertices = if selection.kind == Element::Vertex {
             selection.selected_vertices(self)
         } else {
             edges.iter().flat_map(|e| [e.0, e.1]).collect()
         };
         let direction = self
-            .extrusion_direction(selection)
+            .extrusion_direction(selection, &edges)
             .filter(|_| !vertices.is_empty())
             .ok_or("Выберите вершины или рёбра для экструдирования")?;
         let mut remap = BTreeMap::new();
@@ -682,36 +808,42 @@ impl Geometry {
             motion.push((new, origin, direction));
             self.positions.push(origin);
         }
+        let connected: BTreeSet<_> = edges.iter().flat_map(|edge| [edge.0, edge.1]).collect();
+        let mut new_edges = BTreeSet::new();
+        for edge in edges {
+            let (a, b, material, smooth) = adjacency[&edge]
+                .first()
+                .and_then(|&i| {
+                    let face = &self.faces[i];
+                    face.corners
+                        .iter()
+                        .zip(face.corners.iter().cycle().skip(1))
+                        .find(|(a, b)| Edge::new(a.vertex, b.vertex) == edge)
+                        .map(|(a, b)| (b.clone(), a.clone(), face.material, face.smooth))
+                })
+                .unwrap_or_else(|| (Corner::new(edge.0), Corner::new(edge.1), 0, false));
+            let mut na = a.clone();
+            let mut nb = b.clone();
+            na.vertex = remap[&a.vertex];
+            nb.vertex = remap[&b.vertex];
+            new_edges.insert(Edge::new(na.vertex, nb.vertex));
+            self.loose_edges.remove(&edge);
+            self.faces.push(Face {
+                corners: vec![a, b, nb, na],
+                material,
+                smooth,
+            });
+        }
         if selection.kind == Element::Vertex {
-            self.loose_edges
-                .extend(remap.iter().map(|(&a, &b)| Edge::new(a, b)));
+            self.loose_edges.extend(
+                remap
+                    .iter()
+                    .filter(|(vertex, _)| !connected.contains(vertex))
+                    .map(|(&a, &b)| Edge::new(a, b)),
+            );
             selection.vertices = remap.into_values().collect();
         } else {
-            selection.edges.clear();
-            for edge in edges {
-                let (a, b, material, smooth) = adjacency[&edge]
-                    .first()
-                    .and_then(|&i| {
-                        let face = &self.faces[i];
-                        face.corners
-                            .iter()
-                            .zip(face.corners.iter().cycle().skip(1))
-                            .find(|(a, b)| Edge::new(a.vertex, b.vertex) == edge)
-                            .map(|(a, b)| (b.clone(), a.clone(), face.material, face.smooth))
-                    })
-                    .unwrap_or_else(|| (Corner::new(edge.0), Corner::new(edge.1), 0, false));
-                let mut na = a.clone();
-                let mut nb = b.clone();
-                na.vertex = remap[&a.vertex];
-                nb.vertex = remap[&b.vertex];
-                selection.edges.insert(Edge::new(na.vertex, nb.vertex));
-                self.loose_edges.remove(&edge);
-                self.faces.push(Face {
-                    corners: vec![a, b, nb, na],
-                    material,
-                    smooth,
-                });
-            }
+            selection.edges = new_edges;
         }
         Ok(motion)
     }
@@ -1515,7 +1647,7 @@ impl Geometry {
         selection.all(self);
         Ok(())
     }
-    pub fn buffers(&self) -> BTreeMap<usize, Buffers> {
+    pub(in crate::editor) fn smooth_normals(&self) -> Vec<Vec3> {
         let mut normals = vec![Vec3::ZERO; self.positions.len()];
         for f in &self.faces {
             if f.smooth {
@@ -1525,6 +1657,21 @@ impl Geometry {
                 }
             }
         }
+        normals
+    }
+    pub(in crate::editor) fn corner_normal(
+        face: &Face, corner: &Corner, flat_normal: Vec3, smooth_normals: &[Vec3],
+    ) -> Vec3 {
+        corner.source_normal.unwrap_or_else(|| {
+            if face.smooth {
+                smooth_normals[corner.vertex].normalize_or_zero()
+            } else {
+                flat_normal
+            }
+        })
+    }
+    pub fn buffers(&self) -> BTreeMap<usize, Buffers> {
+        let normals = self.smooth_normals();
         let mut output: BTreeMap<usize, Buffers> = BTreeMap::new();
         let mut maps: BTreeMap<usize, HashMap<[u32; 12], u32>> = BTreeMap::new();
         for f in &self.faces {
@@ -1533,13 +1680,7 @@ impl Geometry {
             for triangle in self.triangles(f) {
                 for i in triangle {
                     let c = &f.corners[i];
-                    let n = c.source_normal.unwrap_or_else(|| {
-                        if f.smooth {
-                            normals[c.vertex].normalize_or_zero()
-                        } else {
-                            normal
-                        }
-                    });
+                    let n = Self::corner_normal(f, c, normal, &normals);
                     let key = [
                         c.vertex as u32,
                         n.x.to_bits(),

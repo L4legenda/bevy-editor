@@ -38,6 +38,7 @@ fn hdri_settings_roundtrip_and_legacy_lighting_defaults() {
 #[test]
 fn downloaded_hdri_references_roundtrip_and_reject_ambiguous_or_nonportable_paths() {
     let asset = HdriAsset {
+        uid: None,
         provider: HdriProvider::AmbientCg,
         id: "DaySkyHDRI072B".into(),
         name: "Day Sky HDRI 072 B".into(),

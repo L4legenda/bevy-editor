@@ -332,6 +332,16 @@ fn contained(root: &Path, physical: &Path) -> io::Result<()> {
 
 fn resolved_string(redirects: &Redirects, root: &Path, path: &str) -> io::Result<String> {
     let result = asset_string(redirects, path, false)?;
+    let (base, suffix) = result.split_once('#').unwrap_or((&result, ""));
+    let mut result = if crate::asset_registry::supported(base) {
+        crate::asset_registry::index(root)?.resolve(base, None)
+    } else {
+        base.to_owned()
+    };
+    if !suffix.is_empty() {
+        result.push('#');
+        result.push_str(suffix);
+    }
     contained(
         root,
         Path::new(result.split('#').next().unwrap_or_default()),
@@ -345,6 +355,7 @@ fn resolved_string(redirects: &Redirects, root: &Path, path: &str) -> io::Result
 pub fn apply_project_paths(project: &mut crate::project::EditorProject) -> io::Result<()> {
     let root = project.asset_root.canonicalize()?;
     let redirects = Redirects::read(&root)?;
+    let index = crate::asset_registry::index(&root)?;
     let scenes: Vec<_> = project
         .scenes
         .iter()
@@ -366,10 +377,14 @@ pub fn apply_project_paths(project: &mut crate::project::EditorProject) -> io::R
         .collect::<io::Result<_>>()?;
     for (scene, (asset, file)) in project.scenes.iter_mut().zip(scenes) {
         scene.asset = asset;
+        if !scene.asset.is_empty() {
+            index.bind(&mut scene.asset, &mut scene.uid);
+        }
         scene.file = file;
     }
     for (item, asset) in project.catalog.iter_mut().zip(catalog) {
         item.asset = asset;
+        index.bind(&mut item.asset, &mut item.uid);
     }
     Ok(())
 }
@@ -410,6 +425,12 @@ impl AssetRedirects {
             .read()
             .map_err(|_| io::Error::other("Asset redirect lock was poisoned"))?
             .resolve(path)?;
+        let portable = physical.to_string_lossy().replace('\\', "/");
+        let physical = if crate::asset_registry::supported(&portable) {
+            PathBuf::from(crate::asset_registry::index(&self.root)?.resolve(&portable, None))
+        } else {
+            physical
+        };
         // Lexical normalization also protects missing paths. For existing
         // paths, resolve the nearest ancestor to reject escaping symlinks.
         contained(&self.root, &physical)?;

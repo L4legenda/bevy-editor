@@ -75,7 +75,16 @@ pub fn spawn_model(commands: &mut Commands, server: &AssetServer, model: &Placed
 
 pub fn load_model(server: &AssetServer, model: &PlacedModel) -> Handle<WorldAsset> {
     match crate::data::ModelFormat::from_path(&model.asset) {
-        Some(crate::data::ModelFormat::Fbx) => server.load(model.asset.clone()),
-        _ => server.load(format!("{}#Scene0", model.asset)),
+        Some(crate::data::ModelFormat::Fbx) => {
+            match model.selector.as_deref().filter(|selector| *selector != "Scene0") {
+                Some(selector) => server.load(format!("{}#{selector}", model.asset)),
+                None => server.load(model.asset.clone()),
+            }
+        }
+        _ => server.load(format!(
+            "{}#{}",
+            model.asset,
+            model.selector.as_deref().unwrap_or("Scene0")
+        )),
     }
 }

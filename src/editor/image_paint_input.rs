@@ -3,11 +3,47 @@ use bevy::input::touch::{ForceTouch, TouchPhase};
 use bevy::{input::ButtonState, prelude::*, window::WindowEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Sample {
+pub(in crate::editor) enum Sample {
     Pressure(f32),
     Down(Vec2),
     Move(Vec2),
     Up(Vec2),
+}
+
+#[derive(Resource, Default)]
+pub(in crate::editor) struct PointerFrame {
+    input: Samples,
+    pub samples: Vec<Sample>,
+}
+
+pub(in crate::editor) struct PointerPlugin;
+impl Plugin for PointerPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<PointerFrame>()
+            .add_systems(PreUpdate, collect_frame.after(bevy::input::InputSystems));
+    }
+}
+
+impl PointerFrame {
+    pub fn pen_cursor(&self) -> Option<Vec2> {
+        self.input.pen_cursor()
+    }
+    pub fn pen_down(&self) -> bool {
+        self.input.pen_down()
+    }
+}
+
+pub(in crate::editor) fn collect_frame(
+    mut frame: ResMut<PointerFrame>,
+    mut events: MessageReader<WindowEvent>,
+    window: Single<(Entity, &Window), With<bevy::window::PrimaryWindow>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    _main_thread: bevy::ecs::system::NonSendMarker,
+) {
+    let (id, window) = *window;
+    frame.samples = frame
+        .input
+        .collect(events.read(), id, window.cursor_position(), &mouse);
 }
 
 #[derive(Default)]

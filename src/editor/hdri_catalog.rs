@@ -549,6 +549,7 @@ pub(super) fn download(
     );
     let folder = directory(root, Path::new(&relative))?;
     let asset = HdriAsset {
+        uid: None,
         provider: entry.provider,
         id: entry.id.clone(),
         name: entry.name.clone(),

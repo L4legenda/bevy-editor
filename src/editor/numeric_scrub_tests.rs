@@ -77,7 +77,13 @@ fn gpu_numeric_scrub_all_numeric_inputs_live_cancel_and_one_undo() {
         warm(app, 3);
     }
     fn begin(app: &mut App, window: Entity, entity: Entity) -> Vec2 {
-        assert!(app.world().get::<Number>(entity).is_some());
+        assert!(
+            app.world().get::<Number>(entity).is_some(),
+            "Expected a scrubbable field: {:?}",
+            app.world()
+                .get::<AccessibleLabel>(entity)
+                .map(|label| &label.0)
+        );
         let point = center(app, entity);
         move_pointer(app, window, point);
         mouse(app, window, ButtonState::Pressed);
@@ -226,7 +232,7 @@ fn gpu_numeric_scrub_all_numeric_inputs_live_cancel_and_one_undo() {
         }
     }
     warm(&mut app, 8);
-    let model_field = find(&mut app, "Модель: X");
+    let model_field = find(&mut app, "Модель: Позиция X");
     let position = app.world().resource::<ModelEditingState>().documents[&0]
         .active()
         .unwrap()

@@ -10,6 +10,8 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "image_brush_size_tests.rs"]
 mod brush_sizing;
+#[path = "image_color_drop_tests.rs"]
+mod color_dropping;
 #[path = "image_cursor_restore_tests.rs"]
 mod cursor_restoration;
 #[path = "image_edge_paint_tests.rs"]
@@ -40,8 +42,6 @@ mod pixel_eraser;
 mod selections;
 #[path = "image_color_tests.rs"]
 mod tool_colors;
-#[path = "image_color_drop_tests.rs"]
-mod color_dropping;
 
 struct Fixture(PathBuf);
 
@@ -107,6 +107,7 @@ impl Fixture {
             .init_resource::<viewport::PointerState>()
             .add_message::<Action>()
             .add_message::<bevy::window::WindowEvent>()
+            .add_plugins(paint_input::PointerPlugin)
             .add_systems(
                 Update,
                 (
@@ -894,6 +895,7 @@ fn closing_the_last_image_tab_returns_to_the_model_that_opened_it() {
     {
         let mut editor = app.world_mut().resource_mut::<Editor>();
         editor.project.catalog.push(crate::project::CatalogItem {
+            uid: None,
             asset: "model.glb".into(),
             label: "Model".into(),
             category: String::new(),
@@ -1817,6 +1819,30 @@ fn gpu_photo_cursor_is_visible_on_light_dark_and_grey_and_tracks_zoom() {
     println!("Painting cursor captures: {}", output.display());
 }
 
+fn model_target_pixels(app: &mut App, image: &Handle<Image>) -> Vec<u8> {
+    use bevy::render::gpu_readback::{Readback, ReadbackComplete};
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    app.world_mut()
+        .spawn(Readback::texture(image.clone()))
+        .observe(
+            move |mut event: On<ReadbackComplete>, mut commands: Commands| {
+                let _ = send.try_send(std::mem::take(&mut event.event_mut().data));
+                commands.entity(event.entity).try_despawn();
+            },
+        );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        crate::editor::selection_outline::render_tests::frame(app);
+        if let Ok(pixels) = receive.try_recv() {
+            return pixels;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Missing live model texture"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires GPU adapter; drags GLB and FBX onto the PhotoCraft canvas"]
 fn gpu_model_cards_add_transparent_reference_layers_and_save() {
@@ -1853,6 +1879,7 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
         geometry: primitive.geometry(&primitive.defaults()).unwrap().into(),
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
+            bake_fixes: Default::default(),
             authored: None,
             material: default(),
             source: serde_json::json!({"material": 0}),
@@ -2002,9 +2029,403 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .unwrap();
         assert_eq!(doc.document.layers.len(), count);
     }
+    // Real filesystem events must preserve the open PhotoCraft tab, authored layers and model identity.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    frame(&mut app);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while app.world().resource::<ImageViewer>().edit.file_busy(tab) {
+        frame(&mut app);
+        assert!(std::time::Instant::now() < deadline);
+    }
+    let model_uid = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .model_reference(Some(tab))
+        .unwrap()
+        .uid
+        .unwrap();
+    assert_eq!(
+        app.world().resource::<ImageViewer>().edit.model_tool,
+        Some(Tool::Move)
+    );
+    let old_bundle = source.with_extension("pcraft");
+    assert!(old_bundle.exists());
+    let renamed = fixture.0.join("nested/renamed.png");
+    std::fs::rename(&source, &renamed).unwrap();
+    std::fs::rename(models.join("props.fbx"), models.join("moved.fbx")).unwrap();
+    let source = renamed;
+    loop {
+        frame(&mut app);
+        let editor = app.world().resource::<Editor>();
+        if editor
+            .image_tab(tab)
+            .is_some_and(|t| t.path == std::path::Path::new("nested/renamed.png"))
+            && editor
+                .project
+                .catalog
+                .iter()
+                .any(|m| m.asset == "models/moved.fbx" && m.uid.as_deref() == Some(&model_uid))
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", editor.status);
+    }
+    assert!(!old_bundle.exists());
+    let restored = crate::editor::photo_document::PhotoDocument::load(&source).unwrap();
+    assert_eq!(restored.document.layers.len(), 3);
     app.world_mut().write_message(Action::Drawer);
     for _ in 0..25 {
         frame(&mut app);
+    }
+    // The cube fits inside the document. Its pixels should follow pointer samples
+    // on the GPU without replacing the canvas texture or moving the second model.
+    let select_layer = |app: &mut App, index| {
+        app.world_mut()
+            .write_message(Action::ImageEdit(edit::EditAction::SelectLayer(index)));
+        frame(app);
+    };
+    select_layer(&mut app, 1);
+    let cube_canvas = {
+        let world = app.world_mut();
+        let (n, t) = world
+            .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+            .single(world)
+            .unwrap();
+        Rect::from_center_size(
+            t.translation * n.inverse_scale_factor(),
+            n.size() * n.inverse_scale_factor(),
+        )
+    };
+    let center = edit::interface::model_handle_center(app.world());
+    let origin = cube_canvas.min + center;
+    move_pointer(&mut app, window, origin);
+    mouse(&mut app, window, ButtonState::Pressed);
+    let mut textures = None;
+    let mut grabbed_texel: Option<Vec2> = None;
+    for x in [3.0, 7.0, 13.0, 19.0] {
+        move_pointer(&mut app, window, origin + Vec2::new(x, 0.0));
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let m = app
+                .world()
+                .resource::<Assets<CanvasMaterial>>()
+                .get(&super::canvas_material::HANDLE)
+                .unwrap();
+            if m.transform_style.x == 1.0 {
+                // The shader must sample the same point of the moving layer under
+                // the cursor each frame, even at fractional image zoom.
+                let viewer = app.world().resource::<ImageViewer>();
+                let rect = viewer.image_rect(viewer.dimensions.unwrap(), cube_canvas);
+                let uv = ((origin + Vec2::X * x - rect.min) / rect.size()).extend(1.0);
+                let rows = m.transform_rows;
+                let sample = Vec2::new(rows[0].truncate().dot(uv), rows[1].truncate().dot(uv))
+                    / rows[2].truncate().dot(uv);
+                if let Some(original) = grabbed_texel {
+                    assert!(original.abs_diff_eq(sample, 1e-4), "Grabbed texel slipped");
+                }
+                grabbed_texel = Some(sample);
+                let handles = (
+                    m.transform_under.clone(),
+                    m.transform_moving.clone(),
+                    m.transform_above.clone(),
+                );
+                if let Some(previous) = &textures {
+                    assert_eq!(&handles, previous);
+                } else {
+                    textures = Some(handles);
+                }
+                assert!(
+                    edit::interface::model_handle_center(app.world())
+                        .abs_diff_eq(center + Vec2::X * x, 0.1)
+                );
+                break;
+            }
+            assert!(
+                textures.is_none() && std::time::Instant::now() < end,
+                "Move preview dropped a pointer sample"
+            );
+            frame(&mut app);
+        }
+    }
+    let end_center = edit::interface::model_handle_center(app.world());
+    mouse(&mut app, window, ButtonState::Released);
+    let end = std::time::Instant::now() + Duration::from_secs(15);
+    assert!(
+        app.world()
+            .resource::<crate::editor::image_reference::ReferenceRender>()
+            .pending_for(Some(tab)),
+        "Test must sample the release-to-render handoff"
+    );
+    while app
+        .world()
+        .resource::<crate::editor::image_reference::ReferenceRender>()
+        .pending_for(Some(tab))
+    {
+        assert!(
+            edit::interface::model_handle_center(app.world()).abs_diff_eq(end_center, 0.1),
+            "Handle jumped back after release"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<Assets<CanvasMaterial>>()
+                .get(&super::canvas_material::HANDLE)
+                .unwrap()
+                .transform_style
+                .x,
+            1.0
+        );
+        assert!(std::time::Instant::now() < end);
+        frame(&mut app);
+    }
+    frame(&mut app);
+    assert!(edit::interface::model_handle_center(app.world()).abs_diff_eq(end_center, 0.1));
+    assert_eq!(
+        app.world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::canvas_material::HANDLE)
+            .unwrap()
+            .transform_style
+            .x,
+        0.0
+    );
+    // Commit a clipped layer, then pull it back into view. The cached moving
+    // texture must include the geometry that was outside the saved document.
+    let wait_model = |app: &mut App| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while app
+            .world()
+            .resource::<crate::editor::image_reference::ReferenceRender>()
+            .pending_for(Some(tab))
+        {
+            frame(app);
+            assert!(std::time::Instant::now() < deadline);
+        }
+        frame(app);
+    };
+    let viewer = app.world().resource::<ImageViewer>();
+    let size = viewer.dimensions.unwrap();
+    let image = viewer.image_rect(size, cube_canvas);
+    let start = cube_canvas.min + end_center;
+    let edge = Vec2::new(image.max.x - 22.0, start.y);
+    move_pointer(&mut app, window, start);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, edge);
+    mouse(&mut app, window, ButtonState::Released);
+    wait_model(&mut app);
+    let layer = app
+        .world()
+        .resource::<ImageViewer>()
+        .edit
+        .document(Some(tab))
+        .unwrap()
+        .active_layer()
+        .unwrap();
+    assert_eq!(layer.surface().unwrap().content_bounds().x1, size.x as i32);
+    let center = cube_canvas.min + edit::interface::model_handle_center(app.world());
+    move_pointer(&mut app, window, center);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, center - Vec2::X * 80.0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        frame(&mut app);
+        let m = app
+            .world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::canvas_material::HANDLE)
+            .unwrap();
+        if m.transform_style.x == 1.0 {
+            let moving = app
+                .world()
+                .resource::<Assets<Image>>()
+                .get(m.transform_moving.as_ref().unwrap())
+                .unwrap();
+            let boundary = ((1.0 - m.transform_frame.x) / m.transform_frame.z
+                * moving.width() as f32)
+                .ceil()
+                .max(0.0) as usize;
+            assert!(boundary < moving.width() as usize);
+            assert!(
+                moving
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .chunks_exact(moving.width() as usize * 4)
+                    .any(|row| row[boundary * 4..].chunks_exact(4).any(|p| p[3] > 128)),
+                "Revealed model geometry was cropped"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Clipped model did not acquire a GPU preview"
+        );
+    }
+    mouse(&mut app, window, ButtonState::Released);
+    wait_model(&mut app);
+    select_layer(&mut app, 2);
+    let model_pose = |app: &App| {
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .unwrap()
+            .pose
+    };
+    for tool in [Tool::Move, Tool::Rotate, Tool::Scale] {
+        let before = model_pose(&app);
+        click_action(&mut app, window, |action| {
+            matches!(action,
+            Action::ImageEdit(edit::EditAction::ModelTool(selected)) if selected == tool)
+        });
+        let canvas = {
+            let world = app.world_mut();
+            let (node, transform) = world
+                .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+                .single(world)
+                .unwrap();
+            let center = transform.translation * node.inverse_scale_factor();
+            Rect::from_center_size(center, node.size() * node.inverse_scale_factor())
+        };
+        if tool == Tool::Rotate {
+            let center = canvas.min + edit::interface::model_handle_center(app.world());
+            move_pointer(&mut app, window, canvas.min + Vec2::splat(4.0));
+            let scale = app.world().get::<Window>(window).unwrap().scale_factor();
+            let crop = ((center - Vec2::splat(86.0)) * scale)
+                .max(Vec2::ZERO)
+                .as_uvec2();
+            let side = (172.0 * scale).ceil() as u32;
+            let screenshot = capture_when(
+                &mut app,
+                &output,
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target/model-rotation-handles.png"),
+                |image| {
+                    let mut count = [0; 3];
+                    for y in crop.y..(crop.y + side).min(image.height()) {
+                        for x in crop.x..(crop.x + side).min(image.width()) {
+                            let [r, g, b, _] = image.get_pixel(x, y).0;
+                            count[0] += usize::from(r > 190 && g < 90 && b < 135);
+                            count[1] += usize::from(g > 165 && r < 180 && b < 80);
+                            count[2] += usize::from(b > 190 && r < 100 && g > 75);
+                        }
+                    }
+                    count.iter().all(|&n| n > 45)
+                },
+            );
+            let crop_width = side.min(screenshot.width() - crop.x);
+            let crop_height = side.min(screenshot.height() - crop.y);
+            image::imageops::crop_imm(&screenshot, crop.x, crop.y, crop_width, crop_height)
+                .to_image()
+                .save(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("target/model-rotation-detail.png"),
+                )
+                .unwrap();
+        }
+        let (start, end) = super::model_transform::test_handle(
+            app.world().resource::<ImageViewer>(),
+            tab,
+            canvas,
+            tool,
+        );
+        move_pointer(&mut app, window, start);
+        mouse(&mut app, window, ButtonState::Pressed);
+        let placement = |app: &App| {
+            let material = app
+                .world()
+                .resource::<Assets<CanvasMaterial>>()
+                .get(&super::canvas_material::HANDLE)
+                .unwrap();
+            (material.transform_style.x == 1.0).then(|| {
+                (
+                    material.transform_moving.clone().unwrap(),
+                    material.transform_rows,
+                )
+            })
+        };
+        move_pointer(&mut app, window, start.lerp(end, 0.45));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (target, first_rows) = loop {
+            frame(&mut app);
+            if let Some(placement) = placement(&app) {
+                break placement;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "No live canvas during {tool:?}"
+            );
+        };
+        let first_pixels = (tool != Tool::Move).then(|| model_target_pixels(&mut app, &target));
+        move_pointer(&mut app, window, end);
+        let (end_target, end_rows) = placement(&app).expect("Live canvas dropped a pointer sample");
+        assert_eq!(end_target, target);
+        let mut end_pixels = first_pixels.map(|first| {
+            let last = model_target_pixels(&mut app, &target);
+            assert!(last.chunks_exact(4).any(|px| px[3] > 128));
+            assert!(
+                first != last || first_rows != end_rows,
+                "{tool:?} preview stayed still"
+            );
+            last
+        });
+        let expected = app
+            .world()
+            .resource::<ImageViewer>()
+            .model_drag
+            .as_ref()
+            .unwrap()
+            .preview;
+        let handles = edit::interface::model_handle_geometry(app.world());
+        assert_eq!(handles.1, expected.rotation);
+        assert_ne!(expected, before);
+        assert_eq!(model_pose(&app), before);
+        mouse(&mut app, window, ButtonState::Released);
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        let mut pending_frames = 0;
+        while model_pose(&app) == before {
+            let viewer = app.world().resource::<ImageViewer>();
+            assert_eq!(viewer.released_model.map(|(_, pose)| pose), Some(expected));
+            assert_eq!(
+                placement(&app),
+                Some((target.clone(), end_rows)),
+                "{tool:?} jumped on release"
+            );
+            assert_eq!(edit::interface::model_handle_geometry(app.world()), handles);
+            pending_frames += 1;
+            if let Some(last) = end_pixels.take() {
+                assert!(
+                    model_target_pixels(&mut app, &target) == last,
+                    "{tool:?} image changed after release"
+                );
+            } else {
+                frame(&mut app);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Transform did not apply: {:?}",
+                app.world().resource::<ImageViewer>().edit.error
+            );
+        }
+        assert_eq!(edit::interface::model_handle_geometry(app.world()), handles);
+        assert!(pending_frames > 0);
+        assert_eq!(model_pose(&app), expected);
+        let after = model_pose(&app);
+        match tool {
+            Tool::Move => assert_ne!(before.position, after.position),
+            Tool::Rotate => assert_ne!(before.rotation, after.rotation),
+            Tool::Scale => assert_ne!(before.scale, after.scale),
+            Tool::Universal => unreachable!(),
+        }
+        app.world_mut()
+            .write_message(Action::ImageEdit(edit::EditAction::Undo));
+        frame(&mut app);
+        assert_eq!(model_pose(&app), before);
+        app.world_mut()
+            .write_message(Action::ImageEdit(edit::EditAction::Redo));
+        frame(&mut app);
+        assert_eq!(model_pose(&app), after);
     }
     capture_when(
         &mut app,
@@ -2012,6 +2433,7 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/model-reference.png"),
         |_| true,
     );
+    exercise_model_inspector(&mut app, window, tab);
 
     app.world_mut()
         .write_message(Action::ImageEdit(edit::EditAction::Save));
@@ -2031,4 +2453,247 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .iter()
             .all(|layer| layer.locks.pixels)
     );
+    let reloaded_pose = reloaded.document.layers[2]
+        .xmp
+        .as_deref()
+        .and_then(crate::editor::image_reference::ModelReference::from_xmp)
+        .unwrap()
+        .pose;
+    assert_eq!(reloaded_pose, model_pose(&app));
+}
+
+/// Exercise keyboard focus, native window rendering, and silhouette picking after an external rename.
+fn exercise_model_inspector(app: &mut App, window: Entity, tab: usize) {
+    use crate::editor::selection_outline::render_tests::frame;
+    use bevy::input::{
+        ButtonState,
+        keyboard::{Key, KeyboardInput},
+    };
+    use lighting_ui_render::{mouse, move_pointer};
+    #[cfg(windows)]
+    #[allow(deprecated)]
+    let (_events, native) = {
+        use winit::{event_loop::EventLoop, platform::windows::EventLoopBuilderExtWindows};
+        let events = EventLoop::builder().with_any_thread(true).build().unwrap();
+        let native = bevy::window::WindowWrapper::new(
+            events
+                .create_window(
+                    winit::window::Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(1280, 900)),
+                )
+                .unwrap(),
+        );
+        app.world_mut()
+            .entity_mut(window)
+            .insert(bevy::window::RawHandleWrapper::new(&native).unwrap());
+        let world = app.world_mut();
+        *world
+            .query_filtered::<&mut bevy::camera::RenderTarget, With<bevy::ui::IsDefaultUiCamera>>()
+            .single_mut(world)
+            .unwrap() = bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Entity(window));
+        (events, native)
+    };
+    let pose = |app: &App| {
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .unwrap()
+            .pose
+    };
+    let press = |app: &mut App, code: KeyCode, key: Key| {
+        for state in [ButtonState::Pressed, ButtonState::Released] {
+            app.world_mut().write_message(KeyboardInput {
+                key_code: code,
+                logical_key: key.clone(),
+                state,
+                text: None,
+                repeat: false,
+                window,
+            });
+            frame(app);
+        }
+    };
+    let wait = |app: &mut App| {
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            frame(app);
+            if !app
+                .world()
+                .resource::<crate::editor::image_reference::ReferenceRender>()
+                .pending_for(Some(tab))
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < end, "Transform did not finish");
+        }
+    };
+    for (code, letter, tool) in [
+        (KeyCode::KeyR, "r", Some(Tool::Rotate)),
+        (KeyCode::KeyS, "s", Some(Tool::Scale)),
+        (KeyCode::KeyQ, "q", None),
+        (KeyCode::KeyG, "g", Some(Tool::Move)),
+    ] {
+        press(app, code, Key::Character(letter.into()));
+        assert_eq!(app.world().resource::<ImageViewer>().edit.model_tool, tool);
+    }
+    for (dpi, zoom, bg) in [(1.0, 1.0, Backdrop::Dark), (2.0, 1.5, Backdrop::Light)] {
+        app.world_mut().resource_mut::<ImageViewer>().zoom = Zoom::Scale(zoom);
+        app.world_mut().resource_mut::<ImageViewer>().background = bg;
+        #[cfg(windows)]
+        {
+            let _ = native.request_inner_size(winit::dpi::PhysicalSize::new(
+                (1280.0 * dpi) as u32,
+                (900.0 * dpi) as u32,
+            ));
+            let mut win = app.world_mut().get_mut::<Window>(window).unwrap();
+            win.resolution.set_scale_factor_override(Some(dpi));
+            win.resolution.set(1280.0, 900.0);
+        }
+        for _ in 0..8 {
+            frame(app);
+        }
+        let canvas = {
+            let world = app.world_mut();
+            let (n, t) = world
+                .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+                .single(world)
+                .unwrap();
+            Rect::from_center_size(
+                t.translation * n.inverse_scale_factor(),
+                n.size() * n.inverse_scale_factor(),
+            )
+        };
+        let (solid, clear) = {
+            let viewer = app.world().resource::<ImageViewer>();
+            let size = viewer.dimensions.unwrap();
+            let image = viewer.image_rect(size, canvas);
+            let doc = viewer.edit.document(Some(tab)).unwrap();
+            let photocraft_doc::LayerContent::Raster(surface) =
+                &doc.active_layer().unwrap().content
+            else {
+                unreachable!()
+            };
+            let on_handle = super::model_transform::test_move_hit(viewer, tab, canvas);
+            let mut clear = None;
+            let mut solid = None;
+            for y in (0..size.y).step_by(2) {
+                for x in (0..size.x).step_by(2) {
+                    let p = image.min
+                        + (Vec2::new(x as f32, y as f32) + Vec2::splat(0.5)) / size.as_vec2()
+                            * image.size();
+                    if !canvas.contains(p) || on_handle(p) {
+                        continue;
+                    }
+                    if surface.sample_channel(x as i32, y as i32, 3) > 0.5 {
+                        solid = Some(p);
+                    } else {
+                        clear = Some(p);
+                    }
+                    if solid.is_some() && clear.is_some() {
+                        break;
+                    }
+                }
+                if solid.is_some() && clear.is_some() {
+                    break;
+                }
+            }
+            (
+                solid.expect("visible silhouette outside handles"),
+                clear.unwrap(),
+            )
+        };
+        let before = pose(app);
+        move_pointer(app, window, clear);
+        mouse(app, window, ButtonState::Pressed);
+        assert!(app.world().resource::<ImageViewer>().model_drag.is_none());
+        mouse(app, window, ButtonState::Released);
+        move_pointer(app, window, solid);
+        mouse(app, window, ButtonState::Pressed);
+        assert!(
+            app.world().resource::<ImageViewer>().model_drag.is_some(),
+            "silhouette at DPI {dpi}"
+        );
+        if dpi == 1.0 {
+            let revision = app
+                .world()
+                .resource::<ImageViewer>()
+                .edit
+                .document(Some(tab))
+                .unwrap()
+                .revision;
+            mouse(app, window, ButtonState::Released);
+            assert_eq!(
+                app.world()
+                    .resource::<ImageViewer>()
+                    .edit
+                    .document(Some(tab))
+                    .unwrap()
+                    .revision,
+                revision
+            );
+            mouse(app, window, ButtonState::Pressed);
+        }
+        move_pointer(app, window, solid + Vec2::new(14.0, 9.0));
+        if dpi == 1.0 {
+            press(app, KeyCode::Escape, Key::Escape);
+        }
+        mouse(app, window, ButtonState::Released);
+        wait(app);
+        if dpi == 1.0 {
+            assert_eq!(pose(app), before);
+        } else {
+            let delta = Vec3::from(pose(app).position) - Vec3::from(before.position);
+            assert!(delta.length() > 0.001);
+            let model = app
+                .world()
+                .resource::<ImageViewer>()
+                .edit
+                .model_reference(Some(tab))
+                .unwrap();
+            assert!(delta.dot(*model.view().back()).abs() < 1e-4);
+        }
+    }
+    let field = |app: &mut App, name: &str| {
+        let w = app.world_mut();
+        w.query_filtered::<(Entity, &AccessibleLabel, &ComputedNode), With<super::model_fields::PoseField>>()
+            .iter(w)
+            .find(|(_, label, n)| label.0 == name && !n.is_empty())
+            .unwrap()
+            .0
+    };
+    let x = field(app, "Позиция X");
+    let y = field(app, "Позиция Y");
+    let write = |app: &mut App, id, value: &str| {
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(id, bevy::input_focus::FocusCause::Auto);
+        frame(app);
+        app.world_mut()
+            .get_mut::<EditableText>(id)
+            .unwrap()
+            .editor_mut()
+            .set_text(value);
+    };
+    let before = pose(app);
+    write(app, x, "bad");
+    press(app, KeyCode::Enter, Key::Enter);
+    assert_eq!(pose(app), before);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(x));
+    press(app, KeyCode::Escape, Key::Escape);
+    assert_eq!(pose(app), before);
+    write(app, x, "0,125");
+    write(app, y, "0.25");
+    press(app, KeyCode::Enter, Key::Enter);
+    wait(app);
+    assert_eq!(pose(app).position[..2], [0.125, 0.25]);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    frame(app);
+    assert_eq!(pose(app).position[..2], [0.125, before.position[1]]);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Redo));
+    frame(app);
+    assert_eq!(pose(app).position[..2], [0.125, 0.25]);
 }

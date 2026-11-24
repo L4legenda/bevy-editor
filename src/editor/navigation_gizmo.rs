@@ -71,6 +71,15 @@ fn orient(view: &mut Transform, pivot: Vec3, direction: Vec3) {
 }
 
 impl State {
+    pub(super) fn hide(&mut self, workspace: Workspace) {
+        if self.workspace == Some(workspace) {
+            self.workspace = None;
+            self.gesture = None;
+            self.blocked = false;
+            self.hover = None;
+        }
+    }
+
     pub fn blocks_input(&self) -> bool {
         self.blocked
     }

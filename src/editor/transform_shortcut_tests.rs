@@ -68,6 +68,8 @@ fn alt_resets_only_the_requested_parts_of_the_selection_and_supports_undo_redo()
                     });
                     let asset = editor.project.catalog[0].asset.clone();
                     editor.edits.models.push(PlacedModel {
+                        selector: None,
+                        uid: None,
                         id: 1,
                         asset,
                         pose: Transform::IDENTITY.into(),

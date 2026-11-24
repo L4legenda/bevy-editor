@@ -43,6 +43,8 @@ fn spawn(app: &mut App, file: &str) -> Entity {
     let handle = crate::runtime::load_model(
         &server,
         &crate::PlacedModel {
+            selector: None,
+            uid: None,
             id: 1,
             asset: file.into(),
             pose: Transform::IDENTITY.into(),

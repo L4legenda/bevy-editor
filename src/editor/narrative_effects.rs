@@ -45,8 +45,8 @@ impl Snapshot {
             .collect();
         let mut edges = BTreeMap::new();
         for n in &d.nodes {
-            for (i, choice) in n.choices.iter().enumerate() {
-                if let Some(next) = choice.target.and_then(|id| d.node(id)) {
+            for (i, target) in n.output_targets() {
+                if let Some(next) = d.node(target) {
                     edges.insert(
                         Edge(n.id, answers.key(n.id, i), next.id),
                         (
@@ -365,6 +365,7 @@ mod tests {
         d.node_mut(from).unwrap().choices.push(Choice {
             text: "Второй".into(),
             target: Some(target),
+            condition: Default::default(),
             dialogue: None,
         });
         let mut answers = answers::State::default();

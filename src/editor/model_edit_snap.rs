@@ -159,7 +159,10 @@ mod tests {
             hidden: false,
         };
         let base = Snapshot {
+            bake_settings: default(),
+            cage_edits: default(),
             objects: vec![object(0, 1.0), object(1, 0.0), object(2, -1.0)],
+            custom_bakes: default(),
             active: Some(0),
             selected: [0].into(),
             selection: default(),

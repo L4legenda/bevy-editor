@@ -92,6 +92,7 @@ impl Number {
 struct SceneDrag {
     room: usize,
     selection: Selection,
+    targets: Vec<Selection>,
     local: bool,
     field: Field,
     before: RoomEdits,
@@ -190,7 +191,14 @@ pub(in crate::editor) fn input(
                     .replace(',', ".")
                     .parse::<f64>()
                     .ok()
-                    .filter(|v| v.is_finite())?;
+                    .filter(|v| v.is_finite())
+                    .or_else(|| {
+                        let field = field.copied()?;
+                        if original != "—" || !editor.inspector_field_allowed(field) {
+                            return None;
+                        }
+                        editor.field_value(editor.selection?, field).map(f64::from)
+                    })?;
                 Some((entity, *number, original, value, *mode, field.copied()))
             });
         if let Some((entity, mut number, original, value, mode, field)) = candidate {
@@ -222,11 +230,7 @@ pub(in crate::editor) fn input(
         .ok()
         .and_then(|(.., field)| field.copied());
     let accessible = editor.pending.is_none()
-        && field.is_none_or(|field| {
-            editor
-                .selection
-                .is_some_and(|selection| editor.field_allowed(selection, field))
-        })
+        && field.is_none_or(|field| editor.inspector_field_allowed(field))
         && geometry
             .get(drag.entity)
             .is_ok_and(|(node, _, _)| !node.is_empty())
@@ -258,6 +262,7 @@ pub(in crate::editor) fn input(
                 drag.scene = Some(SceneDrag {
                     room: editor.room,
                     selection,
+                    targets: editor.inspector_targets(field).collect(),
                     local: editor.local_space,
                     field,
                     before: editor.edits.clone(),
@@ -273,6 +278,9 @@ pub(in crate::editor) fn input(
             scene.room == editor.room
                 && Some(scene.selection) == editor.selection
                 && scene.local == editor.local_space
+                && editor
+                    .inspector_targets(scene.field)
+                    .eq(scene.targets.iter().copied())
         });
         if let Ok((_, _, mut input, ..)) = fields.get_mut(drag.entity) {
             input.pending_edits.clear();
@@ -311,6 +319,7 @@ pub(in crate::editor) fn input(
                     let draft = super::Draft {
                         room: scene.room,
                         selection: scene.selection,
+                        targets: Vec::new(),
                         local_space: scene.local,
                         field: scene.field,
                         original_text: String::new(),
@@ -322,7 +331,10 @@ pub(in crate::editor) fn input(
                 if accepted {
                     drag.value = value;
                     if let Some(scene) = &drag.scene {
-                        editor.set_field(scene.field, text.replace(',', ".").parse().unwrap());
+                        editor.set_inspector_field(
+                            scene.field,
+                            text.replace(',', ".").parse().unwrap(),
+                        );
                     }
                     input.editor_mut().set_text(&text);
                 }

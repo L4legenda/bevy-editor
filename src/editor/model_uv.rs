@@ -1,6 +1,7 @@
 //! UV workspace: transactions, background jobs and view-only comparison.
 use super::*;
 use crate::editor::{model_uv_backend as backend, model_uv_mesh as topology};
+use crate::editor::model_import_mesh::AutoUnwrap;
 use bevy::tasks::{IoTaskPool, Task, block_on, poll_once};
 use bevy::window::RequestRedraw;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +16,8 @@ mod input;
 mod ui;
 #[path = "model_uv_view.rs"]
 mod view;
+
+pub(in crate::editor) const UDIM_IMPORT_HINT: &str = "При следующем открытии внешней модели выделяет отдельный набор текстур для каждой плитки UDIM. Отключите для моделей с повторяющимися UV. Сохранённые плитки восстанавливаются всегда.";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum UvAction {
@@ -40,6 +43,70 @@ pub(in crate::editor) enum UvAction {
     Resolution,
     Padding,
     Quality(usize),
+    DetectUdim,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+struct ImportPreferences {
+    udim_tiles: bool,
+    auto_unwrap: AutoUnwrap,
+    texture_size: u32,
+    bake_on_load: bool,
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+
+impl Default for ImportPreferences {
+    fn default() -> Self {
+        Self {
+            udim_tiles: true,
+            auto_unwrap: AutoUnwrap::default(),
+            texture_size: crate::editor::model_paint_data::DEFAULT_SIZE,
+            bake_on_load: false,
+            path: None,
+        }
+    }
+}
+
+impl ImportPreferences {
+    fn open(path: Option<PathBuf>) -> Self {
+        let mut prefs = Self::default();
+        if let Some(file) = path.as_deref() {
+            let load = || -> std::io::Result<Self> {
+                let bytes = bevy_scene_format::read_limited(file, 8192)?;
+                Ok(serde_json::from_slice(&bytes)?)
+            };
+            match load() {
+                Ok(saved) => prefs = saved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warn!("Could not read model import preferences: {error}"),
+            }
+        }
+        prefs.path = path;
+        if !crate::editor::model_paint_data::RESOLUTIONS.contains(&prefs.texture_size) {
+            prefs.texture_size = crate::editor::model_paint_data::DEFAULT_SIZE;
+        }
+        prefs
+    }
+
+    fn update(&mut self, change: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        let mut next = self.clone();
+        change(&mut next);
+        if let Some(file) = self.path.as_deref() {
+            bevy_scene_format::atomic_write(
+                file,
+                &serde_json::to_vec(&next)?,
+                bevy_scene_format::Revision::read(file)?,
+            )?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn toggle_udim(&mut self) -> std::io::Result<()> {
+        self.update(|prefs| prefs.udim_tiles = !prefs.udim_tiles)
+    }
 }
 struct Job {
     source: PathBuf,
@@ -88,15 +155,19 @@ enum Tool {
     Wand,
 }
 struct Drag {
+    model: usize,
+    source: PathBuf,
     start: Vec2,
     snapshot: Snapshot,
     atlas: topology::Atlas,
     selected: BTreeSet<usize>,
     changed: bool,
+    tile_delta: Option<Vec2>,
 }
 
 #[derive(Resource)]
 pub(in crate::editor) struct UvState {
+    import: ImportPreferences,
     job: Option<Job>,
     proposal: Option<Proposal>,
     layout_settings: Option<(u32, u32)>,
@@ -115,6 +186,7 @@ pub(in crate::editor) struct UvState {
     zoom: f32,
     pan: Option<Vec2>,
     drag: Option<Drag>,
+    relocation: Option<input::Relocation>,
     checker: bool,
     seams: bool,
     quality: usize,
@@ -132,6 +204,10 @@ pub(in crate::editor) struct UvState {
 impl Default for UvState {
     fn default() -> Self {
         Self {
+            import: ImportPreferences::open(
+                super::super::paint::presets::directory()
+                    .and_then(|folder| folder.parent().map(|root| root.join("model-import.json"))),
+            ),
             job: None,
             proposal: None,
             layout_settings: None,
@@ -150,6 +226,7 @@ impl Default for UvState {
             zoom: 1.,
             pan: None,
             drag: None,
+            relocation: None,
             checker: true,
             seams: true,
             quality: 1,
@@ -167,6 +244,42 @@ impl Default for UvState {
     }
 }
 impl UvState {
+    pub(in crate::editor) fn detect_udim_on_import(&self) -> bool {
+        self.import.udim_tiles
+    }
+
+    pub(in crate::editor) fn auto_unwrap(&self) -> AutoUnwrap {
+        self.import.auto_unwrap
+    }
+
+    pub(in crate::editor) fn toggle_udim_import(&mut self) -> std::io::Result<()> {
+        self.import.toggle_udim()
+    }
+
+    pub(in crate::editor) fn cycle_auto_unwrap(&mut self) -> std::io::Result<()> {
+        self.import.update(|prefs| prefs.auto_unwrap = prefs.auto_unwrap.next())
+    }
+
+    pub(in crate::editor) fn texture_size_on_import(&self) -> u32 {
+        self.import.texture_size
+    }
+
+    pub(in crate::editor) fn cycle_texture_size(&mut self) -> std::io::Result<()> {
+        let sizes = crate::editor::model_paint_data::RESOLUTIONS;
+        self.import.update(|prefs| {
+            let index = sizes.iter().position(|size| *size == prefs.texture_size).unwrap_or(0);
+            prefs.texture_size = sizes[(index + 1) % sizes.len()];
+        })
+    }
+
+    pub(in crate::editor) fn bake_on_load(&self) -> bool {
+        self.import.bake_on_load
+    }
+
+    pub(in crate::editor) fn toggle_bake_on_load(&mut self) -> std::io::Result<()> {
+        self.import.update(|prefs| prefs.bake_on_load = !prefs.bake_on_load)
+    }
+
     pub(super) fn display_geometry(&self, index: usize, object: &Object) -> document::MeshData {
         if let Some(p) = &self.proposal
             && p.index == index
@@ -216,9 +329,13 @@ impl UvState {
         let surface = doc
             .and_then(|d| d.active())
             .is_some_and(|o| !o.hidden && !o.geometry.faces.is_empty());
-        let free =
-            surface && self.job.is_none() && self.proposal.is_none() && state.saving.is_none();
+        let free = surface
+            && self.job.is_none()
+            && self.relocation.is_none()
+            && self.proposal.is_none()
+            && state.saving.is_none();
         match action {
+            UvAction::DetectUdim => doc.is_some(),
             UvAction::Accept | UvAction::Dismiss => self.proposal.is_some() && self.job.is_none(),
             UvAction::Brush | UvAction::Suggest => free && !self.comparing,
             UvAction::ClearMask => {
@@ -230,7 +347,10 @@ impl UvState {
                     .is_some_and(|m| !m.is_empty())
             }
             UvAction::Cancel => {
-                self.job.is_some() || self.proposal.is_some() || self.tool != Tool::Select
+                self.job.is_some()
+                    || self.relocation.is_some()
+                    || self.proposal.is_some()
+                    || self.tool != Tool::Select
             }
             UvAction::Unwrap | UvAction::Preview => free,
             UvAction::Pack => free && !self.comparing && self.atlas.area > 1e-9,
@@ -270,17 +390,31 @@ impl UvState {
             self.view_object = Some((index, object.id));
             self.brush_at = None;
             self.selected.clear();
-            self.center = Vec2::splat(0.5);
-            self.zoom = 1.;
+            self.fit(Some(object));
         }
         let geometry = self.display_geometry(index, object);
-        self.atlas = topology::Atlas::new(&geometry);
+        self.atlas = topology::Atlas::with_offsets(&geometry, |slot| object.uv_offset(slot));
         if self.heatmap {
             self.atlas.measure_stretch(&geometry);
         }
         self.selected.retain(|i| *i < self.atlas.count);
         self.stamp = Some(stamp);
     }
+    fn fit(&mut self, object: Option<&Object>) {
+        let mut tiles = object.into_iter().flat_map(Object::udim_tiles);
+        let first = tiles.next().map_or(Vec2::ZERO, |tile| tile.offset());
+        let (mut min, mut max) = tiles.map(|tile| tile.offset())
+            .fold((first, first + Vec2::ONE), |(min, max), offset| {
+                (min.min(offset), max.max(offset + Vec2::ONE))
+            });
+        if object.is_some_and(|object| object.materials.iter().any(|slot| slot.udim().is_none())) {
+            min = min.min(Vec2::ZERO);
+            max = max.max(Vec2::ONE);
+        }
+        self.center = (min + max) * 0.5;
+        self.zoom = (max - min).max_element().recip();
+    }
+
     fn transform(&mut self, index: usize, state: &mut State, angle: f32, scale: f32) {
         if self.comparing || self.job.is_some() || self.proposal.is_some() {
             return;
@@ -290,14 +424,21 @@ impl UvState {
         };
         let before = doc.snapshot();
         if let Some(object) = doc.active_mut() {
+            let mut geometry = object.geometry.clone();
             self.atlas.transform(
-                &mut object.geometry,
+                &mut geometry,
                 &self.selected,
                 Vec2::ZERO,
                 angle,
                 scale,
             );
+            if !object.preserves_udim_assignment(&geometry) {
+                self.error = "Остров выходит за границы своего тайла UDIM".into();
+                return;
+            }
+            object.geometry = geometry;
         }
+        self.error.clear();
         doc.checkpoint(before);
         self.reveal = 1.;
     }
@@ -319,7 +460,7 @@ impl Plugin for UvPlugin {
             .add_systems(Startup, view::setup_gizmos)
             .add_systems(
                 Update,
-                (actions, poll, input::handle)
+                (actions, poll, input::poll_relocation, input::handle)
                     .chain()
                     .after(super::super::actions)
                     .before(super::render),
@@ -333,7 +474,8 @@ impl Plugin for UvPlugin {
                 Update,
                 (ui::refresh, view::refresh)
                     .chain()
-                    .after(controls::refresh),
+                    .after(controls::refresh)
+                    .before(crate::editor::ui::refresh_inspector),
             )
             .add_systems(
                 PostUpdate,
@@ -372,6 +514,7 @@ fn actions(
             UvAction::Accept => jobs::accept(&mut uv, &mut state, index),
             UvAction::Dismiss | UvAction::Cancel => {
                 uv.job.take();
+                uv.relocation.take();
                 uv.proposal = None;
                 uv.tool = Tool::Select;
                 uv.brush_at = None;
@@ -406,8 +549,7 @@ fn actions(
                 uv.stamp = None;
             }
             UvAction::Fit => {
-                uv.center = Vec2::splat(0.5);
-                uv.zoom = 1.;
+                uv.fit(state.documents.get(&index).and_then(Document::active));
             }
             UvAction::Checker => uv.checker = !uv.checker,
             UvAction::Seams => uv.seams = !uv.seams,
@@ -437,6 +579,11 @@ fn actions(
                 }
             }
             UvAction::Quality(q) => uv.quality = q.min(2),
+            UvAction::DetectUdim => {
+                if let Err(error) = uv.import.toggle_udim() {
+                    uv.error = format!("Не удалось сохранить настройку импорта · {error}");
+                }
+            }
         }
     }
 }
@@ -449,8 +596,30 @@ fn apply_job(
     corners: &[(usize, [usize; 3])],
     output: &backend::Output,
 ) -> Result<(document::MeshData, document::MeshData), String> {
-    let after = topology::apply(original, corners, output)?.into();
+    let object = state.documents.get(&index)
+        .and_then(|doc| doc.objects.iter().find(|object| object.id == id))
+        .ok_or("Объект удалён")?;
+    if &object.geometry != original {
+        return Err("Модель изменилась во время расчёта. Запустите развёртку снова.".into());
+    }
+    let after = apply_layout(object, corners, output)?;
     commit_layout(state, index, id, original, after)
+}
+fn apply_layout(
+    object: &Object,
+    corners: &[(usize, [usize; 3])],
+    output: &backend::Output,
+) -> Result<document::MeshData, String> {
+    let mut mesh = topology::apply(&object.geometry, corners, output)?;
+    for face in &mut mesh.faces {
+        let offset = object.uv_offset(face.material);
+        if offset != Vec2::ZERO {
+            for corner in &mut face.corners {
+                corner.uv += offset;
+            }
+        }
+    }
+    Ok(mesh.into())
 }
 fn commit_layout(
     state: &mut State,

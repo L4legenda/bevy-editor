@@ -1,4 +1,69 @@
 use super::*;
+use std::collections::HashMap;
+
+pub(super) fn run_layout(
+    request: backend::Request,
+    sets: Vec<Option<(usize, u32)>>,
+    progress: Arc<backend::Progress>,
+) -> Result<backend::Output, String> {
+    if request.options.method == backend::Method::Suggest || sets.iter().all(Option::is_none) {
+        return backend::run(request, progress);
+    }
+    let mut groups = BTreeMap::<_, Vec<usize>>::new();
+    for (triangle, set) in sets.into_iter().enumerate() {
+        groups.entry(set).or_default().push(triangle);
+    }
+    let total = groups.len();
+    let mut layout = backend::Output {
+        suggestion: Vec::new(),
+        uv: vec![[[0.; 2]; 3]; request.triangles.len()],
+        charts: 0,
+        utilization: 0.,
+    };
+    let protected: BTreeSet<_> = request.options.protected.iter().copied().collect();
+    for (batch, (set, indices)) in groups.into_iter().enumerate() {
+        let mut positions = Vec::new();
+        let mut vertices = HashMap::new();
+        let triangles = indices.iter().map(|&index| {
+            request.triangles[index].map(|vertex| *vertices.entry(vertex).or_insert_with(|| {
+                let id = positions.len();
+                positions.push(request.positions[vertex]);
+                id
+            }))
+        }).collect();
+        let options = backend::Options {
+            materials: if request.options.materials.is_empty() {
+                Vec::new()
+            } else {
+                indices.iter().map(|&index| request.options.materials[index]).collect()
+            },
+            protected: indices.iter().enumerate()
+                .filter_map(|(local, index)| protected.contains(index).then_some(local))
+                .collect(),
+            method: request.options.method,
+            guide_seams: request.options.guide_seams,
+            seed: None,
+        };
+        let group = backend::Request {
+            positions,
+            triangles,
+            threshold: request.threshold,
+            resolution: request.resolution,
+            padding: request.padding,
+            existing_uv: request.existing_uv.as_ref()
+                .map(|uv| indices.iter().map(|&index| uv[index]).collect()),
+            options,
+        };
+        progress.set_tile(batch, total, set.map(|(_, tile)| tile));
+        let result = backend::run(group, progress.clone())?;
+        for (index, uv) in indices.into_iter().zip(result.uv) {
+            layout.uv[index] = uv;
+        }
+        layout.charts += result.charts;
+        layout.utilization += result.utilization / total as f32;
+    }
+    Ok(layout)
+}
 
 pub(super) fn start(
     uv: &mut UvState,
@@ -28,7 +93,11 @@ pub(super) fn start(
                 input
                     .corners
                     .iter()
-                    .map(|(fi, c)| c.map(|i| object.geometry.faces[*fi].corners[i].uv.to_array()))
+                    .map(|(fi, corners)| {
+                        let face = &object.geometry.faces[*fi];
+                        let offset = object.uv_offset(face.material);
+                        corners.map(|i| (face.corners[i].uv - offset).to_array())
+                    })
                     .collect(),
             )
         }
@@ -70,6 +139,10 @@ pub(super) fn start(
     }
     let progress = Arc::new(backend::Progress::default());
     let worker_progress = progress.clone();
+    let sets = input.corners.iter().map(|(face, _)| {
+        let slot = object.geometry.faces[*face].material;
+        object.materials.get(slot)?.udim().map(|tile| (slot, tile.number()))
+    }).collect();
     let request = input.request;
     uv.job = Some(Job {
         source: doc.source.path.clone(),
@@ -80,7 +153,7 @@ pub(super) fn start(
         settings: (request.resolution, request.padding),
         corners: input.corners,
         progress,
-        task: IoTaskPool::get().spawn(async move { backend::run(request, worker_progress) }),
+        task: IoTaskPool::get().spawn(async move { run_layout(request, sets, worker_progress) }),
     });
     uv.elapsed = 0.;
     uv.progress = 0.;
@@ -192,8 +265,10 @@ fn finish(
                 uv.status = "DA Wand предложил область".into();
                 Proposed::Island(mask)
             } else {
+                let object = state.documents.get(&job.index).and_then(Document::active)
+                    .ok_or("Объект удалён")?;
                 uv.status = "Предпросмотр готов".into();
-                Proposed::Layout(topology::apply(&job.original, &job.corners, output)?.into())
+                Proposed::Layout(apply_layout(object, &job.corners, output)?)
             };
             uv.proposal = Some(Proposal {
                 source: job.source.clone(),

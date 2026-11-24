@@ -1,5 +1,6 @@
 //! Model workspace lighting starts with the same defaults as a new scene.
 use super::*;
+use super::paint::post::{Effects, Field as PostField};
 use bevy::{
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     ui_widgets::{
@@ -22,6 +23,7 @@ pub(in crate::editor) enum Setting {
     KeyIntensity,
     KeyAzimuth,
     KeyElevation,
+    Post(PostField),
 }
 
 impl Setting {
@@ -47,6 +49,7 @@ impl Setting {
                 "Горизонтальное направление дополнительного света относительно окружения, в градусах."
             }
             Self::KeyElevation => "Высота дополнительного света над горизонтом, в градусах.",
+            Self::Post(field) => field.hint(),
         }
     }
     fn range(self) -> (f32, f32) {
@@ -58,6 +61,7 @@ impl Setting {
             Self::BackgroundBrightness => (0.0, 2.0),
             Self::KeyIntensity => (0.0, 8.0),
             Self::KeyElevation => (5.0, 90.0),
+            Self::Post(field) => field.range(),
         }
     }
 
@@ -74,6 +78,7 @@ impl Setting {
             Self::KeyIntensity => settings.key_intensity,
             Self::KeyAzimuth => settings.key_azimuth,
             Self::KeyElevation => settings.key_elevation,
+            Self::Post(field) => field.value(settings.post),
         }
     }
 
@@ -95,6 +100,7 @@ impl Setting {
             Self::KeyIntensity => settings.key_intensity = value,
             Self::KeyAzimuth => settings.key_azimuth = value,
             Self::KeyElevation => settings.key_elevation = value,
+            Self::Post(field) => field.set(&mut settings.post, value),
         }
     }
 }
@@ -107,6 +113,8 @@ pub(in crate::editor) enum EnvironmentAction {
     ToggleBackground,
     ToggleKey,
     ToneMap,
+    PostTone,
+    ResetPost,
     Reset,
 }
 
@@ -122,6 +130,7 @@ pub(super) struct Settings {
     key_intensity: f32,
     key_azimuth: f32,
     key_elevation: f32,
+    pub(super) post: Effects,
 }
 
 impl Default for Settings {
@@ -135,13 +144,42 @@ impl Default for Settings {
             key_intensity: 2.2,
             key_azimuth: 40.0,
             key_elevation: 45.0,
+            post: Effects::default(),
         }
     }
 }
 
 impl Settings {
+    pub(super) fn tone_mapper(&self) -> bevy::render::view::Tonemapping {
+        self.lighting.tonemapping.into()
+    }
+
+    pub(super) fn trace_light(&self, key: Option<(&DirectionalLight, &Transform)>) -> (super::paint::pathtrace::Lighting, f32, crate::ToneMap) {
+        let (key_direction, key_color, key_intensity) = key
+            .map(|(light, transform)| {
+                let color = light.color.to_linear();
+                (*transform.back(), Vec3::new(color.red, color.green, color.blue), light.illuminance / LIGHT_SCALE)
+            })
+            .unwrap_or((Vec3::Y, Vec3::ONE, 0.0));
+        (
+            super::paint::pathtrace::Lighting {
+                environment_rotation: self.lighting.hdri_rotation.to_radians(),
+                environment_intensity: self.lighting.hdri_brightness / LIGHT_SCALE,
+                background: (!self.lighting.hdri_background).then_some(Vec3::new(0.05, 0.05, 0.055)),
+                background_blur: self.blur,
+                background_intensity: self.background_brightness,
+                key_direction,
+                key_color,
+                key_intensity,
+            },
+            Setting::Exposure.value(self),
+            self.lighting.tonemapping,
+        )
+    }
+
     fn valid(&self) -> bool {
         self.version == 2
+            && self.post.valid()
             && self.lighting.validate().is_ok()
             && self.lighting.hdri.is_some()
             && self.lighting.hdri_asset.is_none()
@@ -172,9 +210,7 @@ pub(super) struct Applied(Settings);
 pub(super) struct Panel;
 #[derive(Resource)]
 pub(super) struct PanelUi {
-    body: Entity,
-    arrow: Entity,
-    angle: f32,
+    section: Entity,
     uv_open: bool,
     model_open: bool,
 }
@@ -191,10 +227,10 @@ pub(super) struct ControlValue {
 }
 #[derive(Component)]
 pub(super) enum Caption {
-    Panel,
     Background,
     Key,
     ToneMap,
+    PostTone,
 }
 
 #[derive(Component)]
@@ -210,50 +246,37 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
         .filter(Settings::valid)
         .unwrap_or_default();
-    let panel = inspector_card(&mut commands, interface.inspector);
-    commands
-        .entity(panel)
-        .entry::<Node>()
-        .and_modify(|mut n| n.display = Display::None);
-    commands
-        .entity(panel)
-        .insert((Panel, AccessibleLabel("Окружение просмотра модели".into())));
+    let panel = node(
+        &mut commands,
+        interface.inspector,
+        Node {
+            display: Display::None,
+            ..column(0.0)
+        },
+    );
+    commands.entity(panel).insert(Panel);
     let font = &interface.font;
-    let toggle = button(
+    let section = inspector::section(
         &mut commands,
         panel,
         font,
         "Окружение",
-        action(EnvironmentAction::TogglePanel),
-        Look::Regular,
+        "environment lighting hdr hdri",
+        true,
     );
-    commands.entity(toggle).insert(Caption::Panel);
-    let arrow = icons::themed(&mut commands, toggle, icons::Glyph::ChevronRight, 14.);
-    commands.entity(toggle).entry::<Node>().and_modify(|mut n| {
-        n.width = percent(100);
-        n.justify_content = JustifyContent::SpaceBetween;
-    });
-    control_hints::attach(
-        &mut commands,
-        toggle,
-        "Развернуть или свернуть настройки освещения и фона предпросмотра. Они не меняют сцену и материалы модели.",
-    );
-    let body = node(
-        &mut commands,
-        panel,
-        Node {
-            width: percent(100),
-            ..column(6.)
+    commands.entity(section.button).insert((
+        Control {
+            action: action(EnvironmentAction::TogglePanel),
+            look: Look::Regular,
         },
-    );
+        AccessibleLabel("Окружение просмотра модели".into()),
+    ));
     commands.insert_resource(PanelUi {
-        body,
-        arrow,
-        angle: 0.,
+        section: section.root,
         uv_open: false,
         model_open: true,
     });
-    let panel = body;
+    let panel = section.body;
     let presets = node(
         &mut commands,
         panel,
@@ -263,6 +286,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
             ..row(3.0)
         },
     );
+    inspector::searchable(&mut commands, presets, "схемы освещения пресеты presets");
     for preset in crate::EnvironmentPreset::ALL {
         let button = button(
             &mut commands,
@@ -289,9 +313,15 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
     ] {
         scalar(&mut commands, panel, font, label, field, &settings);
     }
+    let tone_row = node(&mut commands, panel, column(0.0));
+    inspector::searchable(
+        &mut commands,
+        tone_row,
+        "тонмаппинг цвет tone mapping aces agx",
+    );
     let tone = button(
         &mut commands,
-        panel,
+        tone_row,
         font,
         "",
         action(EnvironmentAction::ToneMap),
@@ -309,9 +339,15 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         heading,
         "Отображение окружения за моделью. Фон можно затемнить или размыть независимо от освещения.",
     );
+    let background_row = node(&mut commands, panel, column(0.0));
+    inspector::searchable(
+        &mut commands,
+        background_row,
+        "фон показать скрыть background",
+    );
     let background = button(
         &mut commands,
-        panel,
+        background_row,
         font,
         "",
         action(EnvironmentAction::ToggleBackground),
@@ -352,9 +388,15 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         heading,
         "Направленный свет для проверки формы и теней. Работает вместе с окружением и не добавляется в сцену.",
     );
+    let key_row = node(&mut commands, panel, column(0.0));
+    inspector::searchable(
+        &mut commands,
+        key_row,
+        "направленный дополнительный свет key light",
+    );
     let key = button(
         &mut commands,
-        panel,
+        key_row,
         font,
         "",
         action(EnvironmentAction::ToggleKey),
@@ -373,9 +415,11 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
     ] {
         scalar(&mut commands, panel, font, label, field, &settings);
     }
+    let reset_row = node(&mut commands, panel, column(0.0));
+    inspector::searchable(&mut commands, reset_row, "сбросить просмотр reset defaults");
     let reset = button(
         &mut commands,
-        panel,
+        reset_row,
         font,
         "Сбросить просмотр",
         action(EnvironmentAction::Reset),
@@ -402,6 +446,8 @@ fn scalar(
     setting: Setting,
     settings: &Settings,
 ) {
+    let parent = node(commands, parent, column(0.0));
+    inspector::searchable(commands, parent, label);
     let header = node(
         commands,
         parent,
@@ -482,6 +528,24 @@ fn scalar(
     });
 }
 
+pub(super) fn paint_post_controls(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    settings: &Settings,
+) {
+    scalar(commands, parent, font, "Экспозиция", Setting::Exposure, settings);
+    let tone = button(commands, parent, font, "", action(EnvironmentAction::PostTone), Look::Regular);
+    caption(commands, tone, Caption::PostTone);
+    for (field, label) in PostField::ALL {
+        scalar(commands, parent, font, label, Setting::Post(field), settings);
+    }
+    button(
+        commands, parent, font, "Сбросить обработку изображения",
+        action(EnvironmentAction::ResetPost), Look::Regular,
+    );
+}
+
 fn change_slider(
     event: On<ValueChange<f32>>,
     controls: Query<&ControlValue>,
@@ -548,6 +612,11 @@ pub(super) fn actions(
                     _ => crate::ToneMap::AcesFitted,
                 }
             }
+            EnvironmentAction::PostTone => settings.post.cycle_curve(),
+            EnvironmentAction::ResetPost => {
+                settings.post = Effects::default();
+                Setting::Exposure.set(&mut settings, 0.0);
+            }
             EnvironmentAction::Reset => *settings = Settings::default(),
         }
     }
@@ -583,7 +652,11 @@ pub(super) fn synchronize(
 ) {
     let mut changed = false;
     for (entity, applied) in &cameras {
-        if applied.is_some_and(|applied| applied.0 == *settings) {
+        if applied.is_some_and(|applied| {
+            let mut current = settings.clone();
+            current.post = applied.0.post;
+            current == applied.0
+        }) {
             continue;
         }
         let mut camera = commands.entity(entity);
@@ -641,7 +714,8 @@ pub(super) fn synchronize(
 pub(super) fn refresh(
     editor: Res<Editor>,
     settings: Res<Settings>,
-    mut ui: ResMut<PanelUi>,
+    ui: Res<PanelUi>,
+    mut sections: Query<&mut inspector::Section>,
     editing: Res<editing::State>,
     mut commands: Commands,
     mut panels: Query<&mut Node, With<Panel>>,
@@ -650,35 +724,16 @@ pub(super) fn refresh(
     mut labels: Query<&mut Text>,
     captions: Query<(&Caption, &Children)>,
     mut presets: Query<(&PresetChoice, &Hovered, &mut BackgroundColor)>,
-    time: Res<Time>,
-    mut transforms: Query<&mut UiTransform>,
-    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
 ) {
-    let shown = editor.viewing_model.is_some();
+    let shown = editor.viewing_model.is_some() && editor.viewing_image.is_none();
     let open =
         ui.open(editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv);
-    let target = if open {
-        std::f32::consts::FRAC_PI_2
-    } else {
-        0.
-    };
-    ui.angle += (target - ui.angle) * (1. - (-time.delta_secs().min(0.1) * 18.).exp());
-    if (target - ui.angle).abs() < 0.001 {
-        ui.angle = target;
-    } else if shown {
-        redraw.write(bevy::window::RequestRedraw);
+    if let Ok(mut section) = sections.get_mut(ui.section)
+        && section.open() != open
+    {
+        section.set_open(open);
     }
-    if let Ok(mut arrow) = transforms.get_mut(ui.arrow) {
-        arrow.set_if_neq(UiTransform::from_rotation(Rot2::radians(ui.angle)));
-    }
-    if let Ok(mut body) = nodes.get_mut(ui.body) {
-        body.display = if open { Display::Flex } else { Display::None };
-    }
-    let enabled = shown
-        && open
-        && editor.pending.is_none()
-        && editor.viewing_image.is_none()
-        && !editor.hdri_library_open;
+    let enabled = shown && editor.pending.is_none() && !editor.hdri_library_open;
     for mut panel in &mut panels {
         panel.display = if shown { Display::Flex } else { Display::None };
     }
@@ -691,6 +746,7 @@ pub(super) fn refresh(
                 (computed.size().x * computed.inverse_scale_factor() - 14.0).max(0.0) * position,
             );
         }
+        let enabled = enabled && !computed.is_empty();
         if let Ok(mut label) = labels.get_mut(control.readout) {
             label.0 = format!("{value:.2}");
         }
@@ -705,7 +761,6 @@ pub(super) fn refresh(
     }
     for (caption, children) in &captions {
         let value = match caption {
-            Caption::Panel => "Окружение".into(),
             Caption::Background => {
                 if settings.lighting.hdri_background {
                     "Фон: окружение".into()
@@ -721,6 +776,7 @@ pub(super) fn refresh(
                 }
             }
             Caption::ToneMap => format!("Цвет: {}", settings.lighting.tonemapping.label()),
+            Caption::PostTone => format!("Тональная компрессия · {}", settings.post.curve.map_or("Окружение", |curve| curve.label())),
         };
         for child in children.iter() {
             if let Ok(mut label) = labels.get_mut(child) {
@@ -774,12 +830,18 @@ mod tests {
             .write_message(action(EnvironmentAction::Preset(
                 crate::EnvironmentPreset::PhotoStudio,
             )));
+        app.world_mut().write_message(action(EnvironmentAction::Set(
+            Setting::Post(PostField::BloomThreshold), 6.0, true,
+        )));
+        app.world_mut().write_message(action(EnvironmentAction::PostTone));
         app.update();
         let saved: Settings =
             serde_json::from_slice(&std::fs::read(scratch.join(SETTINGS_FILE)).unwrap()).unwrap();
         assert!(saved.valid());
         assert_eq!(saved, *app.world().resource::<Settings>());
         assert_eq!(Setting::Exposure.value(&saved), 1.5);
+        assert_eq!(PostField::BloomThreshold.value(saved.post), 4.0);
+        assert_eq!(saved.post.curve, Some(crate::ToneMap::AcesFitted));
         assert_eq!(
             saved.lighting.hdri,
             Some(crate::EnvironmentPreset::PhotoStudio)
@@ -805,6 +867,9 @@ mod tests {
         );
         let json = serde_json::to_vec(&settings).unwrap();
         assert_eq!(serde_json::from_slice::<Settings>(&json).unwrap(), settings);
+        let mut before_post = serde_json::to_value(&settings).unwrap();
+        before_post.as_object_mut().unwrap().remove("post");
+        assert_eq!(serde_json::from_value::<Settings>(before_post).unwrap(), settings);
         let mut legacy = serde_json::to_value(&settings).unwrap();
         legacy.as_object_mut().unwrap().remove("version");
         assert!(!serde_json::from_value::<Settings>(legacy).unwrap().valid());

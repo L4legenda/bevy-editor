@@ -1,16 +1,23 @@
 //! Camera-dependent stroke geometry is prepared lazily on the paint worker.
 use super::*;
+pub(in crate::editor::ui::model_viewer::paint) use crate::editor::model_mesh::uv_weights as weights;
+#[cfg(test)]
 use std::sync::OnceLock;
+#[cfg(test)]
 const CELL: f32 = 64.;
+pub(super) type GeometryVersion = (u64, u64);
 pub(super) struct Mapping {
     pub objects: Vec<Object>,
     pub slot: usize,
     pub revision:u64,
+    pub visibility: sets::SetVisibility,
     pub object: usize,
     pub camera: CameraMap,
     pub uv: bool,
+    #[cfg(test)]
     geometry: OnceLock<Projection>,
 }
+#[cfg(test)]
 pub(super) struct Projection {
     pub triangles: Vec<Triangle>,
     pub bvh: editing::input::Bvh,
@@ -19,17 +26,19 @@ pub(super) struct Projection {
     rows: usize,
     rect: Rect,
 }
+#[cfg(test)]
 pub(super) struct Triangle {
     pub points: [Vec3; 3],
     pub uv: [Vec2; 3],
     pub face: usize,
     pub screen: Option<[Vec2; 3]>,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct CameraMap {
     pub pose: Transform,
     pub inverse: Mat4,
     pub rect: Rect,
+    pub clip: Rect,
     pub ortho: bool,
     pub height: f32,
     pub depth: f32,
@@ -84,21 +93,10 @@ impl CameraMap {
         }
     }
 }
-#[cfg(test)] pub(super) fn weights(p: Vec2, t: [Vec2; 3]) -> Option<Vec3> {
-    let a = t[1] - t[0];
-    let b = t[2] - t[0];
-    let d = a.perp_dot(b);
-    if d.abs() < 1.0e-10 {
-        return None;
-    }
-    let q = p - t[0];
-    let u = q.perp_dot(b) / d;
-    let v = a.perp_dot(q) / d;
-    Some(Vec3::new(1. - u - v, u, v))
-}
 #[cfg(test)] pub(super) fn mix3(t: [Vec3; 3], b: Vec3) -> Vec3 {
     t[0] * b.x + t[1] * b.y + t[2] * b.z
 }
+#[cfg(test)]
 pub(super) fn mapping(
     doc: &Document,
     object: &Object,
@@ -106,27 +104,24 @@ pub(super) fn mapping(
     viewer: &Viewer,
     rect: Rect,
     uv: bool,
+    visibility: &sets::SetVisibility,
 ) -> Mapping {
+    Mapping::for_camera(doc, object, slot, camera_map(viewer, rect), uv, visibility)
+}
+pub(super) fn camera_map(viewer: &Viewer, rect: Rect) -> CameraMap {
     let pose = view_pose(viewer);
-    Mapping {
-        revision:doc.revision,
-        objects: doc.objects.clone(),
-        slot,
-        object: object.id,
-        uv,
-        geometry: OnceLock::new(),
-        camera: CameraMap {
-            pose,
-            inverse: pose.to_matrix().inverse(),
-            rect,
-            ortho: viewer.orthographic,
-            height: view_height(viewer, viewer.distance),
-            depth: orthographic_depth(viewer),
-            epsilon: viewer.radius.max(0.001) * 0.0005,
-        },
+    CameraMap {
+        pose,
+        inverse: pose.to_matrix().inverse(),
+        rect,
+        clip: rect,
+        ortho: viewer.orthographic,
+        height: view_height(viewer, viewer.distance),
+        depth: orthographic_depth(viewer),
+        epsilon: viewer.radius.max(0.001) * 0.0005,
     }
 }
-pub(super) fn has_uv(object: &Object, slot: usize) -> bool {
+pub(in crate::editor::ui::model_viewer::paint) fn has_uv(object: &Object, slot: usize) -> bool {
     object
         .geometry
         .faces
@@ -140,16 +135,36 @@ pub(super) fn has_uv(object: &Object, slot: usize) -> bool {
         })
 }
 impl Mapping {
+    pub fn for_camera(doc: &Document, object: &Object, slot: usize, camera: CameraMap, uv: bool, visibility: &sets::SetVisibility) -> Self {
+        Self {
+            revision: doc.revision,
+            visibility: visibility.clone(),
+            objects: doc.objects.clone(),
+            slot,
+            object: object.id,
+            uv,
+            #[cfg(test)]
+            geometry: OnceLock::new(),
+            camera,
+        }
+    }
+
+    pub fn version(&self) -> GeometryVersion {
+        (self.revision, self.visibility.revision)
+    }
+
+    #[cfg(test)]
     pub fn geometry(&self) -> &Projection {
         self.geometry.get_or_init(|| {
             let mut triangles = Vec::new();
             if let Some(object) = self.objects.iter().find(|o| o.id == self.object) {
+                let offset = object.uv_offset(self.slot);
                 for (face, f) in object
                     .geometry
                     .faces
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| f.material == self.slot)
+                    .filter(|(_, f)| f.material == self.slot && self.visibility.shown(object.id, f.material))
                 {
                     for indices in object.geometry.triangles(f) {
                         let points = indices.map(|i| {
@@ -157,7 +172,7 @@ impl Mapping {
                                 .transform
                                 .transform_point(object.geometry.positions[f.corners[i].vertex])
                         });
-                        let uv = indices.map(|i| f.corners[i].uv);
+                        let uv = indices.map(|i| f.corners[i].uv - offset);
                         let screen = if self.uv {
                             Some(uv.map(|p| self.camera.rect.min + p * self.camera.rect.size()))
                         } else {
@@ -181,7 +196,7 @@ impl Mapping {
             let rows = (self.camera.rect.height() / CELL).ceil().max(1.) as usize;
             let mut out = Projection {
                 triangles,
-                bvh: editing::input::Bvh::from_objects(&self.objects),
+                bvh: editing::input::Bvh::from_objects_where(&self.objects, |id, slot| self.visibility.shown(id, slot)),
                 bins: vec![Vec::new(); columns * rows],
                 columns,
                 rows,
@@ -210,6 +225,7 @@ impl Mapping {
         })
     }
 }
+#[cfg(test)]
 impl Projection {
     fn cells(&self, r: Rect) -> (UVec2, UVec2) {
         let limit = Vec2::new((self.columns - 1) as f32, (self.rows - 1) as f32);
@@ -224,7 +240,7 @@ impl Projection {
                 .as_uvec2(),
         )
     }
-    #[cfg(test)] pub fn candidates(&self, r: Rect) -> Vec<usize> {
+    pub fn candidates(&self, r: Rect) -> Vec<usize> {
         let (lo, hi) = self.cells(r);
         let mut out = Vec::new();
         for y in lo.y..=hi.y {

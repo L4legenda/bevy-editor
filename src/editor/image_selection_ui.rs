@@ -348,15 +348,19 @@ fn refresh(
         .edit
         .document(editor.viewing_image)
         .map(|d| d.revision);
-    let nearest = viewer.edit.selection.nearest;
+    let nearest = viewer.edit.selection.transform.is_some() && viewer.edit.selection.nearest;
     if let Some(mut material) = materials.get_mut(&super::super::canvas_material::HANDLE) {
+        let placement = if !enabled {
+            None
+        } else if let Some(t) = viewer.edit.selection.transform.as_mut() {
+            (Some(t.id) == editor.viewing_image)
+                .then(|| t.placement())
+                .flatten()
+        } else {
+            viewer.layer_preview.as_mut().and_then(|m| m.placement())
+        };
         ui.transform_images.sync(
-            viewer
-                .edit
-                .selection
-                .transform
-                .as_mut()
-                .filter(|t| Some(t.id) == editor.viewing_image && enabled),
+            placement,
             source.as_ref(),
             dimensions,
             revision,

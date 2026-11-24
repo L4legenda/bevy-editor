@@ -26,3 +26,16 @@ fn compact(@builtin(global_invocation_id) p:vec3<u32>){
     atomicStore(&work[4u+slot],i);
     atomicMax(&work[1],slot/64u+1u);
 }
+
+// Each tile extends pixel bounds by the full 8x8 tile. Store minima
+// as distance from the far edge so the whole buffer can be cleared to zero.
+@compute @workgroup_size(64)
+fn bounds(@builtin(global_invocation_id) p: vec3<u32>) {
+    let i = p.x;
+    if (i >= u.columns * u.rows || dirty[i] == 0u) { return; }
+    let xy = vec2<u32>(i % u.columns, i / u.columns);
+    atomicMax(&work[0], (xy.x + 1u) * 8u);
+    atomicMax(&work[1], (xy.y + 1u) * 8u);
+    atomicMax(&work[2], (u.columns - xy.x) * 8u);
+    atomicMax(&work[3], (u.rows - xy.y) * 8u);
+}

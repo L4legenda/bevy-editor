@@ -138,9 +138,13 @@ pub(super) fn drive(
         } else {
             0.002
         };
-        viewer.distance = (viewer.distance * (-scroll.delta.y * factor).exp()).clamp(
-            (viewer.radius * 0.06).clamp(0.000001, 0.35),
-            (viewer.radius * 1000.0).max(80.0),
-        );
+        zoom(viewer, -scroll.delta.y * factor);
     }
+}
+
+pub(super) fn zoom(viewer: &mut Viewer, exponent: f32) {
+    viewer.distance = (viewer.distance * exponent.exp()).clamp(
+        (viewer.radius * 0.06).clamp(0.000001, 0.35),
+        (viewer.radius * 1000.0).max(80.0),
+    );
 }

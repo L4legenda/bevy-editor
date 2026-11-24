@@ -1,0 +1,6 @@
+PBR texture sets from Poly Haven (https://polyhaven.com), released under CC0
+(public domain). Each folder is named after its Poly Haven asset id, e.g.
+https://polyhaven.com/a/rusty_metal_02. Maps are 2K: color (diffuse),
+rough, height, and metal.png (metalness) where the material is bare metal.
+height.jpg combines the asset's displacement map with fine detail
+integrated from its normal map.

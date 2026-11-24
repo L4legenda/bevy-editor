@@ -19,8 +19,24 @@ fn srgb(v:vec3<f32>)->vec3<f32>{return select(1.055*pow(max(v,vec3<f32>(0.0)),ve
 fn display(p:vec3<u32>){
     if(any(p.xy>=vec2<u32>(u.settings.x))){return;}
     let at=vec2<i32>(p.xy);let i=p.y*u.settings.x+p.x;let v=unpack4x8unorm(composite[i]);
-    let channel=u.ids.w;
+    let channel=u.ids.w & 0x0fffffffu;
     var a=v;var b=v;
+    if(channel==9u || channel==10u){
+        let baked=unpack4x8unorm(auxiliary[i]);
+        if(channel==9u){
+            let value=mix(baked.r,v.r,v.a);
+            a=vec4<f32>(vec3<f32>(value),baked.a);
+        }else{
+            a=baked;
+            if(v.a>0.0){
+                let xy=(baked.rg*2.0-1.0)*(1.0-v.a);
+                let z=sqrt(max(0.0,1.0-dot(xy,xy)));
+                a=vec4<f32>(vec3<f32>(xy,z)*0.5+0.5,baked.a);
+            }
+        }
+        textureStore(out0,at,a);
+        return;
+    }
     if(channel==0u){a=vec4<f32>(v.rgb,textureLoad(color_map,at,0).a);}
     if(channel==1u){a=vec4<f32>(1.0,v.r,textureLoad(rm_map,at,0).b,1.0);}
     if(channel==2u){a=vec4<f32>(1.0,textureLoad(rm_map,at,0).g,v.r,1.0);}
@@ -32,8 +48,9 @@ fn display(p:vec3<u32>){
         a=vec4<f32>(n*0.5+0.5,1.0);
     }
     if(channel==4u){a=vec4<f32>(srgb(textureLoad(color_map,at,0).rgb),v.r);}
+    if(channel==7u){b=vec4<f32>(v.rgb,sqrt(v.r*0.5));}
     textureStore(out0,at,a);
-    if(channel==1u||channel==2u||channel==3u||channel==4u){textureStore(out1,at,b);}
+    if(channel==1u||channel==2u||channel==3u||channel==4u||channel==7u){textureStore(out1,at,b);}
 }
 @compute @workgroup_size(8,8)
 fn present(@builtin(workgroup_id) g:vec3<u32>,@builtin(local_invocation_id) l:vec3<u32>){

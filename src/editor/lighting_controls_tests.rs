@@ -40,7 +40,6 @@ fn fixture() -> (App, Entity, Entity) {
         tooltip: dummy,
         tooltip_label: dummy,
         menu_open: false,
-        advanced: false,
         pointer_consumed: false,
         controls: State::default(),
         name_draft: None,

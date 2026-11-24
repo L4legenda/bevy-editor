@@ -20,9 +20,11 @@ mod rename;
 mod scene_creation;
 use crate::editor::{
     browser_files,
+    model_import_mesh::AutoUnwrap,
     model_primitives::{Parameters, Primitive},
     thumbnails::Thumbnails,
 };
+use super::model_viewer::editing::uv::UvState;
 use bevy::{
     input_focus::FocusCause,
     tasks::{IoTaskPool, Task, block_on, poll_once},
@@ -47,6 +49,7 @@ enum Phase {
     Image,
     Scene,
     Rename,
+    Report,
     Primitive(Primitive),
 }
 
@@ -54,7 +57,7 @@ impl Phase {
     fn dialog(self) -> bool {
         matches!(
             self,
-            Self::Folder | Self::Image | Self::Scene | Self::Rename | Self::Primitive(_)
+            Self::Folder | Self::Image | Self::Scene | Self::Rename | Self::Primitive(_) | Self::Report
         )
     }
     fn primitive(self) -> Option<Primitive> {
@@ -78,7 +81,8 @@ enum Work {
         name: String,
         parameters: Parameters,
     },
-    Import(Vec<PathBuf>),
+    Import(Vec<PathBuf>, AutoUnwrap),
+    ImportModel(AutoUnwrap),
     Image {
         name: String,
         width: u32,
@@ -154,11 +158,25 @@ impl Work {
                     },
                 },
             },
-            Self::Import(paths) => {
-                let report = browser_files::import_files(&root, &parent, paths);
+            Self::Import(paths, auto_unwrap) => {
+                let report = browser_files::import_files(&root, &parent, paths, auto_unwrap);
                 let status = report.status();
                 Outcome { report, status }
             }
+            Self::ImportModel(auto_unwrap) => match crate::editor::asset_monitor::choose_file_path(&root) {
+                Ok(Some(path)) if path.extension().is_some_and(|ext| {
+                    ["obj", "fbx", "spp"].iter().any(|kind| ext.eq_ignore_ascii_case(kind))
+                }) => {
+                    let report = browser_files::import_editable_files(&root, &parent, vec![path], auto_unwrap);
+                    let status = report.status();
+                    Outcome { report, status }
+                }
+                Ok(None) => Outcome { report: Default::default(), status: "Импорт модели отменён".into() },
+                result => {
+                    let error = result.err().map_or_else(|| "Выберите файл OBJ, FBX или SPP".into(), |error| error.to_string());
+                    Outcome { report: Default::default(), status: format!("Не удалось импортировать модель · {error}") }
+                }
+            },
             Self::Image {
                 name,
                 width,
@@ -224,6 +242,7 @@ pub(in crate::editor) struct BrowserContext {
     queue: VecDeque<Batch>,
     pending: Option<Import>,
     completed: Option<Completed>,
+    import_report: String,
 }
 
 impl BrowserContext {
@@ -248,7 +267,8 @@ pub(in crate::editor) struct ContextUi {
     menu: Entity,
     menu_title: Entity,
     new_folder: Entity,
-    creation: [Entity; 5],
+    creation: [Entity; 10],
+    import_labels: [(Entity, Entity); 4],
     open: Entity,
     instance: Entity,
     open_icon: Entity,
@@ -260,6 +280,10 @@ pub(in crate::editor) struct ContextUi {
     dialogues: primitive_creation::MenuUi,
     primitives: primitive_creation::MenuUi,
     dialog: Entity,
+    report: Entity,
+    report_scroll: Entity,
+    report_text: Entity,
+    report_close: Entity,
     dialog_title: Entity,
     name_label: Entity,
     extension: Entity,
@@ -475,6 +499,34 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         });
     let icon = icons::themed(commands, new_image, icons::Glyph::Image, 16.0);
     commands.entity(new_image).insert_children(0, &[icon]);
+    let import = button(commands, menu, font_handle, "Импорт для рисования…", Action::BrowserImportModel, Look::Regular);
+    commands.entity(import).entry::<Node>().and_modify(|mut node| {
+        node.width = percent(100);
+        node.height = px(34);
+        node.border = UiRect::all(px(0));
+    });
+    let icon = icons::themed(commands, import, icons::Glyph::Box, 16.0);
+    commands.entity(import).insert_children(0, &[icon]);
+    let import_labels = [
+        Action::BrowserAutoUnwrap,
+        Action::BrowserDetectUdim,
+        Action::BrowserTextureSize,
+        Action::BrowserBakeOnLoad,
+    ].map(|action| {
+        let row = control(
+            commands,
+            menu,
+            action,
+            Look::Regular,
+            Node {
+                width: percent(100),
+                height: px(29),
+                padding: UiRect::horizontal(px(9)),
+                ..self::row(4.0)
+            },
+        );
+        (row, text(commands, row, font_handle, "", 13.0, TEXT))
+    });
     let dialogues = primitive_creation::setup_dialogues(commands, menu, font_handle);
     let primitives = primitive_creation::setup(commands, menu, font_handle);
 
@@ -604,6 +656,57 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
             });
     }
 
+    let report = surface(
+        commands,
+        overlay,
+        Node {
+            width: px(600),
+            max_width: percent(90),
+            max_height: percent(90),
+            padding: UiRect::all(px(22)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(12)),
+            ..column(12.0)
+        },
+        PANEL,
+    );
+    commands.entity(report).insert(AccessibleLabel("Отчёт об импорте SPP".into()));
+    text(commands, report, font_handle, "Импорт Substance Painter", 21.0, TEXT);
+    text(
+        commands,
+        report,
+        font_handle,
+        "В режиме «Рисование» итоговые карты и восстановленные слои доступны в стеке модели.",
+        13.0,
+        MUTED,
+    );
+    let report_scroll = node(
+        commands,
+        report,
+        Node {
+            width: percent(100),
+            min_height: px(0),
+            max_height: px(380),
+            overflow: Overflow::scroll_y(),
+            ..column(0.0)
+        },
+    );
+    commands.entity(report_scroll).insert((Scroller, ScrollPosition::default()));
+    let report_text = text(commands, report_scroll, font_handle, "", 13.0, TEXT);
+    commands.entity(report_text).insert((
+        TextLayout::default(),
+        Node { width: percent(100), flex_shrink: 0.0, ..default() },
+    ));
+    let report_close = button(
+        commands, report, font_handle, "Закрыть", Action::BrowserCancelPopup, Look::Primary,
+    );
+    commands.entity(report_close).entry::<Node>().and_modify(|mut node| {
+        node.align_self = AlignSelf::End;
+        node.min_width = px(88);
+        node.height = px(34);
+        node.justify_content = JustifyContent::Center;
+    });
+
     let indicator = surface(
         commands,
         root,
@@ -658,9 +761,15 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
             new_folder,
             new_scene,
             new_image,
+            import,
+            import_labels[0].0,
+            import_labels[1].0,
+            import_labels[2].0,
+            import_labels[3].0,
             dialogues.trigger,
             primitives.trigger,
         ],
+        import_labels,
         open,
         instance,
         open_icon,
@@ -672,6 +781,10 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         dialogues,
         primitives,
         dialog,
+        report,
+        report_scroll,
+        report_text,
+        report_close,
         dialog_title,
         name_label,
         extension,
@@ -822,7 +935,7 @@ pub(in crate::editor) fn input(
     viewer: Option<Res<ImageViewer>>,
     browser: Res<Browser>,
     mut context: ResMut<BrowserContext>,
-    interfaces: (Res<ContextUi>, ResMut<drawer::BrowserUi>),
+    interfaces: (Res<ContextUi>, ResMut<drawer::BrowserUi>, Res<UvState>),
     motion: Res<DrawerMotion>,
     window: Single<(Entity, &Window), With<PrimaryWindow>>,
     (mouse, mut keys, focus): (
@@ -839,7 +952,7 @@ pub(in crate::editor) fn input(
     (mut redraw, mut actions): (MessageWriter<RequestRedraw>, MessageWriter<Action>),
 ) {
     let (entity, window) = *window;
-    let (interface, mut browser_ui) = interfaces;
+    let (interface, mut browser_ui, prefs) = interfaces;
     context.suppress_release &=
         mouse.pressed(MouseButton::Left) || mouse.just_released(MouseButton::Left);
     let allowed = editor.drawer
@@ -851,7 +964,7 @@ pub(in crate::editor) fn input(
         && !motion.resizing
         && !editor.sidebar.resizing()
         && !drag.active();
-    if !allowed {
+    if !allowed && context.phase != Phase::Report {
         context.phase = Phase::Closed;
         context.hovered.clear();
     }
@@ -956,7 +1069,7 @@ pub(in crate::editor) fn input(
                 context.queue.push_back(Batch {
                     parent: browser.folders[folder].path.clone(),
                     revision: browser.revision,
-                    work: Work::Import(paths),
+                    work: Work::Import(paths, prefs.auto_unwrap()),
                 });
             } else {
                 editor.status =
@@ -1024,10 +1137,14 @@ pub(in crate::editor) fn update(
     mut inputs: Query<&mut EditableText>,
     mut last_name: Local<String>,
     redirects: Option<Res<crate::asset_paths::AssetRedirects>>,
-    (model_edit, image_viewer): (Res<ModelEditingState>, Option<Res<ImageViewer>>),
+    (model_edit, image_viewer, mut prefs): (
+        Res<ModelEditingState>,
+        Option<Res<ImageViewer>>,
+        ResMut<UvState>,
+    ),
 ) {
     let allowed = editor.drawer && editor.pending.is_none() && !editor.hdri_library_open;
-    if context.phase.dialog()
+    if context.phase.dialog() && context.phase != Phase::Report
         && let Ok(input) = inputs.get(interface.name)
     {
         let signature = context.phase.primitive().map_or_else(
@@ -1253,6 +1370,34 @@ pub(in crate::editor) fn update(
                     .parameters
                     .reset(primitive, &mut inputs, &mut commands);
             }
+            Action::BrowserImportModel if allowed && matches!(context.phase, Phase::Menu | Phase::Closed) => {
+                let parent = if context.phase == Phase::Menu {
+                    context.parent.clone()
+                } else {
+                    browser.folders[browser.current].path.clone()
+                };
+                context.queue.push_back(Batch {
+                    parent,
+                    revision: browser.revision,
+                    work: Work::ImportModel(prefs.auto_unwrap()),
+                });
+                context.phase = Phase::Closed;
+            }
+            Action::BrowserAutoUnwrap | Action::BrowserDetectUdim
+            | Action::BrowserTextureSize | Action::BrowserBakeOnLoad
+                if allowed && context.is_menu() && !context.file_menu() =>
+            {
+                let result = match action {
+                    Action::BrowserAutoUnwrap => prefs.cycle_auto_unwrap(),
+                    Action::BrowserDetectUdim => prefs.toggle_udim_import(),
+                    Action::BrowserTextureSize => prefs.cycle_texture_size(),
+                    Action::BrowserBakeOnLoad => prefs.toggle_bake_on_load(),
+                    _ => unreachable!(),
+                };
+                if let Err(error) = result {
+                    editor.status = format!("Не удалось сохранить настройки импорта · {error}");
+                }
+            }
             Action::BrowserConfirmPrimitive if allowed => {
                 let Some(kind) = context.phase.primitive() else {
                     continue;
@@ -1399,6 +1544,7 @@ pub(in crate::editor) fn update(
                 context.phase = Phase::Closed;
                 context.rename_target = None;
                 context.error.clear();
+                context.import_report.clear();
             }
             Action::BrowserCreateFolder if allowed && context.phase == Phase::Folder => {
                 let name = inputs
@@ -1486,6 +1632,11 @@ pub(in crate::editor) fn update(
                 context.focus_after = Some(path.clone());
             }
         }
+        if let Some(details) = completed.report.spp_details() {
+            context.previous_focus = focus.get();
+            context.import_report = details;
+            context.phase = Phase::Report;
+        }
         editor.status = completed.status;
     }
     if context.pending.is_none()
@@ -1505,7 +1656,8 @@ pub(in crate::editor) fn update(
             Work::Primitive { .. } => "Создание 3D-модели…",
             Work::Image { .. } => "Создание изображения…",
             Work::Scene { .. } => "Создание сцены…",
-            Work::Import(_) => "Добавление файлов…",
+            Work::Import(..) => "Добавление файлов…",
+            Work::ImportModel(_) => "Импорт модели…",
         };
         context.pending = Some(Import {
             parent: batch.parent,
@@ -1522,7 +1674,7 @@ pub(in crate::editor) fn update(
 pub(in crate::editor) fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
-    browser: Res<Browser>,
+    (browser, prefs): (Res<Browser>, Res<UvState>),
     mut context: ResMut<BrowserContext>,
     mut interface: ResMut<ContextUi>,
     browser_ui: Res<drawer::BrowserUi>,
@@ -1564,6 +1716,22 @@ pub(in crate::editor) fn refresh(
             } else {
                 Display::Flex
             };
+        }
+    }
+    if phase == Phase::Menu && !file_menu {
+        let names = [
+            format!("Авторазвёртка · {}", prefs.auto_unwrap().label()),
+            format!("Распознавать UDIM · {}", if prefs.detect_udim_on_import() { "Вкл." } else { "Выкл." }),
+            format!("Новые текстуры · {}²", prefs.texture_size_on_import()),
+            format!("Автозапекание · {}", if prefs.bake_on_load() { "Вкл." } else { "Выкл." }),
+        ];
+        for ((control, label), name) in interface.import_labels.into_iter().zip(names) {
+            if let Ok(mut text) = labels.get_mut(label)
+                && text.0 != name
+            {
+                commands.entity(control).insert(AccessibleLabel(name.clone()));
+                text.0 = name;
+            }
         }
     }
     for entity in [interface.open, interface.reveal] {
@@ -1632,7 +1800,8 @@ pub(in crate::editor) fn refresh(
     for (entity, shown) in [
         (interface.overlay, phase != Phase::Closed),
         (interface.menu, phase == Phase::Menu),
-        (interface.dialog, phase.dialog()),
+        (interface.dialog, phase.dialog() && phase != Phase::Report),
+        (interface.report, phase == Phase::Report),
         (interface.size.root, phase == Phase::Image),
         (interface.parameters.root, phase.primitive().is_some()),
         (
@@ -1760,7 +1929,15 @@ pub(in crate::editor) fn refresh(
         }
         .into(),
     ));
-    if phase != interface.phase && phase.dialog() {
+    if phase != interface.phase && phase == Phase::Report {
+        if let Ok(mut label) = labels.get_mut(interface.report_text) {
+            label.set_if_neq(Text(context.import_report.clone()));
+        }
+        if let Ok(mut scroll) = scrolls.get_mut(interface.report_scroll) {
+            scroll.0 = Vec2::ZERO;
+        }
+    }
+    if phase != interface.phase && phase.dialog() && phase != Phase::Report {
         if let Ok(mut scroll) = scrolls.get_mut(interface.dialog) {
             scroll.0 = Vec2::ZERO;
         }
@@ -1837,6 +2014,8 @@ pub(in crate::editor) fn refresh(
                     } else {
                         interface.new_folder
                     }
+                } else if phase == Phase::Report {
+                    interface.report_close
                 } else {
                     interface.name
                 },

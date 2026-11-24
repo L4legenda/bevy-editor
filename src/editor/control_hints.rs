@@ -127,6 +127,13 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         }
     }
     Some(match action {
+        Action::BrowserAutoUnwrap =>
+            "Авторазвёртка для редактируемого импорта OBJ и FBX: строить только недостающие UV, строить для всех наборов или требовать готовые UV.".into(),
+        Action::BrowserDetectUdim => super::model_viewer::editing::uv::UDIM_IMPORT_HINT.into(),
+        Action::BrowserTextureSize =>
+            "Разрешение новых наборов текстур при открытии модели. Сохранённые наборы используют своё разрешение.".into(),
+        Action::BrowserBakeOnLoad =>
+            "Подготовить карты видимых наборов при первом входе в режим рисования. Сохранённые карты используются повторно.".into(),
         Action::Generation(super::GenerationAction::Open) => "Открыть генерацию 3D модели по изображению. Настройки сохраняются при переключении вкладок.".into(),
         Action::Generation(super::GenerationAction::Toggle) if editor.generation.active => "Закрыть вкладку генерации и вернуться к предыдущему документу.".into(),
         Action::Generation(super::GenerationAction::Toggle) => "Открыть генерацию 3D модели по изображению.".into(),
@@ -304,6 +311,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
                 UvAction::Resolution => "Разрешение следующего атласа: 1024, 2048 или 4096. Отступ задаётся в пикселях.",
                 UvAction::Padding => "Расстояние между островами для следующей авторазвёртки: 4, 8 или 16 пикселей.",
                 UvAction::Quality(_) => "Выберите баланс между растяжением поверхности и количеством швов для следующей развёртки.",
+                UvAction::DetectUdim => super::model_viewer::editing::uv::UDIM_IMPORT_HINT,
             }.into()
         },
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Xray)) =>
@@ -311,7 +319,7 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Wireframe)) =>
             "Показать сетку поверх всех объектов модели. Повторное нажатие скрывает сетку; исходный GLB не меняется.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::ExtrudeTool)) =>
-            "Экструдировать · потяните ручку «+» над выделением. E сразу запускает вытягивание за курсором.".into(),
+            "Экструдировать вершины (1), рёбра (2) или грани (3). Потяните ручку «+» над выделением или нажмите E, чтобы начать сразу.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Element(kind))) => {
             use crate::editor::model_mesh::Element;
             match kind {

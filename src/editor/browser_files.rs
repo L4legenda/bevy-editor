@@ -187,11 +187,29 @@ pub(super) fn create_image(
 pub(super) struct ImportReport {
     pub imported: Vec<PathBuf>,
     pub(super) textures_copied: usize,
+    pub(super) mesh_unwrapped_sets: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
+    pub(super) spp: Vec<(PathBuf, super::model_paint_spp::ImportDetails)>,
 }
 
 impl ImportReport {
+    pub(super) fn spp_details(&self) -> Option<String> {
+        if self.spp.is_empty() {
+            return None;
+        }
+        let mut sections = Vec::new();
+        for (path, report) in &self.spp {
+            let mut lines = vec![path.display().to_string(), report.overview.clone()];
+            lines.extend(report.warnings.iter().map(|warning| format!("• {warning}")));
+            sections.push(lines.join("\n"));
+        }
+        if !self.errors.is_empty() {
+            sections.push(format!("Ошибки импорта\n{}", self.errors.join("\n")));
+        }
+        Some(sections.join("\n\n"))
+    }
+
     pub fn status(&self) -> String {
         let mut status = if self.imported.is_empty() {
             "Не добавлено новых файлов".into()
@@ -200,6 +218,15 @@ impl ImportReport {
         };
         if self.textures_copied > 0 {
             status.push_str(&format!(" · Текстур FBX: {}", self.textures_copied));
+        }
+        if self.mesh_unwrapped_sets > 0 {
+            status.push_str(&format!(" · Построена UV-развёртка · наборов: {}", self.mesh_unwrapped_sets));
+        }
+        if let Some((_, summary)) = self.spp.first() {
+            status.push_str(&format!(" · {}", summary.label));
+            if self.spp.len() > 1 {
+                status.push_str(&format!(" (SPP-проектов: {})", self.spp.len()));
+            }
         }
         if self.skipped != 0 {
             status.push_str(&format!(" · Уже в папке: {}", self.skipped));
@@ -214,7 +241,31 @@ impl ImportReport {
     }
 }
 
-pub(super) fn import_files(root: &Path, parent: &Path, sources: Vec<PathBuf>) -> ImportReport {
+pub(super) fn import_files(
+    root: &Path,
+    parent: &Path,
+    sources: Vec<PathBuf>,
+    auto_unwrap: super::model_import_mesh::AutoUnwrap,
+) -> ImportReport {
+    import(root, parent, sources, false, auto_unwrap)
+}
+
+pub(super) fn import_editable_files(
+    root: &Path,
+    parent: &Path,
+    sources: Vec<PathBuf>,
+    auto_unwrap: super::model_import_mesh::AutoUnwrap,
+) -> ImportReport {
+    import(root, parent, sources, true, auto_unwrap)
+}
+
+fn import(
+    root: &Path,
+    parent: &Path,
+    sources: Vec<PathBuf>,
+    editable_fbx: bool,
+    auto_unwrap: super::model_import_mesh::AutoUnwrap,
+) -> ImportReport {
     let mut report = ImportReport::default();
     let target = match directory(root, parent) {
         Ok(target) => target,
@@ -229,6 +280,46 @@ pub(super) fn import_files(root: &Path, parent: &Path, sources: Vec<PathBuf>) ->
     let mut fbx_files = Vec::new();
     for source in sources {
         let label = source.file_name().unwrap_or_default().to_string_lossy();
+        if source.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("obj") || (editable_fbx && ext.eq_ignore_ascii_case("fbx"))
+        }) {
+            let result = (|| {
+                let source = source.canonicalize().map_err(|error| error.to_string())?;
+                if !seen.insert(source.clone()) {
+                    return Ok(None);
+                }
+                let name = source.file_stem().and_then(|name| name.to_str())
+                    .filter(|name| !name.starts_with('.'))
+                    .ok_or("Недопустимое имя модели")?;
+                super::model_import_mesh::convert(&source, &target, name, auto_unwrap).map(Some)
+            })();
+            match result {
+                Ok(Some(imported)) => {
+                    report.imported.push(parent.join(imported.name));
+                    report.errors.extend(imported.warnings);
+                    report.mesh_unwrapped_sets += imported.unwrapped_sets;
+                }
+                Ok(None) => report.skipped += 1,
+                Err(error) => report.errors.push(format!("{label}: {error}")),
+            }
+            continue;
+        }
+        if source.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("spp")) {
+            let result = source.canonicalize().and_then(|source| {
+                if !seen.insert(source.clone()) { return Ok(None); }
+                super::model_paint_spp::convert(&source, &target).map(Some)
+            });
+            match result {
+                Ok(Some((name, summary))) => {
+                    let path = parent.join(name);
+                    report.imported.push(path.clone());
+                    report.spp.push((path, summary));
+                }
+                Ok(None) => report.skipped += 1,
+                Err(error) => report.errors.push(format!("{label}: {error}")),
+            }
+            continue;
+        }
         match import_file(&source, &target, &mut seen) {
             Ok(Some(name)) => {
                 report.imported.push(parent.join(&name));
@@ -356,7 +447,7 @@ fn import_file(
         .and_then(ModelFormat::from_path)
         .is_some();
     if !is_image(source) && !model {
-        return Err("Поддерживаются GLB, FBX, PNG, JPEG, WebP, BMP, TGA, GIF, ICO и SVG".into());
+        return Err("Поддерживаются GLB, FBX, OBJ, SPP, PNG, JPEG, WebP, BMP, TGA, GIF, ICO и SVG".into());
     }
     let source = source.canonicalize().map_err(|error| error.to_string())?;
     if !source.is_file() {

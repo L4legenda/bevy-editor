@@ -104,6 +104,7 @@ pub(in crate::editor) fn fixture() -> Fixture {
             let edits = RoomEdits::<String>::read(&root, file).unwrap();
             let settings = edits.scene.unwrap();
             SceneDefinition {
+                uid: None,
                 label: settings.label,
                 asset: String::new(),
                 file: file.into(),
@@ -279,6 +280,8 @@ fn scene_hierarchy_tree_drop_is_atomic_and_preserves_instance_ids() {
 fn scene_hierarchy_tree_drop_flat_order_survives_reopen() {
     let f = fixture();
     let model = |id| PlacedModel {
+        selector: None,
+        uid: None,
         id,
         asset: "models/block.glb".into(),
         pose: Transform::IDENTITY.into(),
@@ -616,6 +619,8 @@ fn scene_hierarchy_ui_flat_upgrade_migrates_history_and_can_undo_then_save() {
             cameras: settings.cameras,
         }),
         models: vec![PlacedModel {
+            selector: None,
+            uid: None,
             id: 1,
             asset: "models/block.glb".into(),
             pose: Transform::IDENTITY.into(),
@@ -632,7 +637,7 @@ fn scene_hierarchy_ui_flat_upgrade_migrates_history_and_can_undo_then_save() {
     assert!(app.world().resource::<Editor>().edits.hierarchy.is_none());
     send(&mut app, Action::Select(Selection::Model(1)));
     send(&mut app, Action::Number(Field::Position(0), 2.0));
-    send(&mut app, Action::Hierarchy(HierarchyAction::GroupSelection));
+    send(&mut app, Action::Hierarchy(HierarchyAction::AddFolder));
     assert!(app.world().resource::<Editor>().edits.hierarchy.is_some());
     assert_eq!(app.world().resource::<Editor>().undo.len(), 2);
     assert!(
@@ -682,7 +687,7 @@ fn scene_hierarchy_ui_flat_upgrade_migrates_history_and_can_undo_then_save() {
             .unwrap()
             .nodes
             .iter()
-            .any(|n| n.entity.parent.is_some())
+            .any(|n| n.entity.name.as_deref() == Some("Папка"))
     );
 }
 

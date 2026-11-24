@@ -26,6 +26,8 @@ use crate::{
 #[derive(Clone, Resource, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GameLevel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     pub title: String,
     pub asset: String,
     pub groups: Vec<String>,
@@ -46,6 +48,7 @@ impl GameLevel {
             .as_ref()
             .ok_or_else(|| io::Error::other("Native scene metadata is missing"))?;
         let level = Self {
+            uid: None,
             title: settings.label.clone(),
             asset: String::new(),
             groups: vec![],
@@ -63,6 +66,19 @@ impl GameLevel {
         Ok(level)
     }
 
+    fn resolve_assets(&mut self, root: &Path) -> io::Result<()> {
+        let index = crate::asset_registry::index(root)?;
+        if !self.asset.is_empty() {
+            index.read_ref(&mut self.asset, &mut self.uid);
+        }
+        for model in &mut self.edits.models {
+            index.read_ref(&mut model.asset, &mut model.uid);
+        }
+        if let Some(hdri) = &mut self.environment.hdri_asset {
+            index.read_ref(&mut hdri.asset, &mut hdri.uid);
+        }
+        Ok(())
+    }
     pub fn validate(&self, root: &Path) -> io::Result<()> {
         self.edits.validate(root)?;
         self.environment.validate()?;
@@ -100,13 +116,17 @@ impl GameLevel {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GameLaunch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<bevy_scene_format::Scene>,
     pub asset_root: PathBuf,
     pub level: GameLevel,
 }
 
 impl GameLaunch {
     pub fn read(path: impl AsRef<Path>) -> io::Result<Self> {
-        let launch: Self = serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+        let mut launch: Self =
+            serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+        launch.level.resolve_assets(&launch.asset_root)?;
         launch.level.validate(&launch.asset_root)?;
         Ok(launch)
     }
@@ -151,8 +171,9 @@ impl Plugin for GameLevelPlugin {
 
 /// The default game foundation: native window, authored level and a fly camera.
 /// RMB + mouse looks around; WASD/QE moves; Shift accelerates; Esc closes.
-pub fn create_game_app(root: impl AsRef<Path>, level: GameLevel) -> io::Result<App> {
+pub fn create_game_app(root: impl AsRef<Path>, mut level: GameLevel) -> io::Result<App> {
     let root = root.as_ref().canonicalize()?;
+    level.resolve_assets(&root)?;
     level.validate(&root)?;
     let mut app = App::new();
     app.add_plugins(crate::AssetRedirectPlugin::new(&root)?)

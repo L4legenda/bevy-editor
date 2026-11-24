@@ -1,4 +1,5 @@
 mod area_selection;
+mod asset_monitor;
 mod asset_placement;
 mod browser;
 mod browser_files;
@@ -18,8 +19,12 @@ mod lighting_gizmos;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub mod mcp;
 mod model_document;
+mod model_bake_settings;
+mod model_cage_data;
+mod model_import_mesh;
 mod model_mesh;
 mod model_paint_data;
+mod model_paint_spp;
 mod model_primitives;
 mod model_source;
 mod model_uv_backend;
@@ -144,7 +149,8 @@ enum Action {
     HdriLibrary(ui::HdriAction),
     UseDownloadedHdri(usize),
     LightMenu,
-    LightAdvanced,
+    Inspector(ui::InspectorAction),
+    RevertProperty(ui::TransformProperty),
     Tool(Tool),
     LocalSpace,
     ToggleSceneTree,
@@ -163,6 +169,11 @@ enum Action {
     BrowserNewImage,
     BrowserCreateImage,
     BrowserNewScene,
+    BrowserImportModel,
+    BrowserAutoUnwrap,
+    BrowserDetectUdim,
+    BrowserTextureSize,
+    BrowserBakeOnLoad,
     BrowserCreateScene,
     BrowserDialogueMenu,
     BrowserPrimitiveMenu,
@@ -263,6 +274,7 @@ struct Editor {
     selection_group: Option<(Room, Vec<Selection>)>,
     hierarchy_collapsed: std::collections::HashSet<(Room, u32)>,
     hierarchy_parenting: Option<(Room, u32)>,
+    folder_arrival: Option<(Room, u32, std::time::Instant)>,
     tool: Tool,
     local_space: bool,
     snap: bool,
@@ -326,6 +338,7 @@ impl Editor {
             selection_group: None,
             hierarchy_collapsed: default(),
             hierarchy_parenting: None,
+            folder_arrival: None,
             tool: Tool::default(),
             local_space: false,
             snap: false,
@@ -384,6 +397,7 @@ impl Editor {
                 | Action::CloseModelTab(_)
                 | Action::ModelView(_)
                 | Action::ToggleSceneTree
+                | Action::Inspector(_)
                 | Action::Drawer
                 | Action::OpenBrowser
                 | Action::Browse(_)
@@ -403,6 +417,11 @@ impl Editor {
                 | Action::BrowserNewImage
                 | Action::BrowserCreateImage
                 | Action::BrowserNewScene
+                | Action::BrowserImportModel
+                | Action::BrowserAutoUnwrap
+                | Action::BrowserDetectUdim
+                | Action::BrowserTextureSize
+                | Action::BrowserBakeOnLoad
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -715,6 +734,20 @@ impl Editor {
         }
     }
 
+    fn default_light(&self, id: u32) -> Option<crate::lighting::SceneLight> {
+        use crate::lighting::{LightKind, LightPreset};
+        let current = self.light(id)?;
+        let preset = match current.kind {
+            LightKind::Point => LightPreset::Bulb,
+            LightKind::Spot => LightPreset::Spot,
+            LightKind::Directional => LightPreset::Sun,
+            LightKind::Rect => LightPreset::Softbox,
+        };
+        let mut light = preset.create(id);
+        light.name.clone_from(&current.name);
+        Some(light)
+    }
+
     fn reset(&mut self, reset: Reset) {
         let Some(target) = self.selection else {
             return;
@@ -776,17 +809,9 @@ impl Editor {
             Selection::Imported(index) => self.imported[index].original,
             Selection::Camera(shot) => self.default_camera(shot).pose,
             Selection::Light(id) => {
-                let Some(current) = self.light(id) else {
+                let Some(light) = self.default_light(id) else {
                     return;
                 };
-                let preset = match current.kind {
-                    crate::lighting::LightKind::Point => crate::lighting::LightPreset::Bulb,
-                    crate::lighting::LightKind::Spot => crate::lighting::LightPreset::Spot,
-                    crate::lighting::LightKind::Directional => crate::lighting::LightPreset::Sun,
-                    crate::lighting::LightKind::Rect => crate::lighting::LightPreset::Softbox,
-                };
-                let mut light = preset.create(id);
-                light.name = current.name.clone();
                 let original = light.pose;
                 light_defaults = Some(light);
                 original
@@ -884,6 +909,9 @@ impl Editor {
     }
 
     fn add_model(&mut self, mut model: PlacedModel) {
+        if let Ok(index) = crate::asset_registry::index(&self.root) {
+            index.bind(&mut model.asset, &mut model.uid);
+        }
         if self.edits.hierarchy.is_some() {
             if let Some(key) = self.edit_hierarchy(|h| h.add_model(model, None)) {
                 self.select(Some(Selection::Model(key)));
@@ -905,27 +933,24 @@ impl Editor {
         self.select(Some(Selection::Model(id)));
     }
 
-    fn add_light(&mut self, mut light: crate::lighting::SceneLight) {
-        if self.edits.hierarchy.is_some() {
-            if let Some(key) = self.edit_hierarchy(|h| h.add_light(light)) {
-                self.select(Some(Selection::Light(key)));
-            }
-            return;
-        }
-        let Some(id) = self
-            .edits
-            .lights
-            .iter()
-            .map(|light| light.id)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-        else {
-            return;
+    fn add_light(&mut self, mut light: crate::lighting::SceneLight) -> Option<u32> {
+        let id = if self.edits.hierarchy.is_some() {
+            self.edit_hierarchy(|graph| graph.add_light(light))?
+        } else {
+            let id = self
+                .edits
+                .lights
+                .iter()
+                .map(|light| light.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)?;
+            light.id = id;
+            self.edits.lights.push(light);
+            id
         };
-        light.id = id;
-        self.edits.lights.push(light);
         self.select(Some(Selection::Light(id)));
+        Some(id)
     }
 
     fn field_value(&self, target: Selection, field: Field) -> Option<f32> {
@@ -954,9 +979,27 @@ impl Editor {
             self.set_lighting_field(field, value);
             return;
         }
-        let Some(mut pose) = self.inspector_pose(target) else {
-            return;
-        };
+        if let Field::Lens = field {
+            if let Selection::Camera(shot) = target
+                && self.definition().cameras[shot].projection.valid_lens(value)
+            {
+                self.set_camera(
+                    shot,
+                    CameraPlacement {
+                        lens: value,
+                        ..self.camera(shot)
+                    },
+                );
+            } else {
+                self.status = "Значение объектива вне допустимого диапазона".into();
+            }
+        } else if let Some(pose) = self.inspector_pose(target) {
+            let pose = Self::with_transform_field(pose, field, value);
+            self.set_inspector_pose(target, pose, field);
+        }
+    }
+
+    fn with_transform_field(mut pose: Transform, field: Field, value: f32) -> Transform {
         match field {
             Field::Position(axis) => pose.translation[axis] = value.clamp(-1000.0, 1000.0),
             Field::Scale(axis) => {
@@ -973,23 +1016,9 @@ impl Editor {
                     degrees.z.to_radians(),
                 );
             }
-            Field::Lens => {
-                if let Selection::Camera(shot) = target
-                    && self.definition().cameras[shot].projection.valid_lens(value)
-                {
-                    let camera = CameraPlacement {
-                        lens: value,
-                        ..self.camera(shot)
-                    };
-                    self.set_camera(shot, camera);
-                } else {
-                    self.status = "Значение объектива вне допустимого диапазона".into();
-                }
-                return;
-            }
-            Field::Light(_) | Field::Environment(_) => return,
+            _ => {}
         }
-        self.set_inspector_pose(target, pose, field);
+        pose
     }
 }
 
@@ -1035,6 +1064,7 @@ impl EditorPlugin {
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
         area_selection::register(app);
+        app.add_systems(Update, asset_monitor::update);
         app.add_plugins(ui::LayerDragFxPlugin);
         app.add_plugins(ui::LayerFlyoutFxPlugin);
         app.add_plugins(ui::ColorDropPlugin);
@@ -1121,6 +1151,7 @@ impl Plugin for EditorPlugin {
                     ui::photo_editor_input,
                     ui::photo_color_input,
                     ui::photo_layers_input,
+                    ui::image_viewer::model_fields::update,
                     ui::view_images,
                     image_reference::update,
                     ui::browser_context_actions,
@@ -1158,6 +1189,7 @@ impl Plugin for EditorPlugin {
                         ui::refresh_lighting_controls,
                     )
                         .chain(),
+                    ui::animate_scene_folders.after(ui::refresh),
                     ui::refresh_browser,
                     ui::update_browser_files,
                     ui::refresh_image_viewer
@@ -1194,6 +1226,10 @@ impl Plugin for EditorPlugin {
             (ui::cleanup_image_cursor, ui::number_scrub_cursor)
                 .chain()
                 .before(bevy::window::CursorSystems::Update),
+        );
+        app.add_systems(
+            Update,
+            ui::refresh_inspector.after(ui::refresh_lighting_controls),
         );
         app.add_systems(Update, ui::lock_numeric_text.after(ui::refresh));
         app.add_systems(
@@ -1246,7 +1282,38 @@ fn setup(
     if render_worker.is_none() {
         chrome.set_maximized(&mut window, true);
     }
-    commands.insert_resource(browser::Browser::new(&mut editor.project));
+    let discover_models = editor.project.catalog.iter().all(|m| {
+        m.asset.starts_with(".bevy-editor/missing/") || editor.root.join(&m.asset).is_file()
+    });
+    let browser = browser::Browser::discover(&mut editor.project, discover_models);
+    let priority = editor
+        .edits
+        .models
+        .iter()
+        .map(|m| std::path::PathBuf::from(&m.asset))
+        .chain(std::iter::once(std::path::PathBuf::from(
+            &editor.definition().asset,
+        )))
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let initial = browser
+        .files
+        .iter()
+        .map(|f| f.path.clone())
+        .chain(
+            editor
+                .project
+                .catalog
+                .iter()
+                .map(|m| std::path::PathBuf::from(&m.asset)),
+        )
+        .collect();
+    commands.insert_resource(asset_monitor::Monitor::start(
+        editor.root.clone(),
+        initial,
+        priority,
+    ));
+    commands.insert_resource(browser);
     commands.insert_resource(viewport::Surface::new(&mut images));
     commands.insert_resource(thumbnails::Thumbnails::new(
         &mut images,
@@ -1559,6 +1626,12 @@ fn save_editor(
     match editor
         .definition()
         .validate_edits(&saved)
+        .and_then(|()| {
+            if !editor.definition().is_native() {
+                crate::hdri::export_preset(&editor.root, saved.lighting.as_ref())?;
+            }
+            Ok(())
+        })
         .and_then(|()| saved.write(&editor.root, &editor.definition().file))
     {
         Ok(()) => {
@@ -1638,6 +1711,8 @@ fn apply_asset_drop(
     let before = editor.edits.clone();
     let label = asset.rsplit('/').next().unwrap_or(&asset).to_owned();
     editor.add_model(PlacedModel {
+        selector: None,
+        uid: None,
         id: 0,
         asset,
         pose: Transform::from_translation(point).into(),
@@ -1686,6 +1761,11 @@ fn handle_actions(
                 | Action::BrowserNewImage
                 | Action::BrowserCreateImage
                 | Action::BrowserNewScene
+                | Action::BrowserImportModel
+                | Action::BrowserAutoUnwrap
+                | Action::BrowserDetectUdim
+                | Action::BrowserTextureSize
+                | Action::BrowserBakeOnLoad
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -1710,7 +1790,7 @@ fn handle_actions(
                 | Action::ImageView(_)
                 | Action::ImageEdit(_)
                 | Action::LightMenu
-                | Action::LightAdvanced
+                | Action::Inspector(_)
         ) {
             continue;
         }
@@ -1889,6 +1969,8 @@ fn handle_actions(
                         let asset = editor.project.catalog[index].asset.clone();
                         let point = editor.pivot.with_y(0.0);
                         editor.add_model(PlacedModel {
+                            selector: None,
+                            uid: None,
                             id: 0,
                             asset,
                             pose: Transform::from_translation(point).into(),
@@ -1898,6 +1980,7 @@ fn handle_actions(
                     Action::Duplicate => editor.duplicate_targets(),
                     Action::Delete => editor.delete_targets(),
                     Action::Reset(reset) => editor.reset(reset),
+                    Action::RevertProperty(property) => property.revert(&mut editor),
                     Action::Align => {
                         if let Some(target @ Selection::Camera(_)) = editor.selection
                             && !editor.pilot

@@ -256,6 +256,8 @@ pub(in crate::editor) fn update(
         if replace {
             preview.clear(&mut commands);
             let model = PlacedModel {
+                selector: None,
+                uid: None,
                 id: 0,
                 asset: asset.clone(),
                 pose: Transform::IDENTITY.into(),

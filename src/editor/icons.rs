@@ -24,6 +24,8 @@ pub(crate) enum Glyph {
     LayerClipping,
     LayerBlend,
     Search,
+    Flag,
+    Hash,
     Close,
     Minimize,
     Maximize,
@@ -115,6 +117,12 @@ impl Glyph {
             Self::LayerBlend => include_str!("../../assets/icons/layer-blend.svg"),
             Self::LayerClipping => include_str!("../../assets/icons/layer-clipping.svg"),
             Self::Search => include_str!("../../assets/icons/lucide/search.svg"),
+            Self::Flag => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 21V4c5-4 9 4 15 0v10c-6 4-10-4-15 0"/></svg>"#
+            }
+            Self::Hash => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m10 3-3 18M17 3l-3 18M4 9h16M3 15h16"/></svg>"#
+            }
             Self::Close => include_str!("../../assets/icons/lucide/x.svg"),
             Self::Minimize => include_str!("../../assets/icons/lucide/minus.svg"),
             Self::Maximize => include_str!("../../assets/icons/lucide/square.svg"),

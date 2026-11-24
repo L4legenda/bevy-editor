@@ -331,6 +331,7 @@ pub(super) fn spawn(
     font: &Handle<Font>,
     n: &DialogueNode,
     state: &State,
+    catalog: &crate::editor::dialogue::conditions::Catalog,
 ) {
     let Some(slots) = state.nodes.get(&n.id) else {
         return;
@@ -462,6 +463,15 @@ pub(super) fn spawn(
                 DraftField::Choice(index),
                 n.id,
                 format!("Ответ {} ноды #{}", index + 1, n.id),
+            );
+            condition_ui::trigger(
+                commands,
+                line,
+                font,
+                n.id,
+                Some(index),
+                &slot.choice.condition,
+                catalog,
             );
             icons::button(
                 commands,
@@ -612,6 +622,7 @@ mod tests {
         n.choices.push(Choice {
             text: "Второй".into(),
             target: None,
+            condition: Default::default(),
             dialogue: None,
         });
         state.add(1, n, 1.);
@@ -639,11 +650,13 @@ mod tests {
             Choice {
                 text: "Второй".into(),
                 target: Some(7),
+                condition: Default::default(),
                 dialogue: None,
             },
             Choice {
                 text: "Третий".into(),
                 target: Some(8),
+                condition: Default::default(),
                 dialogue: None,
             },
         ]);

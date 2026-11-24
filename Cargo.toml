@@ -16,6 +16,7 @@ lighting = [
     "dep:half",
     "bevy/bevy_light",
     "bevy/bevy_pbr",
+    "bevy/pbr_specular_textures",
     "bevy/tonemapping_luts",
     "bevy/area_light_luts",
     "bevy/zstd_rust",
@@ -34,6 +35,12 @@ game = [
     "bevy/x11",
 ]
 editor = [
+    "dep:notify",
+    "dep:hidapi",
+    "dep:subcraft-spp",
+    "dep:material-painter-graph",
+    "dep:blake3",
+    "dep:lz4_flex",
     "game",
     "dep:parley",
     "lighting",
@@ -75,7 +82,15 @@ name = "bevy-editor-mcp"
 path = "src/bin/bevy-editor-mcp.rs"
 required-features = ["mcp"]
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
 [dependencies]
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native", "linux-native-basic-udev", "macos-shared-device"] }
+subcraft-spp = { path = "vendor/subcraft-spp", optional = true }
+material-painter-graph = { path = "vendor/material-painter/graph", optional = true }
+blake3 = { version = "1", optional = true }
+lz4_flex = { version = "0.14.2", optional = true }
 bevy-scene-format = { path = "crates/scene-format" }
 parley = { version = "0.11.1", optional = true, default-features = false }
 photocraft-geom = { path = "vendor/photocraft/crates/geom", optional = true }
@@ -87,7 +102,7 @@ photocraft-format = { path = "vendor/photocraft/crates/format", optional = true 
 photocraft-engine = { path = "vendor/photocraft/crates/engine", optional = true }
 photocraft-compose = { path = "vendor/photocraft/crates/compose", optional = true }
 bevy = { version = "0.20.1", default-features = false, features = ["bevy_world_serialization"] }
-image = { version = "0.25.10", optional = true, default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tga", "webp", "hdr", "exr"] }
+image = { version = "0.25.10", optional = true, default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tga", "tiff", "webp", "hdr", "exr"] }
 half = { version = "2.7", optional = true }
 # HTTPS catalog/download workers and ambientCG's compressed environment packages.
 reqwest = { version = "0.13.5", optional = true, default-features = false, features = ["blocking", "json", "rustls"] }
@@ -104,6 +119,7 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 uuid = { version = "1", optional = true, features = ["v4"] }
 base64 = { version = "0.22", optional = true }
 spade = "2.15.1"
+notify = { version = "8.2", default-features = false, features = ["macos_fsevent"], optional = true }
 
 [build-dependencies]
 bevy-uv-build = { path = "native/uv-build" }

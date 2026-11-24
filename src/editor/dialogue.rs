@@ -11,6 +11,10 @@ use std::{
 };
 pub(super) use text::{TextAlign, TextFormat};
 
+#[path = "dialogue_conditions.rs"]
+pub(super) mod conditions;
+pub(super) use conditions::{Condition, OTHERWISE};
+
 pub(super) const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -18,6 +22,8 @@ pub(super) struct Dialogue {
     pub version: u32,
     pub title: String,
     pub nodes: Vec<DialogueNode>,
+    #[serde(flatten)]
+    pub extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,14 +52,64 @@ pub(super) struct DialogueNode {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_spans: Vec<text::TextSpan>,
     pub choices: Vec<Choice>,
+    #[serde(default, skip_serializing_if = "Condition::is_empty")]
+    pub condition: Condition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otherwise: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct Choice {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Condition::is_empty")]
+    pub condition: Condition,
     pub target: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialogue: Option<String>,
+}
+
+impl DialogueNode {
+    pub fn has_otherwise(&self) -> bool {
+        self.kind == NodeKind::Jump || self.kind == NodeKind::Line && !self.condition.is_empty()
+    }
+
+    pub fn output_exists(&self, index: usize) -> bool {
+        if index == OTHERWISE {
+            self.has_otherwise()
+        } else {
+            self.choices.get(index).is_some()
+        }
+    }
+
+    pub fn output_target(&self, index: usize) -> Option<u32> {
+        if index == OTHERWISE {
+            self.otherwise
+        } else {
+            self.choices.get(index)?.target
+        }
+    }
+
+    pub fn output_connected(&self, index: usize) -> bool {
+        self.output_target(index).is_some()
+            || self.choices.get(index).is_some_and(Choice::connected)
+    }
+
+    pub fn output_targets(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.choices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.target.map(|target| (i, target)))
+            .chain(self.otherwise.map(|target| (OTHERWISE, target)))
+    }
+
+    pub fn set_output(&mut self, index: usize, target: Option<u32>) {
+        if index == OTHERWISE {
+            self.otherwise = target;
+        } else if let Some(choice) = self.choices.get_mut(index) {
+            choice.target = target;
+            choice.dialogue = None;
+        }
+    }
 }
 
 impl Choice {
@@ -67,6 +123,7 @@ impl Dialogue {
         Self {
             version: VERSION,
             title,
+            extensions: Default::default(),
             nodes: vec![DialogueNode {
                 id: 0,
                 kind: NodeKind::Start,
@@ -77,9 +134,12 @@ impl Dialogue {
                 dialogue: None,
                 text_format: TextFormat::default(),
                 text_spans: Vec::new(),
+                condition: Condition::default(),
+                otherwise: None,
                 choices: vec![Choice {
                     text: "Начать".into(),
                     target: None,
+                    condition: Default::default(),
                     dialogue: None,
                 }],
             }],
@@ -135,10 +195,13 @@ impl Dialogue {
             dialogue: None,
             text_format: TextFormat::default(),
             text_spans: Vec::new(),
+            condition: Condition::default(),
+            otherwise: None,
             choices: if kind == NodeKind::Line {
                 vec![Choice {
                     text: "Продолжить".into(),
                     target: None,
+                    condition: Default::default(),
                     dialogue: None,
                 }]
             } else {
@@ -173,6 +236,9 @@ impl Dialogue {
         }
         self.nodes.retain(|n| n.id != id);
         for node in &mut self.nodes {
+            if node.otherwise == Some(id) {
+                node.otherwise = None;
+            }
             for choice in &mut node.choices {
                 if choice.target == Some(id) {
                     choice.target = None;
@@ -195,7 +261,7 @@ impl Dialogue {
                 continue;
             }
             if let Some(n) = self.node(id) {
-                pending.extend(n.choices.iter().filter_map(|c| c.target));
+                pending.extend(n.output_targets().map(|(_, target)| target));
             }
         }
         for n in &self.nodes {
@@ -207,6 +273,18 @@ impl Dialogue {
             }
             if matches!(n.kind, NodeKind::Start | NodeKind::Line) && n.choices.is_empty() {
                 result.push(format!("Узел #{}: добавьте переход или завершение", n.id));
+            }
+            if n.kind == NodeKind::Line
+                && !n.choices.is_empty()
+                && n.choices.iter().all(|c| !c.condition.is_empty())
+            {
+                result.push(format!(
+                    "Реплика #{}: оставьте запасной ответ без условия",
+                    n.id
+                ));
+            }
+            if n.kind == NodeKind::Line && n.has_otherwise() && n.otherwise.is_none() {
+                result.push(format!("Реплика #{}: подключите выход «Иначе»", n.id));
             }
             for (i, c) in n.choices.iter().enumerate() {
                 if !c.connected() {
@@ -256,6 +334,11 @@ impl Dialogue {
             }) {
                 return Err("Переход должен указывать на один файл .dialog внутри ассетов".into());
             }
+            if n.otherwise
+                .is_some_and(|id| !n.has_otherwise() || !ids.contains(&id))
+            {
+                return Err("Некорректная запасная связь «Иначе»".into());
+            }
             if n.dialogue
                 .as_ref()
                 .is_some_and(|path| n.kind != NodeKind::Jump || !valid_dialogue_path(path))
@@ -284,6 +367,8 @@ pub(super) struct Character {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct Portrait {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     pub label: String,
     pub path: String,
 }
@@ -318,6 +403,13 @@ impl Content {
     }
 
     pub fn remap_character(&mut self, from: &Path, to: &Path) {
+        if let Self::Character(character) = self {
+            for portrait in &mut character.portraits {
+                if Path::new(&portrait.path) == from {
+                    portrait.path = to.to_string_lossy().replace('\\', "/");
+                }
+            }
+        }
         if let Self::Dialogue(dialogue) = self {
             let from = from.to_string_lossy().replace('\\', "/");
             let to = to.to_string_lossy().replace('\\', "/");
@@ -352,6 +444,12 @@ impl Content {
             return Err("Ожидается .dialog или .dcharacter".into());
         };
         content.validate()?;
+        if let Self::Character(c) = &mut content {
+            let index = crate::asset_registry::index(root).map_err(|e| e.to_string())?;
+            for portrait in &mut c.portraits {
+                index.read_ref(&mut portrait.path, &mut portrait.uid);
+            }
+        }
         if let Self::Dialogue(d) = &mut content {
             d.migrate_jumps();
         }
@@ -376,7 +474,14 @@ impl Content {
         let path = checked_path(root, relative)?;
         let bytes = match self {
             Self::Dialogue(d) => serde_json::to_vec_pretty(d),
-            Self::Character(c) => serde_json::to_vec_pretty(c),
+            Self::Character(c) => {
+                let mut c = c.clone();
+                let index = crate::asset_registry::index(root).map_err(|e| e.to_string())?;
+                for portrait in &mut c.portraits {
+                    index.save_ref(&mut portrait.path, &mut portrait.uid);
+                }
+                serde_json::to_vec_pretty(&c)
+            }
         }
         .map_err(|e| e.to_string())?;
         let temp = path.with_extension(format!(

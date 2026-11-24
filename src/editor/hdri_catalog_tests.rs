@@ -87,6 +87,7 @@ fn downloaded_library_survives_reopening_and_ignores_invalid_records() {
     fs::write(path.join("environment.hdr"), b"test fixture").unwrap();
     let record = LibraryRecord {
         environment: HdriAsset {
+            uid: None,
             provider: HdriProvider::PolyHaven,
             id: "studio".into(),
             name: "Studio".into(),

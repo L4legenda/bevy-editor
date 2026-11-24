@@ -90,7 +90,11 @@ pub(super) struct PhotoDocument {
 }
 
 impl PhotoDocument {
+    #[cfg(test)]
     pub fn load(source: &Path) -> Result<Self, String> {
+        Self::load_indexed(source, None)
+    }
+    pub fn load_indexed(source: &Path, root: Option<&Path>) -> Result<Self, String> {
         source_format(source)?;
         let native = sidecar(source);
         let document = if native.exists() {
@@ -109,10 +113,23 @@ impl PhotoDocument {
                     .name
                     .eq_ignore_ascii_case(&source.file_name().unwrap_or_default().to_string_lossy())
             {
-                return Err(format!(
-                    "Этот .pcraft относится к «{}». Изображения с одинаковым именем и разными расширениями разместите в разных папках.",
-                    document.name
-                ));
+                let owned = root
+                    .and_then(|root| {
+                        let relative = source
+                            .strip_prefix(root)
+                            .ok()?
+                            .to_str()?
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        let index = crate::asset_registry::index(root).ok()?;
+                        Some(index.previous_name(&relative, &document.name))
+                    })
+                    .unwrap_or(false);
+                if !owned {
+                    return Err(format!(
+                        "Этот .pcraft относится к «{}». Изображения с одинаковым именем и разными расширениями разместите в разных папках.",
+                        document.name
+                    ));
+                }
             }
             document
         } else {
@@ -282,17 +299,50 @@ impl PhotoDocument {
     pub fn add_layer(&mut self) {
         let _ = self.layer_command("layer.new.layer", serde_json::json!({}));
     }
-    pub(super) fn add_reference(&mut self, name: String, surface: Surface) -> Result<(), String> {
+    pub(super) fn add_reference(
+        &mut self,
+        name: String,
+        surface: Surface,
+        model: &crate::editor::image_reference::ModelReference,
+    ) -> Result<(), String> {
         if self.document.layer_count() >= MAX_LAYERS {
             return Err("достигнут предел в 4096 слоёв".into());
         }
         let index = self.document.walk().len();
         let mut reference = Layer::new(name, LayerContent::Raster(surface));
+        reference.xmp = Some(model.to_xmp()?);
         reference.locks.pixels = true;
         self.checkpoint();
         // A reference must be visible even if the selected layer is in a hidden group.
         self.document.layers.push(reference);
         self.select(index, false, false);
+        self.changed();
+        Ok(())
+    }
+    pub(super) fn replace_reference(
+        &mut self,
+        target: crate::editor::image_reference::ReferenceTarget,
+        surface: Surface,
+        model: &crate::editor::image_reference::ModelReference,
+    ) -> Result<(), String> {
+        if self.revision != target.revision {
+            return Err("Документ изменился во время рендера".into());
+        }
+        let layer = self
+            .document
+            .layer(target.layer)
+            .ok_or("Слой больше не существует")?;
+        if !matches!(layer.content, LayerContent::Raster(_))
+            || layer.locks.position
+            || layer.locks.all
+        {
+            return Err("Трансформация слоя недоступна".into());
+        }
+        let xmp = model.to_xmp()?;
+        self.checkpoint();
+        let layer = self.document.layer_mut(target.layer).unwrap();
+        layer.xmp = Some(xmp);
+        layer.content = LayerContent::Raster(surface);
         self.changed();
         Ok(())
     }
@@ -486,7 +536,7 @@ pub(super) fn composite(doc: &Document) -> Rgba8Image {
     composite_region(doc, Rect::from_size(doc.size))
 }
 
-fn composite_region(doc: &Document, rect: Rect) -> Rgba8Image {
+pub(super) fn composite_region(doc: &Document, rect: Rect) -> Rgba8Image {
     let rect = rect.intersect(&Rect::from_size(doc.size));
     if rect.is_empty() {
         return Rgba8Image::new(0, 0);
@@ -545,6 +595,15 @@ pub(super) fn save(source: &Path, document: &Document) -> Result<(), String> {
     // restores the previous sidecar; the source remains untouched on that failure.
     let native_path = sidecar(source);
     let previous = std::fs::read(&native_path).map_err(|e| e.to_string())?;
+    let archive = photocraft_format::zip::ZipReader::new(&previous).map_err(|e| e.to_string())?;
+    let manifest = archive
+        .read_by_name("manifest.json", 32 << 20)
+        .map_err(|e| e.to_string())?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
+    if manifest.pointer("/document/id").and_then(|v| v.as_u64()) != Some(document.id.0) {
+        return Err("Файл слоёв в папке назначения принадлежит другому документу".into());
+    }
     photocraft_format::atomic_write(&native_path, &native).map_err(|e| e.to_string())?;
     if let Err(error) = photocraft_format::atomic_write(source, encoded.get_ref()) {
         if let Err(rollback) = photocraft_format::atomic_write(&native_path, &previous) {

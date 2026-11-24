@@ -40,10 +40,17 @@ mod camera_preview;
 mod confirmation;
 #[path = "control_hints.rs"]
 mod control_hints;
+#[path = "inspector.rs"]
+mod inspector;
+#[path = "inspector_transform.rs"]
+mod inspector_transform;
 #[path = "play_ui.rs"]
 mod play_ui;
+pub(super) use inspector::{InspectorAction, refresh as refresh_inspector};
+pub(super) use inspector_transform::TransformProperty;
 #[path = "scene_hierarchy_ui.rs"]
 mod scene_hierarchy_ui;
+pub(super) use scene_hierarchy_ui::animate_folders as animate_scene_folders;
 #[path = "scene_tree_drag.rs"]
 pub(super) mod scene_tree_drag;
 pub(super) use play_ui::update as refresh_play;
@@ -176,15 +183,19 @@ pub(super) struct Interface {
     outliner: Entity,
     tree_chevron: Entity,
     inspector: Entity,
+    scene_properties: Entity,
     dirty: Entity,
     selected: Entity,
     kind: Entity,
-    hierarchy_info: Entity,
+    hierarchy_info: scene_hierarchy_ui::Inspector,
     perspective: Entity,
     lens_label: Entity,
     transforms: Entity,
-    scale_row: Entity,
-    lens_row: Entity,
+    rotation_scope: Entity,
+    scale_scope: Entity,
+    camera_scope: Entity,
+    object_scope: Entity,
+    space_label: Entity,
     field_error: Entity,
     navigation_hint: Entity,
 }
@@ -210,6 +221,7 @@ pub(super) struct OutlineState {
         bool,
     )>,
     hierarchy_selection: Option<Selection>,
+    inspector_multiple: bool,
     hierarchy_parenting: Option<(Room, u32)>,
 }
 
@@ -242,6 +254,12 @@ fn node(commands: &mut Commands, parent: Entity, node: Node) -> Entity {
 
 fn font(handle: &Handle<Font>, size: f32) -> TextFont {
     TextFont::from_font_size(size).with_font(handle.clone())
+}
+
+impl Interface {
+    pub(super) fn text_font(&self, size: f32) -> TextFont {
+        font(&self.font, size)
+    }
 }
 
 fn text(
@@ -295,26 +313,6 @@ fn group(commands: &mut Commands, parent: Entity) -> Entity {
     )
 }
 
-fn inspector_card(commands: &mut Commands, parent: Entity) -> Entity {
-    let card = surface(
-        commands,
-        parent,
-        Node {
-            width: percent(100),
-            padding: UiRect::all(px(8)),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(8)),
-            flex_shrink: 0.,
-            ..column(6.)
-        },
-        WELL.with_alpha(0.55),
-    );
-    commands
-        .entity(card)
-        .insert(BorderColor::all(EDGE.with_alpha(0.65)));
-    card
-}
-
 fn inspector_section(
     commands: &mut Commands,
     parent: Entity,
@@ -322,10 +320,9 @@ fn inspector_section(
     title: &str,
     hint: &str,
 ) -> Entity {
-    let card = inspector_card(commands, parent);
-    let heading = text(commands, card, font, title, 13., TEXT);
-    control_hints::attach(commands, heading, hint);
-    card
+    let section = inspector::section(commands, parent, font, title, "uv", true);
+    control_hints::attach(commands, section.title, hint);
+    section.body
 }
 
 fn control(
@@ -659,59 +656,66 @@ pub(super) fn setup(
     ));
     sidebar_resize::height_grip(&mut commands, side);
 
-    let inspector = surface(
+    let inspector_shell = surface(
         &mut commands,
         side,
         Node {
             height: px(300),
             flex_shrink: 0.0,
-            padding: UiRect::all(px(12)),
+            overflow: Overflow::clip(),
             border: UiRect::top(px(1)),
-            overflow: Overflow::scroll_y(),
-            ..column(6.0)
+            ..column(0.0)
         },
         CHROME,
     );
-    commands.entity(inspector).insert(Scroller);
-    sidebar_resize::inspector(&mut commands, inspector);
-    starfield::background(&mut commands, inspector, &stars.chrome);
-    horizon(&mut commands, inspector);
-    text(&mut commands, inspector, &font, "Инспектор", 13.0, MUTED);
-    let selected = text(
+    sidebar_resize::inspector(&mut commands, inspector_shell);
+    starfield::background(&mut commands, inspector_shell, &stars.chrome);
+    let inspector::Shell {
+        content: inspector,
+        name: selected,
+        kind,
+    } = inspector::setup(&mut commands, inspector_shell, &font);
+    let scene_properties = node(&mut commands, inspector, column(6.0));
+    lighting_ui::setup(
         &mut commands,
-        inspector,
+        header,
+        scene_properties,
+        root,
         &font,
-        "Выберите объект",
-        17.0,
-        TEXT,
+        &mut images,
     );
-    let kind = text(&mut commands, inspector, &font, "", 12.0, MUTED);
-    let hierarchy_info = node(&mut commands, inspector, column(4.0));
-    lighting_ui::setup(&mut commands, header, inspector, root, &font, &mut images);
-    let transforms = node(&mut commands, inspector, column(6.0));
-    transform_row(&mut commands, transforms, &font, "Позиция", Field::Position);
-    transform_row(&mut commands, transforms, &font, "Поворот", Field::Rotation);
-    let scale_row = transform_row(&mut commands, transforms, &font, "Масштаб", Field::Scale);
-    let lens_row = node(&mut commands, transforms, row(4.0));
-    let lens_label = field_caption(&mut commands, lens_row, &font, "Обзор, °");
-    number(&mut commands, lens_row, &font, Field::Lens, "·", BLUE);
+    let transform_ui = inspector_transform::setup(&mut commands, scene_properties, &font);
+
+    let hierarchy_info =
+        scene_hierarchy_ui::setup_inspector(&mut commands, scene_properties, &font);
+    let object_scope = node(&mut commands, scene_properties, column(0.0));
+    let actions = inspector::section(
+        &mut commands,
+        object_scope,
+        &font,
+        "Действия",
+        "объект actions duplicate delete",
+        false,
+    )
+    .body;
     let actions = node(
         &mut commands,
-        transforms,
+        actions,
         Node {
             flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3),
             ..row(3.0)
         },
     );
     for (label, action) in [
-        ("Управление камерой", Action::Pilot),
-        ("Из вида", Action::Align),
         ("Дублировать", Action::Duplicate),
         ("Удалить", Action::Delete),
     ] {
-        button(&mut commands, actions, &font, label, action, Look::Regular);
+        let item = node(&mut commands, actions, row(0.0));
+        inspector::searchable(&mut commands, item, label);
+        button(&mut commands, item, &font, label, action, Look::Regular);
     }
-    let field_error = text(&mut commands, transforms, &font, "", 11.0, ERROR);
+    let field_error = text(&mut commands, scene_properties, &font, "", 11.0, ERROR);
     commands.entity(field_error).insert((
         TextLayout::default(),
         Node {
@@ -774,15 +778,19 @@ pub(super) fn setup(
         outliner,
         tree_chevron,
         inspector,
+        scene_properties,
         dirty,
         selected,
         kind,
         hierarchy_info,
         perspective,
-        lens_label,
-        transforms,
-        scale_row,
-        lens_row,
+        lens_label: transform_ui.lens_label,
+        transforms: transform_ui.transforms,
+        rotation_scope: transform_ui.rotation_scope,
+        scale_scope: transform_ui.scale_scope,
+        camera_scope: transform_ui.camera_scope,
+        object_scope,
+        space_label: transform_ui.space_label,
         field_error,
         navigation_hint,
     });
@@ -796,6 +804,7 @@ fn outline_entry(
     selection: Selection,
     kind: Option<crate::lighting::LightKind>,
     enabled: bool,
+    node_icon: icons::Glyph,
 ) -> Entity {
     let entry = button(
         commands,
@@ -811,7 +820,7 @@ fn outline_entry(
         .and_modify(|mut node| node.padding.left = px(26));
     let color = if enabled { AMBER } else { MUTED };
     let glyph = match selection {
-        Selection::Node(_) => icons::Glyph::Layers,
+        Selection::Node(_) => node_icon,
         Selection::Environment => icons::Glyph::Globe,
         Selection::Camera(_) => icons::Glyph::Camera,
         Selection::Imported(_) | Selection::Model(_) => icons::Glyph::Box,
@@ -854,6 +863,7 @@ fn object_outline_entry(
         Node {
             width: percent(100),
             height: px(28),
+            padding: UiRect::left(px(18)),
             flex_shrink: 0.0,
             ..row(0.0)
         },
@@ -881,6 +891,7 @@ fn object_outline_entry(
         target,
         light.map(|light| light.kind),
         !hidden && light.is_none_or(|light| light.enabled),
+        icons::Glyph::Folder,
     );
     commands.entity(item).observe(scene_objects::pointer_menu);
     if editor.has_scene() && editor.definition().is_native()
@@ -921,89 +932,6 @@ fn object_outline_entry(
         16.0,
         if hidden { MUTED } else { TEXT },
     );
-}
-
-fn field_caption(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    label: &str,
-) -> Entity {
-    let cell = node(
-        commands,
-        parent,
-        Node {
-            width: px(70),
-            flex_shrink: 0.0,
-            ..default()
-        },
-    );
-    text(commands, cell, font, label, 12.0, MUTED)
-}
-
-fn transform_row(
-    commands: &mut Commands,
-    parent: Entity,
-    font: &Handle<Font>,
-    label: &str,
-    field: fn(usize) -> Field,
-) -> Entity {
-    let line = node(commands, parent, row(4.0));
-    field_caption(commands, line, font, label);
-    for (index, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
-        number(commands, line, font, field(index), axis, AXIS[index]);
-    }
-    line
-}
-
-fn number(
-    commands: &mut Commands,
-    parent: Entity,
-    font_handle: &Handle<Font>,
-    field: Field,
-    axis: &str,
-    accent: Color,
-) {
-    let cell = node(
-        commands,
-        parent,
-        Node {
-            width: px(69),
-            ..row(3.0)
-        },
-    );
-    text(commands, cell, font_handle, axis, 11.0, accent);
-    commands.spawn((
-        field,
-        Number::scene(field),
-        TextInput,
-        AccessibleLabel(match field {
-            Field::Position(_) => format!("Позиция {axis}"),
-            Field::Rotation(_) => format!("Поворот {axis}"),
-            Field::Scale(_) => format!("Масштаб {axis}"),
-            Field::Lens => "Объектив камеры".to_owned(),
-            Field::Light(_) => format!("Параметр света {axis}"),
-            Field::Environment(_) => format!("Освещение сцены {axis}"),
-        }),
-        EditableText::new("0.00"),
-        crate::ui_theme::text_cursor_style(),
-        font(font_handle, 12.0),
-        TextColor(TEXT),
-        TextLayout::no_wrap(),
-        TabIndex(0),
-        BackgroundColor(WELL),
-        BorderColor::all(EDGE),
-        ChildOf(cell),
-        Node {
-            width: px(55),
-            height: px(27),
-            padding: UiRect::axes(px(4), px(3)),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(5)),
-            overflow: Overflow::clip(),
-            ..default()
-        },
-    ));
 }
 
 fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
@@ -1066,6 +994,11 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
                 | Action::BrowserNewImage
                 | Action::BrowserCreateImage
                 | Action::BrowserNewScene
+                | Action::BrowserImportModel
+                | Action::BrowserAutoUnwrap
+                | Action::BrowserDetectUdim
+                | Action::BrowserTextureSize
+                | Action::BrowserBakeOnLoad
                 | Action::BrowserCreateScene
                 | Action::BrowserDialogueMenu
                 | Action::BrowserPrimitiveMenu
@@ -1119,6 +1052,11 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         Action::BrowserNewFolder
         | Action::BrowserNewImage
         | Action::BrowserNewScene
+        | Action::BrowserImportModel
+        | Action::BrowserAutoUnwrap
+        | Action::BrowserDetectUdim
+        | Action::BrowserTextureSize
+        | Action::BrowserBakeOnLoad
         | Action::BrowserOpenEntry
         | Action::BrowserRevealEntry
         | Action::BrowserInstanceScene
@@ -1148,9 +1086,7 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
             editor.has_scene() && editor.ready && editor.can_toggle_visibility(target)
         }
         Action::LocalSpace | Action::Snap => editor.has_scene() && editor.ready,
-        Action::Lighting(_) | Action::LightMenu | Action::LightAdvanced => {
-            editor.has_scene() && editor.ready
-        }
+        Action::Lighting(_) | Action::LightMenu => editor.has_scene() && editor.ready,
         Action::BrowseBack => browser.can_go_back(),
         Action::BrowseForward => browser.can_go_forward(),
         Action::BrowseUp => browser.current != 0,
@@ -1174,6 +1110,9 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         }
         Action::Focus => editor.has_scene() && editor.ready,
         Action::Reset(_) => editor.has_scene() && editor.ready && editor.selection.is_some(),
+        Action::RevertProperty(property) => {
+            editor.has_scene() && editor.ready && property.can_revert(editor)
+        }
         Action::Delete => editor.has_scene() && editor.deletable_targets(),
         Action::Duplicate => editor.has_scene() && editor.batch_editable(),
         Action::SceneObject(action) => scene_objects::available(editor, action),
@@ -1306,6 +1245,7 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     color_drop: Option<Res<image_viewer::edit::color_drop::ColorDrop>>,
     tree_drag: Option<Res<scene_tree_drag::TreeDrag>>,
+    paint_panes: (Query<&ChildOf>, Query<&model_viewer::paint::PanelBody>),
 ) {
     // Bevy's Button emits Activate for secondary clicks as well. Reserve those
     // for context menus even when press and release arrive in the same frame.
@@ -1338,6 +1278,15 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
         ) {
             focus.clear();
         }
+        if let Action::ModelView(ModelViewAction::Paint(action)) = control.action
+            && !matches!(action, model_viewer::paint::PaintAction::Panel(_))
+            && let Some(panel) = paint_panes.0.iter_ancestors(entity)
+                .find_map(|parent| paint_panes.1.get(parent).ok())
+        {
+            messages.write(Action::ModelView(ModelViewAction::Paint(
+                model_viewer::paint::PaintAction::Panel(panel.0),
+            )));
+        }
         messages.write(control.action);
     }
 }
@@ -1355,7 +1304,10 @@ pub(super) fn shortcuts(
     lighting: Option<Res<LightingUi>>,
     browser_context: Option<Res<BrowserContext>>,
     image_viewer: Option<Res<ImageViewer>>,
-    model_edit: Option<Res<model_viewer::editing::State>>,
+    (model_edit, model_paint): (
+        Option<Res<model_viewer::editing::State>>,
+        Option<Res<model_viewer::paint::PaintState>>,
+    ),
     sliders: Query<(), With<bevy::ui_widgets::Slider>>,
     (pointer, scrub, tree_drag): (
         Option<Res<viewport::PointerState>>,
@@ -1444,6 +1396,9 @@ pub(super) fn shortcuts(
             &keys,
             model_edit.as_deref(),
             editor.viewing_model,
+            model_paint.as_deref().filter(|_| {
+                !mouse.any_pressed([MouseButton::Left, MouseButton::Middle])
+            }),
             &mut actions,
         ) {
             return;
@@ -1825,7 +1780,7 @@ pub(super) fn refresh(
     (mut outline, mut tabs, mut inspector_selection): (
         Local<OutlineState>,
         Local<scene_tabs::Tabs>,
-        Local<Option<(Option<Room>, Option<Selection>)>>,
+        Local<Option<(Option<Room>, Option<Selection>, Option<usize>)>>,
     ),
     mut scroll_positions: Query<&mut ScrollPosition>,
     mut labels: Query<(&mut Text, &mut TextColor)>,
@@ -1891,7 +1846,7 @@ pub(super) fn refresh(
     let room =
         (editor.has_scene() && editor.viewing_model.is_none() && editor.viewing_image.is_none())
             .then_some(editor.room);
-    let selected_document = (room, editor.selection);
+    let selected_document = (room, editor.selection, editor.viewing_model);
     if *inspector_selection != Some(selected_document) {
         if let Ok(mut scroll) = scroll_positions.get_mut(interface.inspector) {
             scroll.y = 0.0;
@@ -1955,6 +1910,7 @@ pub(super) fn refresh(
         || outline.lights != lights
         || outline.hierarchy != hierarchy
         || outline.hierarchy_selection != editor.selection
+        || outline.inspector_multiple != editor.multiple_selected()
         || outline.hierarchy_parenting != editor.hierarchy_parenting
     {
         *outline = OutlineState {
@@ -1967,6 +1923,7 @@ pub(super) fn refresh(
             lights,
             hierarchy,
             hierarchy_selection: editor.selection,
+            inspector_multiple: editor.multiple_selected(),
             hierarchy_parenting: editor.hierarchy_parenting,
         };
         commands
@@ -1987,80 +1944,14 @@ pub(super) fn refresh(
         };
         if editor.viewing_model.is_some() {
             // The model document supplies its own object list after this refresh.
-        } else if editor.has_scene() && editor.edits.hierarchy.is_some() {
-            scene_hierarchy_ui::tree(&mut commands, interface.outliner, &interface.font, &editor);
         } else if editor.has_scene() {
-            if editor.definition().is_native() {
-                scene_hierarchy_ui::toolbar(&mut commands, interface.outliner, &interface.font);
-                scene_tree_drag::root_row(&mut commands, interface.outliner, &interface.font);
-            }
-            heading(&mut commands, "ОСВЕЩЕНИЕ");
-            outline_entry(
-                &mut commands,
-                interface.outliner,
-                &interface.font,
-                "Освещение сцены",
-                Selection::Environment,
-                None,
-                true,
-            );
-            for light in &editor.edits.lights {
-                let target = Selection::Light(light.id);
-                object_outline_entry(
-                    &mut commands,
-                    interface.outliner,
-                    &interface.font,
-                    &editor,
-                    target,
-                );
-            }
-            heading(&mut commands, "КАМЕРЫ");
-            for shot in viewport::shots(&editor) {
-                let target = Selection::Camera(shot);
-                object_outline_entry(
-                    &mut commands,
-                    interface.outliner,
-                    &interface.font,
-                    &editor,
-                    target,
-                );
-            }
-            heading(&mut commands, "ОБЪЕКТЫ СЦЕНЫ");
-            for index in 0..editor.imported.len() {
-                if editor.object_deleted(Selection::Imported(index)) {
-                    continue;
-                }
-                object_outline_entry(
-                    &mut commands,
-                    interface.outliner,
-                    &interface.font,
-                    &editor,
-                    Selection::Imported(index),
-                );
-            }
-            if !editor.edits.models.is_empty() {
-                if !editor.definition().is_native() {
-                    heading(&mut commands, "ЭКЗЕМПЛЯРЫ КАТАЛОГА");
-                }
-                for model in &editor.edits.models {
-                    object_outline_entry(
-                        &mut commands,
-                        interface.outliner,
-                        &interface.font,
-                        &editor,
-                        Selection::Model(model.id),
-                    );
-                }
-            }
+            scene_hierarchy_ui::tree(&mut commands, interface.outliner, &interface.font, &editor);
         } else {
             heading(&mut commands, "НЕТ ОТКРЫТОЙ СЦЕНЫ");
         }
-        commands
-            .entity(interface.hierarchy_info)
-            .despawn_related::<Children>();
         scene_hierarchy_ui::inspector(
             &mut commands,
-            interface.hierarchy_info,
+            &interface.hierarchy_info,
             &interface.font,
             &editor,
         );
@@ -2138,7 +2029,10 @@ pub(super) fn refresh(
             GREEN
         },
     );
-    let camera = editor.has_scene() && matches!(editor.selection, Some(Selection::Camera(_)));
+    let inspecting_scene = editor.has_scene() && !editor.asset_viewer_open();
+    let multi = editor.multiple_selected();
+    let camera =
+        inspecting_scene && !multi && matches!(editor.selection, Some(Selection::Camera(_)));
     let filling = camera
         && matches!(editor.selection, Some(Selection::Camera(shot)) if editor.definition().cameras[shot].projection == LensKind::Orthographic);
     let perspective = if editor.pilot {
@@ -2151,6 +2045,15 @@ pub(super) fn refresh(
         "Перспектива · Свет сцены".to_owned()
     };
     set_label(interface.perspective, &perspective, TEXT);
+    set_label(
+        interface.space_label,
+        if editor.local_space {
+            "Родитель"
+        } else {
+            "Мир"
+        },
+        TEXT,
+    );
     set_label(
         interface.lens_label,
         if filling {
@@ -2172,32 +2075,37 @@ pub(super) fn refresh(
     } else if let Some(target) = editor.selection {
         let selected = editor.selected_targets();
         let title = if selected.len() > 1 {
-            format!(
-                "Выбрано объектов: {} · {}",
-                selected.len(),
-                editor.label(target)
-            )
+            format!("Выбрано объектов · {}", selected.len())
         } else {
             editor.label(target)
         };
         set_label(interface.selected, &title, TEXT);
         let kind = match target {
-            Selection::Node(_) => "Группа или экземпляр вложенной сцены",
-            Selection::Camera(_) => "Игровой ракурс",
-            Selection::Imported(_) if !editor.field_allowed(target, Field::Position(1)) => {
-                "Ограничения трансформации проекта"
+            Selection::Node(key) => {
+                if editor
+                    .edits
+                    .hierarchy
+                    .as_ref()
+                    .and_then(|h| h.node(key))
+                    .is_some_and(|node| node.instance.is_some())
+                {
+                    "Вложенная сцена"
+                } else {
+                    "Узел сцены"
+                }
             }
-            Selection::Imported(_) => "Объект исходной сцены",
-            Selection::Model(_) => "Экземпляр общей модели",
-            Selection::Light(_) => "Источник света · настройки ниже",
-            Selection::Environment => "Окружение, экспозиция и свет сцены",
+            Selection::Camera(_) => "Камера",
+            Selection::Imported(_) => "Импортированный объект",
+            Selection::Model(_) => "3D-модель",
+            Selection::Light(_) => "Источник света",
+            Selection::Environment => "Окружение сцены",
         };
         let kind = if selected.len() > 1 {
-            format!("Поля активного объекта · {}", editor.label(target))
+            "Общие координаты · тире при различиях"
         } else {
-            kind.into()
+            kind
         };
-        set_label(interface.kind, &kind, MUTED);
+        set_label(interface.kind, kind, MUTED);
     } else {
         set_label(interface.selected, "Выберите объект или камеру", MUTED);
         set_label(interface.kind, "В 3D-виде или в дереве сцены", MUTED);
@@ -2249,20 +2157,17 @@ pub(super) fn refresh(
                 && editor.viewing_model.is_none()
                 && editor.viewing_image.is_none(),
         ),
-        (
-            interface.transforms,
-            editor.has_scene()
-                && editor.viewing_model.is_none()
-                && editor
-                    .selection
-                    .is_some_and(|target| target != Selection::Environment),
-        ),
-        (interface.lens_row, camera),
+        (interface.scene_properties, inspecting_scene),
+        (interface.transforms, inspecting_scene
+            && editor.selection.is_some_and(|target| editor.pose(target).is_some())),
+        (interface.camera_scope, camera),
+        (interface.object_scope, editor.has_scene() && !editor.asset_viewer_open()
+            && (editor.batch_editable() || editor.deletable_targets())),
         (interface.field_error, numeric.error_message().is_some()),
-        (
-            interface.scale_row,
-            !camera && !matches!(editor.selection, Some(Selection::Light(_))),
-        ),
+        (interface.rotation_scope, editor.inspector_targets(Field::Rotation(0)).all(|target| !matches!(target,
+            Selection::Light(id) if editor.light(id).is_some_and(|light| light.kind == crate::lighting::LightKind::Point)))),
+        (interface.scale_scope, editor.inspector_targets(Field::Scale(0)).all(|target| !matches!(target,
+            Selection::Light(_) | Selection::Camera(_)))),
     ] {
         if let Ok(mut pane) = panes.get_mut(entity) {
             let display = if shown { Display::Flex } else { Display::None };
@@ -2353,6 +2258,14 @@ pub(super) fn refresh(
             }
         };
         let visible = match control.action {
+            Action::RevertProperty(property) => property.can_revert(&editor),
+            Action::ModelView(ModelViewAction::Edit(
+                model_viewer::editing::EditAction::RevertTransform(property),
+            )) => model_edit.is_some_and(|state| {
+                state
+                    .transform_to_revert(editor.viewing_model, property)
+                    .is_some()
+            }),
             Action::BrowseClear => !browser.search.is_empty(),
             Action::Pilot | Action::Align => camera,
             Action::Play => play_ui::visible(&editor),
@@ -2513,9 +2426,7 @@ pub(super) fn refresh(
         let allowed = editor.ready
             && !editor.asset_viewer_open()
             && editor.pending.is_none()
-            && editor
-                .selection
-                .is_some_and(|target| editor.field_allowed(target, field));
+            && editor.inspector_field_allowed(field);
         let tab = if allowed && computed.size().min_element() > 0.0 {
             0
         } else {
@@ -2540,10 +2451,7 @@ pub(super) fn refresh(
             TextReadWriteMode::ReadOnly
         });
         if !focused && !numeric.preserve_text(entity) {
-            let value = editor
-                .selection
-                .and_then(|target| editor.field_value(target, field));
-            let display = value.map_or_else(|| "—".into(), |value| format!("{value:.2}"));
+            let display = numeric_input::display_value(&editor, field);
             if text.value().to_string() != display {
                 text.editor_mut().set_text(&display);
             }

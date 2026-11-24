@@ -607,6 +607,63 @@ fn finish_import(app: &mut App) {
 }
 
 #[test]
+#[ignore = "requires GPU; drops SPP projects, opens the collected import report and closes it"]
+fn gpu_browser_displays_the_spp_import_report() {
+    use crate::editor::model_paint_spp::fixture as spp;
+
+    let fixture = Fixture::new();
+    let (mut app, window, _) = lighting_ui_render::fixture();
+    app.world_mut().resource_scope(|world, mut browser: Mut<Browser>| {
+        let mut editor = world.resource_mut::<Editor>();
+        editor.root = fixture.assets();
+        editor.project.asset_root = fixture.assets();
+        editor.drawer = true;
+        browser.refresh(&mut editor.project);
+    });
+    warm(&mut app, 45);
+    let grid = app.world().resource::<drawer::BrowserUi>().grid;
+    let point = rect(&mut app, grid).max - Vec2::splat(24.0);
+    move_to(&mut app, window, point);
+    for name in ["Report.spp", "Second.spp"] {
+        let path = fixture.source(name);
+        std::fs::write(
+            &path,
+            spp::hdf5_file(&[
+                ("paint/scene.assbin", spp::assbin_quad()),
+                ("paint/document.bin", spp::document_with_uv_stencil("missing.image")),
+            ]),
+        )
+        .unwrap();
+        app.world_mut().write_message(FileDragAndDrop::DroppedFile { window, path_buf: path });
+    }
+    finish_import(&mut app);
+    {
+        let world = app.world();
+        let ui = world.resource::<ContextUi>();
+        assert!(world.resource::<BrowserContext>().phase == Phase::Report);
+        assert_eq!(world.get::<Node>(ui.report).unwrap().display, Display::Flex);
+        assert_eq!(world.get::<Node>(ui.dialog).unwrap().display, Display::None);
+        assert_eq!(world.resource::<InputFocus>().get(), Some(ui.report_close));
+        let body = &world.get::<Text>(ui.report_text).unwrap().0;
+        for line in [
+            "Report_SPP.glb",
+            "Second_SPP.glb",
+            "карта «цвет» отсутствует в кэше",
+            "карта «шероховатость» отсутствует в кэше",
+            "«Scratches» · восстановлен частично",
+        ] {
+            assert!(body.contains(line), "{line}\n{body}");
+        }
+        assert!(world.resource::<Editor>().browser_popup);
+    }
+    key(&mut app, window, KeyCode::Escape, Key::Escape);
+    let world = app.world();
+    let ui = world.resource::<ContextUi>();
+    assert_eq!(world.get::<Node>(ui.report).unwrap().display, Display::None);
+    assert!(!world.resource::<Editor>().browser_popup);
+}
+
+#[test]
 #[ignore = "requires GPU; right-clicks real file cards and empty space, checks selection and executes the file menu"]
 fn gpu_browser_context_menu_selects_files_and_separates_creation_actions() {
     let (mut app, window, target) = lighting_ui_render::fixture();
@@ -715,6 +772,26 @@ fn gpu_browser_context_menu_selects_files_and_separates_creation_actions() {
     let empty = rect(&mut app, grid).max - Vec2::splat(24.0);
     click(&mut app, window, empty, MouseButton::Right);
     assert_menu(&app, None);
+    assert!(app.world().resource::<Editor>().viewing_model.is_none());
+    let [(unwrap, _), (udim, _), (size, _), (bake, _)] =
+        app.world().resource::<ContextUi>().import_labels;
+    for expected in [AutoUnwrap::All, AutoUnwrap::Off, AutoUnwrap::Missing] {
+        let point = rect(&mut app, unwrap).center();
+        click(&mut app, window, point, MouseButton::Left);
+        assert_eq!(app.world().resource::<UvState>().auto_unwrap(), expected);
+        assert!(app.world().get::<AccessibleLabel>(unwrap).unwrap().0.ends_with(expected.label()));
+    }
+    let point = rect(&mut app, udim).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(!app.world().resource::<UvState>().detect_udim_on_import());
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(app.world().resource::<UvState>().detect_udim_on_import());
+    let point = rect(&mut app, size).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert_eq!(app.world().resource::<UvState>().texture_size_on_import(), 2048);
+    let point = rect(&mut app, bake).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert!(app.world().resource::<UvState>().bake_on_load());
     capture_when(&mut app, &target, &output.join("02-empty-menu.png"), |_| {
         true
     });
@@ -1051,6 +1128,10 @@ fn gpu_browser_import_and_context_folders() {
     click(&mut app, window, empty, MouseButton::Right);
     assert!(app.world().resource::<Editor>().browser_popup);
     assert!(app.world().resource::<BrowserContext>().phase == Phase::Menu);
+    let [(unwrap, _), ..] = app.world().resource::<ContextUi>().import_labels;
+    let point = rect(&mut app, unwrap).center();
+    click(&mut app, window, point, MouseButton::Left);
+    assert_eq!(app.world().resource::<UvState>().auto_unwrap(), AutoUnwrap::All);
     capture_when(
         &mut app,
         &target,
@@ -1111,7 +1192,11 @@ fn gpu_browser_import_and_context_folders() {
         &output.join("03-drop-indicator.png"),
         |_| true,
     );
-    for name in ["picture.png", "logo.svg"] {
+    std::fs::write(
+        fixture.source("existing-uv.obj"),
+        b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0.125 0.125\nvt 0.375 0.125\nvt 0.125 0.375\nf 1/1 2/2 3/3\n",
+    ).unwrap();
+    for name in ["picture.png", "logo.svg", "existing-uv.obj"] {
         app.world_mut().write_message(FileDragAndDrop::DroppedFile {
             window,
             path_buf: fixture.source(name),
@@ -1120,6 +1205,8 @@ fn gpu_browser_import_and_context_folders() {
     app.world_mut().get_mut::<Window>(window).unwrap().focused = false;
     finish_import(&mut app);
     app.world_mut().get_mut::<Window>(window).unwrap().focused = true;
+    assert!(fixture.assets().join("textures/existing-uv.glb").exists());
+    assert!(app.world().resource::<Editor>().status.contains("Построена UV-развёртка · наборов: 1"));
     for name in ["picture.png", "logo.svg"] {
         assert!(fixture.source(name).exists());
         assert_eq!(

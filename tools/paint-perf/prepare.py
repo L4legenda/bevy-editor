@@ -45,4 +45,10 @@ with manifest.open("a") as f:
 shutil.copy2(root / "tools/paint-perf/material_painter_bench.rs", dest / "src/paint_comparison.rs")
 with (dest / "src/main.rs").open("a") as f:
     f.write('\n#[cfg(test)]\nmod paint_comparison;\n')
+    if "--bake" in sys.argv[2:]:
+        from prepare_bake_fixture import prepare
+
+        prepare(out)
+        shutil.copy2(root / "tools/paint-perf/material_painter_bake_bench.rs", dest / "src/bake_comparison.rs")
+        f.write('\n#[cfg(test)]\nmod bake_comparison;\n')
 print(dest)

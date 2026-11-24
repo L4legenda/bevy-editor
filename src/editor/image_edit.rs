@@ -8,7 +8,7 @@ use photocraft_paint::{BrushSettings, StrokePoint};
 use photocraft_raster::Surface;
 
 #[path = "image_edit_ui.rs"]
-mod interface;
+pub(super) mod interface;
 pub(in crate::editor) use interface::{color_pointer, refresh, setup};
 #[path = "image_color.rs"]
 pub(in crate::editor) mod color;
@@ -56,6 +56,8 @@ pub(in crate::editor) enum EditAction {
     View,
     Edit,
     Tool(PhotoTool),
+    ModelTool(Tool),
+    ModelPanel,
     EraserMode(EraserMode),
     DrawingTool,
     PixelShape(PixelShape),
@@ -125,6 +127,8 @@ enum Gesture {
 
 #[derive(Default)]
 pub(in crate::editor) struct State {
+    pub(in crate::editor) model_tool: Option<Tool>,
+    pub(super) model_panel_closed: bool,
     pub selection: selection::SelectionState,
     pub layers: layers::LayerState,
     sessions: HashMap<usize, Session>,
@@ -202,7 +206,17 @@ impl State {
         self.sessions.contains_key(&id)
     }
     pub fn active(&self, action: EditAction, id: Option<usize>) -> bool {
+        if self.model_tool.is_some()
+            && matches!(
+                action,
+                EditAction::Tool(_) | EditAction::DrawingTool | EditAction::EraserMode(_)
+            )
+            && self.model_reference(id).is_some()
+        {
+            return false;
+        }
         match action {
+            EditAction::ModelTool(tool) => self.model_tool.unwrap_or(Tool::Universal) == tool,
             EditAction::Selection(action) => self.selection.active(action, self.tool),
             EditAction::View => !self.editing(id),
             EditAction::Edit => self.editing(id),
@@ -257,6 +271,36 @@ impl State {
     pub fn document(&self, id: Option<usize>) -> Option<&PhotoDocument> {
         Some(&self.sessions.get(&id?)?.doc)
     }
+    pub(super) fn display_model_preview(
+        &mut self,
+        id: usize,
+        image: photocraft_raster::Rgba8Image,
+    ) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.prepared = Some((session.doc.revision, session.doc.view_revision, image));
+            session.rendered = None;
+        }
+    }
+    pub(super) fn clear_model_preview(&mut self, id: usize) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.prepared = None;
+            session.rendered = None;
+        }
+    }
+    pub(in crate::editor) fn model_reference(
+        &self,
+        id: Option<usize>,
+    ) -> Option<crate::editor::image_reference::ModelReference> {
+        let photo = self.document(id)?;
+        let layer = photo.active_layer()?;
+        if photo.mask_target || photo.filter_target || layer.locks.position || layer.locks.all {
+            return None;
+        }
+        layer
+            .xmp
+            .as_deref()
+            .and_then(crate::editor::image_reference::ModelReference::from_xmp)
+    }
     pub(in crate::editor) fn insert_reference(
         &mut self,
         id: usize,
@@ -264,6 +308,8 @@ impl State {
         size: UVec2,
         name: String,
         surface: &Surface,
+        reference: &crate::editor::image_reference::ModelReference,
+        replace: Option<crate::editor::image_reference::ReferenceTarget>,
     ) -> Result<bool, String> {
         if self.file_busy(id)
             || self.gesture.as_ref().is_some_and(|(tab, _)| *tab == id)
@@ -286,7 +332,16 @@ impl State {
         {
             return Err("холст изменился во время рендера".into());
         }
-        session.doc.add_reference(name, surface.clone())?;
+        if let Some(target) = replace {
+            session
+                .doc
+                .replace_reference(target, surface.clone(), reference)?;
+        } else {
+            session
+                .doc
+                .add_reference(name, surface.clone(), reference)?;
+            self.model_tool = Some(Tool::Move);
+        }
         Ok(true)
     }
     pub fn available(&self, action: EditAction, id: Option<usize>) -> bool {
@@ -309,6 +364,9 @@ impl State {
         }
         let doc = self.document(id);
         match action {
+            EditAction::ModelTool(_) | EditAction::ModelPanel => {
+                self.editing(id) && self.model_reference(id).is_some()
+            }
             EditAction::Selection(selection::SelectionAction::Apply) => {
                 self.selection.transform.is_some()
             }
@@ -412,6 +470,7 @@ impl State {
         self.gesture = None;
     }
     fn select_tool(&mut self, tool: PhotoTool) {
+        self.model_tool = None;
         if self.tool != tool {
             if !selection::finish_pending(self) {
                 return;
@@ -454,7 +513,7 @@ impl State {
             color[0], color[1], color[2], color[3],
         )));
     }
-    fn save(&mut self, id: usize, editor: &mut Editor) {
+    pub(super) fn save(&mut self, id: usize, editor: &mut Editor) {
         if !selection::finish_pending(self) {
             return;
         }
@@ -481,12 +540,21 @@ impl State {
             return;
         };
         let source = editor.root.join(&tab.path);
-        let document = session.doc.document.clone();
+        let mut document = session.doc.document.clone();
+        let root = editor.root.clone();
         self.saving = Some(Saving {
             id,
             revision: session.doc.revision,
-            task: AsyncComputeTaskPool::get()
-                .spawn(async move { photo_document::save(&source, &document) }),
+            task: AsyncComputeTaskPool::get().spawn(async move {
+                let index = crate::asset_registry::index(&root).map_err(|e| e.to_string())?;
+                crate::editor::image_reference::ModelReference::bind_layers(
+                    &mut document.layers,
+                    &index,
+                )?;
+                photo_document::save(&source, &document)?;
+                crate::asset_registry::scan::record_save(&root, &source)
+                    .map_err(|e| format!("Изображение сохранено, ошибка обновления реестра: {e}"))
+            }),
         });
         editor.status = "Сохранение слоёв .pcraft и изображения…".into();
     }
@@ -746,11 +814,13 @@ pub(super) fn update(
                     let path = editor.root.join(&tab.path);
                     let source = path.clone();
                     state.error = None;
+                    let asset_root = editor.root.clone();
                     state.opening = Some(Opening {
                         id,
                         path,
-                        task: AsyncComputeTaskPool::get()
-                            .spawn(async move { PhotoDocument::load(&source) }),
+                        task: AsyncComputeTaskPool::get().spawn(async move {
+                            PhotoDocument::load_indexed(&source, Some(&asset_root))
+                        }),
                     });
                     editor.status = "Открытие редактора PhotoCraft…".into();
                 }
@@ -774,6 +844,15 @@ pub(super) fn update(
             }
             EditAction::Tool(tool) => {
                 state.select_tool(tool);
+            }
+            EditAction::ModelPanel => state.model_panel_closed ^= true,
+            EditAction::ModelTool(tool) => {
+                if state.model_reference(Some(id)).is_some() {
+                    state.model_tool = (tool != Tool::Universal).then_some(tool);
+                    state.selection.transform = None;
+                    state.selection.draft = None;
+                    viewer.gesture = None;
+                }
             }
             EditAction::EraserMode(mode) => {
                 if state.tool != PhotoTool::Eraser {
@@ -946,6 +1025,12 @@ pub(super) fn update(
                 }
             }
             _ => {}
+        }
+        if matches!(
+            action,
+            EditAction::SelectLayer(_) | EditAction::Layers(layers::LayerAction::Select(..))
+        ) {
+            state.model_tool = state.model_reference(Some(id)).map(|_| Tool::Move);
         }
     }
     state
@@ -1407,6 +1492,19 @@ pub(in crate::editor) fn shortcuts(
             return true;
         }
     } else {
+        if viewer.edit.model_reference(viewer.tab).is_some() {
+            for (key, tool) in [
+                (KeyCode::KeyQ, Tool::Universal),
+                (KeyCode::KeyG, Tool::Move),
+                (KeyCode::KeyR, Tool::Rotate),
+                (KeyCode::KeyS, Tool::Scale),
+            ] {
+                if keys.just_pressed(key) {
+                    actions.write(Action::ImageEdit(EditAction::ModelTool(tool)));
+                    return true;
+                }
+            }
+        }
         if keys.just_pressed(KeyCode::Delete) {
             actions.write(Action::ImageEdit(EditAction::DeleteLayer));
             return true;

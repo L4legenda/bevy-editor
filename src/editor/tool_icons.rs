@@ -20,6 +20,15 @@ pub(super) fn label(tool: Tool, model: bool) -> &'static str {
 }
 
 pub(super) fn setup(commands: &mut Commands, parent: Entity) {
+    group(commands, parent, false, Action::Tool);
+}
+
+pub(super) fn group(
+    commands: &mut Commands,
+    parent: Entity,
+    model: bool,
+    action: impl Fn(Tool) -> Action,
+) -> Entity {
     let group = surface(
         commands,
         parent,
@@ -57,7 +66,7 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) {
         let button = control(
             commands,
             group,
-            Action::Tool(tool),
+            action(tool),
             Look::Tool,
             Node {
                 width: px(30),
@@ -71,7 +80,8 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity) {
         );
         commands
             .entity(button)
-            .insert(AccessibleLabel(label(tool, false).into()));
+            .insert(AccessibleLabel(label(tool, model).into()));
         icons::themed(commands, button, glyph, 18.0);
     }
+    group
 }

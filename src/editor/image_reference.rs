@@ -7,7 +7,8 @@ use std::{
 
 use bevy::{
     camera::{
-        ClearColorConfig, Exposure, Hdr, RenderTarget, primitives::Aabb, visibility::RenderLayers,
+        ClearColorConfig, Exposure, Hdr, RenderTarget, ScalingMode, primitives::Aabb,
+        visibility::RenderLayers,
     },
     core_pipeline::tonemapping::Tonemapping,
     gltf::Gltf,
@@ -34,6 +35,8 @@ use super::{
 
 #[path = "image_reference_cpu.rs"]
 mod cpu;
+#[path = "image_reference_live.rs"]
+mod live;
 
 const LAYER: usize = 22;
 const RESOLUTION: u32 = 1024;
@@ -43,13 +46,101 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Component)]
 pub(super) struct ReferenceCamera;
 
+/// Authoring data travels with the raster preview through save, duplication and undo.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(in crate::editor) struct ModelReference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    pub asset: String,
+    pub direction: [f32; 3],
+    pub center: [f32; 2],
+    pub pose: crate::Pose,
+    #[serde(default)]
+    pub pixels_per_unit: f32,
+}
+
+impl ModelReference {
+    const START: &str = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:bevy=\"urn:bevy-editor:model-reference:1\"><bevy:reference><![CDATA[";
+    const END: &str = "]]></bevy:reference></rdf:Description></rdf:RDF></x:xmpmeta>";
+
+    pub(super) fn to_xmp(&self) -> Result<std::sync::Arc<str>, String> {
+        let body = serde_json::to_string(self)
+            .map_err(|error| error.to_string())?
+            .replace('>', "\\u003e");
+        Ok(format!("{}{body}{}", Self::START, Self::END).into())
+    }
+
+    pub(super) fn from_xmp(packet: &str) -> Option<Self> {
+        let body = packet.strip_prefix(Self::START)?.strip_suffix(Self::END)?;
+        let reference: Self = serde_json::from_str(body).ok()?;
+        (reference.pose.valid()
+            && reference.pixels_per_unit.is_finite()
+            && reference.pixels_per_unit >= 0.0
+            && Vec3::from(reference.direction).is_finite()
+            && Vec2::from(reference.center).is_finite()
+            && crate::data::ModelFormat::from_path(&reference.asset).is_some())
+        .then_some(reference)
+    }
+
+    pub(super) fn resolved(mut self, root: &Path) -> Self {
+        if let Ok(index) = crate::asset_registry::index(root) {
+            index.read_ref(&mut self.asset, &mut self.uid);
+        }
+        self
+    }
+
+    pub(super) fn bind_layers(
+        layers: &mut [photocraft_doc::Layer],
+        index: &crate::asset_registry::Index,
+    ) -> Result<(), String> {
+        for layer in layers {
+            if let Some(mut model) = layer.xmp.as_deref().and_then(Self::from_xmp) {
+                index.save_ref(&mut model.asset, &mut model.uid);
+                layer.xmp = Some(model.to_xmp()?);
+            }
+            if let Some(children) = layer.children_mut() {
+                Self::bind_layers(children, index)?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn view(&self) -> Transform {
+        framing::fit(
+            crate::BoxBounds {
+                center: [0.0; 3],
+                half_size: [1.0; 3],
+            },
+            self.direction.into(),
+            1.0,
+        )
+        .0
+    }
+
+    pub(super) fn canvas_center(&self) -> Vec2 {
+        let view = self.view();
+        let position = Vec3::from(self.pose.position);
+        Vec2::from(self.center)
+            + Vec2::new(position.dot(*view.right()), -position.dot(*view.up()))
+                * self.pixels_per_unit
+    }
+}
+
 struct Request {
+    uid: Option<String>,
     document: usize,
     photo: photocraft_doc::DocId,
     asset: String,
     direction: Vec3,
     center: Vec2,
     canvas_size: UVec2,
+    pose: crate::Pose,
+    replace: Option<ReferenceTarget>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReferenceTarget {
+    pub layer: photocraft_doc::LayerId,
+    pub revision: u64,
 }
 
 struct Job {
@@ -57,11 +148,93 @@ struct Job {
     started: Instant,
     captures: u8,
     stage: Stage,
+    frame: Option<ReferenceFrame>,
+}
+
+#[derive(Clone)]
+struct ReferenceFrame {
+    view: Transform,
+    projection: Projection,
+    center: Vec2,
+    pixel_span: f32,
+    pixels_per_unit: f32,
+}
+
+fn pixel_density(half: Vec3, view: &Transform, size: UVec2) -> f32 {
+    let extent = half
+        .dot(view.right().abs())
+        .max(half.dot(view.up().abs()))
+        .max(1e-5);
+    (size.min_element() as f32 * 0.6).min(RESOLUTION as f32) / (2.0 * extent)
+}
+
+fn reference_frame(bounds: crate::BoxBounds, request: &Request) -> (Transform, ReferenceFrame) {
+    projected_frame(
+        bounds,
+        request.direction,
+        request.center,
+        request.canvas_size,
+        request.pose,
+    )
+}
+
+fn projected_frame(
+    bounds: crate::BoxBounds,
+    direction: Vec3,
+    origin: Vec2,
+    size: UVec2,
+    pose: crate::Pose,
+) -> (Transform, ReferenceFrame) {
+    let (mut view, _) = framing::fit(bounds, direction, 1.0);
+    let pivot = Vec3::from(bounds.center);
+    let half = Vec3::from(bounds.half_size);
+    let (right, up, back) = (*view.right(), *view.up(), *view.back());
+    let mut pose = pose.transform();
+    let mut extent = Vec3::ZERO;
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            for z in [-1.0, 1.0] {
+                let offset = pose.rotation * (pose.scale * half * Vec3::new(x, y, z));
+                extent = extent
+                    .max(Vec3::new(offset.dot(right), offset.dot(up), offset.dot(back)).abs());
+            }
+        }
+    }
+    let pixels_per_unit = pixel_density(half, &view, size);
+    let displacement = pose.translation;
+    let center =
+        origin + Vec2::new(displacement.dot(right), -displacement.dot(up)) * pixels_per_unit;
+    let span = (2.16 * extent.x.max(extent.y)).max(1e-5);
+    let distance = extent.z + span;
+    view.translation = pivot + displacement + back * distance;
+    let projection = Projection::Orthographic(OrthographicProjection {
+        far: distance + extent.z + span,
+        scaling_mode: ScalingMode::Fixed {
+            width: span,
+            height: span,
+        },
+        area: Rect::from_center_size(Vec2::ZERO, Vec2::splat(span)),
+        ..OrthographicProjection::default_3d()
+    });
+    pose.translation += pivot - pose.rotation * (pose.scale * pivot);
+    (
+        pose,
+        ReferenceFrame {
+            view,
+            projection,
+            center,
+            pixel_span: span * pixels_per_unit,
+            pixels_per_unit,
+        },
+    )
 }
 
 enum Stage {
     Loading(ModelSource),
-    Framing(Entity),
+    Framing {
+        root: Entity,
+        model: Entity,
+    },
     Rendering {
         root: Entity,
         image: Handle<Image>,
@@ -84,9 +257,9 @@ enum Stage {
 impl Stage {
     fn cleanup(&self, commands: &mut Commands) {
         match self {
-            Self::Framing(root) | Self::Rendering { root, .. } | Self::Processing { root, .. } => {
-                commands.entity(*root).try_despawn()
-            }
+            Self::Framing { root, .. }
+            | Self::Rendering { root, .. }
+            | Self::Processing { root, .. } => commands.entity(*root).try_despawn(),
             Self::Capturing { root, readback, .. } => {
                 commands.entity(*root).try_despawn();
                 commands.entity(*readback).try_despawn();
@@ -98,11 +271,71 @@ impl Stage {
 
 #[derive(Resource, Default)]
 pub(super) struct ReferenceRender {
+    pub(super) live: live::Preview,
     queue: VecDeque<Request>,
     job: Option<Job>,
 }
 
 impl ReferenceRender {
+    fn pending_requests(&self) -> impl DoubleEndedIterator<Item = &Request> {
+        self.job
+            .iter()
+            .map(|job| &job.request)
+            .chain(self.queue.iter())
+    }
+
+    pub(in crate::editor) fn pending_pose(
+        &self,
+        tab: usize,
+        layer: photocraft_doc::LayerId,
+    ) -> Option<crate::Pose> {
+        self.pending_requests()
+            .rev()
+            .find(|r| r.document == tab && r.replace.is_some_and(|target| target.layer == layer))
+            .map(|r| r.pose)
+    }
+
+    pub(super) fn transform_selected(
+        &mut self,
+        document: usize,
+        photo: &super::photo_document::PhotoDocument,
+        pose: crate::Pose,
+    ) -> Result<(), String> {
+        let layer = photo.active_layer().ok_or("Слой больше не существует")?;
+        if self.pending_requests().any(|r| {
+            r.document == document
+                && (r.photo != photo.document.id || r.replace.is_none_or(|t| t.layer != layer.id))
+        }) {
+            return Err("Дождитесь обновления 3D-слоя".into());
+        }
+        let model = layer
+            .xmp
+            .as_deref()
+            .and_then(ModelReference::from_xmp)
+            .ok_or("Выберите слой с 3D-моделью")?;
+        if !pose.valid() || layer.locks.position || layer.locks.all {
+            return Err("Трансформация слоя недоступна".into());
+        }
+        if pose != self.pending_pose(document, layer.id).unwrap_or(model.pose) {
+            let size = photo.size();
+            self.queue.push_back(Request {
+                document,
+                photo: photo.document.id,
+                uid: model.uid,
+                asset: model.asset,
+                direction: model.direction.into(),
+                center: model.center.into(),
+                canvas_size: UVec2::new(size.width, size.height),
+                pose,
+                replace: Some(ReferenceTarget {
+                    layer: layer.id,
+                    revision: photo.revision,
+                }),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn pending_for(&self, document: Option<usize>) -> bool {
         self.job
             .as_ref()
@@ -131,6 +364,43 @@ pub(super) fn update(
     geometry: cpu::Geometry,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    let live_asset = viewer
+        .edit
+        .model_tool
+        .and_then(|_| {
+            let id = editor.viewing_image;
+            viewer
+                .edit
+                .editing(id)
+                .then(|| viewer.edit.model_reference(id))
+                .flatten()
+        })
+        .map(|model| model.resolved(&editor.root).asset);
+    render.live.load(
+        live_asset,
+        &mut commands,
+        &assets,
+        &gltfs,
+        &images,
+        &prepared,
+        &subjects,
+        &children,
+        &meshes,
+        &geometry,
+        &mut redraw,
+    );
+    let frame = render.live.update_camera(
+        viewer
+            .layer_preview
+            .as_ref()
+            .and_then(|p| p.camera_request()),
+        &mut commands,
+        &mut images,
+        &mut redraw,
+    );
+    if let Some(preview) = viewer.layer_preview.as_mut() {
+        preview.set_camera_image(frame);
+    }
     for &action in actions.read() {
         let Action::DropModelReference {
             entry,
@@ -169,10 +439,15 @@ pub(super) fn update(
         render.queue.push_back(Request {
             document,
             photo: doc.document.id,
+            uid: crate::asset_registry::index(&editor.root)
+                .ok()
+                .and_then(|i| i.uid(&asset).map(str::to_owned)),
             asset,
             direction,
             center: point,
             canvas_size: UVec2::new(size.width, size.height),
+            pose: Transform::IDENTITY.into(),
+            replace: None,
         });
         viewer.edit.error = None;
         editor.status = "Рендер слоя-референса…".into();
@@ -188,13 +463,17 @@ pub(super) fn update(
         render.job = None;
     }
     if render.job.is_none()
-        && let Some(request) = render.queue.pop_front()
+        && let Some(mut request) = render.queue.pop_front()
     {
+        if let Ok(index) = crate::asset_registry::index(&editor.root) {
+            index.read_ref(&mut request.asset, &mut request.uid);
+        }
         render.job = Some(Job {
             stage: Stage::Loading(ModelSource::load(&assets, &request.asset, false)),
             request,
             started: Instant::now(),
             captures: 0,
+            frame: None,
         });
     }
     let Some(job) = &mut render.job else { return };
@@ -212,22 +491,26 @@ pub(super) fn update(
             Stage::Loading(source) => source.world(&assets, &gltfs).map(|world| {
                 if let Some(world) = world {
                     let root = commands
+                        .spawn((Transform::IDENTITY, Visibility::Inherited))
+                        .id();
+                    let model = commands
                         .spawn((
                             WorldAssetRoot(world),
                             scene::CatalogModel,
                             Transform::IDENTITY,
                             Visibility::Hidden,
                             RenderLayers::layer(LAYER),
+                            ChildOf(root),
                         ))
                         .observe(scene::prepare)
                         .id();
-                    job.stage = Stage::Framing(root);
+                    job.stage = Stage::Framing { root, model };
                 }
                 false
             }),
-            Stage::Framing(root) if prepared.contains(*root) => {
-                if let Some(bounds) = framing::bounds(*root, &subjects, &children, &meshes) {
-                    let (view, projection) = framing::fit(bounds, job.request.direction, 1.0);
+            Stage::Framing { root, model } if prepared.contains(*model) => {
+                if let Some(bounds) = framing::bounds(*model, &subjects, &children, &meshes) {
+                    let (pose, frame) = reference_frame(bounds, &job.request);
                     let mut target = Image::new_target_texture(
                         RESOLUTION,
                         RESOLUTION,
@@ -236,8 +519,19 @@ pub(super) fn update(
                     );
                     target.texture_descriptor.usage |= TextureUsages::COPY_SRC;
                     let image = images.add(target);
-                    commands.entity(*root).insert(Visibility::Inherited);
-                    spawn_camera(&mut commands, *root, view, projection, image.clone());
+                    commands
+                        .entity(*model)
+                        .insert((Visibility::Inherited, pose));
+                    let (camera, _) = spawn_camera(
+                        &mut commands,
+                        *root,
+                        frame.view,
+                        frame.projection.clone(),
+                        image.clone(),
+                        LAYER,
+                    );
+                    commands.entity(camera).insert(ReferenceCamera);
+                    job.frame = Some(frame);
                     job.stage = Stage::Rendering {
                         root: *root,
                         image,
@@ -282,22 +576,23 @@ pub(super) fn update(
                 }
                 Some(Ok(None)) => {
                     let root = *root;
-                    framing::bounds(root, &subjects, &children, &meshes)
-                        .ok_or_else(|| "геометрия модели недоступна".to_string())
-                        .map(|bounds| {
-                            let (view, projection) =
-                                framing::fit(bounds, job.request.direction, 1.0);
+                    job.frame
+                        .clone()
+                        .ok_or_else(|| "камера модели недоступна".to_string())
+                        .map(|frame| {
                             let parts = geometry.snapshot(children.iter_descendants(root), &images);
-                            let center = job.request.center;
                             let canvas = job.request.canvas_size;
+                            let replacing = job.request.replace.is_some();
                             commands.entity(root).try_despawn();
                             job.stage =
                                 Stage::Software(AsyncComputeTaskPool::get().spawn(async move {
                                     prepare_surface(
-                                        cpu::render(parts, view, projection),
-                                        center,
+                                        &cpu::render(parts, frame.view, frame.projection),
+                                        frame.center,
+                                        frame.pixel_span,
                                         canvas,
                                     )
+                                    .or_else(|| replacing.then(|| Surface::new(PixelFormat::RGBA8)))
                                     .ok_or_else(|| "не удалось отрисовать геометрию модели".into())
                                 }));
                             false
@@ -325,6 +620,18 @@ pub(super) fn update(
                     job.request.canvas_size,
                     format!("Референс · {name}"),
                     surface,
+                    &ModelReference {
+                        uid: job.request.uid.clone(),
+                        asset: job.request.asset.clone(),
+                        direction: job.request.direction.to_array(),
+                        center: job.request.center.to_array(),
+                        pose: job.request.pose,
+                        pixels_per_unit: job
+                            .frame
+                            .as_ref()
+                            .map_or(0.0, |frame| frame.pixels_per_unit),
+                    },
+                    job.request.replace,
                 )
             }
             _ => Ok(false),
@@ -336,7 +643,12 @@ pub(super) fn update(
             if let Some(tab) = editor.image_tabs.iter_mut().find(|tab| tab.id == document) {
                 tab.dirty = true;
             }
-            editor.status = "Слой-референс добавлен".into();
+            editor.status = if job.request.replace.is_some() {
+                "Трансформация 3D-слоя применена"
+            } else {
+                "Слой-референс добавлен"
+            }
+            .into();
             if editor.viewing_image == Some(document)
                 && viewer
                     .edit
@@ -345,6 +657,21 @@ pub(super) fn update(
                     .is_some_and(|error| error.starts_with("Не удалось добавить слой-референс"))
             {
                 viewer.edit.error = None;
+            }
+            // Rebase consecutive field edits only on successful replacement of this layer.
+            if let Some(completed) = job.request.replace {
+                let photo = job.request.photo;
+                let revision = viewer.edit.document(Some(document)).unwrap().revision;
+                for pending in &mut render.queue {
+                    if pending.document == document
+                        && pending.photo == photo
+                        && let Some(target) = &mut pending.replace
+                        && target.layer == completed.layer
+                        && target.revision == completed.revision
+                    {
+                        target.revision = revision;
+                    }
+                }
             }
             render.job = None;
             redraw.write(RequestRedraw);
@@ -356,6 +683,14 @@ pub(super) fn update(
                 viewer.edit.error = Some(message.clone());
             }
             editor.status = message;
+            if let Some(failed) = job.request.replace {
+                render.queue.retain(|request| {
+                    !(request.document == document
+                        && request
+                            .replace
+                            .is_some_and(|target| target.layer == failed.layer))
+                });
+            }
             render.job = None;
         }
     }
@@ -367,38 +702,43 @@ fn spawn_camera(
     view: Transform,
     projection: Projection,
     image: Handle<Image>,
-) {
-    commands.spawn((
-        ReferenceCamera,
-        Camera3d::default(),
-        Camera {
-            order: -4,
-            clear_color: ClearColorConfig::Custom(Color::NONE),
-            ..default()
-        },
-        RenderTarget::Image(image.into()),
-        RenderLayers::layer(LAYER),
-        view,
-        projection,
-        Hdr,
-        Exposure::BLENDER,
-        Tonemapping::AgX,
-        AmbientLight {
-            brightness: 350.0,
-            ..default()
-        },
-        ChildOf(root),
-    ));
+    layer: usize,
+) -> (Entity, Entity) {
+    let camera = commands
+        .spawn((
+            Camera3d::default(),
+            Camera {
+                order: -4,
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                ..default()
+            },
+            RenderTarget::Image(image.into()),
+            RenderLayers::layer(layer),
+            view,
+            projection,
+            Hdr,
+            Exposure::BLENDER,
+            Tonemapping::AgX,
+            AmbientLight {
+                brightness: 350.0,
+                ..default()
+            },
+            ChildOf(root),
+        ))
+        .id();
     let light_direction = *view.back() * 0.55 - *view.right() * 0.55 + *view.up();
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 3500.0,
-            ..default()
-        },
-        Transform::from_translation(light_direction).looking_at(Vec3::ZERO, Vec3::Y),
-        RenderLayers::layer(LAYER),
-        ChildOf(root),
-    ));
+    let light = commands
+        .spawn((
+            DirectionalLight {
+                illuminance: 3500.0,
+                ..default()
+            },
+            Transform::from_translation(light_direction).looking_at(Vec3::ZERO, Vec3::Y),
+            RenderLayers::layer(layer),
+            ChildOf(root),
+        ))
+        .id();
+    (camera, light)
 }
 
 fn captured(
@@ -420,7 +760,11 @@ fn captured(
     }
     commands.entity(*readback).try_despawn();
     let data = std::mem::take(&mut capture.event_mut().data);
-    let center = job.request.center;
+    let Some(frame) = job.frame.as_ref() else {
+        return;
+    };
+    let center = frame.center;
+    let span = frame.pixel_span;
     let canvas = job.request.canvas_size;
     job.stage = Stage::Processing {
         root: *root,
@@ -429,12 +773,33 @@ fn captured(
             // The 1024-pixel RGBA rows are already aligned for GPU readback.
             let image = image::RgbaImage::from_raw(RESOLUTION, RESOLUTION, data)
                 .ok_or("не удалось прочитать пиксели модели")?;
-            Ok(prepare_surface(image, center, canvas))
+            Ok(prepare_surface(&image, center, span, canvas))
         }),
     };
 }
 
-fn prepare_surface(image: image::RgbaImage, center: Vec2, canvas: UVec2) -> Option<Surface> {
+fn prepare_surface(
+    image: &image::RgbaImage,
+    center: Vec2,
+    span: f32,
+    canvas: UVec2,
+) -> Option<Surface> {
+    prepare_region(
+        image,
+        center,
+        span,
+        PixelRect::new(0, 0, canvas.x as i32, canvas.y as i32),
+    )
+}
+
+fn prepare_region(
+    image: &image::RgbaImage,
+    center: Vec2,
+    span: f32,
+    clip: PixelRect,
+) -> Option<Surface> {
+    let low = Vec2::new(clip.x0 as f32, clip.y0 as f32);
+    let high = Vec2::new(clip.x1 as f32, clip.y1 as f32);
     let mut min = UVec2::new(image.width(), image.height());
     let mut max = UVec2::ZERO;
     for (x, y, pixel) in image.enumerate_pixels() {
@@ -446,52 +811,91 @@ fn prepare_surface(image: image::RgbaImage, center: Vec2, canvas: UVec2) -> Opti
     if min.cmpge(max).any() {
         return None;
     }
-    let original = max - min;
-    let cropped =
-        image::imageops::crop_imm(&image, min.x, min.y, original.x, original.y).to_image();
-    let scale = ((canvas.as_vec2() * 0.6) / original.as_vec2())
-        .min_element()
-        .min(1.0);
-    let size = (original.as_vec2() * scale)
+    let frame = UVec2::new(image.width(), image.height()).as_vec2();
+    let scale = span / frame.max_element();
+    let origin = center - frame * 0.5 * scale;
+    let start = (origin + min.as_vec2() * scale)
         .round()
-        .max(Vec2::ONE)
-        .as_uvec2();
-    let pixels = if size == original {
-        cropped
-    } else {
-        image::imageops::resize(
-            &cropped,
-            size.x,
-            size.y,
-            image::imageops::FilterType::Triangle,
-        )
-    };
-    let offset = (center - size.as_vec2() * 0.5)
-        .round()
-        .clamp(Vec2::ZERO, (canvas - size).as_vec2())
+        .clamp(low, high)
         .as_ivec2();
-    let bounds = PixelRect::new(
-        offset.x,
-        offset.y,
-        offset.x + size.x as i32,
-        offset.y + size.y as i32,
+    let end = (origin + max.as_vec2() * scale)
+        .round()
+        .clamp(low, high)
+        .as_ivec2();
+    if start.cmpge(end).any() {
+        return None;
+    }
+    let clipped = (end - start).as_uvec2();
+    let from = ((start.as_vec2() - origin) / scale)
+        .floor()
+        .clamp(min.as_vec2(), (max - UVec2::ONE).as_vec2())
+        .as_uvec2();
+    let to = ((end.as_vec2() - origin) / scale)
+        .ceil()
+        .clamp((from + UVec2::ONE).as_vec2(), max.as_vec2())
+        .as_uvec2();
+    let crop = image::imageops::crop_imm(image, from.x, from.y, to.x - from.x, to.y - from.y);
+    let pixels = image::imageops::resize(
+        &crop.to_image(),
+        clipped.x,
+        clipped.y,
+        image::imageops::FilterType::Triangle,
     );
+    let bounds = PixelRect::new(start.x, start.y, end.x, end.y);
     let mut surface = Surface::new(PixelFormat::RGBA8);
     surface.write_interleaved(bounds, pixels.as_raw());
     Some(surface)
 }
 
 pub(super) fn track_frame(mut world: ResMut<MainWorld>, cache: Res<PipelineCache>) {
-    if let Some(mut render) = world.get_resource_mut::<ReferenceRender>()
-        && let Some(Job {
-            stage: Stage::Rendering { frames, .. },
-            ..
-        }) = &mut render.job
+    let Some(mut render) = world.get_resource_mut::<ReferenceRender>() else {
+        return;
+    };
+    let ready = cache.waiting_pipelines().next().is_none();
+    render.live.track_camera_frame(ready);
+    if let Some(Job {
+        stage: Stage::Rendering { frames, .. },
+        ..
+    }) = &mut render.job
     {
-        *frames = if cache.waiting_pipelines().next().is_none() {
-            frames.saturating_add(1)
-        } else {
-            0
+        *frames = if ready { frames.saturating_add(1) } else { 0 };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_frame_preserves_move_scale_and_rotation_about_model_center() {
+        let bounds = crate::BoxBounds {
+            center: [5.0, 2.0, 0.0],
+            half_size: [2.0, 1.0, 0.5],
         };
+        let mut request = Request {
+            uid: None,
+            document: 0,
+            photo: photocraft_doc::DocId::fresh(),
+            asset: "models/block.glb".into(),
+            direction: Vec3::Z,
+            center: Vec2::new(320.0, 240.0),
+            canvas_size: UVec2::new(640, 480),
+            pose: Transform::IDENTITY.into(),
+            replace: None,
+        };
+        let (_, base) = reference_frame(bounds, &request);
+        let change = Transform::from_xyz(1.0, -2.0, 0.0)
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::splat(2.0));
+        request.pose = change.into();
+        let (model, frame) = reference_frame(bounds, &request);
+        let pivot = Vec3::from(bounds.center);
+        assert!(
+            model
+                .transform_point(pivot)
+                .abs_diff_eq(pivot + change.translation, 1e-5)
+        );
+        assert!((frame.pixel_span - 2.0 * base.pixel_span).abs() < 0.001);
+        assert!(frame.center.abs_diff_eq(Vec2::new(392.0, 384.0), 0.001));
     }
 }

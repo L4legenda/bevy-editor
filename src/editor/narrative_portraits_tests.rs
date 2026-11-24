@@ -67,14 +67,17 @@ fn gpu_narrative_portrait_selection() {
     std::fs::create_dir_all(lab.join("NPC")).unwrap();
     let portraits = vec![
         Portrait {
+            uid: None,
             label: "Спокойствие".into(),
             path: "calm.png".into(),
         },
         Portrait {
+            uid: None,
             label: "Тревога".into(),
             path: "alert.png".into(),
         },
         Portrait {
+            uid: None,
             label: "Радость".into(),
             path: "happy.png".into(),
         },
@@ -101,10 +104,12 @@ fn gpu_narrative_portrait_selection() {
         description: String::new(),
         portraits: vec![
             Portrait {
+                uid: None,
                 label: "Нейтрально".into(),
                 path: "happy.png".into(),
             },
             Portrait {
+                uid: None,
                 label: "Улыбка".into(),
                 path: "alert.png".into(),
             },
@@ -332,6 +337,7 @@ fn gpu_narrative_portrait_selection() {
         };
         for i in 4..=9 {
             c.portraits.push(Portrait {
+                uid: None,
                 label: format!("Выражение {i}"),
                 path: if i == 9 {
                     "missing.png".into()

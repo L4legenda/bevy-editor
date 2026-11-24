@@ -11,6 +11,8 @@ fn fixture(tool: Tool, local: bool, orthographic: bool) -> (App, Entity, Entity,
         .with_rotation(Quat::from_euler(EulerRot::YXZ, 0.7, 0.4, 0.3))
         .with_scale(Vec3::new(2.0, 3.0, 4.0));
     editor.edits.models.push(crate::data::PlacedModel {
+        selector: None,
+        uid: None,
         id: 42,
         asset: editor.project.catalog[0].asset.clone(),
         pose: start.into(),

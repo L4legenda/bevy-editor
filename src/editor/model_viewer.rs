@@ -1,5 +1,6 @@
 //! Isolated model documents. Their meshes, camera and lights never enter a scene.
 use super::*;
+use crate::editor::model_source::ModelSource;
 use bevy::{
     camera::{ClearColorConfig, RenderTarget, primitives::Aabb, visibility::RenderLayers},
     gltf::Gltf,
@@ -7,7 +8,6 @@ use bevy::{
     render::render_resource::{Extent3d, TextureFormat},
     world_serialization::WorldInstanceReady,
 };
-use crate::editor::model_source::ModelSource;
 
 const LAYER: usize = 8;
 const FOV: f32 = crate::editor::viewport::EDITOR_FOV;
@@ -16,8 +16,10 @@ const FOV: f32 = crate::editor::viewport::EDITOR_FOV;
 mod environment;
 #[path = "model_navigation.rs"]
 mod navigation;
+#[path = "model_space_mouse.rs"]
+mod space_mouse;
 #[path = "model_paint.rs"]
-mod paint;
+pub(in crate::editor) mod paint;
 
 #[path = "model_edit.rs"]
 pub(in crate::editor) mod editing;
@@ -28,6 +30,7 @@ pub(in crate::editor) enum ModelViewAction {
     Fit,
     Retry,
     Environment(environment::EnvironmentAction),
+    SpaceMouse(space_mouse::Setting),
     Edit(editing::EditAction),
     Uv(editing::uv::UvAction),
     Paint(paint::PaintAction),
@@ -90,11 +93,25 @@ pub(in crate::editor) struct ModelViewerPlugin;
 impl Plugin for ModelViewerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Viewer>()
+            .init_resource::<space_mouse::State>()
+            .add_plugins(super::image_viewer::paint_input::PointerPlugin)
             .add_plugins(editing::selection::SelectionPlugin)
             .init_resource::<editing::State>()
             .init_resource::<paint::PaintState>()
+            .init_resource::<paint::sets::ShelfPick>()
+            .init_resource::<paint::export::prefs::Store>()
             .init_resource::<paint::engine::Runtime>()
+            .init_resource::<paint::bake::State>()
+            .init_resource::<paint::bake::custom_gizmo::Gizmo>()
+            .init_resource::<paint::bake::cage_preview::State>()
+            .init_resource::<paint::bake::cage_brush::Brush>()
+            .init_resource::<paint::engine::fill_preview::Preview>()
             .add_plugins(paint::engine::gpu::PluginGpu)
+            .add_plugins(paint::pathtrace::viewport::Plugin)
+            .add_plugins(paint::post::Plugin)
+            .add_plugins(paint::GraphPreviewPlugin)
+            .add_plugins(paint::shader_preview::Plugin)
+            .add_plugins(paint::sets::Plugin)
             .add_plugins(editing::uv::UvPlugin)
             .init_resource::<editing::xray::Materials>()
             .init_resource::<editing::wireframe::Materials>()
@@ -102,6 +119,7 @@ impl Plugin for ModelViewerPlugin {
             .add_systems(Startup, setup.after(super::setup))
             .add_systems(Startup, environment::setup.after(super::setup))
             .add_systems(Startup, paint::setup.after(setup).after(environment::setup))
+            .add_systems(Last, paint::export::prefs::on_exit)
             .add_systems(
                 Update,
                 paint::actions.after(actions).before(editing::input::input),
@@ -109,10 +127,34 @@ impl Plugin for ModelViewerPlugin {
             .add_systems(
                 Update,
                 paint::refresh
+                    .after(paint::actions)
                     .after(editing::controls::groups)
                     .after(environment::refresh),
             )
-            .add_systems(Update, (paint::engine::update, paint::engine::input, paint::engine::cursor).chain().after(paint::refresh))
+            .add_systems(Update, paint::refresh_graph.after(paint::refresh))
+            .add_systems(Update, paint::refresh_shader_maker.after(paint::refresh))
+            .add_systems(Update, paint::decorate_shader_code.after(paint::refresh_shader_maker))
+            .add_systems(Update, paint::dock::update.after(paint::refresh))
+            .add_systems(Update, paint::sidebar::update.after(paint::actions).before(paint::refresh))
+            .add_systems(
+                Update,
+                (
+                    paint::engine::update,
+                    paint::bake::update,
+                    paint::bake::custom_gizmo::input,
+                    paint::bake::live::update,
+                    paint::engine::live_mask::update,
+                    paint::bake::cage_brush::input,
+                    paint::bake::cage_preview::draw,
+                    paint::engine::uv_navigation::navigate,
+                    paint::engine::input,
+                    paint::export::actions,
+                    paint::engine::cursor,
+                    paint::engine::fill_preview::draw,
+                )
+                    .chain()
+                    .after(paint::refresh),
+            )
             .add_systems(
                 Startup,
                 editing::controls::setup
@@ -135,10 +177,12 @@ impl Plugin for ModelViewerPlugin {
                     actions,
                     environment::actions,
                     load,
+                    space_mouse::update,
                     navigate,
                     editing::initialize,
                     editing::input::input,
                     editing::render,
+                    paint::sets::refresh,
                     editing::wireframe::sync,
                     editing::xray::sync,
                     editing::selection::sync,
@@ -152,13 +196,16 @@ impl Plugin for ModelViewerPlugin {
             );
         app.add_systems(
             Update,
-            environment::refresh.after(crate::editor::ui::refresh),
+            environment::refresh
+                .after(crate::editor::ui::refresh)
+                .before(crate::editor::ui::refresh_inspector),
         );
         app.add_systems(
             Update,
             (editing::controls::refresh, editing::controls::groups)
                 .chain()
-                .after(crate::editor::ui::refresh),
+                .after(crate::editor::ui::refresh)
+                .before(crate::editor::ui::refresh_inspector),
         );
         app.add_systems(
             PostUpdate,
@@ -249,6 +296,7 @@ fn setup(
         .insert((Canvas, AccessibleLabel("3D-вид модели".into())));
     commands.spawn((
         ImageNode::new(image.clone()),
+        paint::pathtrace::viewport::CanvasImage,
         Pickable::IGNORE,
         Node {
             position_type: PositionType::Absolute,
@@ -376,7 +424,7 @@ fn actions(
                             retry = true;
                         }
                     }
-                    ModelViewAction::Environment(_) => {}
+                    ModelViewAction::Environment(_) | ModelViewAction::SpaceMouse(_) => {}
                     ModelViewAction::Edit(editing::EditAction::Mode(_)) => {
                         focus.clear();
                     }
@@ -592,16 +640,32 @@ fn navigate(
     mut images: ResMut<Assets<Image>>,
     mut cameras: Query<(&mut Transform, &mut Projection), (With<ViewCamera>, Without<ModelGrid>)>,
     editing: Res<editing::State>,
-    runtime: (
+    mut runtime: (
         Res<Time>,
         Res<InputFocus>,
         Query<(), With<bevy::ui_widgets::TextInput>>,
         Res<bevy::input::mouse::AccumulatedMouseMotion>,
         Res<DrawerMotion>,
         Option<ResMut<super::navigation_gizmo::State>>,
+        Res<paint::bake::custom_gizmo::Gizmo>,
+        Res<paint::PaintState>,
+        Res<paint::ShaderMaker>,
+        Res<space_mouse::State>,
+        Res<paint::engine::Runtime>,
+        MessageWriter<bevy::window::RequestRedraw>,
     ),
     mut grids: Query<(&mut Transform, &mut Visibility), (With<ModelGrid>, Without<ViewCamera>)>,
 ) {
+    if let Some(model) = editor.viewing_model
+        && editing.mode(Some(model)) == crate::editor::model_document::Mode::Paint
+        && runtime.7.blocks_view_navigation(Some(model), runtime.8.shows_model())
+    {
+        if let Some(gizmo) = runtime.5.as_deref_mut() {
+            gizmo.hide(super::navigation_gizmo::Workspace::Model(model));
+        }
+        viewer.gesture = None;
+        return;
+    }
     if editor.viewing_model.is_none()
         || editor.pending.is_some()
         || editor.viewing_image.is_some()
@@ -690,6 +754,7 @@ fn navigate(
         .get()
         .is_some_and(|entity| runtime.2.contains(entity));
     let blocked = typing
+        || runtime.6.dragging()
         || editing.gesture.is_some()
         || editing.menu
         || editing.add_menu
@@ -700,7 +765,6 @@ fn navigate(
         || window
             .cursor_position()
             .is_some_and(|point| runtime.4.covers(point, &window));
-    let mut runtime = runtime;
     let gizmo_blocked = runtime.5.as_deref_mut().is_some_and(|gizmo| {
         let mut frame = super::navigation_gizmo::Frame {
             workspace: super::navigation_gizmo::Workspace::Model(editor.viewing_model.unwrap()),
@@ -734,6 +798,16 @@ fn navigate(
         rect,
         blocked || gizmo_blocked,
     );
+    let in_paint = editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Paint;
+    if !blocked
+        && !gizmo_blocked
+        && !mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
+        && !runtime.10.stroke_active()
+        && (!in_paint || runtime.7.has_3d_view(editor.viewing_model, runtime.8.shows_model()))
+        && runtime.9.drive(&mut viewer, runtime.0.delta_secs())
+    {
+        runtime.11.write(bevy::window::RequestRedraw);
+    }
     for (mut grid, mut visibility) in &mut grids {
         grid.translation = crate::editor::viewport_grid::recenter(&view_pose(&viewer));
         *visibility = if viewer.orthographic {
@@ -841,7 +915,7 @@ fn refresh(
             } else if editing.mode(editor.viewing_model)
                 == crate::editor::model_document::Mode::Paint
             {
-                "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · СКМ — панорама · Tab — объект".into()
+                "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · [ / ] — размер кисти · Ctrl+ПКМ — размер и жёсткость".into()
             } else if editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv
             {
                 "Alt+ЛКМ — орбита · Ctrl+S — сохранить".into()
@@ -867,7 +941,8 @@ fn refresh(
             } else if editing.box_armed || editing.box_start.is_some() {
                 "Рамка: протяните ЛКМ · Shift — добавить · Ctrl — исключить · Esc — отмена".into()
             } else if editing.extrude_tool {
-                "Потяните «+» на выделении · E — начать вытягивание · Esc — выйти из инструмента".into()
+                "ЛКМ — выделить вершины, рёбра или грани · Потяните «+» или нажмите E · Esc — выйти"
+                    .into()
             } else {
                 "ЛКМ — выбор / рамка · Shift — добавить · Ctrl — исключить · ПКМ + WASD / Q E — полёт · Alt+ЛКМ — орбита · G/R/S — трансформации".into()
             };

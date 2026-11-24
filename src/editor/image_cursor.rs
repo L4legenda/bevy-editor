@@ -326,6 +326,15 @@ pub(in crate::editor) fn cursor(
                 SystemCursorIcon::Grab
             });
         }
+        if viewer.edit.model_tool.is_some()
+            && viewer.edit.model_reference(editor.viewing_image).is_some()
+        {
+            return CursorIcon::from(if viewer.model_drag.is_some() {
+                SystemCursorIcon::Grabbing
+            } else {
+                SystemCursorIcon::Default
+            });
+        }
         if viewer.edit.eyedropper(&keys, editor.viewing_image) {
             viewer.pipette_preview = pointer.and_then(|cursor| {
                 let dimensions = viewer.dimensions?;
@@ -403,9 +412,7 @@ pub(in crate::editor) fn cursor(
         let (icon, full) = cache.cursor_with_overlay(
             tip,
             &mut images,
-            resize_center.is_some()
-                || viewer.pen_cursor.is_some()
-                || pixel_tool,
+            resize_center.is_some() || viewer.pen_cursor.is_some() || pixel_tool,
         );
         viewer.brush_cursor = Some(tip);
         viewer.brush_cursor_position = position;

@@ -197,7 +197,12 @@ pub(super) struct Atlas {
     pub angular_p95: Option<f32>,
 }
 impl Atlas {
+    #[cfg(test)]
     pub fn new(mesh: &Geometry) -> Self {
+        Self::with_offsets(mesh, |_| Vec2::ZERO)
+    }
+
+    pub fn with_offsets(mesh: &Geometry, offset: impl Fn(usize) -> Vec2) -> Self {
         let mut parent: Vec<_> = (0..mesh.faces.len()).collect();
         fn root(parent: &mut [usize], mut i: usize) -> usize {
             while parent[i] != i {
@@ -216,9 +221,10 @@ impl Atlas {
                     .or_default()
                     .push((fi, a.uv, b.uv));
             }
+            let origin = offset(f.material);
             if f.corners
                 .iter()
-                .any(|c| c.uv.min_element() < -0.00001 || c.uv.max_element() > 1.00001)
+                .any(|c| (c.uv - origin).min_element() < -0.00001 || (c.uv - origin).max_element() > 1.00001)
             {
                 atlas.outside += 1;
             }

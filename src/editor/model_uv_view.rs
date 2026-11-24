@@ -181,17 +181,24 @@ pub(super) fn refresh(
     cache.meshes.clear();
     let geometry = uv.display_geometry(index, object);
     let mut backdrop = Drawing::default();
-    for x in 0..16 {
-        for y in 0..16 {
-            let a = Vec2::new(x as f32 / 16., y as f32 / 16.);
-            let b = a + Vec2::splat(1. / 16.);
-            let color = if (x + y) % 2 == 0 {
-                Color::srgb(0.065, 0.085, 0.115)
-            } else {
-                Color::srgb(0.08, 0.10, 0.13)
-            };
-            backdrop.triangle([a, Vec2::new(b.x, a.y), b], -0.02, color);
-            backdrop.triangle([a, b, Vec2::new(a.x, b.y)], -0.02, color);
+    let mut offsets: BTreeSet<_> = object.udim_tiles().map(|tile| tile.offset().as_ivec2().to_array()).collect();
+    if offsets.is_empty() || object.materials.iter().any(|slot| slot.udim().is_none()) {
+        offsets.insert([0, 0]);
+    }
+    for [u, v] in &offsets {
+        let offset = Vec2::new(*u as f32, *v as f32);
+        for x in 0..16 {
+            for y in 0..16 {
+                let a = offset + Vec2::new(x as f32 / 16., y as f32 / 16.);
+                let b = a + Vec2::splat(1. / 16.);
+                let color = if (x + y) % 2 == 0 {
+                    Color::srgb(0.065, 0.085, 0.115)
+                } else {
+                    Color::srgb(0.08, 0.10, 0.13)
+                };
+                backdrop.triangle([a, Vec2::new(b.x, a.y), b], -0.02, color);
+                backdrop.triangle([a, b, Vec2::new(a.x, b.y)], -0.02, color);
+            }
         }
     }
     let mut faces = Drawing::default();
@@ -225,13 +232,29 @@ pub(super) fn refresh(
             );
         }
     }
-    for (a, b) in [
-        (Vec2::ZERO, Vec2::X),
-        (Vec2::X, Vec2::ONE),
-        (Vec2::ONE, Vec2::Y),
-        (Vec2::Y, Vec2::ZERO),
-    ] {
-        lines.line(a, b, 0.004, width * 1.5, Color::srgb(0.32, 0.50, 0.59));
+    if let Some(drag) = &uv.drag
+        && let Some(delta) = drag.tile_delta
+        && let Some(original) = drag.snapshot.objects.iter().find(|source| source.id == object.id)
+    {
+        for (face, island) in original.geometry.faces.iter().zip(&drag.atlas.islands) {
+            if !drag.selected.contains(island) {
+                continue;
+            }
+            for (a, b) in face.corners.iter().zip(face.corners.iter().cycle().skip(1)) {
+                lines.line(a.uv + delta, b.uv + delta, 0.01, width * 2., Color::srgb(1., 0.88, 0.55));
+            }
+        }
+    }
+    for [u, v] in offsets {
+        let offset = Vec2::new(u as f32, v as f32);
+        for (a, b) in [
+            (Vec2::ZERO, Vec2::X),
+            (Vec2::X, Vec2::ONE),
+            (Vec2::ONE, Vec2::Y),
+            (Vec2::Y, Vec2::ZERO),
+        ] {
+            lines.line(a + offset, b + offset, 0.004, width * 1.5, Color::srgb(0.32, 0.50, 0.59));
+        }
     }
     for drawing in [backdrop, faces, lines] {
         let mesh = meshes.add(drawing.mesh());

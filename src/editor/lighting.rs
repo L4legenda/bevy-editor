@@ -328,24 +328,12 @@ pub(super) fn handle(editor: &mut Editor, action: LightingAction) -> bool {
     let before = editor.edits.clone();
     match action {
         LightingAction::Add(preset) => {
-            let Some(id) = editor
-                .edits
-                .lights
-                .iter()
-                .map(|light| light.id)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-            else {
+            let mut light = preset.create(0);
+            light.pose.position = (Vec3::from(light.pose.position) + editor.pivot).to_array();
+            let Some(id) = editor.add_light(light) else {
                 return false;
             };
-            let mut light = preset.create(id);
-            light.pose.position = (Vec3::from(light.pose.position) + editor.pivot).to_array();
-            // Start authored lighting with a camera calibrated to the source.
-            // Imported preview lights otherwise overwhelm ordinary local lights.
-            editor.edits.lights.push(light);
             editor.initialize_light_environment(id);
-            editor.select(Some(Selection::Light(id)));
         }
         LightingAction::ApplyPreset(preset) => {
             let (mut settings, mut lights) = preset.create(1);

@@ -687,12 +687,8 @@ fn labeled_rect(app: &mut App, wanted: &str) -> Rect {
     let mut query = world.query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>();
     let (_, node, transform) = query
         .iter(world)
-        .find(|(label, _, _)| label.0 == wanted)
-        .unwrap_or_else(|| panic!("Missing actual UI control: {wanted}"));
-    assert!(
-        node.size().min_element() > 0.0,
-        "Control is hidden: {wanted}"
-    );
+        .find(|(label, node, _)| label.0 == wanted && !node.is_empty())
+        .unwrap_or_else(|| panic!("No visible UI control: {wanted}"));
     let center = transform.affine().translation;
     Rect::from_corners(center - node.size() * 0.5, center + node.size() * 0.5)
 }
@@ -820,6 +816,218 @@ fn gpu_space_toggle_rotates_the_rendered_gizmo_without_moving_the_object() {
     assert_eq!(editor.edits, before);
     assert_eq!(editor.undo.len(), history);
     println!("World/local space screenshots: {}", output.display());
+}
+
+#[test]
+#[ignore = "requires GPU; exercises filtering, folding and actual property editing in the 3D inspector"]
+fn gpu_scene_inspector_filters_and_reverts_properties() {
+    use crate::editor::area_selection::Mode;
+    use bevy::{input_focus::InputFocus, text::EditableText};
+
+    let files = crate::editor::scene_hierarchy::tests::fixture();
+    let source = std::fs::read(files.root.join("lamp.scene")).unwrap();
+    let (mut app, window, target) = fixture_project(files.project.clone());
+    let (mesh, a, b) = {
+        let graph = app
+            .world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap();
+        (
+            graph.by_id("a/mesh").unwrap().key,
+            graph.by_id("a").unwrap().key,
+            graph.by_id("b").unwrap().key,
+        )
+    };
+    let click = |app: &mut App, label: &str| {
+        let pos = labeled_rect(app, label).center();
+        move_pointer(app, window, pos);
+        mouse(app, window, ButtonState::Pressed);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 2);
+    };
+    let search = |app: &mut App, query: &str| {
+        click(app, "Поиск свойств");
+        let field = app.world().resource::<InputFocus>().get().unwrap();
+        let world = app.world_mut();
+        assert_eq!(
+            world.get::<AccessibleLabel>(field).unwrap().0,
+            "Поиск свойств"
+        );
+        world
+            .get_mut::<EditableText>(field)
+            .unwrap()
+            .editor_mut()
+            .set_text(query);
+        warm(app, 3);
+    };
+    let send = |app: &mut App, action: Action| {
+        app.world_mut().write_message(action);
+        warm(app, 4);
+    };
+    send(&mut app, Action::Select(Selection::Model(mesh)));
+    click(&mut app, "Пространство координат инспектора");
+    assert!(app.world().resource::<Editor>().local_space);
+    let search_rect = labeled_rect(&mut app, "Поиск свойств");
+    assert!(visible_field(&mut app, Field::Position(0)));
+
+    click(&mut app, "Трансформация");
+    assert!(!visible_field(&mut app, Field::Position(0)));
+    search(&mut app, "МАСШТАБ");
+    assert!(visible_field(&mut app, Field::Scale(0)));
+    assert!(!visible_field(&mut app, Field::Position(0)));
+    assert!(!visible_field(&mut app, Field::Lens));
+    click(&mut app, "Очистить поиск свойств");
+    assert!(
+        !visible_field(&mut app, Field::Scale(0)),
+        "Clearing search restores the folded section"
+    );
+    click(&mut app, "Трансформация");
+    assert!(visible_field(&mut app, Field::Position(0)));
+
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/inspector-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    send(&mut app, Action::Number(Field::Position(1), 1.3));
+    send(&mut app, Action::Number(Field::Rotation(1), 35.0));
+    let edited = {
+        let editor = app.world().resource::<Editor>();
+        editor
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .node(mesh)
+            .unwrap()
+            .local()
+    };
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("scene-transform.png"),
+        ui_pixels,
+    );
+    click(&mut app, "Вернуть исходную позицию");
+    {
+        let editor = app.world().resource::<Editor>();
+        let graph = editor.edits.hierarchy.as_ref().unwrap();
+        let reverted = graph.node(mesh).unwrap().local();
+        assert_eq!(reverted.position, [0.0, 0.5, 0.0]);
+        assert_eq!(reverted.rotation, edited.rotation);
+        assert!(graph.overridden(mesh));
+    }
+    scroll_to_label(&mut app, "Вернуть исходный поворот");
+    assert_eq!(labeled_rect(&mut app, "Поиск свойств"), search_rect);
+    click(&mut app, "Вернуть исходный поворот");
+    assert!(
+        !app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    send(&mut app, Action::Undo);
+    assert!(
+        app.world()
+            .resource::<Editor>()
+            .edits
+            .hierarchy
+            .as_ref()
+            .unwrap()
+            .overridden(mesh)
+    );
+    send(&mut app, Action::Redo);
+    send(&mut app, Action::Save);
+    assert_eq!(
+        std::fs::read(files.root.join("lamp.scene")).unwrap(),
+        source
+    );
+    assert!(
+        !crate::LevelEdits::<String>::read(&files.root, "room.scene")
+            .unwrap()
+            .hierarchy
+            .unwrap()
+            .overridden(mesh)
+    );
+
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.select_targets(vec![Selection::Node(a), Selection::Node(b)], Mode::Replace);
+    }
+    warm(&mut app, 4);
+    assert!(visible_field(&mut app, Field::Position(0)));
+    click(&mut app, "Позиция X");
+    let field = app.world().resource::<InputFocus>().get().unwrap();
+    assert_eq!(
+        app.world()
+            .get::<EditableText>(field)
+            .unwrap()
+            .value()
+            .to_string(),
+        "—"
+    );
+    app.world_mut()
+        .get_mut::<EditableText>(field)
+        .unwrap()
+        .editor_mut()
+        .set_text("2,5");
+    let history = app.world().resource::<Editor>().undo.len();
+    // Clicking the search field follows the normal blur-to-commit path.
+    click(&mut app, "Поиск свойств");
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.undo.len(), history + 1);
+    for key in [a, b] {
+        assert_eq!(
+            editor
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .node(key)
+                .unwrap()
+                .local()
+                .position[0],
+            2.5
+        );
+    }
+
+    send(&mut app, Action::Select(Selection::Camera(0)));
+    search(&mut app, "fov");
+    assert!(visible_field(&mut app, Field::Lens));
+    assert!(!visible_field(&mut app, Field::Position(0)));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("camera-search.png"),
+        ui_pixels,
+    );
+
+    send(
+        &mut app,
+        Action::Lighting(LightingAction::Add(LightPreset::Spot)),
+    );
+    assert!(matches!(
+        app.world().resource::<Editor>().selection,
+        Some(Selection::Light(_))
+    ));
+    search(&mut app, "смещение глубины");
+    assert!(visible_field(
+        &mut app,
+        Field::Light(LightField::ShadowDepthBias)
+    ));
+    assert!(!visible_field(
+        &mut app,
+        Field::Light(LightField::Intensity)
+    ));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("light-search.png"),
+        ui_pixels,
+    );
 }
 
 fn visible_field(app: &mut App, wanted: Field) -> bool {
@@ -1556,7 +1764,6 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
 
     app.world_mut()
         .write_message(Action::Lighting(LightingAction::Add(LightPreset::Softbox)));
-    app.world_mut().write_message(Action::LightAdvanced);
     warm(&mut app, 8);
     scroll_to_field(&mut app, Field::Light(LightField::Height));
     assert!(visible_field(&mut app, Field::Light(LightField::Width)));

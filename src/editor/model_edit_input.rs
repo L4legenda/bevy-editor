@@ -11,7 +11,7 @@ use bevy::{
 
 #[path = "model_pick.rs"]
 mod picking;
-pub(in crate::editor) use picking::Bvh;
+pub(in crate::editor) use picking::{Bvh, Triangle as PickTriangle};
 #[path = "model_bevel_input.rs"]
 mod bevel;
 pub(super) use bevel::{BevelControl, LastBevel};
@@ -42,9 +42,11 @@ pub(in crate::editor) struct Gesture {
 struct Extrusion {
     pivot: Vec3,
     direction: Vec3,
+    edges: BTreeSet<Edge>,
     screen_motion: Option<Vec2>,
     vertices: Vec<(usize, Vec3, Vec3)>,
     distance: f32,
+    free_offset: Option<Vec3>,
 }
 impl Gesture {
     pub fn new(tool: Tool, base: Snapshot, model: usize, pivot: Vec3) -> Self {
@@ -67,15 +69,18 @@ impl Gesture {
             knife: None,
         }
     }
-    pub(super) fn extrude(doc: &Document, model: usize) -> Option<Self> {
-        let (pivot, direction) = extrusion_axis(doc)?;
+    pub(super) fn extrude(doc: &Document, model: usize, viewer: &Viewer) -> Option<Self> {
+        let edges = doc.active()?.geometry.extrusion_edges(&doc.selection);
+        let (pivot, direction) = extrusion_axis(doc, viewer, &edges)?;
         let mut gesture = Self::new(Tool::Move, doc.snapshot(), model, pivot);
         gesture.extrusion = Some(Extrusion {
             pivot,
             direction,
+            edges,
             screen_motion: None,
             vertices: Vec::new(),
             distance: 0.0,
+            free_offset: None,
         });
         Some(gesture)
     }
@@ -198,13 +203,87 @@ fn plane_point(
     (denominator.abs() > 0.0001)
         .then(|| origin + direction * ((pivot - origin).dot(normal) / denominator))
 }
-fn extrusion_axis(doc: &Document) -> Option<(Vec3, Vec3)> {
+fn extrusion_axis(
+    doc: &Document,
+    viewer: &Viewer,
+    edges: &BTreeSet<Edge>,
+) -> Option<(Vec3, Vec3)> {
     let object = doc.active()?;
-    let normal = object.geometry.extrusion_direction(&doc.selection)?;
-    Some((
-        doc.selection_center()?,
-        object.transform.to_matrix().transform_vector3(normal),
-    ))
+    let mesh = &object.geometry;
+    let normal = mesh.extrusion_direction(&doc.selection, edges)?;
+    let transform = object.transform.to_matrix();
+    let direction = transform.transform_vector3(normal);
+    let camera = view_pose(viewer);
+    let pivot = doc.selection_center()?;
+    let screen_direction = |world| extrusion_screen_direction(viewer, &camera, pivot, world);
+    let edge_tangents: Vec<_> = edges
+        .iter()
+        .filter_map(|edge| {
+            let local = *mesh.positions.get(edge.1)? - *mesh.positions.get(edge.0)?;
+            let world = transform.transform_vector3(local);
+            let screen = screen_direction(world);
+            if screen.length_squared() <= world.length_squared() * 1.0e-4 {
+                return None;
+            }
+            screen.try_normalize()
+        })
+        .collect();
+    let screen_clearance = |world| {
+        let direction = screen_direction(world).normalize_or_zero();
+        edge_tangents
+            .iter()
+            .map(|tangent| tangent.perp_dot(direction).abs())
+            .fold(1.0, f32::min)
+    };
+    let obscured = screen_direction(direction).length_squared()
+        <= direction.length_squared() * 0.0225
+        || screen_clearance(direction) < 0.15;
+    let local_direction = if doc.selection.kind != Element::Face && obscured {
+        // Keep new vertices and strips visible in side and orthographic views.
+        let inverse = transform.inverse();
+        let up = *camera.up();
+        let right = *camera.right();
+        let across_edge = edge_tangents
+            .first()
+            .map(|tangent| right * tangent.y + up * tangent.x);
+        let mut candidates = across_edge
+            .into_iter()
+            .chain([up, right, up + right, up - right])
+            .filter_map(|axis| inverse.transform_vector3(axis).try_normalize());
+        if !edges.is_empty() {
+            candidates
+                .filter(|&axis| mesh.edge_extrusion_clearance(edges, axis) >= 1.0e-4)
+                .map(|axis| (axis, screen_clearance(transform.transform_vector3(axis))))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(axis, _)| axis)
+        } else {
+            candidates.next()
+        }
+    } else {
+        None
+    };
+    let direction = local_direction.map_or(direction, |axis| transform.transform_vector3(axis));
+    Some((pivot, direction))
+}
+
+fn extrusion_screen_direction(
+    viewer: &Viewer,
+    camera: &Transform,
+    pivot: Vec3,
+    direction: Vec3,
+) -> Vec2 {
+    let right = *camera.right();
+    let up = *camera.up();
+    let forward = *camera.forward();
+    let projected = Vec2::new(direction.dot(right), -direction.dot(up));
+    if viewer.orthographic {
+        return projected;
+    }
+    let offset = pivot - camera.translation;
+    let depth = offset.dot(forward).max(0.000001);
+    let screen_offset = Vec2::new(offset.dot(right), -offset.dot(up));
+    // Depth changes the projected position of a selection away from the view center.
+    projected - screen_offset * (direction.dot(forward) / depth)
 }
 
 // Pixels per local mesh unit. A face viewed head-on still has a usable handle.
@@ -213,9 +292,9 @@ fn extrusion_motion(viewer: &Viewer, rect: Rect, pivot: Vec3, direction: Vec3) -
     let depth = (pivot - camera.translation).dot(*camera.forward());
     let height = view_height(viewer, depth).max(0.000001);
     let pixels_per_unit = rect.height() / height;
-    let projected = Vec2::new(direction.dot(*camera.right()), -direction.dot(*camera.up()));
+    let projected = extrusion_screen_direction(viewer, &camera, pivot, direction);
     let length = direction.length().max(0.000001);
-    if projected.length() < length * 0.15 {
+    if projected.length_squared() <= direction.length_squared() * 0.0225 {
         Vec2::NEG_Y * length * pixels_per_unit
     } else {
         projected * pixels_per_unit
@@ -227,10 +306,19 @@ pub(super) fn extrusion_handle(
     viewer: &Viewer,
     rect: Rect,
 ) -> Option<(Vec3, Vec2, Vec2)> {
-    let (pivot, direction) = extrusion_axis(doc)?;
+    let edges = doc.active()?.geometry.extrusion_edges(&doc.selection);
+    let (pivot, direction) = extrusion_axis(doc, viewer, &edges)?;
     let center = project(viewer, rect, pivot)?;
-    let handle =
-        center + extrusion_motion(viewer, rect, pivot, direction).normalize_or_zero() * 54.0;
+    let offset = extrusion_motion(viewer, rect, pivot, direction).normalize_or_zero() * 54.0;
+    let inside = rect.inflate(-13.0);
+    let handle = if rect.contains(center)
+        && !inside.contains(center + offset)
+        && inside.contains(center - offset)
+    {
+        center - offset
+    } else {
+        center + offset
+    };
     Some((pivot, center, handle))
 }
 
@@ -244,20 +332,82 @@ fn drag_extrusion(
 ) -> Result<(), String> {
     let start = *gesture.start.get_or_insert(cursor);
     let extrusion = gesture.extrusion.as_mut().unwrap();
-    let motion = *extrusion.screen_motion.get_or_insert_with(|| {
-        extrusion_motion(viewer, rect, extrusion.pivot, extrusion.direction)
-    });
     let delta = cursor - start;
-    let mut distance = if delta.length() < 2.0 {
-        0.0
+    // Faces follow their normals. Vertices and edges follow the cursor in the view plane.
+    let free_offset = if gesture.base.selection.kind != Element::Face {
+        let pose = view_pose(viewer);
+        let normal = *pose.forward();
+        let pivot = extrusion.pivot;
+        let (Some(from), Some(to)) = (
+            plane_point(viewer, rect, start, pivot, normal),
+            plane_point(viewer, rect, cursor, pivot, normal),
+        ) else {
+            return Ok(());
+        };
+        let inverse = doc
+            .active()
+            .ok_or("Нет активного объекта")?
+            .transform
+            .to_matrix()
+            .inverse();
+        let offset = inverse.transform_vector3(to - from);
+        let offset = if !extrusion.edges.is_empty() {
+            // Check the original edges, including after the preview changes selection.
+            let source = gesture
+                .base
+                .objects
+                .iter()
+                .find(|object| Some(object.id) == gesture.base.active)
+                .ok_or("Нет активного объекта")?;
+            if offset.try_normalize().is_some_and(|direction| {
+                source.geometry.edge_extrusion_clearance(&extrusion.edges, direction) < 1.0e-6
+            }) {
+                // A parallel drag would produce a zero-area wall. Use the same
+                // extrusion axis as the handle, including when starting with E.
+                let motion = *extrusion.screen_motion.get_or_insert_with(|| {
+                    extrusion_motion(viewer, rect, pivot, extrusion.direction)
+                });
+                let sign = if delta.dot(motion.normalize_or_zero()) < -0.5 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                inverse.transform_vector3(extrusion.direction)
+                    * (sign * delta.length() / motion.length().max(0.000001))
+            } else {
+                offset
+            }
+        } else {
+            offset
+        };
+        Some(offset)
     } else {
+        None
+    };
+    let mut distance = if delta.length_squared() < 4.0 {
+        0.0
+    } else if let Some(offset) = free_offset {
+        offset.length()
+    } else {
+        let motion = *extrusion.screen_motion.get_or_insert_with(|| {
+            extrusion_motion(viewer, rect, extrusion.pivot, extrusion.direction)
+        });
         delta.dot(motion) / motion.length_squared()
     };
     if snap {
         let step = doc.amount.max(0.000001);
         distance = (distance / step).round() * step;
     }
-    if !distance.is_finite() || distance == extrusion.distance {
+    let free_offset = free_offset.filter(|_| distance != 0.0).map(|offset| {
+        if snap {
+            offset.normalize_or_zero() * distance
+        } else {
+            offset
+        }
+    });
+    if !distance.is_finite()
+        || (distance == extrusion.distance && free_offset == extrusion.free_offset)
+    {
         return Ok(());
     }
     if distance == 0.0 {
@@ -271,15 +421,18 @@ fn drag_extrusion(
             object.geometry.discard_normals();
         }
         for &(vertex, origin, normal) in &extrusion.vertices {
-            object.geometry.positions[vertex] = origin + normal * distance;
+            let offset = free_offset.unwrap_or(normal * distance);
+            object.geometry.positions[vertex] = origin + offset;
         }
         doc.selection = selection;
         doc.revision += 1;
         doc.ui_revision += 1;
     }
     extrusion.distance = distance;
+    extrusion.free_offset = free_offset;
     Ok(())
 }
+
 fn axis(doc: &Document, index: usize, local: bool) -> Vec3 {
     let unit = [Vec3::X, Vec3::Y, Vec3::Z][index];
     if local {
@@ -539,14 +692,16 @@ pub(in crate::editor) fn input(
                 state.status.clear();
             }
         } else {
-            let distance = gesture.extrusion.as_ref().unwrap().distance;
+            let extrusion = gesture.extrusion.as_ref().unwrap();
             let confirm = if gesture.drag {
                 "Отпустите ЛКМ"
             } else {
                 "ЛКМ или Enter"
             };
-            state.status =
-                format!("Экструдирование · {distance:.3} · {confirm} — применить · Esc — отменить");
+            state.status = format!(
+                "Экструдирование · {:.3} · {confirm} — применить · Esc — отменить",
+                extrusion.distance
+            );
             state.gesture = Some(gesture);
         }
         viewer.gesture = None;
@@ -789,10 +944,11 @@ pub(in crate::editor) fn input(
         viewer.gesture = None;
     } else {
         text.clear();
+        let auto_select = state.extrude_tool || state.tool == Tool::Universal;
         if let Some(start) = state.box_start {
             if mouse.just_pressed(MouseButton::Right)
                 || mouse.just_pressed(MouseButton::Middle)
-                || (state.box_auto && state.tool != Tool::Universal)
+                || (state.box_auto && !auto_select)
             {
                 state.box_start = None;
                 state.box_auto = false;
@@ -862,10 +1018,11 @@ pub(in crate::editor) fn input(
                     state.bisect_start = Some(cursor);
                 }
             } else {
-                let extrusion = state.extrude_tool
-                    && extrusion_handle(&doc, &viewer, rect)
-                        .is_some_and(|(_, _, handle)| handle.distance(cursor) <= 13.0);
-                if extrusion && let Some(mut gesture) = Gesture::extrude(&doc, index) {
+                if state.extrude_tool
+                    && let Some((_, _, handle)) = extrusion_handle(&doc, &viewer, rect)
+                    && handle.distance(cursor) <= 13.0
+                    && let Some(mut gesture) = Gesture::extrude(&doc, index, &viewer)
+                {
                     gesture.start = Some(cursor);
                     gesture.drag = true;
                     state.gesture = Some(gesture);
@@ -896,7 +1053,7 @@ pub(in crate::editor) fn input(
                         state.gesture = Some(gesture);
                         viewer.gesture = None;
                     } else {
-                        if state.extrude_tool || state.tool == Tool::Universal {
+                        if auto_select {
                             state.box_start = Some(cursor);
                             state.box_auto = true;
                         } else {
@@ -924,6 +1081,27 @@ pub(in crate::editor) fn input(
 
 fn world_per_pixel(viewer: &Viewer, rect: Rect) -> f32 {
     viewer.distance * 2.0 * (FOV * 0.5).tan() / rect.height()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extrusion_motion_matches_projected_displacement_away_from_center() {
+        let viewer = Viewer {
+            distance: 5.0,
+            ..default()
+        };
+        let rect = Rect::from_corners(Vec2::ZERO, Vec2::new(1000.0, 800.0));
+        let pivot = Vec3::new(1.5, 0.5, 0.0);
+        let direction = Vec3::NEG_Z;
+        let step = 0.01;
+        let before = project(&viewer, rect, pivot).unwrap();
+        let after = project(&viewer, rect, pivot + direction * step).unwrap();
+        let motion = extrusion_motion(&viewer, rect, pivot, direction);
+        assert!((motion * step).distance(after - before) < 0.01);
+    }
 }
 
 pub(in crate::editor) fn draw(

@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SERIAL: AtomicU64 = AtomicU64::new(1);
 
+pub(in crate::editor) type PrepareLayer =
+    Box<dyn FnOnce(&mut photocraft_raster::Surface) + Send + Sync>;
+
 pub(super) struct Planes {
     pub under: Rgba8Image,
     pub moving: Rgba8Image,
@@ -24,6 +27,7 @@ pub(in crate::editor) struct Live {
     pub serial: u64,
     pub revision: u64,
     pub direct: bool,
+    opacity: f32,
     ready: Option<Planes>,
     source: Source,
     task: Option<Task<Result<Planes, String>>>,
@@ -102,6 +106,37 @@ impl Live {
         doc: &crate::editor::photo_document::PhotoDocument,
         frame: [f32; 4],
     ) -> Option<Self> {
+        let selected = if doc.selected.is_empty() {
+            doc.active_id().into_iter().collect()
+        } else {
+            doc.selected.clone()
+        };
+        let targets =
+            photocraft_engine::commands::transform_cmds::box_targets(&doc.document, &selected);
+        if targets.iter().any(|id| !selected.contains(id)) {
+            return None;
+        }
+        Self::for_layers(doc, frame, &selected, None)
+    }
+
+    pub(in crate::editor) fn for_model(
+        doc: &PhotoDocument,
+        frame: [f32; 4],
+        layer: LayerId,
+        extend: Option<PrepareLayer>,
+    ) -> Option<Self> {
+        if doc.document.selection.is_some() {
+            return None;
+        }
+        Self::for_layers(doc, frame, &[layer], extend)
+    }
+
+    fn for_layers(
+        doc: &PhotoDocument,
+        frame: [f32; 4],
+        selected: &[LayerId],
+        extend: Option<PrepareLayer>,
+    ) -> Option<Self> {
         if doc.mask_target
             || doc.mask_view.is_some()
             || doc.document.mode != photocraft_doc::ColorMode::Rgb
@@ -113,16 +148,6 @@ impl Live {
             frame_quad(frame).map(|p| p.to_array()),
         )
         .ok()?;
-        let selected = if doc.selected.is_empty() {
-            doc.active_id().into_iter().collect()
-        } else {
-            doc.selected.clone()
-        };
-        let targets =
-            photocraft_engine::commands::transform_cmds::box_targets(&doc.document, &selected);
-        if targets.iter().any(|id| !selected.contains(id)) {
-            return None;
-        }
         let mut source = Source {
             doc: doc.document.clone(),
             moving: Vec::new(),
@@ -132,7 +157,7 @@ impl Live {
         let mut flat = Vec::new();
         flatten(
             &doc.document.layers,
-            &selected,
+            selected,
             false,
             true,
             &mut flat,
@@ -166,8 +191,15 @@ impl Live {
         {
             return None;
         }
+        let first = &flat[indices[0]];
+        let opacity = if first.visible {
+            first.opacity * first.fill_opacity
+        } else {
+            0.0
+        };
         source.doc.layers = flat;
-        let direct = source.doc.layers.len() == 1
+        let direct = extend.is_none()
+            && source.doc.layers.len() == 1
             && source.doc.selection.is_none()
             && frame[0] >= 0.0
             && frame[1] >= 0.0
@@ -177,6 +209,7 @@ impl Live {
             serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             revision: doc.revision,
             direct,
+            opacity,
             ready: None,
             source,
             task: None,
@@ -185,13 +218,23 @@ impl Live {
             commit: None,
         };
         if !direct {
-            live.start();
+            live.start(extend);
         }
         Some(live)
     }
-    fn start(&mut self) {
-        let source = self.source.clone();
-        self.task = Some(AsyncComputeTaskPool::get().spawn(async move { prepare(source) }));
+    fn start(&mut self, extend: Option<PrepareLayer>) {
+        let mut source = self.source.clone();
+        self.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+            if let Some(extend) = extend {
+                let layer = source
+                    .doc
+                    .layer_mut(source.moving[0])
+                    .and_then(Layer::surface_mut)
+                    .ok_or("Missing model layer")?;
+                extend(layer);
+            }
+            prepare(source)
+        }));
     }
     pub fn poll(&mut self, revision: u64) {
         // A command can change the document before the UI captures the original
@@ -203,7 +246,7 @@ impl Live {
             && self.ready.is_none()
             && !self.failed
         {
-            self.start();
+            self.start(None);
         }
         if let Some(result) = self.task.as_mut().and_then(|t| block_on(poll_once(t))) {
             self.task = None;
@@ -212,6 +255,9 @@ impl Live {
                 Err(_) => self.failed = true,
             }
         }
+    }
+    pub(in crate::editor) fn ready_for_display(&self) -> bool {
+        self.captured || self.ready.is_some()
     }
     pub fn usable(&self) -> bool {
         !self.failed
@@ -395,6 +441,25 @@ pub(super) fn inverse(quad: [Vec2; 4], size: Vec2) -> Option<[Vec4; 3]> {
 #[path = "image_transform_preview_tests.rs"]
 mod tests;
 
+pub(in crate::editor) struct Placement<'a> {
+    pub live: &'a mut Live,
+    pub frame: [f32; 4],
+    pub quad: [Vec2; 4],
+    pub deferred: bool,
+    pub camera: Option<Handle<Image>>,
+}
+impl Transform {
+    pub(in crate::editor) fn placement(&mut self) -> Option<Placement<'_>> {
+        Some(Placement {
+            live: self.live.as_mut()?,
+            frame: self.frame,
+            quad: self.quad,
+            deferred: self.deferred,
+            camera: None,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(in crate::editor) struct Textures {
     serial: u64,
@@ -405,7 +470,7 @@ pub(in crate::editor) struct Textures {
 impl Textures {
     pub(in crate::editor) fn sync(
         &mut self,
-        transform: Option<&mut Transform>,
+        transform: Option<Placement>,
         source: Option<&Handle<Image>>,
         dimensions: Option<UVec2>,
         revision: Option<u64>,
@@ -418,10 +483,7 @@ impl Textures {
             self.clear(images, material);
             return;
         };
-        let Some(live) = &mut t.live else {
-            self.clear(images, material);
-            return;
-        };
+        let live = t.live;
         if self.serial != live.serial {
             self.clear(images, material);
             if live.direct
@@ -482,10 +544,11 @@ impl Textures {
         };
         material.transform_under = Some(self.handles[0].clone());
         material.transform_selection = self.selection.clone();
-        material.transform_moving = Some(self.handles[1].clone());
+        let camera = t.camera.is_some();
+        material.transform_moving = t.camera.or_else(|| Some(self.handles[1].clone()));
         material.transform_above = Some(self.handles[if self.full_source { 0 } else { 2 }].clone());
         material.transform_rows = rows;
-        material.transform_source = if self.full_source {
+        material.transform_source = if self.full_source && !camera {
             Vec4::new(
                 t.frame[0] / size.x,
                 t.frame[1] / size.y,
@@ -495,7 +558,12 @@ impl Textures {
         } else {
             Vec4::new(0.0, 0.0, 1.0, 1.0)
         };
-        material.transform_style = Vec4::new(1.0, if nearest { 1.0 } else { 0.0 }, 0.0, 0.0);
+        material.transform_style = Vec4::new(
+            1.0,
+            if nearest { 1.0 } else { 0.0 },
+            if camera { live.opacity } else { 1.0 },
+            0.0,
+        );
         material.transform_frame = Vec4::new(
             t.frame[0] / size.x,
             t.frame[1] / size.y,

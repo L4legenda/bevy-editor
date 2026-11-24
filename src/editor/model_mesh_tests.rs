@@ -50,6 +50,75 @@ fn closed(mesh: &Geometry) {
 }
 
 #[test]
+fn extruding_either_end_of_a_loose_edge_extends_away_from_its_neighbor() {
+    for (vertex, expected) in [(0, -Vec3::X * 0.5), (1, Vec3::X * 1.5)] {
+        let mut mesh = Geometry {
+            positions: vec![Vec3::ZERO, Vec3::X],
+            loose_edges: [Edge::new(0, 1)].into(),
+            ..default()
+        };
+        let mut selection = Selection {
+            kind: Element::Vertex,
+            vertices: [vertex].into(),
+            ..default()
+        };
+
+        mesh.extrude(&mut selection, 0.5).unwrap();
+
+        assert_eq!(mesh.positions[2], expected);
+        assert_eq!(mesh.loose_edges.len(), 2);
+        assert!(mesh.loose_edges.contains(&Edge::new(vertex, 2)));
+        assert_eq!(selection.vertices, [2].into());
+    }
+}
+
+#[test]
+fn extruding_connected_loose_edges_keeps_both_new_faces() {
+    let mut mesh = Geometry {
+        positions: vec![Vec3::X, Vec3::ZERO, Vec3::Y],
+        loose_edges: [Edge::new(0, 1), Edge::new(1, 2)].into(),
+        ..default()
+    };
+    let mut selection = Selection {
+        kind: Element::Edge,
+        edges: mesh.loose_edges.clone(),
+        ..default()
+    };
+
+    mesh.extrude(&mut selection, 0.5).unwrap();
+
+    mesh.validate().unwrap();
+    assert_eq!(mesh.positions.len(), 6);
+    assert_eq!(mesh.faces.len(), 2);
+    assert_eq!(selection.edges, [Edge::new(3, 4), Edge::new(4, 5)].into());
+    assert_eq!(mesh.edges()[&Edge::new(1, 4)].len(), 2);
+}
+
+#[test]
+fn extruding_vertices_keeps_connected_strips_and_extends_isolated_points() {
+    let mut mesh = Geometry {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::splat(2.0)],
+        loose_edges: [Edge::new(0, 1), Edge::new(0, 2)].into(),
+        ..default()
+    };
+    let mut selection = Selection {
+        kind: Element::Vertex,
+        vertices: [0, 1, 2, 3].into(),
+        ..default()
+    };
+
+    mesh.extrude(&mut selection, 0.5).unwrap();
+
+    mesh.validate().unwrap();
+    assert_eq!(mesh.positions.len(), 8);
+    assert_eq!(mesh.faces.len(), 2);
+    assert_eq!(mesh.edges()[&Edge::new(0, 4)].len(), 2);
+    assert_eq!(mesh.loose_edges, [Edge::new(3, 7)].into());
+    assert_eq!(selection.kind, Element::Vertex);
+    assert_eq!(selection.vertices, [4, 5, 6, 7].into());
+}
+
+#[test]
 fn loop_cut_preview_matches_asymmetric_and_multiple_cuts() {
     for (count, position) in [(1, 0.25), (1, 0.75), (3, 0.5)] {
         let mut mesh = cube();

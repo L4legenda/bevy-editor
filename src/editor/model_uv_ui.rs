@@ -23,6 +23,7 @@ pub(super) struct UvUi {
     activity: Entity,
     resolution: Entity,
     padding: Entity,
+    detect_udim: Entity,
     auto: Entity,
     cancel: Entity,
     selection: Entity,
@@ -273,6 +274,12 @@ pub(super) fn setup(
         "Развёртка",
         "PartUV Geometric автоматически выбирает швы и создаёт UV-острова. Нативный движок Rust + C++ входит в редактор и работает локально на CPU. Дополнительная установка не нужна.",
     );
+    let unwrap = node(&mut commands, unwrap, column(5.0));
+    inspector::searchable(
+        &mut commands,
+        unwrap,
+        "развёртка авторазвёртка быстрый предпросмотр качество unwrap xatlas",
+    );
     let preview_button = control(
         &mut commands,
         unwrap,
@@ -361,6 +368,32 @@ pub(super) fn setup(
         stats,
         "Число UV-островов и сумма площадей их треугольников в атласе. Это не проверка перекрытий: при наложенных островах площадь может превышать 100%. Грани за пределами 0–1 отмечаются предупреждением.",
     );
+    let import = inspector_section(
+        &mut commands,
+        inspector,
+        &interface.font,
+        "Импорт модели",
+        "Параметры открытия внешних моделей.",
+    );
+    let options = property_row(
+        &mut commands,
+        import,
+        &interface.font,
+        "Распознавать UDIM",
+        UDIM_IMPORT_HINT,
+    );
+    let detect_udim = control(
+        &mut commands,
+        options,
+        &interface.font,
+        "Вкл.",
+        UvAction::DetectUdim,
+        false,
+    );
+    commands
+        .entity(detect_udim)
+        .insert(AccessibleLabel("Распознавать UDIM при импорте".into()));
+    control_hints::attach(&mut commands, detect_udim, UDIM_IMPORT_HINT);
     let preview = inspector_section(
         &mut commands,
         inspector,
@@ -369,6 +402,11 @@ pub(super) fn setup(
         "Проверка UV на модели. Шахматная текстура и подсветка швов меняют только предпросмотр; исходные материалы сохраняются.",
     );
     let preview = wrapping(&mut commands, preview);
+    inspector::searchable(
+        &mut commands,
+        preview,
+        "шахматка швы растяжение checker seams stretch",
+    );
     control(
         &mut commands,
         preview,
@@ -401,6 +439,11 @@ pub(super) fn setup(
         "Авторазвёртка учитывает границы материалов, жёсткие изгибы и отмеченные области.",
     );
     let seam_tools = wrapping(&mut commands, seams);
+    inspector::searchable(
+        &mut commands,
+        seam_tools,
+        "беречь швы предложить остров очистить защиту seam",
+    );
     for (label, action, hint) in [
         (
             "Беречь от швов",
@@ -436,6 +479,11 @@ pub(super) fn setup(
         "UV изменяются в документе. Ctrl+Z отменяет последнее действие, Ctrl+Shift+Z возвращает его. Ctrl+S сохраняет основной UV-канал в исходный GLB.",
     );
     let save = wrapping(&mut commands, changes);
+    inspector::searchable(
+        &mut commands,
+        save,
+        "сохранить отменить повторить save undo redo",
+    );
     for (label, action) in [
         ("Сохранить", EditAction::Save),
         ("↶", EditAction::Undo),
@@ -555,6 +603,7 @@ pub(super) fn setup(
         activity,
         resolution,
         padding,
+        detect_udim,
         auto,
         cancel,
         selection,
@@ -578,6 +627,7 @@ fn property_row(
             ..row(8.)
         },
     );
+    inspector::searchable(commands, line, title);
     let title = text(commands, line, font, title, 12., MUTED);
     control_hints::attach(commands, title, hint);
     line
@@ -623,7 +673,7 @@ pub(super) fn refresh(
         (ui.inspector, showing),
         (ui.toolbar, showing),
         (ui.decision, showing && uv.proposal.is_some()),
-        (ui.cancel, showing && uv.job.is_some()),
+        (ui.cancel, showing && (uv.job.is_some() || uv.relocation.is_some())),
         (ui.progress, showing && uv.job.is_some()),
         (ui.empty, showing && uv.atlas.area < 1e-9),
     ] {
@@ -735,6 +785,8 @@ pub(super) fn refresh(
                 "Предпросмотр xatlas"
             } else if uv.comparing {
                 "Исходная UV"
+            } else if doc.and_then(|d| d.active()).is_some_and(|o| o.udim_tiles().next().is_some()) {
+                "Атлас UDIM"
             } else {
                 "Атлас 0–1"
             },
@@ -759,6 +811,8 @@ pub(super) fn refresh(
             "Защита швов · рисуйте в 3D · Shift — стереть".into()
         } else if uv.selected.is_empty() {
             "ЛКМ — остров · Shift — добавить".into()
+        } else if uv.drag.as_ref().is_some_and(|drag| drag.tile_delta.is_some()) {
+            "Отпустите, чтобы перенести острова и их рисование на другую плитку".into()
         } else {
             format!(
                 "Выделено островов: {} · перетащите для перемещения",
@@ -788,6 +842,12 @@ pub(super) fn refresh(
     label(
         ui.padding,
         &format!("{} px", uv.padding),
+        &children,
+        &mut texts,
+    );
+    label(
+        ui.detect_udim,
+        if uv.detect_udim_on_import() { "Вкл." } else { "Выкл." },
         &children,
         &mut texts,
     );

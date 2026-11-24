@@ -121,7 +121,8 @@ pub(crate) fn decode<K: Ord + serde::de::DeserializeOwned>(
     bytes: &[u8],
     root: &std::path::Path,
 ) -> io::Result<LevelEdits<K>> {
-    let scene = Scene::from_slice(bytes).map_err(invalid)?;
+    let mut scene = Scene::from_slice(bytes).map_err(invalid)?;
+    crate::asset_registry::index(root)?.scene(&mut scene, false);
     if scene.settings.get(crate::hierarchy::TREE_ORDER_SETTING) == Some(&Value::Bool(true))
         || scene.entities.iter().any(|entity| {
             entity.parent.is_some()
@@ -193,20 +194,22 @@ pub(crate) fn decode_scene<K: Ord + serde::de::DeserializeOwned>(
                 .path
                 .as_deref()
                 .ok_or_else(|| invalid("An editor model requires an external GLB or FBX"))?;
-            let format = ModelFormat::from_path(asset)
+            ModelFormat::from_path(asset)
                 .ok_or_else(|| invalid(format!("Unsupported model path: {asset}")))?;
-            if resource
-                .selector
-                .as_deref()
-                .is_some_and(|selector| format != ModelFormat::Glb || selector != "Scene0")
-            {
-                return Err(invalid("Only GLB models accept the Scene0 selector"));
+            if resource.selector.as_deref().is_some_and(|selector| {
+                crate::data::scene_index(selector).is_none()
+            }) {
+                return Err(invalid(
+                    "Expected a model scene selector (Scene followed by its index)",
+                ));
             }
             let id = number(&entity.id, "model");
             if !model_ids.insert(id) {
                 return Err(invalid("Model ID collision in editor bridge"));
             }
             edits.models.push(PlacedModel {
+                selector: resource.selector.clone(),
+                uid: resource.uid.clone(),
                 id,
                 asset: asset.to_owned(),
                 pose: pose(entity.transform),
@@ -280,10 +283,23 @@ pub(crate) fn encode<K: Ord + Serialize>(
     edits: &LevelEdits<K>,
     previous: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
+    encode_indexed(edits, previous, None)
+}
+pub(crate) fn encode_indexed<K: Ord + Serialize>(
+    edits: &LevelEdits<K>,
+    previous: Option<&[u8]>,
+    index: Option<&crate::asset_registry::Index>,
+) -> io::Result<Vec<u8>> {
+    let output = |mut scene: Scene| {
+        if let Some(index) = index {
+            index.scene(&mut scene, true);
+        }
+        scene.to_source().map_err(invalid)
+    };
     if let Some(hierarchy) = &edits.hierarchy {
         let mut hierarchy = (**hierarchy).clone();
         hierarchy.reconcile(edits)?;
-        return hierarchy.source().to_source().map_err(invalid);
+        return output(hierarchy.into_source());
     }
     let settings = edits
         .scene
@@ -298,6 +314,10 @@ pub(crate) fn encode<K: Ord + Serialize>(
         Some(bytes) if modern(bytes)? => Scene::from_slice(bytes).map_err(invalid)?,
         _ => Scene::new(&settings.label),
     };
+    if let Some(index) = index {
+        // Reuse the resource key after a move, including when a different asset now uses the old name.
+        index.scene(&mut scene, false);
+    }
     flat(&scene)?;
     scene.name = settings.label.clone();
     let previous_entities = std::mem::take(&mut scene.entities);
@@ -331,13 +351,14 @@ pub(crate) fn encode<K: Ord + Serialize>(
                     resource
                         .path
                         .as_ref()
-                        .map(|path| (path.clone(), key.clone()))
+                        .map(|path| ((path.clone(), resource.selector.clone()), key.clone()))
                 })
                 .flatten()
         })
         .collect();
     for (index, model) in edits.models.iter().enumerate() {
-        let resource = if let Some(key) = assets.get(&model.asset) {
+        let reference = (model.asset.clone(), model.selector.clone());
+        let resource = if let Some(key) = assets.get(&reference) {
             key.clone()
         } else {
             let digest = bevy_scene_format::content_digest(model.asset.as_bytes());
@@ -351,12 +372,15 @@ pub(crate) fn encode<K: Ord + Serialize>(
                 suffix += 1;
                 key = format!("{stem}_{suffix}");
             }
-            scene
-                .resources
-                .insert(key.clone(), Resource::external("model", &model.asset));
-            assets.insert(model.asset.clone(), key.clone());
+            let mut resource = Resource::external("model", &model.asset);
+            resource.selector = model.selector.clone();
+            scene.resources.insert(key.clone(), resource);
+            assets.insert(reference, key.clone());
             key
         };
+        if model.uid.is_some() {
+            scene.resources.get_mut(&resource).unwrap().uid = model.uid.clone();
+        }
         let mut entity = previous_models
             .get(&model.id)
             .map(|value| (**value).clone())
@@ -441,7 +465,7 @@ pub(crate) fn encode<K: Ord + Serialize>(
     } else {
         scene.settings.remove("environment");
     }
-    scene.to_source().map_err(invalid)
+    output(scene)
 }
 
 #[cfg(feature = "editor")]
@@ -467,6 +491,10 @@ pub(crate) fn remap_scene_paths(scene: &mut Scene, from: &std::path::Path, to: &
             *value = mapped.to_string_lossy().replace('\\', "/");
         }
     };
+    remap_scene_with(scene, &remap);
+}
+#[cfg(feature = "editor")]
+pub(crate) fn remap_scene_with(scene: &mut Scene, remap: &impl Fn(&mut String)) {
     for resource in scene.resources.values_mut() {
         if let Some(path) = &mut resource.path {
             remap(path);

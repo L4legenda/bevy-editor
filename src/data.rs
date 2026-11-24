@@ -9,9 +9,13 @@ use std::{
 
 pub(crate) fn relative_path(path: &str, extension: &str) -> bool {
     relative_asset_path(path)
-        && Path::new(path)
-            .extension()
-            .is_some_and(|value| value == extension)
+        && Path::new(path).extension().is_some_and(|value| {
+            if matches!(extension, "glb" | "hdr" | "exr") {
+                value.eq_ignore_ascii_case(extension)
+            } else {
+                value == extension
+            }
+        })
 }
 
 fn relative_asset_path(path: &str) -> bool {
@@ -34,7 +38,7 @@ impl ModelFormat {
             return None;
         }
         let extension = Path::new(path).extension()?.to_str()?;
-        if extension == "glb" {
+        if extension.eq_ignore_ascii_case("glb") {
             Some(Self::Glb)
         } else if extension.eq_ignore_ascii_case("fbx") {
             Some(Self::Fbx)
@@ -167,8 +171,17 @@ impl BoxBounds {
     }
 }
 
+pub(crate) fn scene_index(selector: &str) -> Option<usize> {
+    let index: usize = selector.strip_prefix("Scene")?.parse().ok()?;
+    (selector == format!("Scene{index}")).then_some(index)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlacedModel {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
     pub id: u32,
     pub asset: String,
     pub pose: Pose,
@@ -260,7 +273,7 @@ impl<K: Ord> LevelEdits<K> {
             serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes))
                 .map_err(io::Error::other)
         };
-        let edits: Self = decoded.map_err(|error| {
+        let mut edits: Self = decoded.map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{}: {error}", path.display()),
@@ -271,6 +284,13 @@ impl<K: Ord> LevelEdits<K> {
                 io::ErrorKind::InvalidData,
                 "Scene metadata is missing",
             ));
+        }
+        let index = crate::asset_registry::index(root)?;
+        for model in &mut edits.models {
+            index.read_ref(&mut model.asset, &mut model.uid);
+        }
+        if let Some(hdri) = edits.lighting.as_mut().and_then(|s| s.hdri_asset.as_mut()) {
+            index.read_ref(&mut hdri.asset, &mut hdri.uid);
         }
         edits.validate(root)?;
         Ok(edits)
@@ -340,13 +360,20 @@ impl<K: Ord> LevelEdits<K> {
             }
         }
         let mut ids = HashSet::new();
+        let index = crate::asset_registry::index(root).ok();
         let mut asset_exists = BTreeMap::new();
         for model in &self.models {
             if ModelFormat::from_path(&model.asset).is_none()
+                || model.selector.as_deref().is_some_and(|selector| {
+                    scene_index(selector).is_none()
+                })
                 || !*asset_exists.entry(&model.asset).or_insert_with(|| {
                     redirects
                         .resolve(&model.asset)
                         .is_ok_and(|path| root.join(path).is_file())
+                        || index
+                            .as_ref()
+                            .is_some_and(|i| i.uid(&model.asset).is_some())
                 })
                 || !ids.insert(model.id)
                 || !model.pose.valid()
@@ -385,7 +412,26 @@ impl<K: Ord> LevelEdits<K> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let bytes = self.encode_document(file, previous.as_deref())?;
+        let index = crate::asset_registry::index(root)?;
+        let bytes = if relative_path(file, "scene") {
+            crate::scene_io::encode_indexed(self, previous.as_deref(), Some(&index))?
+        } else {
+            let mut json = serde_json::to_value(self)?;
+            for model in json
+                .get_mut("models")
+                .and_then(|v| v.as_array_mut())
+                .into_iter()
+                .flatten()
+            {
+                index.bind_json(model);
+            }
+            if let Some(hdri) = json.pointer_mut("/lighting/hdri_asset") {
+                index.bind_json(hdri);
+            }
+            let mut bytes = serde_json::to_vec_pretty(&json)?;
+            bytes.push(b'\n');
+            bytes
+        };
         let expected = previous.as_deref().map_or(
             bevy_scene_format::Revision::Missing,
             bevy_scene_format::Revision::of,
@@ -393,6 +439,7 @@ impl<K: Ord> LevelEdits<K> {
         bevy_scene_format::atomic_write(&path, &bytes, expected).map(|_| ())
     }
 
+    #[cfg(feature = "editor")]
     pub(crate) fn encode_document(&self, file: &str, previous: Option<&[u8]>) -> io::Result<Vec<u8>>
     where
         K: Serialize,

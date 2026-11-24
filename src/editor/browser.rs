@@ -107,6 +107,9 @@ impl Browser {
     /// entries retain their indices and all host-provided placement settings.
     /// Both the source GLB and the saved JSON open their configured scene.
     pub fn new(project: &mut EditorProject) -> Self {
+        Self::discover(project, true)
+    }
+    pub(super) fn discover(project: &mut EditorProject, models: bool) -> Self {
         let mut browser = Self {
             folders: vec![Folder {
                 label: "Ассеты".into(),
@@ -128,6 +131,7 @@ impl Browser {
         };
         // Several host-defined variants may share a GLB while retaining their
         // own labels, collision settings, and thumbnail directions.
+        let identities = crate::asset_registry::index(&project.asset_root).ok();
         let mut catalog: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, model) in project.catalog.iter().enumerate() {
             catalog.entry(model.asset.clone()).or_default().push(index);
@@ -219,6 +223,7 @@ impl Browser {
                                         }],
                                     );
                                     project.scenes.push(crate::project::SceneDefinition {
+                                        uid: None,
                                         label: settings.label,
                                         asset: String::new(),
                                         file: asset.clone(),
@@ -243,9 +248,12 @@ impl Browser {
                         if links.is_none() && (hidden || !discover[folder]) {
                             continue;
                         }
-                        if links.is_none() && ModelFormat::from_path(&asset).is_some() {
+                        if models && links.is_none() && ModelFormat::from_path(&asset).is_some() {
                             let index = project.catalog.len();
                             project.catalog.push(CatalogItem {
+                                uid: identities
+                                    .as_ref()
+                                    .and_then(|i| i.uid(&asset).map(str::to_owned)),
                                 label: Path::new(&name)
                                     .file_stem()
                                     .unwrap_or_default()
@@ -293,6 +301,10 @@ impl Browser {
     /// Rescan after external file changes without resetting the user's location.
     /// If that folder was removed, fall back to its nearest surviving parent.
     pub fn refresh(&mut self, project: &mut EditorProject) {
+        let refreshed = Self::new(project);
+        self.adopt(refreshed);
+    }
+    pub(super) fn adopt(&mut self, mut refreshed: Self) {
         let current = self.folders[self.current].path.clone();
         let back: Vec<_> = self
             .back
@@ -309,7 +321,6 @@ impl Browser {
             .iter()
             .map(|&folder| self.folders[folder].path.clone())
             .collect();
-        let mut refreshed = Self::new(project);
         let folders: HashMap<_, _> = refreshed
             .folders
             .iter()
@@ -660,6 +671,7 @@ mod tests {
 
     fn scene(label: &str, asset: &str, file: &str) -> crate::project::SceneDefinition {
         crate::project::SceneDefinition {
+            uid: None,
             label: label.into(),
             asset: asset.into(),
             file: file.into(),
@@ -680,7 +692,7 @@ mod tests {
             "models/new_table.glb",
             "models/script.rs",
             "models/readme.md",
-            "models/unsupported.GLB",
+            "models/uppercase.GLB",
             ".git/hidden.glb",
             "target/cache.glb",
             "app.js",
@@ -693,6 +705,7 @@ mod tests {
             .scenes
             .push(scene("Room", "scenes/room.glb", "scenes/room.json"));
         project.catalog.push(CatalogItem {
+            uid: None,
             label: "Кресло".into(),
             asset: "models/chair.glb".into(),
             category: "Мебель".into(),
@@ -700,7 +713,7 @@ mod tests {
             preview_direction: [-1.0, 1.0, 2.0],
         });
         let mut browser = Browser::new(&mut project);
-        assert_eq!(project.catalog.len(), 3);
+        assert_eq!(project.catalog.len(), 4);
         assert_eq!(project.catalog[0].label, "Кресло");
         assert_eq!(project.catalog[0].category, "Мебель");
         assert!(project.catalog[0].solid);
@@ -720,14 +733,14 @@ mod tests {
                 .iter()
                 .filter(|entry| matches!(entry, Entry::Model(_)))
                 .count(),
-            2
+            3
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|entry| matches!(entry, Entry::File(_)))
                 .count(),
-            3
+            2
         );
         assert!(
             browser
@@ -945,6 +958,7 @@ mod tests {
             ("Configured hidden model", ".models/chair.glb"),
         ] {
             project.catalog.push(CatalogItem {
+                uid: None,
                 label: label.into(),
                 asset: asset.into(),
                 category: "Configured".into(),

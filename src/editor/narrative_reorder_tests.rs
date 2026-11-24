@@ -94,16 +94,19 @@ fn gpu_narrative_reorder_answers() {
             Choice {
                 text: "Проверить источник сигнала".into(),
                 target: Some(2),
+                condition: Default::default(),
                 dialogue: None,
             },
             Choice {
                 text: "Запросить помощь экипажа".into(),
                 target: Some(3),
+                condition: Default::default(),
                 dialogue: None,
             },
             Choice {
                 text: "Вернуться на корабль".into(),
                 target: Some(4),
+                condition: Default::default(),
                 dialogue: None,
             },
         ];

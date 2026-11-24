@@ -9,8 +9,7 @@ pub(super) mod tests;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum HierarchyAction {
-    Group,
-    GroupSelection,
+    AddFolder,
     Fold(u32),
     PickParent,
     ToRoot,
@@ -34,16 +33,7 @@ pub(super) fn available(editor: &Editor, action: HierarchyAction) -> bool {
         .and_then(|s| editor.hierarchy_key(s))
         .and_then(|k| editor.edits.hierarchy.as_ref()?.node(k));
     match action {
-        HierarchyAction::Group => true,
-        HierarchyAction::GroupSelection => editor.selected_targets().iter().any(|s| {
-            matches!(
-                s,
-                Selection::Model(_)
-                    | Selection::Light(_)
-                    | Selection::Camera(_)
-                    | Selection::Node(_)
-            )
-        }),
+        HierarchyAction::AddFolder => true,
         HierarchyAction::Refresh => editor
             .edits
             .hierarchy
@@ -538,24 +528,22 @@ impl Editor {
         let key = self.selection.and_then(|s| self.hierarchy_key(s));
         let root = self.root.clone();
         let success = match action {
-            HierarchyAction::Group => {
-                if let Some(key) = self.edit_hierarchy(|h| h.add_group(None)) {
-                    self.select(Some(Selection::Node(key)));
-                    true
-                } else {
-                    false
-                }
-            }
-            HierarchyAction::GroupSelection => {
-                let keys = self.hierarchy_roots();
-                if let Some(group) = self.edit_hierarchy(|h| {
-                    let group = h.add_group(None)?;
-                    for key in keys {
-                        h.reparent(key, Some(group))?;
+            HierarchyAction::AddFolder => {
+                if let Some(key) = self.edit_hierarchy(|h| {
+                    // Place the new folder beside the toolbar so its entrance is visible.
+                    let first = h
+                        .nodes
+                        .iter()
+                        .find(|node| node.entity.parent.is_none())
+                        .map(|node| node.key);
+                    let key = h.add_group(None)?;
+                    if let Some(first) = first {
+                        h.drop_node(key, TreeDrop::Before(first))?;
                     }
-                    Ok(group)
+                    Ok(key)
                 }) {
-                    self.select(Some(Selection::Node(group)));
+                    self.folder_arrival = Some((self.room, key, std::time::Instant::now()));
+                    self.select(Some(Selection::Node(key)));
                     true
                 } else {
                     false

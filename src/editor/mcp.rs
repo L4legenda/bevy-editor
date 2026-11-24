@@ -507,7 +507,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.edits.models.iter().any(|model| model.id == u32::MAX) { return Err("Model IDs are exhausted".into()); }
             let pose = patch_pose(editor, None, Transform::IDENTITY.into(), &args.transform.unwrap_or_default())?;
             let before = editor.edits.clone();
-            editor.add_model(crate::PlacedModel { id: 0, asset: args.asset, pose, bounds: None });
+            editor.add_model(crate::PlacedModel { selector: None, uid: None, id: 0, asset: args.asset, pose, bounds: None });
             editor.finish_edit(before);
             Ok(object(editor, editor.selection.ok_or("Model could not be created")?))
         }

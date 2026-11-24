@@ -15,9 +15,10 @@ fn gpu_compare_complex_paint() {
         for id in [i as u32 / 3 + 1, 1, 0] {
             vertices.extend_from_slice(&id.to_le_bytes());
         }
+        vertices.extend_from_slice(&p[12..24]);
     }
     let scene = Scene {
-        count: (vertices.len() / 32) as u32,
+        count: (vertices.len() / 44) as u32,
         vertices,
     };
     let project = crate::EditorProject::load(
@@ -47,6 +48,7 @@ fn gpu_compare_complex_paint() {
             size,
             base: std::array::from_fn(|_| data::solid(size, [128, 128, 128, 255])),
             material: serde_json::json!({}),
+            baked: None,
             stack: Stack {
                 selected,
                 layers: (0..8)
@@ -118,10 +120,12 @@ fn gpu_compare_complex_paint() {
             &mut encoder,
             &surface,
             0,
+            1,
             ids,
             &scene,
             1,
             0,
+            None,
         );
         let pose = Transform::from_xyz(0., 0., 4.);
         let view = View {
@@ -130,6 +134,7 @@ fn gpu_compare_complex_paint() {
                 pose,
                 inverse: pose.to_matrix().inverse(),
                 rect: Rect::from_corners(Vec2::ZERO, Vec2::new(1024., 768.)),
+                clip: Rect::from_corners(Vec2::ZERO, Vec2::new(1024., 768.)),
                 ortho: false,
                 height: 8. * (FOV * 0.5).tan(),
                 depth: 100.,
@@ -139,14 +144,25 @@ fn gpu_compare_complex_paint() {
         let brush = Brush {
             channel: 0,
             color: [230, 26, 13],
+            material: None,
             radius: 35.,
             hardness: 0.6,
             flow: 0.35,
             opacity: 1.,
             erase: false,
             fill: false,
+            fill_mode: FillMode::default(),
+            fill_angle: 30.,
+            fill_padding: 0.,
+            variation: stroke::Variation::default(),
+            tip: None,
+            grain: None,
+            mirror: [0.; 4],
+            projection: BrushProjection::Screen,
+            paint_through: false,
+            facing_limit: 85_f32.to_radians().cos(),
         };
-        context.begin(device, &pipelines, &mut encoder, brush, view);
+        context.begin(device, &pipelines, &mut encoder, 0, brush, view, &images, None);
         queue.submit([encoder.finish()]);
         wait();
         let mut times = Vec::new();
@@ -156,13 +172,16 @@ fn gpu_compare_complex_paint() {
             let points = (0..6)
                 .map(|i| {
                     let t = (frame * 6 + i) as f32 * 0.011;
-                    Vec2::new(512. + t.sin() * 90., 384. + (t * 1.7).cos() * 65.)
+                    Stamp::from(Vec2::new(
+                        512. + t.sin() * 90.,
+                        384. + (t * 1.7).cos() * 65.,
+                    ))
                 })
                 .collect::<Vec<_>>();
             let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("paint comparison frame"),
             });
-            context.points(device, &pipelines, &mut encoder, &points, &images);
+            context.points(device, &pipelines, &mut encoder, &points, None, &images);
             queue.submit([encoder.finish()]);
             let submit = start.elapsed().as_secs_f64() * 1000.;
             wait();

@@ -412,6 +412,7 @@ mod tests {
             .map(|i| Choice {
                 text: format!("Ответ {i}"),
                 target: Some(i + 10),
+                condition: Default::default(),
                 dialogue: None,
             })
             .collect();

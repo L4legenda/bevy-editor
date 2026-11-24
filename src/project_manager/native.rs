@@ -28,7 +28,7 @@ impl Picker {
         let result = Arc::new(Mutex::new(None));
         let output = result.clone();
         std::thread::spawn(move || {
-            let value = choose_folder().map_err(|error| {
+            let value = choose_folder("Bevy Editor: папка проекта").map_err(|error| {
                 format!("Не удалось открыть выбор папки: {error}. Введите путь вручную.")
             });
             if let Ok(mut output) = output.lock() {
@@ -79,24 +79,42 @@ pub(super) fn poll(
     }
 }
 
-fn choose_folder() -> io::Result<Option<PathBuf>> {
+pub(crate) fn choose_folder(prompt: &str) -> io::Result<Option<PathBuf>> {
+    choose_folder_in(prompt, None)
+}
+
+pub(crate) fn choose_folder_in(prompt: &str, directory: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    let directory = directory.filter(|path| path.is_dir());
     #[cfg(target_os = "macos")]
-    let output = Command::new("/usr/bin/osascript").arg("-e").arg("try\nreturn POSIX path of (choose folder with prompt \"Выберите папку проекта Bevy Editor\")\non error number -128\nreturn \"\"\nend try").output()?;
+    let output = Command::new("/usr/bin/osascript").arg("-e").arg("on run argv\ntry\nif (item 2 of argv) is \"\" then\nreturn POSIX path of (choose folder with prompt (item 1 of argv))\nelse\nreturn POSIX path of (choose folder with prompt (item 1 of argv) default location (POSIX file (item 2 of argv)))\nend if\non error number -128\nreturn \"\"\nend try\nend run").arg(prompt).arg(directory.unwrap_or_else(|| Path::new(""))).output()?;
     #[cfg(target_os = "windows")]
-    let output = Command::new("powershell.exe").args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object System.Windows.Forms.FolderBrowserDialog; $dialog.Description = 'Bevy Editor: project folder'; if ($dialog.ShowDialog() -eq 'OK') { [Console]::Write($dialog.SelectedPath) }; $dialog.Dispose()"]).output()?;
+    let output = {
+        use std::os::windows::process::CommandExt;
+        Command::new("powershell.exe")
+            .creation_flags(0x08000000)
+            .env("BEVY_EDITOR_DIRECTORY_PROMPT", prompt)
+            .env("BEVY_EDITOR_START_DIRECTORY", directory.unwrap_or_else(|| Path::new("")))
+            .args(["-NoProfile", "-STA", "-Command", "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $dialog = New-Object Windows.Forms.FolderBrowserDialog; $dialog.Description = $env:BEVY_EDITOR_DIRECTORY_PROMPT; if ($env:BEVY_EDITOR_START_DIRECTORY) { $dialog.SelectedPath = $env:BEVY_EDITOR_START_DIRECTORY }; if ($dialog.ShowDialog() -eq 'OK') { [Console]::Write($dialog.SelectedPath) }; $dialog.Dispose()"])
+            .output()?
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let output = match Command::new("zenity")
-        .args([
-            "--file-selection",
-            "--directory",
-            "--title=Bevy Editor: папка проекта",
-        ])
-        .output()
-    {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Command::new("kdialog")
-            .args(["--getexistingdirectory", "."])
-            .output()?,
-        result => result?,
+    let output = {
+        let mut picker = Command::new("zenity");
+        picker.args(["--file-selection", "--directory"]).arg(format!("--title={prompt}"));
+        if let Some(directory) = directory {
+            let mut filename = std::ffi::OsString::from("--filename=");
+            filename.push(directory);
+            filename.push("/");
+            picker.arg(filename);
+        }
+        match picker.output() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Command::new("kdialog")
+                .arg("--getexistingdirectory")
+                .arg(directory.unwrap_or_else(|| Path::new(".")))
+                .args(["--title", prompt])
+                .output()?,
+            result => result?,
+        }
     };
     if !output.status.success() {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -112,7 +130,7 @@ fn choose_folder() -> io::Result<Option<PathBuf>> {
     Ok((!value.is_empty()).then(|| PathBuf::from(value)))
 }
 
-pub(super) fn reveal(folder: &Path) -> io::Result<()> {
+pub(crate) fn reveal(folder: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = Command::new("/usr/bin/open");
     #[cfg(target_os = "windows")]

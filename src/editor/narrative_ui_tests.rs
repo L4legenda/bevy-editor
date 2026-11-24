@@ -15,6 +15,550 @@ use crate::editor::{
 };
 use bevy::input::ButtonState;
 
+#[test]
+#[ignore = "GPU dialogue condition workflow"]
+fn gpu_narrative_conditions() {
+    use crate::editor::dialogue::conditions::{Catalog, Operator, Rule, Value};
+    use bevy::a11y::AccessibilityNode;
+    let directory =
+        std::env::temp_dir().join(format!("bevy-dialogue-conditions-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let project = crate::project_manager::create_test_project(&directory).unwrap();
+    let root = project.asset_root.clone();
+    let mut linked = Dialogue::new("Маяк".into());
+    let arrival = linked.add(NodeKind::Line, 0);
+    let (mut app, window, surface) = fixture_project(project);
+    let screenshot =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/narrative-qa/conditions");
+    std::fs::create_dir_all(&screenshot).unwrap();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    action(&mut app, NarrativeAction::Create(false));
+    click(&mut app, window, "Переменные диалогов");
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    {
+        let world = app.world_mut();
+        let mut fields = world.query::<(&DraftField, &ComputedNode)>();
+        assert!(!fields.iter(world).any(|(field, node)| {
+            *field == DraftField::Condition(condition_ui::Field::Search) && !node.is_empty()
+        }));
+    }
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variable-create-wide.png"),
+        |_| true,
+    );
+    let submit_position = control_point(&mut app, "Создать");
+    click(&mut app, window, "Тип переменной");
+    assert!(type_menu_visible(&mut app));
+    assert_eq!(control_point(&mut app, "Создать"), submit_position);
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variable-type-dropdown.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Тип переменной");
+    assert!(!type_menu_visible(&mut app));
+    click(&mut app, window, "Тип переменной");
+    click(&mut app, window, "Название переменной");
+    assert!(!type_menu_visible(&mut app));
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    assert!(Catalog::read(&root).unwrap().variables.is_empty());
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    edit_named(&mut app, "Название переменной", "Маяк найден");
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    let catalog = Catalog::read(&root).unwrap();
+    let variable = *catalog.variables.keys().next().unwrap();
+    let search = named_input(&mut app, "Поиск переменных");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(search));
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variables-library-one.png"),
+        |_| true,
+    );
+    let condition = Condition {
+        any: false,
+        rules: vec![Rule {
+            variable,
+            operator: Operator::Eq,
+            value: Value::Flag(true),
+        }],
+    };
+    linked.node_mut(0).unwrap().condition = condition;
+    Content::Dialogue(linked)
+        .save(&root, std::path::Path::new("Маяк.dialog"))
+        .unwrap();
+    click(&mut app, window, "Маяк найден · Нет");
+    edit_named(&mut app, "Название переменной", "Квест «Маяк» завершён");
+    action(&mut app, NarrativeAction::Dismiss);
+    click(&mut app, window, "Продолжить редактирование");
+    click(&mut app, window, "Сохранить переменную");
+    assert_eq!(
+        Catalog::read(&root).unwrap().variables[&variable].name,
+        "Квест «Маяк» завершён"
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    let (line, fallback, jump) = {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        let doc = editor.narrative.current_mut().unwrap();
+        let Content::Dialogue(d) = &mut doc.content else {
+            unreachable!()
+        };
+        let line = d.add(NodeKind::Line, 0);
+        nodes::place(d, line, 0);
+        let fallback = d.add(NodeKind::End, line);
+        nodes::place(d, fallback, line);
+        let jump = d.add(NodeKind::Jump, line);
+        nodes::place(d, jump, line);
+        d.node_mut(jump).unwrap().dialogue = Some("Маяк.dialog".into());
+        d.node_mut(jump).unwrap().otherwise = Some(fallback);
+        d.node_mut(line).unwrap().choices[0].target = Some(jump);
+        (line, fallback, jump)
+    };
+    app.world_mut().resource_mut::<NarrativeUi>().generation += 1;
+    action(&mut app, NarrativeAction::Fit);
+    warm(&mut app, 7);
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::Open(line, None)),
+    );
+    click(&mut app, window, "+ Проверка");
+    click(&mut app, window, "Квест «Маяк» завершён");
+    click(&mut app, window, "Да");
+    click(&mut app, window, "+ Проверка");
+    edit_named(&mut app, "Поиск переменных", "доверие");
+    click(&mut app, window, "Создать переменную");
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "доверие"
+    );
+    edit_named(&mut app, "Название переменной", "Черновик");
+    key(
+        &mut app,
+        window,
+        KeyCode::Escape,
+        bevy::input::keyboard::Key::Escape,
+        None,
+    );
+    let search = named_input(&mut app, "Поиск переменных");
+    assert_eq!(
+        app.world().get::<EditableText>(search).unwrap().value(),
+        "доверие"
+    );
+    click(&mut app, window, "Создать переменную");
+    edit_named(&mut app, "Название переменной", "Доверие");
+    click(&mut app, window, "Тип переменной");
+    key(
+        &mut app,
+        window,
+        KeyCode::Escape,
+        bevy::input::keyboard::Key::Escape,
+        None,
+    );
+    assert!(!type_menu_visible(&mut app));
+    let trigger = app.world().resource::<InputFocus>().get().unwrap();
+    assert_eq!(
+        app.world().get::<AccessibleLabel>(trigger).unwrap().0,
+        "Тип переменной"
+    );
+    let state = app.world().get::<AccessibilityNode>(trigger).unwrap();
+    assert_eq!(state.is_expanded(), Some(false));
+    assert_eq!(state.value(), Some("Флаг (да / нет)"));
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    assert!(type_menu_visible(&mut app));
+    assert_eq!(
+        app.world()
+            .get::<AccessibilityNode>(trigger)
+            .unwrap()
+            .is_expanded(),
+        Some(true)
+    );
+    key(
+        &mut app,
+        window,
+        KeyCode::ArrowDown,
+        bevy::input::keyboard::Key::ArrowDown,
+        None,
+    );
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    assert!(!type_menu_visible(&mut app));
+    edit_named(&mut app, "Значение по умолчанию", "2");
+    choose_variable_type(&mut app, window, "Флаг (да / нет)");
+    choose_variable_type(&mut app, window, "Целое число");
+    let field = named_input(&mut app, "Значение по умолчанию");
+    assert_eq!(app.world().get::<EditableText>(field).unwrap().value(), "2");
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variable-create-in-condition.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Создать и выбрать");
+    assert!(
+        Catalog::read(&root)
+            .unwrap()
+            .variables
+            .values()
+            .any(|v| v.name == "Доверие" && v.default == Value::Number(2))
+    );
+    edit_named(&mut app, "Значение условия", "ошибка");
+    click(&mut app, window, "Применить");
+    assert_eq!(
+        app.world().resource::<NarrativeUi>().picker,
+        Some(Picker::Condition)
+    );
+    edit_named(&mut app, "Значение условия", "2");
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("condition-editor.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Применить");
+    let output = control_point(&mut app, &format!("Связать «Иначе» ноды #{line}"));
+    let input = control_point(&mut app, &format!("Вход ноды #{fallback}"));
+    move_pointer(&mut app, window, output);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, input);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 10);
+    action(&mut app, NarrativeAction::Preview);
+    assert_eq!(
+        app.world().resource::<NarrativeUi>().playing,
+        Some(fallback)
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Connect(line, OTHERWISE, line));
+    action(&mut app, NarrativeAction::Preview);
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_error
+            .as_deref()
+            .is_some_and(|error| error.contains("цикл"))
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Undo);
+    action(&mut app, NarrativeAction::Preview);
+    click(&mut app, window, "+ Тестовые значения");
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::TestFlag(variable)),
+    );
+    action(&mut app, NarrativeAction::Restart);
+    assert_eq!(app.world().resource::<NarrativeUi>().playing, Some(line));
+    action(&mut app, NarrativeAction::Advance(0));
+    let ui = app.world().resource::<NarrativeUi>();
+    assert_eq!(ui.playing, Some(arrival));
+    assert!(ui.preview_dialogue.is_some());
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Undo);
+    action(&mut app, NarrativeAction::Preview);
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::ResetTests),
+    );
+    action(&mut app, NarrativeAction::Restart);
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_error
+            .is_some()
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Undo);
+    action(&mut app, NarrativeAction::Preview);
+    action(&mut app, NarrativeAction::Advance(0));
+    assert_eq!(
+        app.world().resource::<NarrativeUi>().playing,
+        Some(fallback)
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::Open(line, Some(0))),
+    );
+    click(&mut app, window, "+ Проверка");
+    click(&mut app, window, "Квест «Маяк» завершён");
+    click(&mut app, window, "Да");
+    click(&mut app, window, "Применить");
+    action(&mut app, NarrativeAction::Preview);
+    action(&mut app, NarrativeAction::Advance(0));
+    assert_eq!(app.world().resource::<NarrativeUi>().playing, Some(line));
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::TestFlag(variable)),
+    );
+    action(&mut app, NarrativeAction::Restart);
+    action(&mut app, NarrativeAction::Advance(0));
+    assert!(
+        app.world()
+            .resource::<NarrativeUi>()
+            .preview_dialogue
+            .is_some()
+    );
+    action(&mut app, NarrativeAction::Dismiss);
+    action(&mut app, NarrativeAction::Save);
+    let editor = app.world().resource::<Editor>();
+    let doc = editor.narrative.current().unwrap();
+    let Content::Dialogue(saved) = Content::read(&root, &doc.path).unwrap() else {
+        unreachable!()
+    };
+    let choice = &saved.node(line).unwrap().choices[0];
+    assert_eq!(choice.target, Some(jump));
+    assert_eq!(choice.condition.rules[0].variable, variable);
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::Variables),
+    );
+    click(&mut app, window, "Создать переменную");
+    edit_named(&mut app, "Название переменной", "Сигнал получен");
+    click(&mut app, window, "Да");
+    click(&mut app, window, "Создать");
+    move_pointer(&mut app, window, Vec2::new(20., 150.));
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variables-library-wide.png"),
+        |_| true,
+    );
+    resize_qa(&mut app, window, &surface, 440, 720);
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variables-library-narrow.png"),
+        |_| true,
+    );
+    edit_named(&mut app, "Поиск переменных", "Новая цель");
+    click(&mut app, window, "Создать переменную");
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "Новая цель"
+    );
+    edit_named(&mut app, "Название переменной", "Черновик");
+    click(&mut app, window, "Отмена");
+    let search = named_input(&mut app, "Поиск переменных");
+    assert_eq!(
+        app.world().get::<EditableText>(search).unwrap().value(),
+        "Новая цель"
+    );
+    click(&mut app, window, "Очистить поиск переменных");
+    let search = named_input(&mut app, "Поиск переменных");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(search));
+    assert_eq!(app.world().get::<EditableText>(search).unwrap().value(), "");
+    key(
+        &mut app,
+        window,
+        KeyCode::ArrowDown,
+        bevy::input::keyboard::Key::ArrowDown,
+        None,
+    );
+    key(
+        &mut app,
+        window,
+        KeyCode::ArrowDown,
+        bevy::input::keyboard::Key::ArrowDown,
+        None,
+    );
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "Квест «Маяк» завершён"
+    );
+    click(&mut app, window, "Отмена");
+    click(&mut app, window, "Сигнал получен · Да");
+    click(&mut app, window, "Удалить переменную");
+    click(&mut app, window, "Отмена");
+    assert_eq!(Catalog::read(&root).unwrap().variables.len(), 3);
+    click(&mut app, window, "Удалить переменную");
+    click(&mut app, window, "Удалить");
+    assert_eq!(Catalog::read(&root).unwrap().variables.len(), 2);
+    edit_named(&mut app, "Поиск переменных", "доверие");
+    key(
+        &mut app,
+        window,
+        KeyCode::Enter,
+        bevy::input::keyboard::Key::Enter,
+        None,
+    );
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "Доверие"
+    );
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variables-narrow.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Тип переменной");
+    assert!(type_menu_visible(&mut app));
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variable-type-dropdown-narrow.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Флаг (да / нет)");
+    click(&mut app, window, "Сохранить переменную");
+    assert!(
+        Catalog::read(&root)
+            .unwrap()
+            .variables
+            .values()
+            .any(|v| v.name == "Доверие" && v.default == Value::Number(2))
+    );
+    click(&mut app, window, "Изменить тип");
+    assert!(
+        Catalog::read(&root)
+            .unwrap()
+            .variables
+            .values()
+            .any(|v| v.name == "Доверие" && v.default == Value::Flag(false))
+    );
+    click(&mut app, window, "Создать переменную");
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("variable-create-narrow.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Отмена");
+    named_input(&mut app, "Поиск переменных");
+    assert_eq!(Catalog::read(&root).unwrap().variables.len(), 2);
+    action(&mut app, NarrativeAction::Dismiss);
+    resize_qa(&mut app, window, &surface, 700, 800);
+    action(&mut app, NarrativeAction::Fit);
+    action(
+        &mut app,
+        NarrativeAction::Conditions(condition_ui::Edit::Open(line, Some(0))),
+    );
+    capture_when(
+        &mut app,
+        &surface,
+        &screenshot.join("condition-narrow.png"),
+        |_| true,
+    );
+    click(&mut app, window, "Применить");
+}
+
+#[test]
+#[ignore = "GPU variable library scrolling and keyboard focus"]
+fn gpu_narrative_conditions_library_scroll() {
+    use crate::editor::dialogue::conditions::{Catalog, Value, Variable};
+    use bevy::input::keyboard::Key;
+
+    let directory =
+        std::env::temp_dir().join(format!("bevy-variable-library-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let project = crate::project_manager::create_test_project(&directory).unwrap();
+    let mut catalog = Catalog::default();
+    for id in 1..=18 {
+        catalog.variables.insert(
+            id,
+            Variable {
+                name: format!("Сигнал {id:02}"),
+                default: Value::Flag(false),
+            },
+        );
+    }
+    catalog.save(&project.asset_root).unwrap();
+    let (mut app, window, target) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    action(&mut app, NarrativeAction::Create(false));
+    click(&mut app, window, "Переменные диалогов");
+    resize_qa(&mut app, window, &target, 410, 650);
+    key(
+        &mut app,
+        window,
+        KeyCode::KeyZ,
+        Key::Character("z".into()),
+        Some("z"),
+    );
+    let search = named_input(&mut app, "Поиск переменных");
+    assert_eq!(
+        app.world().get::<EditableText>(search).unwrap().value(),
+        "z"
+    );
+    click(&mut app, window, "Очистить поиск переменных");
+    for _ in 0..15 {
+        key(&mut app, window, KeyCode::ArrowDown, Key::ArrowDown, None);
+    }
+    key(&mut app, window, KeyCode::Enter, Key::Enter, None);
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "Сигнал 15"
+    );
+    click(&mut app, window, "Отмена");
+    // A mouse click must reach the previously visited row after returning to a long list.
+    click(&mut app, window, "Сигнал 15 · Нет");
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        "Сигнал 15"
+    );
+    let renamed = "Ядро исследовательской станции переведено в резервный режим";
+    let minimum = i64::MIN.to_string();
+    edit_named(&mut app, "Название переменной", renamed);
+    choose_variable_type(&mut app, window, "Целое число");
+    edit_named(&mut app, "Значение по умолчанию", &minimum);
+    click(&mut app, window, "Сохранить переменную");
+    click(&mut app, window, "Изменить тип");
+    click(&mut app, window, &format!("{renamed} · {minimum}"));
+    let field = named_input(&mut app, "Название переменной");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        renamed
+    );
+    let field = named_input(&mut app, "Значение по умолчанию");
+    assert_eq!(
+        app.world().get::<EditableText>(field).unwrap().value(),
+        minimum.as_str()
+    );
+}
+
 fn warm(app: &mut App, n: usize) {
     for _ in 0..n {
         frame(app);
@@ -41,6 +585,19 @@ fn click(app: &mut App, window: Entity, label: &str) {
     mouse(app, window, ButtonState::Pressed);
     mouse(app, window, ButtonState::Released);
     warm(app, 4);
+}
+
+fn type_menu_visible(app: &mut App) -> bool {
+    let world = app.world_mut();
+    world
+        .query_filtered::<&ComputedNode, With<condition_ui::TypeMenu>>()
+        .iter(world)
+        .any(|node| !node.is_empty())
+}
+
+fn choose_variable_type(app: &mut App, window: Entity, label: &str) {
+    click(app, window, "Тип переменной");
+    click(app, window, label);
 }
 
 fn right_click(app: &mut App, window: Entity, label: &str) {

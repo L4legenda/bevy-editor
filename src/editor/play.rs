@@ -71,8 +71,10 @@ pub(super) fn snapshot(editor: &Editor) -> GameLaunch {
     .map(|camera| camera.id.clone())
     .unwrap_or_default();
     GameLaunch {
+        scene: None,
         asset_root: editor.root.clone(),
         level: GameLevel {
+            uid: definition.uid.clone(),
             title: format!(
                 "{} · {}",
                 editor.project.title,
@@ -122,7 +124,18 @@ pub(super) fn start(editor: &mut Editor) -> io::Result<()> {
     if editor.play.running() {
         return Ok(());
     }
-    let launch = snapshot(editor);
+    let mut launch = snapshot(editor);
+    if editor.definition().is_native() {
+        let path = editor.root.join(&editor.definition().file);
+        let previous = fs::read(path)?;
+        let index = crate::asset_registry::index(&editor.root)?;
+        let bytes = crate::scene_io::encode_indexed(&editor.edits, Some(&previous), Some(&index))?;
+        launch.scene =
+            Some(bevy_scene_format::Scene::from_slice(&bytes).map_err(io::Error::other)?);
+    }
+    if editor.definition().play.is_some() {
+        crate::hdri::export_preset(&editor.root, launch.level.edits.lighting.as_ref())?;
+    }
     let (files, log) = write_snapshot(&launch)?;
     let mut command = if let Some(play) = &editor.definition().play {
         play.command()?

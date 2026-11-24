@@ -4,6 +4,8 @@ use super::*;
 mod answers;
 #[path = "narrative_character.rs"]
 mod character_sheet;
+#[path = "narrative_conditions.rs"]
+mod condition_ui;
 #[path = "narrative_connections.rs"]
 mod connection_paint;
 #[path = "narrative_drag.rs"]
@@ -108,6 +110,7 @@ pub(in crate::editor) enum NarrativeAction {
     Restart,
     Dismiss,
     EditText,
+    Conditions(condition_ui::Edit),
     Text(text_editor::TextAction),
 }
 
@@ -119,6 +122,7 @@ enum DraftField {
     Description,
     PortraitLabel(usize),
     Search,
+    Condition(condition_ui::Field),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +132,8 @@ enum Picker {
     Portrait,
     Target,
     Dialogue,
+    Condition,
+    Variables,
     Text,
 }
 
@@ -159,6 +165,8 @@ pub(in crate::editor) struct NarrativeUi {
     playing: Option<u32>,
     preview_dialogue: Option<(String, Dialogue)>,
     preview_error: Option<String>,
+    conditions: condition_ui::State,
+    preview_values: std::collections::BTreeMap<u64, crate::editor::dialogue::conditions::Value>,
     preview: bool,
     jump_click: Option<(usize, u32, f64, Vec2)>,
     drag_node: Option<u32>,
@@ -213,6 +221,7 @@ impl Plugin for NarrativePlugin {
             Update,
             (
                 edit_fields,
+                condition_ui::keyboard,
                 speaker_menu::input,
                 answers::reordering::input,
                 links::input,
@@ -241,6 +250,20 @@ impl Plugin for NarrativePlugin {
         )
         .add_systems(Update, refresh.after(super::refresh))
         .add_systems(Update, effects::animate.after(refresh))
+        .add_systems(
+            Update,
+            (
+                condition_ui::filter_results,
+                condition_ui::refresh_status,
+                condition_ui::field_borders,
+                condition_ui::update_type_menu,
+            )
+                .after(refresh),
+        )
+        .add_systems(
+            PostUpdate,
+            condition_ui::reveal_result.after(bevy::ui::UiSystems::Layout),
+        )
         .add_systems(Update, speaker_menu::refresh.after(refresh))
         .add_systems(Update, picker_fx::animate.after(speaker_menu::refresh))
         .add_systems(
@@ -458,6 +481,8 @@ pub(super) fn setup(
         playing: None,
         preview_dialogue: None,
         preview_error: None,
+        conditions: condition_ui::State::default(),
+        preview_values: Default::default(),
         preview: false,
         jump_click: None,
         drag_node: None,
@@ -590,6 +615,12 @@ fn edit_fields(
     }
     for (entity, kind, text, owner) in &fields {
         let value = text.value().to_string();
+        if let DraftField::Condition(field) = *kind {
+            if focus.get() == Some(entity) {
+                ui.conditions.input(field, value);
+            }
+            continue;
+        }
         if *kind == DraftField::Search {
             if focus.get() == Some(entity) {
                 ui.search = value;
@@ -787,6 +818,29 @@ fn actions(
         if editor.browser_popup && !matches!(action, NarrativeAction::Create(_)) {
             continue;
         }
+        if matches!(ui.picker, Some(Picker::Variables | Picker::Condition))
+            && matches!(action, NarrativeAction::Dismiss)
+        {
+            condition_ui::handle(&mut editor, &mut ui, condition_ui::Edit::Close);
+            continue;
+        }
+        if ui.picker == Some(Picker::Variables)
+            && matches!(
+                action,
+                NarrativeAction::Open(_)
+                    | NarrativeAction::File(_)
+                    | NarrativeAction::Close(_)
+                    | NarrativeAction::CloseCurrent
+            )
+        {
+            ui.conditions.exit = Some(action);
+            condition_ui::handle(&mut editor, &mut ui, condition_ui::Edit::Leave);
+            continue;
+        }
+        if let NarrativeAction::Conditions(edit) = action {
+            condition_ui::handle(&mut editor, &mut ui, edit);
+            continue;
+        }
         if (ui.preview || ui.picker.is_some())
             && !matches!(
                 action,
@@ -824,6 +878,7 @@ fn actions(
             action,
             NarrativeAction::Preview | NarrativeAction::Restart | NarrativeAction::Advance(_)
         ) {
+            ui.conditions.load(&editor.root);
             if let Some(doc) = editor.narrative.current() {
                 play(&editor, doc, &mut ui, action);
             }
@@ -1145,10 +1200,7 @@ fn actions(
                                     {
                                         c.target = target;
                                     }
-                                    if let Some(c) = n.choices.get_mut(choice) {
-                                        c.target = Some(id);
-                                        c.dialogue = None;
-                                    }
+                                    n.set_output(choice, Some(id));
                                 }
                             }
                             nodes::place(d, id, from);
@@ -1193,7 +1245,7 @@ fn actions(
                             ui.linking = None;
                         }
                         if let NarrativeAction::Disconnect(i) = action {
-                            if !matches!(&doc.content, Content::Dialogue(d) if d.node(doc.selected).and_then(|n| n.choices.get(i)).is_some_and(Choice::connected))
+                            if !matches!(&doc.content, Content::Dialogue(d) if d.node(doc.selected).is_some_and(|n| n.output_connected(i)))
                             {
                                 continue;
                             }
@@ -1206,6 +1258,7 @@ fn actions(
                                         n.choices.push(Choice {
                                             text: format!("Ответ {}", n.choices.len() + 1),
                                             target: None,
+                                            condition: Default::default(),
                                             dialogue: None,
                                         });
                                         effects.answers.add(doc.id, n, time.elapsed_secs_f64());
@@ -1220,10 +1273,7 @@ fn actions(
                                         n.choices.remove(i);
                                     }
                                     NarrativeAction::Disconnect(i) => {
-                                        if let Some(c) = n.choices.get_mut(i) {
-                                            c.target = None;
-                                            c.dialogue = None;
-                                        }
+                                        n.set_output(i, None);
                                     }
                                     _ => {}
                                 }
@@ -1243,6 +1293,7 @@ fn actions(
                                 let path = file.path.to_string_lossy().replace('\\', "/");
                                 if !c.portraits.iter().any(|p| p.path == path) {
                                     c.portraits.push(Portrait {
+                                        uid: None,
                                         label: file
                                             .path
                                             .file_stem()
@@ -1284,90 +1335,156 @@ fn play(editor: &Editor, doc: &Document, ui: &mut NarrativeUi, action: Narrative
     let Content::Dialogue(origin) = &doc.content else {
         return;
     };
-    if !ui.preview && matches!(action, NarrativeAction::Advance(_)) {
-        return;
-    }
-    ui.preview_error = None;
-    let mut next = if let NarrativeAction::Advance(index) = action {
-        let dialogue = ui.preview_dialogue.as_ref().map_or(origin, |(_, d)| d);
-        ui.playing
-            .and_then(|id| dialogue.node(id))
+    let mut next;
+    if let NarrativeAction::Advance(index) = action {
+        if !ui.preview {
+            return;
+        }
+        let d = ui.preview_dialogue.as_ref().map_or(origin, |(_, d)| d);
+        let Some(choice) = ui
+            .playing
+            .and_then(|id| d.node(id))
+            .filter(|n| n.kind == NodeKind::Line)
             .and_then(|n| n.choices.get(index))
-            .cloned()
+            .filter(|c| c.condition.allows(&ui.preview_values))
+        else {
+            return;
+        };
+        next = choice.clone();
     } else {
         ui.preview = true;
+        ui.conditions.invalid_test = ui.conditions.invalid_tests();
+        if let Some(id) = ui.conditions.invalid_test {
+            ui.conditions.reveal_invalid_test(id);
+            return;
+        }
         ui.picker = None;
         ui.linking = None;
         ui.preview_dialogue = None;
-        ui.playing = start_node(origin);
-        ui.playing
-            .and_then(|id| origin.node(id))
-            .and_then(|n| n.choices.first())
-            .cloned()
-    };
-    // Only automatic start transitions are guarded. Player choices may loop freely.
+        ui.preview_values = ui.conditions.values();
+        ui.playing = None;
+        ui.preview_error = None;
+        let Some(start) = start_node(origin).and_then(|id| origin.node(id)) else {
+            return;
+        };
+        if !start.condition.allows(&ui.preview_values) {
+            ui.preview_error = Some("Условие запуска диалога не выполнено".into());
+            return;
+        }
+        ui.playing = Some(start.id);
+        let Some(choice) = start.choices.first() else {
+            return;
+        };
+        next = choice.clone();
+    }
+    ui.preview_error = None;
     let mut visited = std::collections::HashSet::new();
-    while let Some(choice) = next.take() {
-        if let Some(path) = choice.dialogue {
-            let result = crate::asset_paths::resolve_asset_path(&editor.root, &path)
-                .map_err(|e| e.to_string())
-                .and_then(|resolved| {
-                    let content = editor
-                        .narrative
-                        .tabs
-                        .iter()
-                        .find(|tab| same_asset_path(&tab.path.to_string_lossy(), &resolved))
-                        .map(|tab| Ok(tab.content.clone()))
-                        .unwrap_or_else(|| {
-                            Content::read(&editor.root, std::path::Path::new(&resolved))
-                        })?;
-                    match content {
-                        Content::Dialogue(d) => Ok((resolved, d)),
-                        _ => Err("Ожидается файл .dialog".to_owned()),
-                    }
-                });
-            match result {
+    loop {
+        if let Some(path) = next.dialogue {
+            match load_preview_dialogue(editor, &path) {
                 Ok((resolved, dialogue)) => {
-                    ui.playing = start_node(&dialogue);
-                    ui.preview_dialogue = Some((resolved, dialogue));
+                    let Some(start) = start_node(&dialogue).and_then(|id| dialogue.node(id)) else {
+                        break;
+                    };
+                    if start.condition.allows(&ui.preview_values) {
+                        ui.playing = Some(start.id);
+                        ui.preview_dialogue = Some((resolved, dialogue));
+                    } else {
+                        let source = ui.preview_dialogue.as_ref().map_or(origin, |(_, d)| d);
+                        if let Some(target) = ui
+                            .playing
+                            .and_then(|id| source.node(id))
+                            .and_then(|n| n.otherwise)
+                        {
+                            next = preview_transition(Some(target), None);
+                            continue;
+                        }
+                        ui.playing = None;
+                        ui.preview_error = Some(format!(
+                            "«{}»: условие запуска не выполнено. Подключите «Иначе».",
+                            dialogue.title
+                        ));
+                        break;
+                    }
                 }
                 Err(error) => {
                     ui.preview_error = Some(format!("Не удалось открыть «{path}»: {error}"));
                     break;
                 }
             }
-        } else if let Some(target) = choice.target {
+        } else if let Some(target) = next.target {
             ui.playing = Some(target);
         } else {
             break;
         }
         let (path, dialogue) = ui.preview_dialogue.as_ref().map_or_else(
-            || (doc.path.to_string_lossy().into_owned(), origin),
+            || (doc.path.to_string_lossy().replace('\\', "/"), origin),
             |(path, d)| (path.clone(), d),
         );
         let Some(node) = ui.playing.and_then(|id| dialogue.node(id)) else {
             break;
         };
-        if !matches!(node.kind, NodeKind::Start | NodeKind::Jump) {
+        let hidden = node.kind == NodeKind::Line && !node.condition.allows(&ui.preview_values);
+        let automatic = node.kind == NodeKind::Line
+            && node.speaker.is_none()
+            && node.text.is_empty()
+            && matches!(node.choices.as_slice(), [choice] if choice.text.is_empty() && choice.condition.is_empty());
+        if !hidden && !automatic && !matches!(node.kind, NodeKind::Start | NodeKind::Jump) {
             break;
         }
         if !visited.insert((path, node.id)) || visited.len() > 128 {
-            ui.preview_error =
-                Some("Проверьте цепочку автоматических переходов между диалогами".into());
+            ui.playing = None;
+            ui.preview_error = Some("Обнаружен цикл автоматических переходов".into());
             break;
         }
-        next = if node.kind == NodeKind::Jump {
-            if node.dialogue.is_none() {
-                ui.preview_error = Some("Выберите файл в ноде перехода".into());
+        if hidden {
+            if node.otherwise.is_none() {
+                ui.playing = None;
+                ui.preview_error = Some(format!(
+                    "Реплика #{} скрыта: подключите выход «Иначе».",
+                    node.id
+                ));
+                break;
             }
-            node.dialogue.clone().map(|path| Choice {
-                text: String::new(),
-                target: None,
-                dialogue: Some(path),
-            })
+            next = preview_transition(node.otherwise, None);
+        } else if node.kind == NodeKind::Jump {
+            if node.dialogue.is_none() {
+                ui.playing = None;
+                ui.preview_error = Some("Выберите файл в ноде перехода".into());
+                break;
+            }
+            next = preview_transition(None, node.dialogue.clone());
         } else {
-            node.choices.first().cloned()
-        };
+            let Some(choice) = node.choices.first() else {
+                break;
+            };
+            next = choice.clone();
+        }
+    }
+}
+
+fn preview_transition(target: Option<u32>, dialogue: Option<String>) -> Choice {
+    Choice {
+        text: String::new(),
+        condition: Condition::default(),
+        target,
+        dialogue,
+    }
+}
+
+fn load_preview_dialogue(editor: &Editor, path: &str) -> Result<(String, Dialogue), String> {
+    let resolved =
+        crate::asset_paths::resolve_asset_path(&editor.root, path).map_err(|e| e.to_string())?;
+    let content = editor
+        .narrative
+        .tabs
+        .iter()
+        .find(|tab| same_asset_path(&tab.path.to_string_lossy(), &resolved))
+        .map(|tab| Ok(tab.content.clone()))
+        .unwrap_or_else(|| Content::read(&editor.root, std::path::Path::new(&resolved)))?;
+    match content {
+        Content::Dialogue(d) => Ok((resolved, d)),
+        _ => Err("Ожидается файл .dialog".into()),
     }
 }
 
@@ -1734,10 +1851,11 @@ fn graph(
     server: &AssetServer,
     scroll: Vec2,
     answers: &answers::State,
+    catalog: &crate::editor::dialogue::conditions::Catalog,
 ) {
     match &doc.content {
         Content::Dialogue(d) => nodes::spawn(
-            commands, parent, handle, editor, doc, d, linking, server, answers,
+            commands, parent, handle, editor, doc, d, linking, server, answers, catalog,
         ),
         Content::Character(c) => {
             character_sheet::spawn(commands, parent, handle, editor, doc, c, server, scroll)
@@ -1764,33 +1882,53 @@ fn modal(
             ..row(12.0)
         },
     );
-    text(
-        commands,
-        header,
-        handle,
-        if ui.preview {
+    let close = if let Some(title) = ui.conditions.variable_title(ui.picker) {
+        let heading = wrapped(commands, header, handle, title, 22., TEXT);
+        commands
+            .entity(heading)
+            .entry::<TextFont>()
+            .and_modify(|mut font| font.weight = bevy::text::FontWeight::SEMIBOLD);
+        let close = icons::button(
+            commands,
+            header,
+            icons::Glyph::Close,
+            "Закрыть · Esc",
+            Action::Narrative(NarrativeAction::Dismiss),
+            Look::Regular,
+        );
+        commands
+            .entity(close)
+            .insert(control_hints::Help("Закрыть окно (Esc)".into()));
+        close
+    } else {
+        let caption = if ui.preview {
             "ПРЕДПРОСМОТР ДИАЛОГА"
+        } else if ui.picker == Some(Picker::Condition) {
+            "УСЛОВИЕ"
         } else if ui.picker == Some(Picker::Portrait) {
             "ПОРТРЕТ ПЕРСОНАЖА"
         } else {
             "ВЫБОР РЕСУРСА"
-        },
-        11.0,
-        FOCUS,
-    );
-    let close = act(
-        commands,
-        header,
-        handle,
-        "Закрыть · Esc",
-        NarrativeAction::Dismiss,
-        false,
-    );
+        };
+        text(commands, header, handle, caption, 11., FOCUS);
+        act(
+            commands,
+            header,
+            handle,
+            "Закрыть · Esc",
+            NarrativeAction::Dismiss,
+            false,
+        )
+    };
     commands.queue(move |world: &mut World| {
         world
             .resource_mut::<InputFocus>()
             .set(close, bevy::input_focus::FocusCause::Auto);
     });
+    if matches!(ui.picker, Some(Picker::Condition | Picker::Variables)) {
+        condition_ui::panel(commands, parent, handle, ui);
+        return;
+    }
     if ui.preview {
         let Content::Dialogue(d) = &doc.content else {
             return;
@@ -1804,6 +1942,15 @@ fn modal(
             wrapped(commands, parent, handle, error, 14.0, AMBER);
         }
         let Some(n) = ui.playing.and_then(|id| d.node(id)) else {
+            condition_ui::preview(commands, parent, handle, &ui.conditions);
+            act(
+                commands,
+                parent,
+                handle,
+                "Начать заново",
+                NarrativeAction::Restart,
+                false,
+            );
             return;
         };
         if let Some(c) = n.speaker.as_ref().and_then(|p| character(editor, p)) {
@@ -1843,7 +1990,12 @@ fn modal(
                 &n.text_spans,
             );
         }
+        let mut visible = 0;
         for (i, c) in n.choices.iter().enumerate() {
+            if !c.condition.allows(&ui.preview_values) {
+                continue;
+            }
+            visible += 1;
             if c.connected() {
                 let well = surface(
                     commands,
@@ -1885,6 +2037,17 @@ fn modal(
                 );
             }
         }
+        if visible == 0 && !n.choices.is_empty() {
+            wrapped(
+                commands,
+                parent,
+                handle,
+                "Нет доступных ответов: условия скрыли все варианты.",
+                13.,
+                AMBER,
+            );
+        }
+        condition_ui::preview(commands, parent, handle, &ui.conditions);
         act(
             commands,
             parent,
@@ -1928,7 +2091,7 @@ fn modal(
             );
             commands.entity(list).insert((Scroller, ResourceResults));
         }
-        Some(Picker::Portrait | Picker::Dialogue) => {}
+        Some(Picker::Portrait | Picker::Dialogue | Picker::Condition | Picker::Variables) => {}
         Some(Picker::Target) => {
             text(commands, parent, handle, "Куда ведёт ответ?", 23.0, TEXT);
             if let Content::Dialogue(d) = &doc.content {
@@ -2020,7 +2183,12 @@ fn refresh(
     character_stages: Query<(&character_sheet::Stage, &ScrollPosition)>,
     link_state: Res<links::State>,
     text_state: Res<text_editor::State>,
-    effects: Res<effects::State>,
+    (effects, anchors, layout, drawer): (
+        Res<effects::State>,
+        Query<(Entity, &condition_ui::Anchor)>,
+        Query<(&ComputedNode, &UiGlobalTransform)>,
+        Res<DrawerMotion>,
+    ),
 ) {
     if let Ok(mut n) = nodes.get_mut(ui.root) {
         n.display = if editor.narrative.active.is_some() {
@@ -2084,6 +2252,14 @@ fn refresh(
                 &ui.font,
                 "+ Другой диалог",
                 NarrativeAction::Add(NodeKind::Jump),
+                false,
+            );
+            act(
+                &mut commands,
+                ui.toolbar,
+                &ui.font,
+                "Переменные диалогов",
+                NarrativeAction::Conditions(condition_ui::Edit::Variables),
                 false,
             );
             for (label, delta) in [("−", -0.1), ("+", 0.1)] {
@@ -2150,6 +2326,7 @@ fn refresh(
         );
     }
     // Editable cards remain alive while typing or navigating the canvas.
+    ui.conditions.load(&editor.root);
     let graph_key = if is_dialog {
         format!("{}:{}", doc.id, ui.generation)
     } else {
@@ -2171,6 +2348,7 @@ fn refresh(
                 .copied()
                 .unwrap_or_default(),
             &effects.answers,
+            &ui.conditions.catalog,
         );
     }
     let wire_key = if let Content::Dialogue(d) = &doc.content {
@@ -2186,7 +2364,7 @@ fn refresh(
                     n.id,
                     n.kind,
                     n.position,
-                    n.choices.iter().map(|c| c.target).collect::<Vec<_>>()
+                    n.output_targets().collect::<Vec<_>>()
                 ))
                 .collect::<Vec<_>>(),
             link_state
@@ -2224,25 +2402,132 @@ fn refresh(
             }
         }
     }
-    let modal_key = format!(
-        "{:?}:{}:{:?}:{:?}:{:?}:{:?}:{}",
+    let narrow = layout
+        .get(ui.root)
+        .is_ok_and(|(node, _)| node.size().x * node.inverse_scale_factor() < 760.);
+    let modal_key = if ui.picker == Some(Picker::Variables) {
+        format!("variables:{}", ui.conditions.revision)
+    } else {
+        format!(
+            "{:?}:{}:{:?}:{:?}:{:?}:{:?}:{}:{}:{narrow}",
+            ui.picker,
+            ui.preview,
+            ui.playing,
+            ui.preview_dialogue
+                .as_ref()
+                .filter(|_| ui.preview)
+                .map(|(path, _)| path),
+            ui.preview_error,
+            doc.content,
+            browser.scan_revision,
+            ui.conditions.revision,
+        )
+    };
+    let variable_sheet = ui.conditions.variable_title(ui.picker).is_some();
+    let anchored = ui.picker == Some(Picker::Condition);
+    let shown = matches!(
         ui.picker,
-        ui.preview,
-        ui.playing,
-        ui.preview_dialogue
-            .as_ref()
-            .filter(|_| ui.preview)
-            .map(|(path, _)| path),
-        ui.preview_error,
-        doc.content,
-        browser.scan_revision
-    );
-    let shown = matches!(ui.picker, Some(Picker::Image | Picker::Target)) || ui.preview;
+        Some(Picker::Image | Picker::Target | Picker::Condition | Picker::Variables)
+    ) || ui.preview;
+    let anchor = ui.conditions.anchor.and_then(|key| {
+        anchors
+            .iter()
+            .find(|(_, a)| (a.0, a.1) == key)
+            .map(|(entity, _)| entity)
+    });
+    let placement = if anchored {
+        anchor.and_then(|entity| {
+            let (size, at) = layout.get(entity).ok()?;
+            let (root, origin) = layout.get(ui.root).ok()?;
+            let scale = root.inverse_scale_factor();
+            let point = (at.translation - origin.translation + root.size() * 0.5) * scale;
+            let full = root.size() * scale;
+            let usable = (full.y - drawer.visible_height).max(150.);
+            let width = (full.x - 16.).clamp(150., 510.);
+            let half = size.size().y * at.affine().matrix2.y_axis.length() * scale * 0.5;
+            let below = point.y + half + 6.;
+            let above = point.y - half - 6.;
+            let below_room = usable - below - 8.;
+            let above_room = above - 8.;
+            let (top, bottom, height) = if below_room >= 405. || below_room >= above_room {
+                (px(below), Val::Auto, below_room.clamp(90., 405.))
+            } else {
+                (Val::Auto, px(full.y - above), above_room.clamp(90., 405.))
+            };
+            Some((
+                point.x.clamp(8., (full.x - width - 8.).max(8.)),
+                top,
+                bottom,
+                width,
+                height,
+            ))
+        })
+    } else {
+        None
+    };
+    if let Ok(mut panel) = nodes.get_mut(ui.modal) {
+        let mut next = panel.clone();
+        next.position_type = if placement.is_some() {
+            PositionType::Absolute
+        } else {
+            PositionType::Relative
+        };
+        let width = if variable_sheet { 548. } else { 600. };
+        let (left, top, bottom, width, height) =
+            placement.unwrap_or((0., Val::Auto, Val::Auto, width, 0.));
+        next.padding = UiRect::all(px(if anchored || narrow {
+            16.
+        } else if variable_sheet {
+            22.
+        } else {
+            26.
+        }));
+        next.max_width = percent(if variable_sheet { 94 } else { 90 });
+        next.left = px(left);
+        next.top = top;
+        next.bottom = bottom;
+        next.width = px(width);
+        next.max_height = if placement.is_some() {
+            px(height)
+        } else {
+            percent(90)
+        };
+        panel.set_if_neq(next);
+    }
     if let Ok(mut n) = nodes.get_mut(ui.overlay) {
         n.display = if shown { Display::Flex } else { Display::None };
     }
     let modal_rebuilt = shown && ui.modal_key != modal_key;
     if modal_rebuilt {
+        commands
+            .entity(ui.overlay)
+            .insert(BackgroundColor(if anchored {
+                Color::NONE
+            } else if variable_sheet {
+                Color::srgba(0.015, 0.019, 0.032, 0.74)
+            } else {
+                Color::srgba(0.015, 0.019, 0.032, 0.86)
+            }));
+        commands
+            .entity(ui.modal)
+            .insert(BorderColor::all(if variable_sheet {
+                EDGE
+            } else {
+                FOCUS.with_alpha(0.45)
+            }));
+        if variable_sheet {
+            commands
+                .entity(ui.modal)
+                .insert(BoxShadow(vec![ShadowStyle {
+                    color: Color::BLACK.with_alpha(0.38),
+                    x_offset: px(0),
+                    y_offset: px(8),
+                    blur_radius: px(24),
+                    spread_radius: px(0),
+                }]));
+        } else {
+            commands.entity(ui.modal).remove::<BoxShadow>();
+        }
         ui.image_key.clear();
         ui.modal_key = modal_key;
         commands.entity(ui.modal).despawn_related::<Children>();
@@ -2256,6 +2541,7 @@ fn refresh(
             &server,
             &text_state,
         );
+        ui.conditions.focus = None;
     }
     if ui.picker == Some(Picker::Image) && !modal_rebuilt {
         let key = format!("{}:{}", ui.search, browser.scan_revision);
