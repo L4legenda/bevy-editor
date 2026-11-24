@@ -31,6 +31,7 @@ pub enum Control {
     /// Ramp over `fadeSteps` spacing steps (from full to the minimum).
     Fade,
     PenPressure,
+    InversePenPressure,
     PenTilt,
     StylusWheel,
     /// Barrel rotation of the stylus.
@@ -582,6 +583,9 @@ pub struct BrushSettings {
     pub mode: BlendMode,
     // --- Brush Tip Shape ---
     pub tip: TipShape,
+    /// Measured coverage across and along a stroke, sampled in path coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stroke_sample: Option<GrayTile>,
     /// Degrees, counter-clockwise.
     pub angle: f32,
     /// 0..1 (1 = circle).
@@ -640,6 +644,7 @@ impl Default for BrushSettings {
             behind: false,
             mode: BlendMode::Normal,
             tip: TipShape::Round,
+            stroke_sample: None,
             angle: 0.0,
             roundness: 1.0,
             flip_x: false,

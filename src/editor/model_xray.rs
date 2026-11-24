@@ -1,5 +1,6 @@
 //! View-only materials: original GLTF materials remain shared with the scene.
 use super::super::paint::{PaintState, bake, engine::Runtime, sets::SetPart};
+use super::super::shading::{Mode, Shading};
 use super::*;
 use bevy::asset::AssetId;
 
@@ -8,9 +9,10 @@ pub(in crate::editor) struct SourceMaterial(pub Handle<StandardMaterial>);
 
 #[derive(Resource, Default)]
 pub(in crate::editor) struct Materials {
-    transparent: HashMap<AssetId<StandardMaterial>, Handle<StandardMaterial>>,
     channels: HashMap<AssetId<Image>, Handle<StandardMaterial>>,
     bake_map: bake::view3d::Overlay,
+    variants: HashMap<(AssetId<StandardMaterial>, bool, bool), Handle<StandardMaterial>>,
+    solid: Option<Handle<StandardMaterial>>,
 }
 
 pub(in crate::editor::ui::model_viewer) fn sync(
@@ -19,19 +21,31 @@ pub(in crate::editor::ui::model_viewer) fn sync(
     paint: Option<Res<Runtime>>,
     paint_state: Option<Res<PaintState>>,
     baked: Option<Res<bake::State>>,
+    shading: Res<Shading>,
     mut cache: ResMut<Materials>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut meshes: Query<(
+    meshes: Res<Assets<Mesh>>,
+    mut changes: MessageReader<AssetEvent<StandardMaterial>>,
+    mut surfaces: Query<(
         &SourceMaterial,
+        &Mesh3d,
         Option<&SetPart>,
         &mut MeshMaterial3d<StandardMaterial>,
+        &mut RenderLayers,
     )>,
 ) {
+    for event in changes.read() {
+        if let AssetEvent::Modified { id } = event {
+            cache.variants.retain(|(source, _, _), _| source != id);
+        }
+    }
     let mut used = std::collections::HashSet::new();
     let mut shown_channels = std::collections::HashSet::new();
+    let editing_mode = state.mode(editor.viewing_model);
+    let (mode, _) = shading.viewport(editing_mode);
     let paint_model = editor
         .viewing_model
-        .filter(|&index| state.mode(Some(index)) == Mode::Paint);
+        .filter(|_| editing_mode == crate::editor::model_document::Mode::Paint);
     let map = (|| {
         if editor.viewing_image.is_some() {
             return None;
@@ -50,7 +64,19 @@ pub(in crate::editor::ui::model_viewer) fn sync(
     }
     let channel = paint_model.filter(|_| editor.viewing_image.is_none())
         .and_then(|index| Some((index, paint_state.as_deref()?.view_channel(index)?)));
-    for (source, part, mut displayed) in &mut meshes {
+    for (source, mesh, part, mut displayed, mut layers) in &mut surfaces {
+        let wire_only = mode == Mode::Wire
+            && meshes.get(&mesh.0).is_some_and(|mesh| {
+                matches!(
+                    mesh.primitive_topology(),
+                    PrimitiveTopology::TriangleList | PrimitiveTopology::TriangleStrip
+                )
+            });
+        layers.set_if_neq(if wire_only {
+            RenderLayers::none()
+        } else {
+            RenderLayers::layer(LAYER)
+        });
         if let Some((key, handle)) = &map
             && part.is_some_and(|part| (part.0, part.1) == *key)
         {
@@ -81,33 +107,53 @@ pub(in crate::editor::ui::model_viewer) fn sync(
             }
             continue;
         }
-        let source = paint_model
-            .zip(part)
-            .and_then(|(index, part)| paint.as_ref()?.working_material(index, part.0, part.1))
-            .unwrap_or(&source.0);
-        let handle = if state.xray {
-            let id = source.id();
-            used.insert(id);
-            if !cache.transparent.contains_key(&id) {
-                let Some(mut material) = materials.get(source).cloned() else {
+        let source = if mode == Mode::Solid {
+            cache
+                .solid
+                .get_or_insert_with(|| {
+                    materials.add(StandardMaterial {
+                        base_color: Color::srgb(0.62, 0.63, 0.66),
+                        perceptual_roughness: 0.82,
+                        double_sided: true,
+                        cull_mode: None,
+                        ..default()
+                    })
+                })
+                .clone()
+        } else {
+            paint_model
+                .zip(part)
+                .and_then(|(index, part)| paint.as_ref()?.working_material(index, part.0, part.1))
+                .unwrap_or(&source.0)
+                .clone()
+        };
+        let unlit = mode == Mode::Material;
+        let handle = if unlit || state.xray {
+            let key = (source.id(), unlit, state.xray);
+            used.insert(key);
+            if !cache.variants.contains_key(&key) {
+                let Some(mut material) = materials.get(&source).cloned() else {
                     continue;
                 };
-                material.base_color = material
-                    .base_color
-                    .with_alpha(material.base_color.alpha() * 0.22);
-                material.alpha_mode = AlphaMode::Blend;
-                material.double_sided = true;
-                material.cull_mode = None;
-                cache.transparent.insert(id, materials.add(material));
+                material.unlit |= unlit;
+                if state.xray {
+                    material.base_color = material
+                        .base_color
+                        .with_alpha(material.base_color.alpha() * 0.22);
+                    material.alpha_mode = AlphaMode::Blend;
+                    material.double_sided = true;
+                    material.cull_mode = None;
+                }
+                cache.variants.insert(key, materials.add(material));
             }
-            cache.transparent[&id].clone()
+            cache.variants[&key].clone()
         } else {
-            source.clone()
+            source
         };
         if displayed.0 != handle {
             displayed.0 = handle;
         }
     }
-    cache.transparent.retain(|id, _| used.contains(id));
     cache.channels.retain(|id, _| shown_channels.contains(id));
+    cache.variants.retain(|key, _| used.contains(key));
 }

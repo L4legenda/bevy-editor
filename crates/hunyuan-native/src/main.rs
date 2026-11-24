@@ -44,6 +44,7 @@ struct Request {
 struct Model {
     weights: tensor::Weights,
     device: Device,
+    device_name: String,
 }
 
 fn emit(event: &str, mut value: Value) {
@@ -58,22 +59,70 @@ fn progress(stage: &str, f: f32, message: &str) {
         json!({"stage":stage,"current":(f.clamp(0.,1.)*1000.) as u32,"total":1000,"message":message}),
     );
 }
-fn load(model: PathBuf, cancelled: &AtomicBool) -> Result<Model> {
-    progress("loading", 0., "Запуск CUDA");
-    ensure!(
-        cfg!(feature = "cuda"),
-        "Генератор собран без CUDA. Выполните cargo build --release в crates/hunyuan-native."
-    );
-    let device = Device::new_cuda(0).context(
-        "Не удалось запустить CUDA. Проверьте драйвер NVIDIA и нативные библиотеки CUDA 12.",
-    )?;
+#[cfg(feature = "cuda")]
+fn open_device(cancelled: &AtomicBool) -> Result<(Device, String)> {
+    use candle_core::cuda::cudarc::driver::result;
+
+    result::init().context("Не удалось запустить CUDA")?;
+    let count = result::device::get_count().context("Не удалось определить видеокарты CUDA")?;
+    ensure!(count > 0, "Видеокарты с поддержкой CUDA не найдены");
+    let mut devices = Vec::new();
+    for ordinal in 0..count {
+        let handle = result::device::get(ordinal)?;
+        // The CUDA driver returned this device handle above.
+        let memory = unsafe { result::device::total_mem(handle) }?;
+        let name = result::device::get_name(handle)?;
+        devices.push((memory, ordinal as usize, name));
+    }
+    devices.sort_by_key(|(memory, _, _)| std::cmp::Reverse(*memory));
+
+    let mut errors = Vec::new();
+    for (memory, ordinal, name) in devices {
+        tensor::check_cancel(cancelled)?;
+        progress("loading", 0., &format!("Проверка CUDA на {name}"));
+        match Device::new_cuda(ordinal)
+            .map_err(anyhow::Error::from)
+            .and_then(|device| {
+                probe_device(&device)?;
+                Ok(device)
+            }) {
+            Ok(device) => {
+                eprintln!(
+                    "CUDA device {ordinal}: {name}, {} MiB",
+                    memory / (1024 * 1024)
+                );
+                return Ok((device, name));
+            }
+            Err(error) => errors.push(format!("{name}: {error:#}")),
+        }
+    }
+    anyhow::bail!("Не удалось выполнить тест CUDA. {}", errors.join(" · "))
+}
+
+#[cfg(not(feature = "cuda"))]
+fn open_device(_: &AtomicBool) -> Result<(Device, String)> {
+    anyhow::bail!("Генератор собран без поддержки CUDA")
+}
+
+#[cfg(feature = "cuda")]
+fn probe_device(device: &Device) -> Result<()> {
     // Exercise cuBLAS and the reduction kernels now: report ready only after a real CUDA calculation.
-    let t = Tensor::ones((1, 64, 64), DType::F16, &device)?;
-    let _ = t
+    let t = Tensor::ones((1, 64, 64), DType::F16, device)?;
+    let sum = t
         .matmul(&t)?
-        .sum_all()?
         .to_dtype(DType::F32)?
+        .sum_all()?
         .to_scalar::<f32>()?;
+    ensure!(
+        sum == 262144.,
+        "Проверка вычислений CUDA дала неверный результат"
+    );
+    Ok(())
+}
+
+fn load(model: PathBuf, cancelled: &AtomicBool) -> Result<Model> {
+    progress("loading", 0., "Поиск видеокарты");
+    let (device, device_name) = open_device(cancelled)?;
     let file = if model.is_dir() {
         model.join("model.fp16.safetensors")
     } else {
@@ -83,7 +132,11 @@ fn load(model: PathBuf, cancelled: &AtomicBool) -> Result<Model> {
         progress("loading", 0.05 + f * 0.95, m)
     })?;
     device.synchronize()?;
-    Ok(Model { weights, device })
+    Ok(Model {
+        weights,
+        device,
+        device_name,
+    })
 }
 fn generate(model: &Model, directory: PathBuf, cancelled: &AtomicBool) -> Result<()> {
     let start = Instant::now();
@@ -98,12 +151,7 @@ fn generate(model: &Model, directory: PathBuf, cancelled: &AtomicBool) -> Result
     progress("conditioning", 0., "Подготовка изображения");
     let cond = {
         let image = dino::prepare(&directory.join("input"), &model.device)?;
-        let w = model.weights.stage(
-            "conditioner.main_image_encoder.model.",
-            &model.device,
-            cancelled,
-        )?;
-        dino::encode(&w, &image, cancelled, &|f, m| {
+        dino::encode(&model.weights, &image, cancelled, &|f, m| {
             progress("conditioning", f, m)
         })?
     };
@@ -210,7 +258,7 @@ fn main() -> Result<()> {
         reader_cancel.store(true, Ordering::Relaxed);
         let _ = tx.send(Command::Unload);
     });
-    let mut model = None;
+    let mut model: Option<Model> = None;
     emit(
         "hello",
         json!({"protocol":1,"backend":"candle-cuda","version":env!("CARGO_PKG_VERSION")}),
@@ -218,14 +266,20 @@ fn main() -> Result<()> {
     for command in rx {
         let result = match command {
             Command::Load { model: path } => {
-                if model.is_some() {
-                    emit("ready", json!({"resident":true}));
+                if let Some(loaded) = &model {
+                    emit(
+                        "ready",
+                        json!({"resident":true,"device":loaded.device_name}),
+                    );
                     continue;
                 }
                 match load(path, &cancelled) {
                     Ok(loaded) => {
+                        emit(
+                            "ready",
+                            json!({"resident":true,"device":loaded.device_name}),
+                        );
                         model = Some(loaded);
-                        emit("ready", json!({"resident":true}));
                         Ok(())
                     }
                     Err(e) => Err(e),

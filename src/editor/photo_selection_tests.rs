@@ -72,7 +72,7 @@ fn photocraft_selections_combine_and_constrain_paint_and_bucket_fill() {
     assert!(selected(&doc, 5, 5) > 0.9);
     assert_eq!(selected(&doc, 18, 5), 0.0);
     let before = at(&doc, 1, 1);
-    doc.fill(5, 5, [1.0, 0.0, 0.0, 1.0]);
+    doc.fill(5, 5, [1.0, 0.0, 0.0, 1.0]).unwrap();
     assert_eq!(at(&doc, 5, 5), [255, 0, 0, 255]);
     assert_eq!(at(&doc, 1, 1), before);
     doc.layer_command("select.inverse", json!({})).unwrap();

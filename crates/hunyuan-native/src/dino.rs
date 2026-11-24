@@ -2,6 +2,7 @@
 use crate::tensor::{Weights, attention, check_cancel, heads};
 use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Tensor};
+use candle_nn::{LayerNorm, Module};
 use image::{
     GenericImageView, ImageReader, RgbImage,
     imageops::{self, FilterType},
@@ -68,56 +69,55 @@ pub fn prepare(path: &Path, device: &Device) -> Result<Tensor> {
 }
 
 pub fn encode(
-    w: &Weights,
+    weights: &Weights,
     image: &Tensor,
     cancelled: &AtomicBool,
     progress: &dyn Fn(f32, &str),
 ) -> Result<Tensor> {
+    const PREFIX: &str = "conditioner.main_image_encoder.model";
+    let device = image.device();
+    let embeddings = weights.stage(&format!("{PREFIX}.embeddings."), device, cancelled)?;
     let patch = image
         .conv2d(
-            w.get("embeddings.patch_embeddings.projection.weight")?,
+            embeddings.get("patch_embeddings.projection.weight")?,
             0,
             14,
             1,
             1,
         )?
         .broadcast_add(
-            &w.get("embeddings.patch_embeddings.projection.bias")?
+            &embeddings
+                .get("patch_embeddings.projection.bias")?
                 .reshape((1, 1536, 1, 1))?,
         )?;
     let patch = patch.flatten(2, 3)?.transpose(1, 2)?.contiguous()?;
-    let mut x = Tensor::cat(&[w.get("embeddings.cls_token")?, &patch], 1)?
-        .broadcast_add(w.get("embeddings.position_embeddings")?)?;
+    let mut x = Tensor::cat(&[embeddings.get("cls_token")?, &patch], 1)?
+        .broadcast_add(embeddings.get("position_embeddings")?)?;
+    drop(embeddings);
+    // DINO is the largest stage. Reuse VRAM for its blocks instead of holding
+    // all 40 sets of weights on the device while encoding a single image.
     for i in 0..40 {
         check_cancel(cancelled)?;
-        let p = format!("encoder.layer.{i}");
-        let xn = w.norm(&format!("{p}.norm1"), &x, 1e-6)?;
-        let q = heads(
-            &w.linear(&format!("{p}.attention.attention.query"), &xn)?,
-            24,
-        )?;
-        let k = heads(&w.linear(&format!("{p}.attention.attention.key"), &xn)?, 24)?;
-        let v = heads(
-            &w.linear(&format!("{p}.attention.attention.value"), &xn)?,
-            24,
-        )?;
+        let w = weights.stage(&format!("{PREFIX}.encoder.layer.{i}."), device, cancelled)?;
+        let xn = w.norm("norm1", &x, 1e-6)?;
+        let q = heads(&w.linear("attention.attention.query", &xn)?, 24)?;
+        let k = heads(&w.linear("attention.attention.key", &xn)?, 24)?;
+        let v = heads(&w.linear("attention.attention.value", &xn)?, 24)?;
         let a = w
-            .linear(
-                &format!("{p}.attention.output.dense"),
-                &attention(&q, &k, &v)?,
-            )?
-            .broadcast_mul(w.get(&format!("{p}.layer_scale1.lambda1"))?)?;
+            .linear("attention.output.dense", &attention(&q, &k, &v)?)?
+            .broadcast_mul(w.get("layer_scale1.lambda1")?)?;
         x = (&x + a)?;
-        let mlp = w.linear(
-            &format!("{p}.mlp.weights_in"),
-            &w.norm(&format!("{p}.norm2"), &x, 1e-6)?,
-        )?;
+        let mlp = w.linear("mlp.weights_in", &w.norm("norm2", &x, 1e-6)?)?;
         let halves = mlp.chunk(2, 2)?;
         let mlp = (candle_nn::ops::silu(&halves[0])? * &halves[1])?;
         x = (&x
-            + w.linear(&format!("{p}.mlp.weights_out"), &mlp)?
-                .broadcast_mul(w.get(&format!("{p}.layer_scale2.lambda1"))?)?)?;
+            + w.linear("mlp.weights_out", &mlp)?
+                .broadcast_mul(w.get("layer_scale2.lambda1")?)?)?;
         progress((i + 1) as f32 / 40., "Анализ изображения");
     }
-    Ok(w.norm("layernorm", &x, 1e-6)?)
+    let norm = weights.stage(&format!("{PREFIX}.layernorm."), device, cancelled)?;
+    Ok(
+        LayerNorm::new(norm.get("weight")?.clone(), norm.get("bias")?.clone(), 1e-6)
+            .forward(&x.contiguous()?)?,
+    )
 }

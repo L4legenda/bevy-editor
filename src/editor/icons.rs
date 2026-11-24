@@ -61,6 +61,9 @@ pub(crate) enum Glyph {
     Eraser,
     Pipette,
     PaintBucket,
+    Gradient,
+    FlipHorizontal,
+    FlipVertical,
     Undo,
     Redo,
     Selection,
@@ -72,6 +75,9 @@ pub(crate) enum Glyph {
     SelectEdge,
     SelectFace,
     Xray,
+    ShadingSolid,
+    ShadingMaterial,
+    ShadingRendered,
     PrimitivePlane,
     PrimitiveCircle,
     PrimitiveUvSphere,
@@ -156,6 +162,15 @@ impl Glyph {
             Self::Eraser => include_str!("../../assets/icons/lucide/eraser.svg"),
             Self::Pipette => include_str!("../../assets/icons/lucide/pipette.svg"),
             Self::PaintBucket => include_str!("../../assets/icons/lucide/paint-bucket.svg"),
+            Self::Gradient => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><defs><linearGradient id="ramp"><stop stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity=".08"/></linearGradient></defs><rect x="3" y="5" width="18" height="14" rx="3" stroke="currentColor" stroke-width="2" fill="none"/><rect x="6" y="8" width="12" height="8" rx="1" fill="url(#ramp)"/></svg>"##
+            }
+            Self::FlipHorizontal => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 3v2m0 3v2m0 3v2M8 5 3 18h5V5Zm8 0 5 13h-5V5Z"/></svg>"#
+            }
+            Self::FlipVertical => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 3v2m0 3v2m0 3v2M8 5 3 18h5V5Zm8 0 5 13h-5V5Z" transform="rotate(90 12 12)"/></svg>"#
+            }
             Self::Undo => include_str!("../../assets/icons/lucide/undo-2.svg"),
             Self::Redo => include_str!("../../assets/icons/lucide/redo-2.svg"),
             Self::Selection => {
@@ -177,6 +192,9 @@ impl Glyph {
             Self::SelectEdge => include_str!("../../assets/icons/select-edge.svg"),
             Self::SelectFace => include_str!("../../assets/icons/select-face.svg"),
             Self::Xray => include_str!("../../assets/icons/x-ray.svg"),
+            Self::ShadingSolid => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="currentColor"/></svg>"#,
+            Self::ShadingMaterial => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16Z" fill="currentColor"/></svg>"#,
+            Self::ShadingRendered => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="13" r="7"/><path d="M7 15a4 4 0 0 1 4-6m7-6v6m-3-3h6"/></svg>"#,
             Self::PrimitivePlane => include_str!("../../assets/icons/primitive-plane.svg"),
             Self::PrimitiveCircle => include_str!("../../assets/icons/primitive-circle.svg"),
             Self::PrimitiveUvSphere => include_str!("../../assets/icons/primitive-uv-sphere.svg"),

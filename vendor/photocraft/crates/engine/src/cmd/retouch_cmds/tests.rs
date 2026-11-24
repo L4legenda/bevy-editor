@@ -638,6 +638,7 @@ fn protect_detail_dabs_on_one_centre_apply_at_most_one_dab_at_each_pixel() {
         color: [0.0; 4],
         depth: 0.0,
         index: 0,
+        sample_position: 0.0,
         proj_angle: 0.0,
         proj_scale: 1.0,
         wet: 1.0,

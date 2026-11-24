@@ -44,7 +44,8 @@ impl Plugin for ImageSelectionPlugin {
                 Update,
                 refresh
                     .after(super::interface::refresh)
-                    .after(super::super::refresh),
+                    .after(super::super::refresh)
+                    .before(super::super::overview::refresh),
             );
     }
 }
@@ -190,6 +191,23 @@ pub fn setup(
         ("Инверсия", "select.inverse"),
     ] {
         item(commands, select_opts, font, label, Op::Command(command));
+    }
+    for (horizontal, glyph, label) in [
+        (
+            true,
+            icons::Glyph::FlipHorizontal,
+            "Отразить по горизонтали",
+        ),
+        (false, icons::Glyph::FlipVertical, "Отразить по вертикали"),
+    ] {
+        icons::button(
+            commands,
+            select_opts,
+            glyph,
+            label,
+            Action::ImageEdit(EditAction::Selection(Op::FlipSelection(horizontal))),
+            Look::Regular,
+        );
     }
     let advanced = node(commands, select_opts, row(3.0));
     item(commands, advanced, font, "Все слои", Op::SampleAll);

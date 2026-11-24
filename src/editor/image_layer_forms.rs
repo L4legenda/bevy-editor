@@ -300,7 +300,11 @@ impl Form {
             return form;
         }
         if spec.id == "layer.setAdjustment" {
-            let mut form = Self::structured(spec.id, title(spec.id), existing);
+            let title = existing["kind"].as_str().map_or_else(
+                || title(spec.id),
+                |kind| title(&format!("layer.newAdjustmentLayer.{kind}")),
+            );
+            let mut form = Self::structured(spec.id, title, existing);
             form.params["layer"] = json!(doc.active_id().map(|id| id.0));
             return form;
         }
@@ -894,6 +898,15 @@ impl Form {
         Ok(value)
     }
 
+    pub(super) fn adjustment(&self) -> Option<&str> {
+        self.command
+            .strip_prefix("layer.newAdjustmentLayer.")
+            .or_else(|| {
+                (self.command == "layer.setAdjustment")
+                    .then(|| self.params["kind"].as_str())
+                    .flatten()
+            })
+    }
     pub(super) fn is_stroke_field(&self, key: &str) -> bool {
         self.command == "layer.layerStyle.stroke" || is_stroke_param(&self.params, key)
     }

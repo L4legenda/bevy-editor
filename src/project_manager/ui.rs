@@ -2,6 +2,7 @@ use super::{
     Action, ContextMenu, Dialog, Manager, effects,
     native::Picker,
     projects::{self, Template},
+    update,
 };
 
 #[path = "context_menu.rs"]
@@ -129,7 +130,6 @@ fn button(
         Action::New => Some(Glyph::Plus),
         Action::Import
         | Action::Open(_)
-        | Action::OpenSelected
         | Action::PickOpen
         | Action::PickParent
         | Action::Reveal => Some(Glyph::FolderOpen),
@@ -303,6 +303,43 @@ fn mark(commands: &mut Commands, parent: Entity, glyph: Glyph, size: f32) -> Ent
         .insert(BorderColor::all(ACCENT.with_alpha(0.36)));
     icons::spawn(commands, badge, glyph, size * 0.52, ACCENT);
     badge
+}
+
+#[derive(Component)]
+pub(super) struct UpdateControls(Entity, Entity);
+
+pub(super) fn update_status(
+    updates: Res<update::Updates>,
+    controls: Query<&UpdateControls>,
+    mut nodes: Query<&mut Node>,
+    mut labels: Query<&mut Text>,
+) {
+    if !updates.is_changed() {
+        return;
+    }
+    for &UpdateControls(button, label) in &controls {
+        if let Ok(mut node) = nodes.get_mut(button) {
+            node.display = if updates.available.is_some() && !updates.downloading {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+        if let Ok(mut text) = labels.get_mut(label) {
+            text.0 = if updates.downloading {
+                "Загрузка обновления…".into()
+            } else if let Some(release) = &updates.available {
+                let (version, build) = release
+                    .tag_name
+                    .split_once("+build.")
+                    .unwrap_or((&release.tag_name, ""));
+                let build = build.rsplit_once('.').map_or(build, |(number, _)| number);
+                format!("Доступна {} (сборка {build})", version.trim_start_matches('v'))
+            } else {
+                String::new()
+            };
+        }
+    }
 }
 
 pub(super) fn setup(
@@ -495,24 +532,28 @@ pub(super) fn setup(
             ..default()
         },
     );
-    button(
+    text(
         &mut commands,
         status_bar,
         &font,
-        "Убрать из списка",
-        Action::Forget,
-        false,
-        false,
+        concat!("Версия ", env!("CARGO_PKG_VERSION")),
+        11.0,
+        MUTED,
     );
-    button(
+    let update_label = text(&mut commands, status_bar, &font, "", 11.0, MUTED);
+    let (update_button, _) = button(
         &mut commands,
         status_bar,
         &font,
-        "Открыть проект",
-        Action::OpenSelected,
+        "Обновить",
+        Action::UpdateEditor,
         true,
         false,
     );
+    commands.entity(update_button).entry::<Node>().and_modify(|mut node| {
+        node.display = Display::None;
+    });
+    commands.entity(status_bar).insert(UpdateControls(update_button, update_label));
     commands.insert_resource(Interface {
         font,
         root,
@@ -1128,6 +1169,7 @@ pub(super) fn styles(
     mut commands: Commands,
     manager: Res<Manager>,
     picker: Res<Picker>,
+    updates: Res<update::Updates>,
     focus: Res<InputFocus>,
     mut controls: Query<(
         Entity,
@@ -1156,10 +1198,12 @@ pub(super) fn styles(
     for (entity, control, hovered, pressed, children, menu_item, mut motion, mut tab) in
         &mut controls
     {
-        let disabled = (!control.modal && manager.form.is_some())
+        let disabled = updates.downloading
+            || (matches!(control.action, Action::UpdateEditor) && updates.available.is_none())
+            || (!control.modal && manager.form.is_some())
             || (manager.context.is_some() && !menu_item)
             || (manager.selected.is_none()
-                && matches!(control.action, Action::OpenSelected | Action::Forget))
+                && matches!(control.action, Action::Forget))
             || (picker.busy() && !matches!(control.action, Action::Close));
         tab.0 = if disabled { -1 } else { 0 };
         if disabled {

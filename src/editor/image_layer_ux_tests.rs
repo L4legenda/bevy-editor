@@ -347,8 +347,7 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
             .form
             .is_none()
     );
-    click(&mut app, |a| matches!(a, L::Menu));
-    click(&mut app, |a| matches!(a, L::Category("Параметры слоя")));
+    layer(&mut app, L::Category("Параметры слоя"));
     capture_when(&mut app, &target, &output.join("01-properties.png"), |_| {
         true
     });
@@ -475,8 +474,7 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
     }
     click(&mut app, |a| matches!(a, L::Cancel));
     assert_eq!(effects(&app), 0);
-    click(&mut app, |a| matches!(a, L::Menu));
-    click(&mut app, |a| matches!(a, L::Category("Эффекты")));
+    layer(&mut app, L::Category("Эффекты"));
     click(&mut app, |a| {
         matches!(a, L::Command("layer.layerStyle.stroke"))
     });
@@ -500,6 +498,154 @@ fn layer_ux_gpu_panel_properties_preview_and_help_are_usable_without_parameter_t
         &output.join("06-layer-stack.png"),
         |_| true,
     );
+    let doc_pixels = |app: &App| {
+        let viewer = app.world().resource::<ImageViewer>();
+        viewer.edit.document(viewer.tab).unwrap().composite().pixels
+    };
+    let original = doc_pixels(&app);
+    layer(&mut app, L::Category("Коррекция"));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("07-light-and-color.png"),
+        |_| true,
+    );
+    click(&mut app, |a| {
+        matches!(a, L::Command("layer.newAdjustmentLayer.brightnessContrast"))
+    });
+    let brightness = field(&app, "brightness");
+    layer(&mut app, L::FieldNumber(brightness, 45.0));
+    assert_ne!(doc_pixels(&app), original);
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("08-light-settings.png"),
+        |_| true,
+    );
+    click(&mut app, |a| matches!(a, L::Preview));
+    assert_eq!(doc_pixels(&app), original);
+    click(&mut app, |a| matches!(a, L::Preview));
+    assert_ne!(doc_pixels(&app), original);
+    click(&mut app, |a| matches!(a, L::Cancel));
+    assert_eq!(doc_pixels(&app), original);
+
+    layer(&mut app, L::Category("Коррекция"));
+    click(&mut app, |a| {
+        matches!(a, L::Command("layer.newAdjustmentLayer.colorBalance"))
+    });
+    let midtone = field(&app, "/midtones/0");
+    let center = {
+        let world = app.world_mut();
+        world.query_filtered::<(&AccessibleLabel,&ComputedNode,&UiGlobalTransform),With<bevy::ui_widgets::Slider>>()
+            .iter(world).find_map(|(label,n,t)| (label.0 == "Голубой ↔ красный" && !n.is_empty())
+                .then_some((t.affine().translation, n.size().x)))
+            .expect("The colour balance opens on its midtone sliders")
+    };
+    move_pointer(&mut app, window, center.0);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, center.0 - Vec2::new(center.1 * 0.25, 0.0));
+    mouse(&mut app, window, ButtonState::Released);
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    let parameter = |app: &App, index: usize| {
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .layers
+            .form
+            .as_ref()
+            .unwrap()
+            .fields[index]
+            .text
+            .parse::<f32>()
+            .unwrap()
+    };
+    let cyan = parameter(&app, midtone);
+    assert!(
+        cyan < -20.0,
+        "The signed slider reaches the cyan side: {cyan}"
+    );
+    let cyan_preview = doc_pixels(&app);
+    assert_ne!(cyan_preview, original);
+    click(&mut app, |a| matches!(a, L::BalanceTone(0)));
+    assert_eq!(parameter(&app, midtone), cyan);
+    assert_eq!(doc_pixels(&app), cyan_preview);
+    click(&mut app, |a| matches!(a, L::BalanceTone(1)));
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("09-color-balance.png"),
+        |_| true,
+    );
+    click_action(
+        &mut app,
+        window,
+        |a| matches!(a, Action::ImageEdit(edit::EditAction::Layers(L::FieldNumber(index, 0.0))) if index == midtone),
+    );
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    assert_eq!(parameter(&app, midtone), 0.0);
+    layer(&mut app, L::FieldNumber(midtone, f64::from(cyan)));
+    click(&mut app, |a| matches!(a, L::Apply));
+    assert_eq!(doc_pixels(&app), cyan_preview);
+    layer(&mut app, L::Properties);
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .layers
+            .form
+            .as_ref()
+            .unwrap()
+            .title,
+        "Цветовой баланс"
+    );
+    click(&mut app, |a| matches!(a, L::Cancel));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    for _ in 0..5 {
+        frame(&mut app);
+    }
+    assert_eq!(doc_pixels(&app), original);
+    click(&mut app, |a| matches!(a, L::Category("Добавить маску")));
+    let visible = {
+        let world = app.world_mut();
+        world
+            .query::<(&AccessibleLabel, &ComputedNode)>()
+            .iter(world)
+            .any(|(label, node)| label.0 == "Маска из изображения…" && !node.is_empty())
+    };
+    assert!(visible, "The mask button exposes bitmap import");
+    capture_when(&mut app, &target, &output.join("10-add-mask.png"), |_| true);
+    let active_mask = |app: &App| {
+        let viewer = app.world().resource::<ImageViewer>();
+        viewer
+            .edit
+            .document(viewer.tab)
+            .unwrap()
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .map(|mask| mask.value(200, 120))
+    };
+    click(&mut app, |a| {
+        matches!(a, L::Quick("layer.layerMask.hideAll"))
+    });
+    assert_eq!(active_mask(&app), Some(0.0));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    for _ in 0..5 {
+        frame(&mut app);
+    }
+    click(&mut app, |a| matches!(a, L::Category("Добавить маску")));
+    click(&mut app, |a| {
+        matches!(a, L::Quick("layer.layerMask.revealAll"))
+    });
+    assert_eq!(active_mask(&app), Some(1.0));
+    assert_eq!(doc_pixels(&app), original);
     assert!(
         app.world().resource::<ImageViewer>().edit.error.is_none(),
         "{:?}",

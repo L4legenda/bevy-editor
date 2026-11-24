@@ -22,14 +22,65 @@ fn gpu_model_wireframe_button_handles_polygons_edits_and_protected_models() {
     move_pointer(&mut app, window, Vec2::new(20.0, 110.0));
     let region = canvas_rect(&mut app);
     let solid = capture_when(&mut app, &target, &output.join("01-solid.png"), |_| true);
-    click_control(&mut app, window, |action| {
-        matches!(
-            action,
-            Action::ModelView(ModelViewAction::Edit(EditAction::Wireframe))
-        )
-    });
+    let choose = |app: &mut App, choice| {
+        click_control(app, window, |action| {
+            matches!(action, Action::ModelView(ModelViewAction::Shading(value)) if value == choice)
+        });
+    };
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Wire));
+    let surface_layers = |app: &mut App| {
+        let world = app.world_mut();
+        world
+            .query_filtered::<&RenderLayers, With<xray::SourceMaterial>>()
+            .iter(world)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let layers = surface_layers(&mut app);
+    assert!(!layers.is_empty() && layers.iter().all(|layer| *layer == RenderLayers::none()));
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Solid));
+    {
+        let world = app.world_mut();
+        let mut surfaces =
+            world.query::<(&xray::SourceMaterial, &MeshMaterial3d<StandardMaterial>)>();
+        assert!(surfaces.iter(world).all(|(source, displayed)| source.0 != displayed.0));
+    }
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Rendered));
+    {
+        let world = app.world_mut();
+        let mut surfaces =
+            world.query::<(&xray::SourceMaterial, &MeshMaterial3d<StandardMaterial>)>();
+        assert!(surfaces.iter(world).all(|(source, displayed)| source.0 == displayed.0));
+        let brightness = world.resource::<Editor>().environment().ambient_brightness;
+        assert_eq!(
+            world.query_filtered::<&AmbientLight, With<ViewCamera>>()
+                .single(world).unwrap().brightness,
+            brightness,
+        );
+    }
+    send(&mut app, EditAction::Mode(Mode::Object));
+    send(&mut app, EditAction::Deselect);
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Material));
+    {
+        let world = app.world_mut();
+        let camera = world.query_filtered::<Entity, With<ViewCamera>>().single(world).unwrap();
+        assert!(world.get::<bevy::light::Skybox>(camera).is_none());
+        assert!(world.get::<bevy::light::EnvironmentMapLight>(camera).is_none());
+        assert_eq!(world.get::<AmbientLight>(camera).unwrap().brightness, 0.0);
+        let mut surfaces = world.query::<(&xray::SourceMaterial, &MeshMaterial3d<StandardMaterial>)>();
+        let assets = world.resource::<Assets<StandardMaterial>>();
+        for (source, displayed) in surfaces.iter(world) {
+            let source = assets.get(&source.0).unwrap();
+            let displayed = assets.get(&displayed.0).unwrap();
+            assert!(displayed.unlit);
+            assert_eq!(displayed.base_color, source.base_color);
+            assert_eq!(displayed.base_color_texture, source.base_color_texture);
+            assert_eq!(displayed.alpha_mode, source.alpha_mode);
+        }
+    }
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Wire));
     move_pointer(&mut app, window, Vec2::new(20.0, 110.0));
-    assert!(app.world().resource::<State>().wireframe);
     let changed = |image: &image::RgbaImage| {
         image
             .enumerate_pixels()
@@ -77,14 +128,14 @@ fn gpu_model_wireframe_button_handles_polygons_edits_and_protected_models() {
             .len(),
         expected_edges * 2
     );
-    send(&mut app, EditAction::Wireframe);
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Material));
     capture_when(
         &mut app,
         &target,
         &output.join("03-solid-restored.png"),
         |image| changed(image) < 20,
     );
-    send(&mut app, EditAction::Wireframe);
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Wire));
     app.world_mut().resource_mut::<Viewer>().orthographic = true;
     warm(&mut app, 8);
     capture_when(
@@ -148,11 +199,6 @@ fn gpu_model_wireframe_button_handles_polygons_edits_and_protected_models() {
     }
     warm(&mut app, 25);
     assert!(app.world().resource::<State>().errors.contains_key(&1));
-    assert!(
-        app.world()
-            .resource::<State>()
-            .available(EditAction::Wireframe, Some(1))
-    );
     let protected_count = {
         let world = app.world_mut();
         world
@@ -174,13 +220,8 @@ fn gpu_model_wireframe_button_handles_polygons_edits_and_protected_models() {
         &output.join("05-skinned-morph.png"),
         |_| true,
     );
-    click_control(&mut app, window, |action| {
-        matches!(
-            action,
-            Action::ModelView(ModelViewAction::Edit(EditAction::Wireframe))
-        )
-    });
-    assert!(!app.world().resource::<State>().wireframe);
+    choose(&mut app, shading::ShadingAction::Set(shading::Mode::Material));
+    assert!(surface_layers(&mut app).iter().all(|layer| *layer == RenderLayers::layer(LAYER)));
     assert_eq!(app.world().resource::<Editor>().edits, before);
     assert_eq!(std::fs::read(path).unwrap(), original_bytes);
 }

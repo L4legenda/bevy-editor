@@ -5,11 +5,14 @@ $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $tempBase ('bevy-editor-startup-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path (Join-Path $testRoot 'tools') -Force | Out-Null
 $shellPath = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+$savedLocal = $env:LOCALAPPDATA
 $savedPrepare = $env:BEVY_EDITOR_PREPARE_3D
 $savedStage = $env:BEVY_STARTUP_TEST_STAGE
 $savedTrace = $env:BEVY_STARTUP_TEST_TRACE
 $savedMissing = $env:BEVY_STARTUP_TEST_MISSING
 try {
+    $env:LOCALAPPDATA = Join-Path $testRoot 'local-app-data'
+    Copy-Item -LiteralPath (Join-Path $sourceRoot 'tools/run-editor.ps1') -Destination (Join-Path $testRoot 'tools/run-editor.ps1')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'tools/build-editor.ps1') -Destination (Join-Path $testRoot 'tools/build-editor.ps1')
     [IO.File]::WriteAllText((Join-Path $testRoot 'Cargo.toml'), '[package]')
     $cache = @'
@@ -40,7 +43,7 @@ exit 0
     [IO.File]::WriteAllText((Join-Path $testRoot 'tools/cargo.ps1'), $cache)
     [IO.File]::WriteAllText((Join-Path $testRoot 'tools/build-hunyuan.ps1'), $native)
     $env:BEVY_STARTUP_TEST_TRACE = Join-Path $testRoot 'trace.log'
-    function Invoke-Case([string]$Label, [string]$Prepare, [string]$Stage, [bool]$Success, [string]$Trace) {
+    function Invoke-Case([string]$Label, [string]$Prepare, [string]$Stage, [bool]$Success, [string]$Trace, [string]$Script = 'build-editor.ps1') {
         $env:BEVY_EDITOR_PREPARE_3D = $Prepare
         $env:BEVY_STARTUP_TEST_STAGE = $Stage
         [IO.File]::WriteAllText($env:BEVY_STARTUP_TEST_TRACE, '')
@@ -49,7 +52,7 @@ exit 0
         $psi = [Diagnostics.ProcessStartInfo]::new($shellPath)
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-        $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + (Join-Path $testRoot 'tools/build-editor.ps1') + '"'
+        $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + (Join-Path $testRoot ('tools/' + $Script)) + '"'
         $process = [Diagnostics.Process]::Start($psi)
         $outTask = $process.StandardOutput.ReadToEndAsync(); $errTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(30000)) { $process.Kill(); throw "$Label timed out" }
@@ -69,12 +72,16 @@ exit 0
     Invoke-Case 'incomplete-runtime' '1' '' $false 'editor,generator'
     $env:BEVY_STARTUP_TEST_MISSING = ''
     Invoke-Case 'repaired-runtime' '1' '' $true 'editor,generator'
-    $vbs = [IO.File]::ReadAllText((Join-Path $sourceRoot 'run-editor.vbs'))
-    if (-not $vbs.Contains('tools\build-editor.ps1')) { throw 'VBS launcher does not prepare native components' }
+    Invoke-Case 'launcher-generator-failure' '1' 'native-failure' $false 'editor,generator' 'run-editor.ps1'
+    $launcherLog = Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'BevyEditor/logs/launcher.log') -Raw
+    if ($launcherLog -notmatch 'Native compiler progress fixture' -or $launcherLog -notmatch 'Could not prepare the 3D generator') {
+        throw 'Launcher did not record native progress and the build failure'
+    }
     $cmd = [IO.File]::ReadAllText((Join-Path $sourceRoot 'run-editor.cmd'))
-    if (-not $cmd.Contains('run-editor.vbs')) { throw 'CMD launcher bypasses the common VBS path' }
-    Write-Output 'Both Windows launchers use the complete build pipeline.'
+    if (-not $cmd.Contains('tools\run-editor.ps1')) { throw 'CMD launcher bypasses the PowerShell launcher' }
+    Write-Output 'The Windows launcher uses the complete build pipeline.'
 } finally {
+    $env:LOCALAPPDATA = $savedLocal
     $env:BEVY_EDITOR_PREPARE_3D = $savedPrepare
     $env:BEVY_STARTUP_TEST_STAGE = $savedStage
     $env:BEVY_STARTUP_TEST_TRACE = $savedTrace

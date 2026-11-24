@@ -596,6 +596,9 @@ fn gpu_orthographic_workspaces_render_stable_backgrounds_and_grids() {
     check_background(&scene, scene_rect);
 
     app.world_mut().write_message(Action::ViewModel(0));
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
+        shading::ShadingAction::Set(shading::Mode::Rendered),
+    )));
     for _ in 0..240 {
         frame(&mut app);
         if app.world().resource::<Viewer>().fitted {
@@ -1024,6 +1027,13 @@ fn gpu_model_viewer_opens_renders_navigates_and_releases_its_scene() {
             })
             .expect("A visible model pixel must remain outside the handle overlay")
     };
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
+        shading::ShadingAction::Set(shading::Mode::Rendered),
+    )));
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
+        shading::ShadingAction::PreviewLighting,
+    )));
+    frame(&mut app);
     let baseline = capture_when(&mut app, &target, &output.join("model.png"), |image| {
         let mut colored = 0;
         for y in center.y as u32 - 80..center.y as u32 + 80 {

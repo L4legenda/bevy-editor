@@ -15,12 +15,16 @@ use std::{collections::HashMap, path::PathBuf};
 
 #[path = "image_canvas.rs"]
 mod canvas_material;
+#[path = "image_canvas_overview.rs"]
+mod overview;
 #[path = "image_edit.rs"]
 pub(in crate::editor) mod edit;
 #[path = "image_model_fields.rs"]
 pub(in crate::editor) mod model_fields;
 #[path = "image_model_transform.rs"]
 mod model_transform;
+#[path = "image_gradient.rs"]
+mod gradient;
 pub(in crate::editor) use canvas_material::{CanvasMaterial, ImageCanvasPlugin};
 #[path = "image_paint_input.rs"]
 pub(super) mod paint_input;
@@ -393,7 +397,7 @@ pub(super) fn setup(
         AccessibleLabel("Изображение: колесо — масштаб, перетаскивание — панорама".into()),
     ));
     let checker = checker(commands, canvas, checker_image);
-    edit::setup(commands, editing_controls, body, canvas, root, font);
+    edit::setup(commands, editing_controls, body, canvas, root, font, checker_image);
     let picture = commands
         .spawn((
             MaterialNode(canvas_material::HANDLE),
@@ -832,6 +836,7 @@ pub(in crate::editor) fn update(
     }
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
     if viewer.edit.color_dragging || viewer.edit.layers.context_menu_dismissed {
+        viewer.edit.cancel_gradient();
         viewer.gesture = None;
         viewer.released_model = None;
         viewer.layer_preview = None;
@@ -862,6 +867,7 @@ pub(in crate::editor) fn update(
         || editor.hdri_library_open
         || viewer.error.is_some()
     {
+        viewer.edit.cancel_gradient();
         viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
@@ -873,6 +879,7 @@ pub(in crate::editor) fn update(
         return;
     }
     if !window.focused {
+        viewer.edit.cancel_gradient();
         viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
@@ -1002,6 +1009,7 @@ pub(in crate::editor) fn refresh(
     mut materials: ResMut<Assets<CanvasMaterial>>,
     mut colors: Query<&mut BackgroundColor>,
     children: Query<&Children>,
+    gradient: Option<Res<gradient::Preview>>,
 ) {
     let shown = editor.viewing_image.is_some();
     if let Ok(mut node) = nodes.get_mut(interface.background) {
@@ -1039,12 +1047,20 @@ pub(in crate::editor) fn refresh(
         .or_else(|| preview.and_then(|preview| preview.image.as_ref()));
     let ready = handle.is_some() && viewer.error.is_none();
     if let Some(mut material) = materials.get_mut(&canvas_material::HANDLE) {
-        let image = handle.cloned();
+        let draft = gradient
+            .as_deref()
+            .and_then(|preview| preview.image.as_ref());
+        let image = draft
+            .map(|(image, _)| image.clone())
+            .or_else(|| handle.cloned());
         let parameters = dimensions.map_or(Vec4::ZERO, |size| {
             Vec4::new(
                 size.x as f32,
                 size.y as f32,
-                if viewer.image.is_some() && viewer.decoded_size == Some(size) {
+                if draft.map_or(
+                    viewer.image.is_some() && viewer.decoded_size == Some(size),
+                    |(_, full)| *full,
+                ) {
                     1.0
                 } else {
                     0.0

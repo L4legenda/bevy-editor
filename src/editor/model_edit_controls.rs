@@ -281,34 +281,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ));
         icons::themed(&mut commands, button, glyph, 20.0);
     }
-    let view_options = surface(
-        &mut commands,
-        toolbar,
-        Node {
-            padding: UiRect::all(px(2)),
-            border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(6)),
-            flex_shrink: 0.0,
-            ..row(0.0)
-        },
-        PANEL,
-    );
-    let xray = icons::button(
-        &mut commands,
-        view_options,
-        icons::Glyph::Xray,
-        "Модель: X-Ray · Рентген · Alt+Z",
-        action(EditAction::Xray),
-        Look::Regular,
-    );
-    commands.entity(xray).insert(EditButton(EditAction::Xray));
-    control(
-        &mut commands,
-        view_options,
-        &interface.font,
-        "Сетка",
-        EditAction::Wireframe,
-    );
+    super::super::shading::setup(&mut commands, toolbar);
     let bevel_panel = node(
         &mut commands,
         interface.inspector,

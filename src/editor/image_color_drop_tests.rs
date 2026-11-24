@@ -94,11 +94,12 @@ fn escape(app: &mut App, window: Entity) {
 fn gpu_color_drop_fills_connected_region_with_undo_and_animated_feedback() {
     let fixture = Fixture::new();
     image::RgbaImage::from_fn(96, 64, |x, _| {
-        if (47..49).contains(&x) {
-            image::Rgba([0, 0, 0, 255])
-        } else {
-            image::Rgba([255; 4])
-        }
+        let value = match x {
+            46 | 49 => 128,
+            47 | 48 => 0,
+            _ => 255,
+        };
+        image::Rgba([value, value, value, 255])
     })
     .save(fixture.0.join("colour-drop.png"))
     .unwrap();
@@ -201,7 +202,17 @@ fn gpu_color_drop_fills_connected_region_with_undo_and_animated_feedback() {
         let at =
             |x: u32| &pixels.pixels[((32 * 96 + x) * 4) as usize..((32 * 96 + x) * 4 + 4) as usize];
         assert_eq!(at(20), [235, 36, 23, 255]);
+        assert_eq!(
+            at(46),
+            [118, 18, 12, 255],
+            "the boundary keeps its black contribution without a grey halo"
+        );
         assert_eq!(at(48), [0, 0, 0, 255]);
+        assert_eq!(
+            at(49),
+            [128, 128, 128, 255],
+            "the boundary on the far side is untouched"
+        );
         assert_eq!(
             at(75),
             [255; 4],
@@ -267,6 +278,24 @@ fn gpu_color_drop_fills_connected_region_with_undo_and_animated_feedback() {
         &[26, 64, 230, 255]
     );
     send(&mut app, EditAction::Undo);
+    // The ordinary bucket must also erase both grey fringes when replacing the divider with white.
+    send(&mut app, EditAction::Color([1.0; 4]));
+    send(
+        &mut app,
+        EditAction::Tool(crate::editor::photo_document::PhotoTool::Fill),
+    );
+    move_pointer(&mut app, window, pixel_point(image, Vec2::new(47.5, 30.5)));
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert!(
+        doc(&app)
+            .composite()
+            .pixels
+            .iter()
+            .all(|&channel| channel == 255)
+    );
+    send(&mut app, EditAction::Undo);
+    assert_eq!(doc(&app).composite().pixels, original);
     // A locked layer rejects the destination, and switching tabs clears the bead.
     send(
         &mut app,

@@ -18,6 +18,8 @@ mod cursor_restoration;
 mod edge_painting;
 #[path = "image_eyedropper_tests.rs"]
 mod eyedropper;
+#[path = "image_gradient_tests.rs"]
+mod gradients;
 #[path = "image_layers_tests.rs"]
 mod image_layers;
 #[path = "image_layer_drag_tests.rs"]
@@ -30,6 +32,8 @@ mod layer_ux;
 mod painting;
 #[path = "image_panel_resize_tests.rs"]
 mod panel_sizing;
+#[path = "image_canvas_overview_tests.rs"]
+mod canvas_overview;
 #[path = "image_pen_tests.rs"]
 mod pen_pressure;
 #[path = "image_pencil_tests.rs"]

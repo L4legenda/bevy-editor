@@ -1,5 +1,6 @@
 //! Selection feedback belongs to the model viewport, never to the GLTF asset.
 use super::*;
+use crate::editor::model_mesh::ComponentHit;
 use bevy::{
     asset::{AssetPath, RenderAssetUsages, embedded_asset, embedded_path},
     camera::visibility::NoFrustumCulling,
@@ -12,11 +13,9 @@ use bevy::{
         AsBindGroup, CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
     },
     shader::ShaderRef,
-    window::RequestRedraw,
 };
 
-// The viewport tone maps HDR colors; a luminous core keeps stars readable on
-// both dark materials and the default brightly lit orange model.
+// Keep the object bounds and transform controls legible under HDR tonemapping.
 pub(super) const SELECTED: Color = Color::linear_rgb(2.8, 2.2, 1.3);
 pub(super) const BORDER: Color = Color::srgb(0.055, 0.035, 0.085);
 
@@ -29,9 +28,7 @@ pub(in crate::editor) struct SelectedXray;
 #[bind_group_data(FaceKey)]
 pub(in crate::editor) struct FaceMaterial {
     #[uniform(0)]
-    color: Vec4,
-    #[uniform(1)]
-    style: Vec4,
+    params: Vec4,
     xray: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,24 +81,36 @@ impl Material for FaceMaterial {
     }
 }
 
-// Geometry is rebuilt only for document/selection changes. Screen-size contours
-// are expanded by the shader, and nebula coordinates remain object-local.
+// Mesh colors store the tint in RGB and the primitive type in alpha.
+const ORANGE: Vec3 = Vec3::new(1.0, 0.25, 0.018);
+const ACTIVE: Vec3 = Vec3::ONE;
+const CAGE: Vec3 = Vec3::new(0.012, 0.016, 0.022);
+
+pub(super) fn highlighted(selection: &MeshSelection, edge: Edge, faces: &[usize]) -> bool {
+    match selection.kind {
+        Element::Vertex => {
+            selection.vertices.contains(&edge.0) || selection.vertices.contains(&edge.1)
+        }
+        Element::Edge => selection.edges.contains(&edge),
+        Element::Face => faces.iter().any(|face| selection.faces.contains(face)),
+    }
+}
+
 #[derive(Default)]
 struct FeedbackMesh {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
-    coordinates: Vec<[f32; 4]>,
+    colors: Vec<[f32; 4]>,
 }
 impl FeedbackMesh {
-    fn push(&mut self, p: Vec3, n: Vec3, uv: Vec2, coordinate: Vec4) {
-        self.positions.push(p.to_array());
-        self.normals.push(n.to_array());
+    fn push(&mut self, point: Vec3, direction: Vec3, uv: Vec2, color: Vec4) {
+        self.positions.push(point.to_array());
+        self.normals.push(direction.to_array());
         self.uvs.push(uv.to_array());
-        self.coordinates.push(coordinate.to_array());
+        self.colors.push(color.to_array());
     }
-    fn star(&mut self, p: Vec3, coordinate: Vec3, active: bool) {
-        let tag = if active { 2.0 / 3.0 } else { 1.0 / 3.0 };
+    fn dot(&mut self, point: Vec3, color: Vec3) {
         for uv in [
             Vec2::new(-1., -1.),
             Vec2::new(1., -1.),
@@ -110,7 +119,18 @@ impl FeedbackMesh {
             Vec2::ONE,
             Vec2::new(-1., 1.),
         ] {
-            self.push(p, Vec3::Z, uv, coordinate.extend(tag));
+            self.push(point, Vec3::Z, uv, color.extend(0.5));
+        }
+    }
+    fn edge(&mut self, a: Vec3, b: Vec3, colors: [Vec3; 2]) {
+        let direction = (b - a).normalize_or_zero();
+        for (end, side) in [(0, -1.), (0, 1.), (1, 1.), (0, -1.), (1, 1.), (1, -1.)] {
+            self.push(
+                [a, b][end],
+                direction,
+                Vec2::new(side, end as f32),
+                colors[end].extend(1.0),
+            );
         }
     }
     fn mesh(self) -> Mesh {
@@ -121,91 +141,74 @@ impl FeedbackMesh {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.coordinates)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
     }
 }
+
 fn geometry(doc: &Document, object: &Object, state: &State) -> FeedbackMesh {
     let mut result = FeedbackMesh::default();
     let mesh = &object.geometry;
-    if mesh.positions.is_empty() {
-        return result;
-    }
-    let (min, max) = mesh.positions.iter().fold(
-        (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
-        |(min, max), &p| (min.min(p), max.max(p)),
-    );
-    let center = (min + max) * 0.5;
-    let span = (max - min).max_element().max(0.000001);
-    let coordinate = |p: Vec3| (p - center) / span + Vec3::splat(0.5);
+    let selection = &doc.selection;
+    let active = selection.active();
     let world = |p| object.transform.transform_point(p);
-    if doc.selection.kind == Element::Vertex {
-        for &vertex in &doc.selection.vertices {
-            if let Some(&p) = mesh.positions.get(vertex) {
-                result.star(world(p), coordinate(p), doc.selection.vertices.len() == 1);
+    for index in selection.selected_faces(mesh) {
+        let face = &mesh.faces[index];
+        let color = if active == Some(ComponentHit::Face(index)) {
+            ORANGE.lerp(ACTIVE, 0.30)
+        } else {
+            ORANGE
+        };
+        for triangle in mesh.triangles(face) {
+            for corner in triangle {
+                result.push(
+                    world(mesh.positions[face.corners[corner].vertex]),
+                    Vec3::Z,
+                    Vec2::ZERO,
+                    color.extend(0.),
+                );
             }
         }
-        return result;
     }
-    if doc.selection.kind == Element::Face {
-        for &index in &doc.selection.faces {
-            let Some(face) = mesh.faces.get(index) else {
+    if let Some(rendered) = state.render_objects.get(&object.id) {
+        for (&edge, faces) in rendered.edges.iter() {
+            if !highlighted(selection, edge, faces) {
                 continue;
-            };
-            let n = mesh.normal(face).abs();
-            let uv = |p: Vec3| {
-                let p = coordinate(p);
-                let projected = if n.x >= n.y && n.x >= n.z {
-                    p.yz()
-                } else if n.y >= n.z {
-                    p.xz()
-                } else {
-                    p.xy()
-                };
-                projected + Vec2::new((index % 31) as f32 * 0.67, (index % 47) as f32 * 0.73)
-            };
-            for triangle in mesh.triangles(face) {
-                let local = triangle.map(|corner| mesh.positions[face.corners[corner].vertex]);
-                let points = local.map(world);
-                let normal = (points[1] - points[0])
-                    .cross(points[2] - points[0])
-                    .normalize_or_zero();
-                for i in 0..3 {
-                    result.push(
-                        points[i],
-                        normal,
-                        uv(local[i]),
-                        coordinate(local[i]).extend(0.),
-                    );
-                }
             }
-            let p = mesh.center(face);
-            result.star(world(p), coordinate(p), false);
+            let colors = match selection.kind {
+                Element::Vertex => [edge.0, edge.1].map(|i| {
+                    if selection.vertices.contains(&i) {
+                        ORANGE
+                    } else {
+                        CAGE
+                    }
+                }),
+                Element::Edge if active == Some(ComponentHit::Edge(edge)) => [ACTIVE; 2],
+                Element::Face
+                    if active.is_some_and(|hit| match hit {
+                        ComponentHit::Face(i) => faces.contains(&i),
+                        _ => false,
+                    }) =>
+                {
+                    [ACTIVE; 2]
+                }
+                _ => [ORANGE; 2],
+            };
+            result.edge(
+                world(mesh.positions[edge.0]),
+                world(mesh.positions[edge.1]),
+                colors,
+            );
         }
     }
-    if doc.selection.kind != Element::Vertex {
-        if let Some(rendered) = state.render_objects.get(&object.id) {
-            for (&edge, faces) in rendered.edges.iter() {
-                let selected = if doc.selection.kind == Element::Edge {
-                    doc.selection.edges.contains(&edge)
+    if selection.kind == Element::Vertex {
+        for &vertex in &selection.vertices {
+            if let Some(&point) = mesh.positions.get(vertex) {
+                let color = if active == Some(ComponentHit::Vertex(vertex)) {
+                    ACTIVE
                 } else {
-                    faces.iter().any(|f| doc.selection.faces.contains(f))
+                    ORANGE
                 };
-                if !selected {
-                    continue;
-                }
-                let a = mesh.positions[edge.0];
-                let b = mesh.positions[edge.1];
-                let direction = (world(b) - world(a)).normalize_or_zero();
-                for (p, uv) in [
-                    (a, Vec2::new(-1., 0.)),
-                    (a, Vec2::new(1., 0.)),
-                    (b, Vec2::ONE),
-                    (a, Vec2::new(-1., 0.)),
-                    (b, Vec2::ONE),
-                    (b, Vec2::new(-1., 1.)),
-                ] {
-                    result.push(world(p), direction, uv, coordinate(p).extend(1.0));
-                }
+                result.dot(world(point), color);
             }
         }
     }
@@ -253,7 +256,6 @@ pub(in crate::editor) fn sync(
     mut commands: Commands,
     mut fills: Query<(&mut Visibility, &mut MeshMaterial3d<FaceMaterial>)>,
     window: Single<&Window, With<PrimaryWindow>>,
-    mut redraw: MessageWriter<RequestRedraw>,
     mut configs: ResMut<GizmoConfigStore>,
 ) {
     let pixel_scale = window.scale_factor();
@@ -300,13 +302,11 @@ pub(in crate::editor) fn sync(
     if overlay.materials.is_none() {
         overlay.materials = Some([
             materials.add(FaceMaterial {
-                color: Vec4::new(0.22, 0.075, 0.40, 0.768),
-                style: Vec4::new(window.scale_factor(), 0., 0., 0.),
+                params: Vec4::new(window.scale_factor(), 0.24, 0., 0.),
                 xray: false,
             }),
             materials.add(FaceMaterial {
-                color: Vec4::new(0.22, 0.075, 0.40, 0.30),
-                style: Vec4::new(window.scale_factor(), 0., 0., 0.),
+                params: Vec4::new(window.scale_factor(), 0.11, 0., 0.),
                 xray: true,
             }),
         ]);
@@ -314,14 +314,11 @@ pub(in crate::editor) fn sync(
     for handle in overlay.materials.as_ref().unwrap() {
         if materials
             .get(handle)
-            .is_some_and(|m| m.style.x != window.scale_factor())
+            .is_some_and(|m| m.params.x != window.scale_factor())
             && let Some(mut m) = materials.get_mut(handle)
         {
-            m.style.x = window.scale_factor();
+            m.params.x = window.scale_factor();
         }
-    }
-    if overlay.geometry && window.focused {
-        redraw.write(RequestRedraw);
     }
     let material = overlay.materials.as_ref().unwrap()[usize::from(state.xray)].clone();
     if overlay.entity.is_none() && overlay.geometry {

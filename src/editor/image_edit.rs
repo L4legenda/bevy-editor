@@ -1,4 +1,5 @@
 //! PhotoCraft integration for image tabs: commands, background I/O and gestures.
+use super::gradient::{self, Draft, Settings};
 use super::*;
 use crate::editor::{
     PendingAction,
@@ -17,6 +18,8 @@ pub(in crate::editor) mod picker_ui;
 pub(in crate::editor) use color::{ColorComponent, ColorTarget};
 pub(in crate::editor) use picker_ui::ColorPickerScroll;
 pub(in crate::editor) use picker_ui::{input as color_input, refresh as refresh_color_picker};
+#[path = "image_brush_library.rs"]
+mod brush_library;
 #[path = "image_brush_size.rs"]
 mod brush_size;
 #[path = "image_color_drop.rs"]
@@ -67,6 +70,9 @@ pub(in crate::editor) enum EditAction {
     Undo,
     Redo,
     CancelGesture,
+    GradientRadial(bool),
+    GradientTransparent,
+    GradientReverse,
     AddLayer,
     DeleteLayer,
     SelectLayer(usize),
@@ -75,6 +81,8 @@ pub(in crate::editor) enum EditAction {
     Layers(layers::LayerAction),
     Size(f32),
     SizeMenu,
+    BrushCategory(usize),
+    BrushPreset(Option<usize>),
     Hardness(f32),
     BrushOpacity(f32),
     #[cfg(test)]
@@ -123,6 +131,7 @@ enum Gesture {
         original: photo_document::LayerMove,
         origin: Vec2,
     },
+    Gradient(Draft),
 }
 
 #[derive(Default)]
@@ -144,6 +153,9 @@ pub(in crate::editor) struct State {
     pub mode_menu_dismissed: bool,
     pub size_menu: bool,
     pub size_menu_dismissed: bool,
+    brush_category: usize,
+    brush_preset: Option<usize>,
+    preset_sizes: HashMap<Option<usize>, f32>,
     pub drawing_tool: PhotoTool,
     brush_size: f32,
     pencil_size: f32,
@@ -153,6 +165,7 @@ pub(in crate::editor) struct State {
     pub pencil_shape: PixelShape,
     pub pixel_eraser_shape: PixelShape,
     pub tool: PhotoTool,
+    pub(super) gradient: Settings,
     pub size: f32,
     pub hardness: f32,
     pub opacity: f32,
@@ -187,7 +200,7 @@ impl State {
             return matches!(gesture, Gesture::PickColor { .. });
         }
         self.tool == PhotoTool::Eyedropper
-            || ((self.sizeable() || self.tool == PhotoTool::Fill)
+            || ((self.sizeable() || matches!(self.tool, PhotoTool::Fill | PhotoTool::Gradient))
                 && keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]))
     }
     fn set_size(&mut self, size: f32) {
@@ -217,6 +230,10 @@ impl State {
         }
         match action {
             EditAction::ModelTool(tool) => self.model_tool.unwrap_or(Tool::Universal) == tool,
+            EditAction::Layers(layers::LayerAction::BalanceTone(tone)) => self.layers.balance_tone == tone,
+            EditAction::GradientRadial(radial) => self.gradient.radial == radial,
+            EditAction::GradientTransparent => self.gradient.transparent,
+            EditAction::GradientReverse => self.gradient.reverse,
             EditAction::Selection(action) => self.selection.active(action, self.tool),
             EditAction::View => !self.editing(id),
             EditAction::Edit => self.editing(id),
@@ -229,6 +246,8 @@ impl State {
             EditAction::PaintMenu => self.paint_menu && self.tool_menu == ToolMenu::Paint,
             EditAction::EraserMenu => self.paint_menu && self.tool_menu == ToolMenu::Eraser,
             EditAction::SizeMenu => self.size_menu,
+            EditAction::BrushCategory(category) => self.brush_category == category,
+            EditAction::BrushPreset(preset) => self.brush_preset == preset,
             EditAction::ColorPicker(target) => self
                 .color_picker
                 .as_ref()
@@ -267,6 +286,20 @@ impl State {
                 }),
             _ => false,
         }
+    }
+    pub(super) fn gradient_draft(&self, id: usize) -> Option<Draft> {
+        match self.gesture {
+            Some((tab, Gesture::Gradient(draft))) if tab == id => Some(draft),
+            _ => None,
+        }
+    }
+    pub(super) fn cancel_gradient(&mut self) {
+        if matches!(self.gesture, Some((_, Gesture::Gradient(_)))) {
+            self.gesture = None;
+        }
+    }
+    pub(in crate::editor) fn gradient_dragging(&self) -> bool {
+        matches!(self.gesture, Some((_, Gesture::Gradient(_))))
     }
     pub fn document(&self, id: Option<usize>) -> Option<&PhotoDocument> {
         Some(&self.sessions.get(&id?)?.doc)
@@ -366,6 +399,12 @@ impl State {
         match action {
             EditAction::ModelTool(_) | EditAction::ModelPanel => {
                 self.editing(id) && self.model_reference(id).is_some()
+            }
+            EditAction::Selection(selection::SelectionAction::FlipSelection(_)) => {
+                self.editing(id)
+                    && matches!(self.tool, PhotoTool::Select(_))
+                    && self.selection.transform.is_none()
+                    && doc.is_some_and(selection::can_flip_selection)
             }
             EditAction::Selection(selection::SelectionAction::Apply) => {
                 self.selection.transform.is_some()
@@ -490,7 +529,7 @@ impl State {
     }
     fn brush(&self) -> BrushSettings {
         let pencil = self.pixel_tool();
-        BrushSettings {
+        let mut brush = BrushSettings {
             size: if pencil {
                 self.size.round().max(1.0)
             } else {
@@ -505,7 +544,15 @@ impl State {
             pressure_size: !pencil,
             square: pencil && self.pixel_shape() == PixelShape::Square,
             ..Default::default()
+        };
+        if self.tool == PhotoTool::Brush
+            && let Some(preset) = self
+                .brush_preset
+                .and_then(|index| brush_library::library().presets.get(index))
+        {
+            preset.apply(&mut brush);
         }
+        brush
     }
     fn set_color(&mut self, color: [f32; 4]) {
         self.color = Some(color);
@@ -677,6 +724,7 @@ pub(super) fn update(
             }
         }
     }
+    layers::poll_mask_import(state, editor);
     for &action in actions {
         if !matches!(action, Action::ImageEdit(EditAction::Opacity(..))) {
             state.opacity_drag = None;
@@ -685,6 +733,8 @@ pub(super) fn update(
             action,
             Action::ImageEdit(
                 EditAction::SizeMenu
+                    | EditAction::BrushCategory(_)
+                    | EditAction::BrushPreset(_)
                     | EditAction::Size(_)
                     | EditAction::Hardness(_)
                     | EditAction::BrushOpacity(_)
@@ -833,6 +883,11 @@ pub(super) fn update(
                     session.doc.cancel_move(&mut original);
                 }
             }
+            EditAction::GradientRadial(radial) => state.gradient.radial = radial,
+            EditAction::GradientTransparent => {
+                state.gradient.transparent = !state.gradient.transparent
+            }
+            EditAction::GradientReverse => state.gradient.reverse = !state.gradient.reverse,
             EditAction::Layers(action) => {
                 state.selection.transform = None;
                 state.selection.draft = None;
@@ -895,6 +950,36 @@ pub(super) fn update(
                 viewer.last_click = None;
             }
             EditAction::Hardness(value) => state.hardness = value.clamp(0.0, 1.0),
+            EditAction::BrushCategory(category) => {
+                if state.tool == PhotoTool::Brush
+                    && state.size_menu
+                    && category < brush_library::library().categories.len()
+                {
+                    state.brush_category = category;
+                }
+            }
+            EditAction::BrushPreset(preset) => {
+                if state.tool == PhotoTool::Brush
+                    && state.size_menu
+                    && preset.is_none_or(|index| index < brush_library::library().presets.len())
+                {
+                    if state.brush_preset != preset {
+                        state.preset_sizes.insert(state.brush_preset, state.size);
+                        let diameter = state
+                            .preset_sizes
+                            .get(&preset)
+                            .copied()
+                            .or_else(|| {
+                                preset.map(|index| brush_library::library().presets[index].diameter)
+                            })
+                            .unwrap_or(24.0);
+                        state.set_size(diameter);
+                        state.brush_preset = preset;
+                    }
+                    state.size_menu = false;
+                    state.size_menu_dismissed = true;
+                }
+            }
             EditAction::BrushOpacity(value) => state.opacity = value.clamp(0.01, 1.0),
             #[cfg(test)]
             EditAction::Color(color) => {
@@ -1191,6 +1276,14 @@ pub(super) fn pointer(
         viewer.edit.gesture = None;
         return true;
     }
+    if matches!(viewer.edit.gesture, Some((_, Gesture::Gradient(_))))
+        && (keys.just_pressed(KeyCode::Escape)
+            || keys.pressed(KeyCode::Space)
+            || mouse.pressed(MouseButton::Middle))
+    {
+        viewer.edit.gesture = None;
+        return true;
+    }
     if viewer.edit.tool == PhotoTool::Hand
         || keys.pressed(KeyCode::Space)
         || mouse.pressed(MouseButton::Middle)
@@ -1223,7 +1316,7 @@ pub(super) fn pointer(
         // complete trajectory over panels and outside the window until release.
         let captured = matches!(
             state.gesture,
-            Some((gesture_id, Gesture::Paint { .. } | Gesture::PickColor { .. })) if gesture_id == id
+            Some((gesture_id, Gesture::Paint { .. } | Gesture::PickColor { .. } | Gesture::Gradient(_))) if gesture_id == id
         );
         if !input_rect.contains(cursor) && (down || !captured) {
             flush(state, id, &points, position, true);
@@ -1250,6 +1343,7 @@ pub(super) fn pointer(
             }
             focus.clear();
             let color = state.color();
+            let gradient_colors = state.gradient.colors(color, state.background());
             let mut brush = state.brush();
             let Some(session) = state.sessions.get_mut(&id) else {
                 continue;
@@ -1271,7 +1365,24 @@ pub(super) fn pointer(
             } else if !session.doc.paintable() {
                 editor.status = "Выберите видимый незаблокированный слой".into();
             } else if state.tool == PhotoTool::Fill {
-                session.doc.fill(point.x as i32, point.y as i32, color);
+                if let Err(error) = session.doc.fill(point.x as i32, point.y as i32, color) {
+                    state.error = Some(error);
+                }
+            } else if state.tool == PhotoTool::Gradient {
+                state.gesture = Some((
+                    id,
+                    Gesture::Gradient(Draft {
+                        from: point,
+                        to: point,
+                        colors: gradient_colors,
+                        radial: state.gradient.radial,
+                        min_length: 4.0 * dimensions.x as f32 / size.x,
+                        revision: session.doc.revision,
+                        view_revision: session.doc.view_revision,
+                        layer: session.doc.active_id(),
+                        target: session.doc.paint_target(),
+                    }),
+                ));
             } else if let Some(original) = session.doc.paint_surface().cloned() {
                 let gesture = {
                     let renderer =
@@ -1290,6 +1401,15 @@ pub(super) fn pointer(
             }
         }
         sample_color(state, id, point, dimensions);
+        if let Some((tab, Gesture::Gradient(draft))) = &mut state.gesture
+            && *tab == id
+        {
+            draft.to = gradient::snap(
+                draft.from,
+                point,
+                keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
+            );
+        }
         let point = state.snap_point(point);
         position = Some(point);
         if let Some((
@@ -1309,6 +1429,13 @@ pub(super) fn pointer(
             *last_pressure = pressure;
         }
         if up {
+            if let Some(draft) = state.gradient_draft(id)
+                && let Some(session) = state.sessions.get_mut(&id)
+                && draft.valid_for(&session.doc)
+                && let Err(error) = session.doc.layer_command("paint.gradient", draft.params())
+            {
+                state.error = Some(error);
+            }
             flush(state, id, &points, position, true);
             state.gesture = None;
             points.clear();
@@ -1316,6 +1443,10 @@ pub(super) fn pointer(
         }
     }
     let finished = !mouse.pressed(MouseButton::Left);
+    // A lost pointer capture cancels the draft. Only an actual Up applies it.
+    if finished && matches!(state.gesture, Some((_, Gesture::Gradient(_)))) {
+        state.gesture = None;
+    }
     flush(state, id, &points, position, finished);
     if finished {
         state.gesture = None;
@@ -1428,7 +1559,10 @@ pub(in crate::editor) fn shortcuts(
         return true;
     }
     if keys.just_pressed(KeyCode::Escape)
-        && matches!(viewer.edit.gesture, Some((_, Gesture::Move { .. })))
+        && matches!(
+            viewer.edit.gesture,
+            Some((_, Gesture::Move { .. } | Gesture::Gradient(_)))
+        )
     {
         actions.write(Action::ImageEdit(EditAction::CancelGesture));
         return true;
@@ -1531,6 +1665,7 @@ pub(in crate::editor) fn shortcuts(
         for (key, tool) in [
             (KeyCode::KeyE, PhotoTool::Eraser),
             (KeyCode::KeyG, PhotoTool::Fill),
+            (KeyCode::KeyU, PhotoTool::Gradient),
             (KeyCode::KeyI, PhotoTool::Eyedropper),
             (KeyCode::KeyV, PhotoTool::Move),
             (KeyCode::KeyH, PhotoTool::Hand),

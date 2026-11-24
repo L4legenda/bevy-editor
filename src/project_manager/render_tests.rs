@@ -418,6 +418,9 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         app.world().resource::<Manager>().selected.as_ref(),
         Some(&file)
     );
+    app.world_mut()
+        .write_message(Action::Context(file.clone(), Vec2::new(350.0, 350.0)));
+    warm(&mut app);
     click_control(&mut app, window, "Убрать из списка");
     let manager = app.world().resource::<Manager>();
     assert_eq!(manager.recent.projects.len(), 1);
@@ -431,9 +434,8 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         1
     );
 
-    click_control(&mut app, window, "Открыть проект");
-    assert_eq!(app.world().resource::<Manager>().selected, selected);
-    for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
-        child.wait().unwrap();
-    }
+    let world = app.world_mut();
+    assert!(world.query::<&Text>().iter(world).any(|text| {
+        text.0 == concat!("Версия ", env!("CARGO_PKG_VERSION"))
+    }));
 }

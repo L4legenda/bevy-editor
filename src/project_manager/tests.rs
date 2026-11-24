@@ -189,6 +189,7 @@ fn controller(scratch: &Scratch) -> App {
         ))
         .init_resource::<InputFocus>()
         .init_resource::<native::Picker>()
+        .init_resource::<update::Updates>()
         .add_message::<Action>()
         .add_systems(Update, (actions, poll_editors).chain());
     app

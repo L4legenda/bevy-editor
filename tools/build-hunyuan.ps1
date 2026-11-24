@@ -42,34 +42,53 @@ if (-not $cudaRoot -or -not (Test-Path (Join-Path $cudaRoot 'bin/nvcc.exe')) -or
     }
 }
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-$vsInstall = & $vswhere -latest -products '*' -property installationPath
-if (-not $vsInstall) { throw 'Install Visual Studio C++ build tools to compile Candle CUDA kernels' }
+if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+    throw 'Install Visual Studio Build Tools with the Desktop development with C++ workload.'
+}
+$vsInstall = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if ($LASTEXITCODE -ne 0 -or -not $vsInstall) {
+    throw 'Install the Visual Studio x64 C++ build tools to compile Candle CUDA kernels.'
+}
 $dev = Join-Path $vsInstall 'Common7/Tools/VsDevCmd.bat'
-$environmentCommand = '"' + $dev + '" -arch=x64 -host_arch=x64 >nul && set'
-cmd /c $environmentCommand | ForEach-Object {
+$environmentCommand = 'call "' + $dev + '" -arch=x64 -host_arch=x64 >nul && set'
+$developerEnvironment = & cmd.exe /d /c $environmentCommand
+if ($LASTEXITCODE -ne 0) { throw "Could not initialize the x64 MSVC environment: $dev" }
+$developerEnvironment | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+}
+if (-not (Get-Command cl.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw "MSVC compiler cl.exe was not found after initializing $dev."
 }
 $env:CUDA_PATH = $cudaRoot
 $env:PATH = (Join-Path $cudaRoot 'bin') + ';' + $env:PATH
 $env:NVCC_PREPEND_FLAGS = '-allow-unsupported-compiler'
-# PTX can JIT on all supported Ampere-and-newer GPUs, including 3060 Ti.
-if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = '80' }
+# PTX for Pascal can be JIT-compiled on newer devices too. Keep each architecture
+# in its own target directory: bindgen_cuda reuses existing PTX by source mtime.
+if (-not $env:CUDA_COMPUTE_CAP) { $env:CUDA_COMPUTE_CAP = '61' }
+if ($env:CUDA_COMPUTE_CAP -notmatch '^[1-9][0-9]{1,2}$') {
+    throw 'CUDA_COMPUTE_CAP must be a numeric compute capability such as 61 or 80.'
+}
+$target = Join-Path $repo "crates/hunyuan-native/target/sm-$env:CUDA_COMPUTE_CAP"
 $env:RAYON_NUM_THREADS = '2'
-$arguments = @('build', '--locked', '--manifest-path', (Join-Path $repo 'crates/hunyuan-native/Cargo.toml'), '--target-dir', (Join-Path $repo 'crates/hunyuan-native/target'))
+$arguments = @('build', '--locked', '--manifest-path', (Join-Path $repo 'crates/hunyuan-native/Cargo.toml'), '--target-dir', $target)
 $nativeProfile = 'debug'
 if ($Release) { $arguments += '--release'; $nativeProfile = 'release' }
 & cargo @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Native Hunyuan build failed' }
-if ($Destination) {
-    $destinationPath = [IO.Path]::GetFullPath($Destination)
-    New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
-    Copy-Component (Join-Path $repo "crates/hunyuan-native/target/$nativeProfile/bevy-hunyuan.exe") $destinationPath
-    foreach ($name in @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll', 'curand64_10.dll', 'nvrtc64_120_0.dll', 'nvrtc-builtins64_128.dll')) {
-        Copy-Component (Join-Path $cudaRoot "bin/$name") $destinationPath
-    }
-    Copy-Component (Join-Path $repo 'crates/hunyuan-native/LICENSE-TENCENT') $destinationPath
-    Copy-Component (Join-Path $repo 'crates/hunyuan-native/NOTICE') $destinationPath
-    $licenses = Join-Path $destinationPath 'cuda-licenses'
-    New-Item -ItemType Directory -Path $licenses -Force | Out-Null
-    Get-ChildItem -LiteralPath $cudaRoot -File | Where-Object { $_.Name -match 'LICENSE|EULA' } | Copy-Item -Destination $licenses -Force
+if (-not $Destination) { $Destination = Join-Path $repo "crates/hunyuan-native/target/$nativeProfile" }
+$destinationPath = [IO.Path]::GetFullPath($Destination)
+New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+Copy-Component (Join-Path $target "$nativeProfile/bevy-hunyuan.exe") $destinationPath
+foreach ($name in @('cudart64_12.dll', 'cublas64_12.dll', 'cublasLt64_12.dll', 'curand64_10.dll', 'nvrtc64_120_0.dll', 'nvrtc-builtins64_128.dll')) {
+    Copy-Component (Join-Path $cudaRoot "bin/$name") $destinationPath
+}
+Copy-Component (Join-Path $repo 'crates/hunyuan-native/LICENSE-TENCENT') $destinationPath
+Copy-Component (Join-Path $repo 'crates/hunyuan-native/NOTICE') $destinationPath
+$licenses = Join-Path $destinationPath 'cuda-licenses'
+New-Item -ItemType Directory -Path $licenses -Force | Out-Null
+Get-ChildItem -LiteralPath $cudaRoot -File | Where-Object { $_.Name -match 'LICENSE|EULA' } | Copy-Item -Destination $licenses -Force
+$candleLicenses = Join-Path $destinationPath 'candle-licenses'
+New-Item -ItemType Directory -Path $candleLicenses -Force | Out-Null
+foreach ($name in @('LICENSE-APACHE', 'LICENSE-MIT')) {
+    Copy-Component (Join-Path $repo "crates/hunyuan-native/vendor/candle-kernels/$name") $candleLicenses
 }

@@ -344,7 +344,7 @@ pub(in crate::editor) fn cursor(
             });
             return cache.pipette(window.scale_factor(), &mut images);
         }
-        if matches!(viewer.edit.tool, PhotoTool::Select(_)) {
+        if matches!(viewer.edit.tool, PhotoTool::Select(_) | PhotoTool::Gradient) {
             return CursorIcon::from(SystemCursorIcon::Crosshair);
         }
         if matches!(viewer.edit.tool, PhotoTool::Move | PhotoTool::Transform) {

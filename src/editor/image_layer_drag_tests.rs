@@ -108,6 +108,64 @@ fn gpu_layer_flyout_opens_beside_the_row_and_dismisses_without_painting() {
     assert!(visible(&mut app, "Меню слоя"));
     warm(&mut app, 14);
     assert!(!visible(&mut app, "Меню слоя"));
+
+    let open_masks = |app: &mut App| {
+        click_action(app, window, |action| {
+            matches!(
+                action,
+                Action::ImageEdit(edit::EditAction::Layers(L::Category("Добавить маску")))
+            )
+        });
+        warm(app, 18);
+    };
+    open_masks(&mut app);
+    let element_bounds = |app: &mut App, name| {
+        let world = app.world_mut();
+        let (node, transform) = world
+            .query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>()
+            .iter(world)
+            .find_map(|(label, node, transform)| {
+                (label.0 == name && !node.is_empty()).then_some((node, transform))
+            })
+            .unwrap();
+        let scale = node.inverse_scale_factor();
+        Rect::from_center_size(transform.affine().translation * scale, node.size() * scale)
+    };
+    let masks = element_bounds(&mut app, "Меню масок");
+    let button = element_bounds(&mut app, "Добавить маску");
+    assert_eq!(masks.width(), menu.width());
+    assert!(masks.max.y < button.min.y && button.min.y - masks.max.y < 12.0);
+    assert!((masks.center().x - button.center().x).abs() < 2.0);
+    assert!(visible(&mut app, "Маска из изображения…"));
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/mask-flyout.png");
+    capture_when(&mut app, &target, &output, |_| true);
+    move_pointer(&mut app, window, Vec2::new(520.0, 450.0));
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    warm(&mut app, 14);
+    assert!(!visible(&mut app, "Меню масок"));
+    assert_eq!(document(&app).revision, revision);
+    open_masks(&mut app);
+    click_action(&mut app, window, |action| {
+        matches!(
+            action,
+            Action::ImageEdit(edit::EditAction::Layers(L::Quick(
+                "layer.layerMask.hideAll"
+            )))
+        )
+    });
+    warm(&mut app, 14);
+    assert!(!visible(&mut app, "Меню масок"));
+    assert_eq!(
+        document(&app)
+            .active_layer()
+            .unwrap()
+            .mask
+            .as_ref()
+            .unwrap()
+            .value(1, 1),
+        0.0
+    );
 }
 
 #[test]

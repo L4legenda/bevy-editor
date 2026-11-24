@@ -5,6 +5,10 @@ use photocraft_geom::Rect;
 use photocraft_raster::{Surface, from_rgba_into};
 use serde::{Deserialize, Serialize};
 
+#[path = "paint_bucket_edges.rs"]
+mod bucket_edges;
+pub use bucket_edges::bucket_recolor_edges;
+
 /// How a fill lays down its colour: blended with a mode, or Clear, which erases what it covers
 /// (the Paint Bucket's Mode › Clear).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -102,6 +102,8 @@ pub struct Dab {
     pub depth: f32,
     /// Position in the stroke (0 = first).
     pub index: u64,
+    /// Along-path position in document pixels for measured stroke textures.
+    pub sample_position: f64,
     /// Brush Projection: direction (radians, counter-clockwise, y up) along which the tip is
     /// foreshortened, and the factor (1 = no projection).
     pub proj_angle: f32,
@@ -126,6 +128,7 @@ impl Dab {
             color: [0.0, 0.0, 0.0, 1.0],
             depth: 1.0,
             index: 0,
+            sample_position: 0.0,
             proj_angle: 0.0,
             proj_scale: 1.0,
             wet: 1.0,

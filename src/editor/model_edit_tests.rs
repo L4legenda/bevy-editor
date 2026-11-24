@@ -665,15 +665,13 @@ fn scene_workspace_interactions(app: &mut App, window: Entity) {
         TransformHandle as Handle,
         transform_handles::{HandleMaterial, ModelOverlay},
     };
-    let expected = crate::SceneLighting::editor_default();
     {
         let world = app.world_mut();
-        let (exposure, ambient) = world
-            .query_filtered::<(&bevy::camera::Exposure, &AmbientLight), With<ViewCamera>>()
+        let ambient = world
+            .query_filtered::<&AmbientLight, With<ViewCamera>>()
             .single(world)
             .unwrap();
-        assert_eq!(exposure.ev100, expected.exposure_ev100);
-        assert_eq!(ambient.brightness, expected.ambient_brightness);
+        assert_eq!(ambient.brightness, 0.0);
         assert!(
             world
                 .query_filtered::<&Visibility, With<ModelGrid>>()
@@ -1664,7 +1662,12 @@ fn gpu_model_xray_reveals_hidden_faces_without_changing_materials() {
             .query::<(&xray::SourceMaterial, &MeshMaterial3d<StandardMaterial>)>()
             .iter(world)
         {
-            assert_eq!(source.0, displayed.0);
+            let assets = world.resource::<Assets<StandardMaterial>>();
+            let original = assets.get(&source.0).unwrap();
+            let restored = assets.get(&displayed.0).unwrap();
+            assert!(restored.unlit);
+            assert_eq!(restored.base_color, original.base_color);
+            assert_eq!(restored.alpha_mode, original.alpha_mode);
         }
     }
     let restored = capture_when(&mut app, &target, &output.join("04-restored.png"), |_| true);
@@ -1678,391 +1681,135 @@ fn gpu_model_xray_reveals_hidden_faces_without_changing_materials() {
 }
 
 #[test]
-#[ignore = "requires GPU; verifies selected face fill, vertex/edge contrast, accurate labels and X-Ray feedback"]
+#[ignore = "requires GPU; verifies the seven model component selection states"]
 fn gpu_model_selection_feedback_identifies_faces_edges_and_vertices() {
+    use crate::editor::model_mesh::ComponentHit;
+    use bevy::mesh::VertexAttributeValues;
+
     let project = EditorProject::load(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
-    )
-    .unwrap();
+    ).unwrap();
     let (mut app, window, target) = fixture_project(project);
     let scene = app.world().resource::<Editor>().edits.clone();
     app.world_mut().write_message(Action::ViewModel(0));
     model_ready(&mut app, 0);
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
+        shading::ShadingAction::Set(shading::Mode::Solid),
+    )));
     {
         let mut viewer = app.world_mut().resource_mut::<Viewer>();
         viewer.center = Vec3::Y * 0.5;
-        viewer.distance = 2.2;
+        viewer.distance = 3.6;
         viewer.yaw = 0.55;
         viewer.pitch = 0.48;
     }
     send(&mut app, EditAction::Mode(Mode::Edit));
-    send(&mut app, EditAction::Element(Element::Face));
-    send(&mut app, EditAction::Deselect);
     let rect = canvas_rect(&mut app);
-    move_pointer(&mut app, window, rect.center());
-    let (objects, top, top_point, samples, vertex, edge) = {
+    let (objects, vertices, edges, faces) = {
         let state = app.world().resource::<State>();
         let doc = &state.documents[&0];
         let object = doc.active().unwrap();
-        let world = |p| object.transform.transform_point(p);
-        let top = object
-            .geometry
-            .faces
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                world(object.geometry.center(a))
-                    .y
-                    .total_cmp(&world(object.geometry.center(b)).y)
-            })
-            .unwrap()
-            .0;
-        let center = world(object.geometry.center(&object.geometry.faces[top]));
         let viewer = app.world().resource::<Viewer>();
-        let samples: Vec<_> = object.geometry.faces[top]
-            .corners
-            .iter()
-            .map(|c| {
-                input::project(
-                    viewer,
-                    rect,
-                    center.lerp(world(object.geometry.positions[c.vertex]), 0.55),
-                )
-                .unwrap()
-            })
-            .collect();
-        let eye = view_pose(viewer).translation;
-        let vertex = object
-            .geometry
-            .positions
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                world(**a)
-                    .distance_squared(eye)
-                    .total_cmp(&world(**b).distance_squared(eye))
-            })
-            .unwrap()
-            .0;
-        let edge = object
-            .geometry
-            .edges()
-            .into_keys()
-            .min_by(|a, b| {
-                let midpoint = |e: &Edge| {
-                    world((object.geometry.positions[e.0] + object.geometry.positions[e.1]) * 0.5)
-                };
-                midpoint(a)
-                    .distance_squared(eye)
-                    .total_cmp(&midpoint(b).distance_squared(eye))
-            })
-            .unwrap();
-        (
-            doc.objects.clone(),
-            top,
-            input::project(viewer, rect, center).unwrap(),
-            samples,
-            vertex,
-            edge,
-        )
+        let bvh = input::Bvh::build(doc);
+        let point = |p| {
+            let world = object.transform.transform_point(p);
+            input::visible(&bvh, viewer, rect, world)
+                .then(|| input::project(viewer, rect, world)).flatten()
+        };
+        let mesh = &object.geometry;
+        let vertices: Vec<_> = mesh.positions.iter().enumerate().filter_map(|(i, &p)| {
+            Some((ComponentHit::Vertex(i), point(p)?))
+        }).take(2).collect();
+        let edges: Vec<_> = mesh.edges().into_keys().filter_map(|e| {
+            Some((ComponentHit::Edge(e), point((mesh.positions[e.0] + mesh.positions[e.1]) * 0.5)?))
+        }).take(2).collect();
+        let faces: Vec<_> = mesh.faces.iter().enumerate().filter_map(|(i, face)| {
+            let center = object.transform.transform_point(mesh.center(face));
+            let cursor = input::project(viewer, rect, center)?;
+            let (origin, direction) = input::ray(viewer, rect, cursor);
+            let (_, hit, _) = bvh.cast(origin, direction, Some(object.id))?;
+            (hit == i).then_some((ComponentHit::Face(i), cursor))
+        }).take(2).collect();
+        (doc.objects.clone(), vertices, edges, faces)
     };
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/model-selection-qa");
     std::fs::create_dir_all(&output).unwrap();
-    let before = capture_when(
-        &mut app,
-        &target,
-        &output.join("01-no-selection.png"),
-        |_| true,
-    );
-    move_pointer(&mut app, window, top_point);
-    mouse(&mut app, window, ButtonState::Pressed);
-    mouse(&mut app, window, ButtonState::Released);
-    warm(&mut app, 12);
-    assert_eq!(
-        app.world().resource::<State>().documents[&0]
-            .selection
-            .faces,
-        BTreeSet::from([top])
-    );
-    let face_image = capture_when(&mut app, &target, &output.join("02-face.png"), |_| true);
-    let violet_tint = |pixel: image::Rgba<u8>| i16::from(pixel[2]) - i16::from(pixel[1]);
-    let stellar = |pixel: &image::Rgba<u8>| {
-        let [r, g, b, _] = pixel.0.map(u16::from);
-        r > 205 && g > 200 && b > 145 && r > g + 4 && g > b + 12
+    let colors = |app: &mut App| {
+        let world = app.world_mut();
+        let mesh = world.query_filtered::<&Mesh3d, With<MeshMaterial3d<selection::FaceMaterial>>>()
+            .single(world).unwrap();
+        let assets = world.resource::<Assets<Mesh>>();
+        let VertexAttributeValues::Float32x4(colors) = assets.get(mesh).unwrap()
+            .attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
+        else {
+            panic!("Selection feedback requires per-vertex colors");
+        };
+        colors.clone()
     };
-    let sample = |image: &image::RgbaImage, p: Vec2| {
-        *image.get_pixel(p.x.round() as u32, p.y.round() as u32)
+    let capture = |app: &mut App, file: &str| {
+        move_pointer(app, window, Vec2::new(20., 110.));
+        capture_when(app, &target, &output.join(file), |_| true);
     };
-    let has_fill = |image: &image::RgbaImage, p| {
-        violet_tint(sample(image, p)) - violet_tint(sample(&before, p)) > 15
-    };
-    assert!(
-        samples
-            .iter()
-            .filter(|&&p| has_fill(&face_image, p))
-            .count()
-            >= 2,
-        "The translucent fill must give the selected face a visible violet tint"
-    );
-    warm(&mut app, 120);
-    let flowing = capture_when(&mut app, &target, &output.join("02-face-flow.png"), |_| {
-        true
-    });
-    let animated = samples
-        .iter()
-        .map(|&p| {
-            (-3..=3)
-                .flat_map(|y| (-3..=3).map(move |x| (x, y)))
-                .filter(|&(x, y)| {
-                    let p = p + Vec2::new(x as f32, y as f32);
-                    sample(&face_image, p)
-                        .0
-                        .into_iter()
-                        .zip(sample(&flowing, p).0)
-                        .take(3)
-                        .any(|(a, b)| a.abs_diff(b) > 2)
-                })
-                .count()
-        })
-        .sum::<usize>();
-    assert!(
-        animated > 30,
-        "The nebula must drift gently within the selected face: {animated}"
-    );
-    let label = app
-        .world()
-        .resource::<State>()
-        .selection_label(Some(0))
-        .unwrap();
-    assert!(label.contains("Грани · выбрано 1 из 6"), "{label}");
-    let status = app.world().resource::<ViewerUi>().status;
-    assert!(
-        app.world()
-            .get::<Text>(status)
-            .unwrap()
-            .0
-            .contains("Грани · выбрано 1 из 6")
-    );
+    send(&mut app, EditAction::SelectAll);
+    let all = colors(&mut app);
+    assert_eq!(all.iter().filter(|c| c[3] == 0.0).count(), 36);
+    assert_eq!(all.iter().filter(|c| c[3] == 0.5).count(), 48);
+    assert!(all.iter().all(|c| c[..3] != [1.0; 3]));
+    capture(&mut app, "01-all.png");
 
-    send(&mut app, EditAction::Element(Element::Vertex));
-    let converted_face = capture_when(
-        &mut app,
-        &target,
-        &output.join("03-face-to-vertices.png"),
-        |_| true,
-    );
-    assert_eq!(
-        app.world().resource::<State>().documents[&0]
-            .selection
-            .vertices
-            .len(),
-        4
-    );
-    assert!(
-        samples
-            .iter()
-            .all(|&p| !has_fill(&converted_face, p)),
-        "Vertex mode must remove the selected face fill after conversion"
-    );
-    send(&mut app, EditAction::Deselect);
-    let vertex_point = {
-        let state = app.world().resource::<State>();
-        let object = state.documents[&0].active().unwrap();
-        input::project(
-            app.world().resource::<Viewer>(),
-            rect,
-            object
-                .transform
-                .transform_point(object.geometry.positions[vertex]),
-        )
-        .unwrap()
-    };
-    move_pointer(&mut app, window, vertex_point);
-    mouse(&mut app, window, ButtonState::Pressed);
-    mouse(&mut app, window, ButtonState::Released);
-    let vertex_image = capture_when(&mut app, &target, &output.join("03-vertex.png"), |_| true);
-    assert_eq!(
-        app.world().resource::<State>().documents[&0]
-            .selection
-            .vertices,
-        BTreeSet::from([vertex])
-    );
-    assert!(
-        app.world()
-            .resource::<State>()
-            .selection_label(Some(0))
-            .unwrap()
-            .contains("Вершины · выбрано 1 из 8")
-    );
-    let mut colored = 0;
-    for y in -12..=12 {
-        for x in -12..=12 {
-            if stellar(&sample(
-                &vertex_image,
-                vertex_point + Vec2::new(x as f32, y as f32),
-            )) {
-                colored += 1;
+    for (kind, hits, tag, one, two) in [
+        (Element::Vertex, vertices, 0.5, "02-vertex.png", "03-two-vertices.png"),
+        (Element::Edge, edges, 1.0, "04-edge.png", "05-two-edges.png"),
+        (Element::Face, faces, 1.0, "06-face.png", "07-two-faces.png"),
+    ] {
+        assert_eq!(hits.len(), 2);
+        send(&mut app, EditAction::Element(kind));
+        send(&mut app, EditAction::Deselect);
+        for (index, (hit, point)) in hits.into_iter().enumerate() {
+            if index == 1 {
+                app.world_mut().write_message(KeyboardInput {
+                    key_code: KeyCode::ShiftLeft,
+                    logical_key: Key::Shift,
+                    state: ButtonState::Pressed,
+                    text: None,
+                    repeat: false,
+                    window,
+                });
+                warm(&mut app, 2);
             }
+            move_pointer(&mut app, window, point);
+            mouse(&mut app, window, ButtonState::Pressed);
+            mouse(&mut app, window, ButtonState::Released);
+            if index == 1 {
+                app.world_mut().write_message(KeyboardInput {
+                    key_code: KeyCode::ShiftLeft,
+                    logical_key: Key::Shift,
+                    state: ButtonState::Released,
+                    text: None,
+                    repeat: false,
+                    window,
+                });
+            }
+            warm(&mut app, 3);
+            let state = app.world().resource::<State>();
+            assert_eq!(state.documents[&0].selection.active(), Some(hit));
+            assert!(state.selection_label(Some(0)).unwrap().contains(&format!("выбрано {} из", index + 1)));
+            let colors = colors(&mut app);
+            assert!(colors.iter().any(|c| c[3] == tag && c[..3] == [1.0; 3]));
+            if index == 1 {
+                assert!(colors.iter().any(|c| c[3] == tag && c[0] == 1.0 && c[1] < 0.5));
+            }
+            if kind == Element::Face {
+                assert_eq!(colors.iter().filter(|c| c[3] == 0.0).count(), (index + 1) * 6);
+            }
+            capture(&mut app, if index == 0 { one } else { two });
         }
     }
-    assert!(
-        colored >= 30,
-        "A selected vertex must have a luminous orbit visible around the transform pivot: {colored} pixels"
-    );
-
-    send(&mut app, EditAction::Element(Element::Edge));
-    send(&mut app, EditAction::Deselect);
-    let edge_point = {
-        let state = app.world().resource::<State>();
-        let object = state.documents[&0].active().unwrap();
-        let p = (object.geometry.positions[edge.0] + object.geometry.positions[edge.1]) * 0.5;
-        input::project(
-            app.world().resource::<Viewer>(),
-            rect,
-            object.transform.transform_point(p),
-        )
-        .unwrap()
-    };
-    move_pointer(&mut app, window, edge_point);
-    mouse(&mut app, window, ButtonState::Pressed);
-    mouse(&mut app, window, ButtonState::Released);
-    send(&mut app, EditAction::Tool(Tool::Rotate));
-    let edge_image = capture_when(&mut app, &target, &output.join("04-edge.png"), |_| true);
-    assert_eq!(
-        app.world().resource::<State>().documents[&0]
-            .selection
-            .edges,
-        BTreeSet::from([edge])
-    );
-    assert!(
-        app.world()
-            .resource::<State>()
-            .selection_label(Some(0))
-            .unwrap()
-            .contains("Рёбра · выбрано 1 из 12")
-    );
-
-    click_control(&mut app, window, |action| {
-        matches!(
-            action,
-            Action::ModelView(ModelViewAction::Edit(EditAction::Element(Element::Vertex)))
-        )
-    });
-    let converted_edge = capture_when(
-        &mut app,
-        &target,
-        &output.join("04-edge-to-vertices.png"),
-        |_| true,
-    );
-    let (a, b) = {
-        let state = app.world().resource::<State>();
-        let doc = &state.documents[&0];
-        assert_eq!(doc.selection.kind, Element::Vertex);
-        assert_eq!(doc.selection.vertices, BTreeSet::from([edge.0, edge.1]));
-        assert!(doc.selection.edges.is_empty());
-        assert!(doc.selection.faces.is_empty());
-        let object = doc.active().unwrap();
-        let viewer = app.world().resource::<Viewer>();
-        let project = |v| {
-            input::project(
-                viewer,
-                rect,
-                object
-                    .transform
-                    .transform_point(object.geometry.positions[v]),
-            )
-            .unwrap()
-        };
-        (project(edge.0), project(edge.1))
-    };
-    let colored_patch = |image: &image::RgbaImage, p: Vec2, radius: i32| {
-        (-radius..=radius)
-            .flat_map(|y| (-radius..=radius).map(move |x| (x, y)))
-            .filter(|&(x, y)| stellar(&sample(image, p + Vec2::new(x as f32, y as f32))))
-            .count()
-    };
-    for p in [a, b] {
-        let count = colored_patch(&converted_edge, p, 6);
-        assert!(
-            count >= 20,
-            "Each converted endpoint must have a visible filled vertex marker: {p:?}, {count} pixels"
-        );
-    }
-    let interior = |image: &image::RgbaImage| {
-        [0.15, 0.25, 0.35, 0.65, 0.75, 0.85]
-            .into_iter()
-            .map(|t| colored_patch(image, a.lerp(b, t), 2))
-            .sum::<usize>()
-    };
-    assert!(
-        interior(&edge_image) > 40,
-        "Edge mode must highlight the line"
-    );
-    let normal = (b - a).normalize().perp();
-    let contrast_sections = [0.15, 0.25, 0.35, 0.65, 0.75, 0.85]
-        .into_iter()
-        .filter(|&t| {
-            let point = a.lerp(b, t);
-            let dark = (-7..=7)
-                .filter(|&offset| {
-                    let point = point + normal * offset as f32;
-                    let selected = sample(&edge_image, point).0.map(i32::from);
-                    let original = sample(&before, point).0.map(i32::from);
-                    selected[2] > selected[0] + 8
-                        && selected[2] > selected[1] + 18
-                        && (0..3).map(|i| original[i] - selected[i]).sum::<i32>() > 100
-                })
-                .count();
-            dark >= 2 && colored_patch(&edge_image, point, 2) >= 4
-        })
-        .count();
-    assert!(
-        contrast_sections >= 5,
-        "The luminous edge needs a contrasting plum body along its length on the bright model: {contrast_sections}/6 sections"
-    );
-    assert!(
-        interior(&converted_edge) < interior(&edge_image) / 4,
-        "Switching to vertices must remove the connecting edge highlight"
-    );
-
-    send(&mut app, EditAction::Xray);
-    send(&mut app, EditAction::Element(Element::Face));
-    send(&mut app, EditAction::Deselect);
-    let (hidden, point) = {
-        let state = app.world().resource::<State>();
-        let object = state.documents[&0].active().unwrap();
-        let viewer = app.world().resource::<Viewer>();
-        let eye = view_pose(viewer).translation;
-        object
-            .geometry
-            .faces
-            .iter()
-            .enumerate()
-            .find_map(|(i, f)| {
-                let p = object.transform.transform_point(object.geometry.center(f));
-                let (_, _, near) = state.bvh.cast(eye, (p - eye).normalize(), None)?;
-                (near + 0.01 < p.distance(eye)).then_some((i, input::project(viewer, rect, p)?))
-            })
-            .unwrap()
-    };
-    move_pointer(&mut app, window, point);
-    mouse(&mut app, window, ButtonState::Pressed);
-    mouse(&mut app, window, ButtonState::Released);
-    capture_when(&mut app, &target, &output.join("05-xray-face.png"), |_| {
-        true
-    });
-    assert!(
-        app.world().resource::<State>().documents[&0]
-            .selection
-            .faces
-            .contains(&hidden)
-    );
     let state = app.world().resource::<State>();
     assert_eq!(state.documents[&0].objects, objects);
     assert!(!state.documents[&0].dirty());
     assert!(state.documents[&0].undo.is_empty());
     assert_eq!(app.world().resource::<Editor>().edits, scene);
-    eprintln!("Model selection screenshots: {}", output.display());
 }
 
 #[test]

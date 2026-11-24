@@ -342,12 +342,11 @@ impl State {
                 _ => false,
             };
         }
-        if action == EditAction::Wireframe {
-            // Topology can also be viewed for GLTFs protected from editing.
-            return index.is_some();
-        }
         if matches!(action, EditAction::Menu | EditAction::Mode(Mode::Object)) {
             return true;
+        }
+        if action == EditAction::Wireframe {
+            return self.mode(index) == Mode::Paint;
         }
         let doc = index.and_then(|i| self.documents.get(&i));
         let Some(doc) = doc else {
@@ -365,7 +364,6 @@ impl State {
                     | EditAction::SelectObject(_)
                     | EditAction::Focus
                     | EditAction::Cancel
-                    | EditAction::Wireframe
             )
         {
             return false;

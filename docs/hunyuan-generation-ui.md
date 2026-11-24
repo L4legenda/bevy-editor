@@ -21,8 +21,9 @@ There is no Python, PyTorch, Python package installation, external inference
 server or fallback to those in this generation path. Native NVIDIA CUDA driver
 and libraries are required.
 
-Weights remain in RAM across jobs. For an 8 GB GPU alongside the editor,
-conditioning, diffusion and surface decoding transfer weights to CUDA in turn.
+Weights remain in RAM across jobs. The image encoder transfers one block of
+weights at a time. Diffusion and surface decoding transfer their weights to
+CUDA in turn.
 Attention and surface queries are chunked to bound working memory. These stage
 transfers do not reread/reinitialize the checkpoint on each generation.
 
@@ -35,7 +36,7 @@ neutral material, without texturing or automatic background removal.
 
 ## Build and distribution
 
-For a Windows source checkout, start `run-editor.vbs` or `run-editor.cmd`.
+For a Windows source checkout, start `run-editor.cmd`.
 They use `tools/build-editor.ps1` to build the editor and, when an NVIDIA driver
 is detected, prepare `bevy-hunyuan.exe` and all required CUDA DLLs in `target/debug`.
 Cargo checks the generator's freshness after a pull. First-time preparation can
@@ -56,8 +57,14 @@ The build helper uses an installed CUDA toolkit or downloads pinned, SHA-256
 verified CUDA 12.8.1 NVIDIA redistributables into the editor system cache.
 PowerShell is a development/build helper, never an inference runtime. The
 packaged worker requires neither Rust nor Python on an end user's machine.
-Kernels are built to PTX for Ampere or newer by default. Developers may set
-`CUDA_COMPUTE_CAP` for another supported target before building.
+Tensor kernels are built to PTX for compute capability 6.1 by default. The
+CUDA driver can compile this PTX for compatible Pascal and newer GPUs. The
+worker tries detected CUDA devices in order of total memory and runs a small
+FP16 matmul and FP32 reduction before loading the model. This probe checks the
+driver and kernel compatibility. Full-model memory and performance depend on
+the device and generation settings. Developers can set `CUDA_COMPUTE_CAP` to
+build for another architecture. Build outputs are isolated by compute capability
+because Candle's kernel cache does not track architecture changes.
 
 The editor discovers `bevy-hunyuan.exe` alongside its own executable, in the
 native crate's release/debug output, or at `BEVY_EDITOR_HUNYUAN_NATIVE`. CUDA DLLs

@@ -1,6 +1,6 @@
 //! Paint helpers: Paint Bucket and Gradient tool.
 
-use photocraft_algo::paint::{FillMode, GradientShape, bucket_fill_inks, bucket_fill_region_inks, paint_gradient};
+use photocraft_algo::paint::{FillMode, GradientShape, bucket_fill_inks, bucket_fill_region_inks, bucket_recolor_edges, paint_gradient};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, blend_from_str};
@@ -65,6 +65,9 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     let (tol, contiguous, aa) = (f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true));
     let opacity = opacity(p, "paint.bucket")?;
     let mode = fill_mode(p)?;
+    let recolor_edges = b(p, "recolorEdges", false)
+        && contiguous && tol == 0.0 && mode == FillMode::Blend(photocraft_color::BlendMode::Normal)
+        && crate::channel_cmds::target_of(p) == crate::channel_cmds::Target::Pixels;
     let all = b(p, "sampleAllLayers", false) && crate::channel_cmds::target_of(p) == crate::channel_cmds::Target::Pixels;
     // Before the region, the target and the document copy: a Bitmap click changes nothing.
     if s.active().is_some_and(|d| d.doc.mode == photocraft_color::ColorMode::Bitmap) {
@@ -124,6 +127,8 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
         } else if let Some(region) = &region {
             bucket_fill_region_inks(surf, region, opacity, sel.as_ref(), lock, |_, _| c, inks, mode);
             true
+        } else if recolor_edges && surf.format() == photocraft_color::PixelFormat::RGBA8 && inks.is_none() {
+            bucket_recolor_edges(surf, area, (x, y), c, opacity, sel.as_ref(), lock)
         } else {
             bucket_fill_inks(surf, area, (x, y), tol, contiguous, aa, opacity, sel.as_ref(), lock, |_, _| c, inks, mode)
         };

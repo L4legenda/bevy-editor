@@ -29,7 +29,7 @@ fn serial(map: &mut CoverageMap, dab: &DabInput) {
     let (x0, y0) = (dab.rect.x0.div_euclid(COV_TILE), dab.rect.y0.div_euclid(COV_TILE));
     let (x1, y1) = ((dab.rect.x1 - 1).div_euclid(COV_TILE), (dab.rect.y1 - 1).div_euclid(COV_TILE));
     let w = dab.rect.width() as usize;
-    let values = DabValues { vals: &dab.vals, rect: dab.rect, w, ceil: dab.ceil, color: dab.color.as_deref(), depth: dab.depth.as_deref(), nc: map.nc };
+    let values = DabValues { vals: &dab.vals, rect: dab.rect, w, ceil: dab.ceil, color: dab.color.as_deref(), depth: dab.depth.as_deref(), nc: map.nc, measured: false };
     let keys = (y0..=y1).flat_map(|ty| {
         (x0..=x1).map(move |tx| {
             let tr = Rect::new(tx * COV_TILE, ty * COV_TILE, (tx + 1) * COV_TILE, (ty + 1) * COV_TILE).intersect(&dab.rect);

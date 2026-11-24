@@ -41,8 +41,9 @@ pub(in crate::editor) fn action_help(action: LayerAction) -> String {
         LayerAction::SetBlend(_, mode) => blend_help(mode).into(),
         LayerAction::Blend(_) => "Как слой смешивается с нижними. «Обычный» подходит для большинства задач. В меню есть пояснения к каждому режиму.".into(),
         LayerAction::Category("Эффекты") => "Добавить тень, обводку или свечение. Эффекты не меняют сам рисунок, их можно перенастроить или выключить.".into(),
+        LayerAction::Category("Добавить маску") => "Выберите белую, чёрную маску или изображение.".into(),
+        LayerAction::ImportMask => "Белое показывает слой, чёрное скрывает. Прозрачность файла тоже скрывает слой. Изображение подгоняется под холст.".into(),
         LayerAction::Category("Коррекция") => "Изменить свет и цвет отдельным слоем. Исходный рисунок сохранится; действие коррекции можно ослабить непрозрачностью.".into(),
-        LayerAction::Menu => "Частые действия с выбранным слоем. Полный список редких операций доступен в дополнительных инструментах.".into(),
         _ => "Настройки слоёв. Верхние слои перекрывают нижние; глаз скрывает слой без удаления, Ctrl+Z отменяет изменение.".into(),
     }
 }
@@ -283,8 +284,47 @@ pub(super) fn field_help(key: &str) -> &'static str {
     }
 }
 
-pub(super) fn primary(command: &str, key: &str) -> bool {
+pub(super) const TONES: [(&str, &str); 3] = [
+    ("shadows", "Тени"),
+    ("midtones", "Средние тона"),
+    ("highlights", "Света"),
+];
+
+pub(super) fn balance_axis(form: &Form, key: &str) -> Option<(usize, usize)> {
+    if form.adjustment() != Some("colorBalance") {
+        return None;
+    }
+    let (tone, channel) = key.strip_prefix('/')?.split_once('/')?;
+    let axis = channel.parse::<usize>().ok().filter(|axis| *axis < 3)?;
+    Some((TONES.iter().position(|(key, _)| *key == tone)?, axis))
+}
+
+pub(super) fn primary(form: &Form, key: &str) -> bool {
     let last = key.rsplit('/').next().unwrap_or(key);
+    if let Some(adjustment) = form.adjustment() {
+        if balance_axis(form, key).is_some() {
+            return true;
+        }
+        if adjustment == "curves" {
+            return key == "/points" || key.starts_with("/points/");
+        }
+        if key.trim_start_matches('/').contains('/') {
+            return false;
+        }
+        return match adjustment {
+            "brightnessContrast" => matches!(last, "brightness" | "contrast"),
+            "exposure" => matches!(last, "exposure" | "offset" | "gamma"),
+            "vibrance" => matches!(last, "vibrance" | "saturation"),
+            "hueSaturation" => matches!(last, "hue" | "saturation" | "lightness" | "colorize"),
+            "colorBalance" => last == "preserveLuminosity",
+            "levels" => matches!(
+                last,
+                "inBlack" | "inWhite" | "gamma" | "outBlack" | "outWhite"
+            ),
+            "photoFilter" => matches!(last, "color" | "density" | "preserveLuminosity"),
+            _ => true,
+        };
+    }
     if key.contains("/stops/") {
         return last == "1";
     }
@@ -296,13 +336,17 @@ pub(super) fn primary(command: &str, key: &str) -> bool {
                 | "size"
                 | "distance"
                 | "angle"
+                | "useGlobalLight"
+                | "altitude"
+                | "highlightColor"
+                | "shadowColor"
                 | "strokePaint"
                 | "from"
                 | "to"
                 | "style"
         );
     }
-    if command.ends_with("blendingOptions") {
+    if form.command.ends_with("blendingOptions") {
         return matches!(last, "blend" | "opacity" | "fillOpacity");
     }
     matches!(
@@ -316,6 +360,10 @@ pub(super) fn primary(command: &str, key: &str) -> bool {
             | "opacity"
             | "size"
             | "angle"
+            | "useGlobalLight"
+            | "altitude"
+            | "highlightColor"
+            | "shadowColor"
             | "distance"
             | "position"
             | "density"
@@ -340,32 +388,46 @@ pub(super) fn primary(command: &str, key: &str) -> bool {
 }
 
 /// Ranges describe each engine parameter's units; never reinterpret stored values.
-pub(super) fn number(command: &str, key: &str, current: f64) -> (f64, f64, f64) {
+pub(super) fn number(form: &Form, index: usize) -> Option<(f64, f64, f64)> {
+    let field = form.fields.get(index)?;
+    let key = field.key.as_str();
+    let current = field.text.parse::<f64>().unwrap_or(0.0);
+    if balance_axis(form, key).is_some() {
+        return Some((-100.0, 100.0, 1.0));
+    }
     if key.contains("/midpoints/")
         || ((key.contains("/stops/")
             || key.contains("/transparency/")
             || key.contains("/opacityStops/"))
             && key.ends_with("/0"))
     {
-        return (0.0, 1.0, 0.01);
+        return Some((0.0, 1.0, 0.01));
     }
     let key = key.rsplit('/').next().unwrap_or(key);
     let (min, max, step): (f64, f64, f64) = match key {
         "opacity" | "fillOpacity" | "density" | "spread" | "choke" | "noise" | "range"
         | "smoothness" | "highlightOpacity" | "shadowOpacity" => (0.0, 100.0, 1.0),
-        "brightness" | "contrast" | "saturation" | "lightness" | "vibrance" => (-100.0, 100.0, 1.0),
+        "brightness" => (-150.0, 150.0, 1.0),
+        "contrast" if form.adjustment() == Some("brightnessContrast") => {
+            let legacy = form
+                .fields
+                .iter()
+                .any(|f| f.key == "/legacy" && f.text == "true");
+            (if legacy { -100.0 } else { -50.0 }, 100.0, 1.0)
+        }
+        "contrast" | "saturation" | "lightness" | "vibrance" => (-100.0, 100.0, 1.0),
         "hue" | "angle" => (-180.0, 180.0, 1.0),
         "altitude" => (0.0, 90.0, 1.0),
         "gamma" => (0.01, 9.99, 0.01),
-        "exposure" => (-10.0, 10.0, 0.1),
-        "offset" if command.contains("xposure") => (-0.5, 0.5, 0.01),
+        "exposure" => (-20.0, 20.0, 0.1),
+        "offset" if form.adjustment() == Some("exposure") => (-0.5, 0.5, 0.01),
         "scale" | "depth" => (1.0, 1000.0, 1.0),
         "size" | "distance" | "feather" | "soften" | "radius" => (0.0, 250.0, 1.0),
         "x" | "y" | "phaseX" | "phaseY" => (-8192.0, 8192.0, 1.0),
         "width" | "height" => (1.0, 8192.0, 1.0),
         _ => (0.0, 255.0, 1.0),
     };
-    (min.min(current), max.max(current), step)
+    Some((min.min(current), max.max(current), step))
 }
 
 pub(super) fn can_preview(command: &str) -> bool {
@@ -386,6 +448,9 @@ pub(super) fn can_preview(command: &str) -> bool {
 pub(in crate::editor) fn enabled(action: LayerAction, doc: &PhotoDocument) -> bool {
     let layer = doc.active_layer();
     match action {
+        LayerAction::Category("Добавить маску") | LayerAction::ImportMask => {
+            layer.is_some_and(|layer| super::mask_import::can_add(doc, layer.id))
+        }
         LayerAction::Quick(command) | LayerAction::Command(command) => {
             if command.starts_with("layer.new")
                 || command == "type.create"
@@ -395,7 +460,9 @@ pub(in crate::editor) fn enabled(action: LayerAction, doc: &PhotoDocument) -> bo
             }
             let Some(layer) = layer else { return false };
             match command {
-                "layer.layerMask.revealAll" | "layer.layerMask.hideAll" => layer.mask.is_none(),
+                "layer.layerMask.revealAll" | "layer.layerMask.hideAll" => {
+                    super::mask_import::can_add(doc, layer.id)
+                }
                 "layer.layerMask.edit"
                 | "layer.layerMask.delete"
                 | "layer.layerMask.apply"
@@ -445,13 +512,13 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
         ],
         "Эффекты" => vec![
             ("Тень", Command("layer.layerStyle.dropShadow")),
+            ("Внутренняя тень", Command("layer.layerStyle.innerShadow")),
+            ("Внешнее свечение", Command("layer.layerStyle.outerGlow")),
+            ("Внутреннее свечение", Command("layer.layerStyle.innerGlow")),
+            ("Тиснение", Command("layer.layerStyle.bevelEmboss")),
             ("Обводка", Command("layer.layerStyle.stroke")),
             ("Наложение цвета", Command("layer.layerStyle.colorOverlay")),
-            ("Внешнее свечение", Command("layer.layerStyle.outerGlow")),
-            ("Внутренняя тень", Command("layer.layerStyle.innerShadow")),
-            ("Внутреннее свечение", Command("layer.layerStyle.innerGlow")),
             ("Градиент", Command("layer.layerStyle.gradientOverlay")),
-            ("Тиснение", Command("layer.layerStyle.bevelEmboss")),
             ("Узор", Command("layer.layerStyle.patternOverlay")),
             ("Глянец", Command("layer.layerStyle.satin")),
         ],
@@ -460,6 +527,9 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
                 "Яркость и контрастность",
                 Command("layer.newAdjustmentLayer.brightnessContrast"),
             ),
+            ("Экспозиция", Command("layer.newAdjustmentLayer.exposure")),
+            ("Уровни", Command("layer.newAdjustmentLayer.levels")),
+            ("Кривые", Command("layer.newAdjustmentLayer.curves")),
             (
                 "Цветовой тон и насыщенность",
                 Command("layer.newAdjustmentLayer.hueSaturation"),
@@ -468,7 +538,6 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
                 "Сочность цветов",
                 Command("layer.newAdjustmentLayer.vibrance"),
             ),
-            ("Экспозиция", Command("layer.newAdjustmentLayer.exposure")),
             (
                 "Чёрно-белое изображение",
                 Command("layer.newAdjustmentLayer.blackWhite"),
@@ -481,8 +550,11 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
                 "Фотофильтр",
                 Command("layer.newAdjustmentLayer.photoFilter"),
             ),
-            ("Уровни", Command("layer.newAdjustmentLayer.levels")),
-            ("Кривые", Command("layer.newAdjustmentLayer.curves")),
+        ],
+        "Добавить маску" => vec![
+            ("Добавить белую маску", Quick("layer.layerMask.revealAll")),
+            ("Добавить чёрную маску", Quick("layer.layerMask.hideAll")),
+            ("Маска из изображения…", LayerAction::ImportMask),
         ],
         "Маски" => vec![
             (
@@ -493,6 +565,7 @@ pub(super) fn menu(category: &str) -> Vec<(&'static str, LayerAction)> {
                 "Добавить маску: всё скрыто",
                 Quick("layer.layerMask.hideAll"),
             ),
+            ("Маска из изображения…", LayerAction::ImportMask),
             ("Смягчить край маски…", Command("layer.layerMask.edit")),
             (
                 "Убрать маску и показать рисунок",

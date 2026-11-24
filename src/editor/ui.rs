@@ -106,12 +106,12 @@ pub(super) use drawer::{
     update_files as update_browser_files,
 };
 pub(super) use icons::SvgIconsPlugin;
-pub(super) use image_viewer::edit::layers::ui::drag_ui::fx::LayerDragFxPlugin;
-pub(super) use image_viewer::edit::layers::ui::flyout_fx::LayerFlyoutFxPlugin;
 pub(super) use image_viewer::edit::color_drop::{ColorDropPlugin, input as color_drop_input};
+pub(super) use image_viewer::edit::layers::ui::drag_ui::fx::LayerDragFxPlugin;
 pub(super) use image_viewer::edit::layers::ui::drag_ui::{
     LayerDrag, input as drag_photo_layers, visuals as refresh_photo_layer_drag,
 };
+pub(super) use image_viewer::edit::layers::ui::flyout_fx::LayerFlyoutFxPlugin;
 pub(super) use image_viewer::edit::layers::ui::{
     input as photo_layers_input, refresh as refresh_photo_layers, sync_form as refresh_layer_form,
 };
@@ -894,8 +894,12 @@ fn object_outline_entry(
         icons::Glyph::Folder,
     );
     commands.entity(item).observe(scene_objects::pointer_menu);
-    if editor.has_scene() && editor.definition().is_native()
-        && matches!(target, Selection::Model(_) | Selection::Light(_) | Selection::Camera(_))
+    if editor.has_scene()
+        && editor.definition().is_native()
+        && matches!(
+            target,
+            Selection::Model(_) | Selection::Light(_) | Selection::Camera(_)
+        )
     {
         scene_tree_drag::mark(commands, item, Some(target));
     }
@@ -1259,7 +1263,10 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
     if tree_drag.is_some_and(|drag| drag.suppresses(window.cursor_position())) {
         return;
     }
-    if color_drop.as_ref().is_some_and(|drag| drag.suppresses(entity)) {
+    if color_drop
+        .as_ref()
+        .is_some_and(|drag| drag.suppresses(entity))
+    {
         return;
     }
     if !EXPLICIT && entries.contains(entity) {
@@ -1323,7 +1330,10 @@ pub(super) fn shortcuts(
     {
         return;
     }
-    if image_viewer.as_ref().is_some_and(|viewer| viewer.edit.color_dragging) {
+    if image_viewer
+        .as_ref()
+        .is_some_and(|viewer| viewer.edit.color_dragging)
+    {
         return;
     }
     if scrub.as_ref().is_some_and(|scrub| scrub.capturing())
@@ -1490,7 +1500,12 @@ pub(super) fn shortcuts(
             return;
         }
         if keys.just_pressed(KeyCode::Escape) {
-            if let Some(viewer) = image_viewer
+            if image_viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.edit.gradient_dragging())
+            {
+                actions.write(Action::ImageEdit(ImageEditAction::CancelGesture));
+            } else if let Some(viewer) = image_viewer
                 .as_ref()
                 .filter(|viewer| viewer.edit.paint_menu)
             {
@@ -2364,11 +2379,7 @@ pub(super) fn refresh(
         let color = if !visual_enabled || photo_options {
             Color::NONE
         } else if matches!(control.action, Action::EditBrowserImage(..)) {
-            if hovered.0 || pressed {
-                HOVER
-            } else {
-                PANEL
-            }
+            if hovered.0 || pressed { HOVER } else { PANEL }
         } else if layer_row_control {
             if hovered.0 || pressed {
                 HOVER

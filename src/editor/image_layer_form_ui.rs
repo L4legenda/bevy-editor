@@ -2,16 +2,77 @@
 use super::super::ux;
 use super::*;
 use bevy::ui_widgets::SliderThumb;
+use bevy::{
+    asset::{AssetPath, embedded_asset, embedded_path},
+    reflect::TypePath,
+    render::render_resource::AsBindGroup,
+    shader::ShaderRef,
+};
+
+#[derive(Asset, TypePath, AsBindGroup, Clone, PartialEq)]
+pub(in crate::editor) struct ParameterMaterial {
+    // Current and neutral positions, spectrum style, pixel density.
+    #[uniform(0)]
+    state: Vec4,
+    #[uniform(1)]
+    low: Vec4,
+    #[uniform(2)]
+    high: Vec4,
+}
+
+impl UiMaterial for ParameterMaterial {
+    fn fragment_shader() -> ShaderRef {
+        AssetPath::from_path_buf(embedded_path!("image_layer_parameter.wesl"))
+            .with_source("embedded")
+            .into()
+    }
+}
+
+pub(super) fn install(app: &mut App) {
+    embedded_asset!(app, "image_layer_parameter.wesl");
+    app.add_plugins(UiMaterialPlugin::<ParameterMaterial>::default());
+}
+
+const THUMB: f32 = 14.0;
 
 #[derive(Component)]
 pub(in crate::editor) struct NumberSlider {
     index: usize,
     readout: Entity,
     thumb: Entity,
+    track: Entity,
+    direction: Option<Entity>,
+    neutral: f32,
+    spectrum: u8,
+    endpoints: [Vec4; 2],
     step: f64,
 }
 
 fn caption(form: &Form, field: &super::super::forms::Field) -> String {
+    if let Some((_, axis)) = ux::balance_axis(form, &field.key) {
+        return ["Голубой ↔ красный", "Пурпурный ↔ зелёный", "Жёлтый ↔ синий"][axis].into();
+    }
+    if form.adjustment() == Some("levels") {
+        match field.key.as_str() {
+            "/inBlack" => return "Чёрная точка".into(),
+            "/inWhite" => return "Белая точка".into(),
+            "/outBlack" => return "Выходной чёрный".into(),
+            "/outWhite" => return "Выходной белый".into(),
+            _ => {}
+        }
+    }
+    if field.key.rsplit('/').next() == Some("angle")
+        && (form.command.ends_with("Shadow")
+            || form.command.ends_with("bevelEmboss")
+            || form.effect.is_some_and(|i| {
+                matches!(
+                    form.params["effects"][i]["kind"].as_str(),
+                    Some("dropShadow" | "innerShadow" | "bevelEmboss")
+                )
+            }))
+    {
+        return "Направление света, °".into();
+    }
     if field.key.rsplit('/').next() == Some("size") {
         let kind = form
             .effect
@@ -50,14 +111,24 @@ fn number_change(
 pub(in crate::editor) fn sync(
     mut commands: Commands,
     viewer: Res<ImageViewer>,
-    sliders: Query<(Entity, &NumberSlider, &SliderValue, &SliderRange)>,
+    sliders: Query<(
+        Entity,
+        &NumberSlider,
+        &SliderValue,
+        &SliderRange,
+        &ComputedNode,
+    )>,
+    tracks: Query<&MaterialNode<ParameterMaterial>>,
+    materials: Option<ResMut<Assets<ParameterMaterial>>>,
     mut labels: Query<&mut Text>,
     mut nodes: Query<&mut Node>,
+    mut transforms: Query<&mut UiTransform>,
 ) {
     let Some(form) = viewer.edit.layers.form.as_ref() else {
         return;
     };
-    for (entity, slider, current, range) in &sliders {
+    let mut materials = materials;
+    for (entity, slider, current, range, computed) in &sliders {
         if let Some(value) = form
             .fields
             .get(slider.index)
@@ -73,10 +144,47 @@ pub(in crate::editor) fn sync(
                     format!("{value:.2}")
                 }));
             }
+            if let Some(direction) = slider.direction
+                && let Ok(mut transform) = transforms.get_mut(direction)
+            {
+                transform.set_if_neq(UiTransform::from_rotation(Rot2::radians(
+                    (90.0 - value).to_radians(),
+                )));
+            }
+            let normalized =
+                |v: f32| ((v - range.start()) / range.span().max(0.0001)).clamp(0.0, 1.0);
+            let position = normalized(value);
             if let Ok(mut thumb) = nodes.get_mut(slider.thumb) {
-                thumb.left = percent(
-                    ((value - range.start()) / range.span().max(0.0001)).clamp(0.0, 1.0) * 94.0,
-                );
+                let travel = (computed.size().x * computed.inverse_scale_factor() - THUMB).max(0.0);
+                let left = px(position * travel);
+                if thumb.left != left {
+                    thumb.left = left;
+                }
+            }
+            if let Some(materials) = materials.as_deref_mut() {
+                let data = ParameterMaterial {
+                    state: Vec4::new(
+                        position,
+                        normalized(slider.neutral),
+                        f32::from(slider.spectrum),
+                        computed.inverse_scale_factor().recip(),
+                    ),
+                    low: slider.endpoints[0],
+                    high: slider.endpoints[1],
+                };
+                if let Ok(handle) = tracks.get(slider.track) {
+                    if materials
+                        .get(&handle.0)
+                        .is_some_and(|material| *material != data)
+                        && let Some(mut material) = materials.get_mut(&handle.0)
+                    {
+                        *material = data;
+                    }
+                } else {
+                    commands
+                        .entity(slider.track)
+                        .insert(MaterialNode(materials.add(data)));
+                }
             }
         }
     }
@@ -92,7 +200,42 @@ fn numeric(
     let field = &form.fields[index];
     let caption = caption(form, field);
     let current = field.text.parse::<f64>().unwrap_or(0.0);
-    let (min, max, step) = ux::number(form.command, &field.key, current);
+    let (min, max, step) = ux::number(form, index).expect("numeric field is present");
+    let key = field.key.rsplit('/').next().unwrap_or_default();
+    let neutral = if key == "gamma" {
+        1.0
+    } else if min < 0.0 && max > 0.0 {
+        0.0
+    } else {
+        min
+    };
+    let (spectrum, colors) = if let Some((_, axis)) = ux::balance_axis(form, &field.key) {
+        let pairs = [
+            [Color::srgb(0.26, 0.72, 0.78), Color::srgb(0.92, 0.31, 0.34)],
+            [Color::srgb(0.79, 0.42, 0.77), Color::srgb(0.43, 0.77, 0.51)],
+            [Color::srgb(0.94, 0.76, 0.38), Color::srgb(0.43, 0.57, 0.92)],
+        ];
+        (1, pairs[axis])
+    } else if key == "hue" {
+        (2, [EDGE, FOCUS])
+    } else if matches!(
+        key,
+        "brightness"
+            | "lightness"
+            | "exposure"
+            | "gamma"
+            | "inBlack"
+            | "inWhite"
+            | "outBlack"
+            | "outWhite"
+    ) {
+        (
+            1,
+            [Color::srgb(0.25, 0.25, 0.29), Color::srgb(0.75, 0.76, 0.80)],
+        )
+    } else {
+        (0, [EDGE, FOCUS])
+    };
     let header = node(
         commands,
         parent,
@@ -102,7 +245,13 @@ fn numeric(
             ..row(4.0)
         },
     );
-    let label = text(commands, header, font, &caption, 12.0, TEXT);
+    let label_group = node(commands, header, row(6.0));
+    let direction = (caption == "Направление света, °").then(|| {
+        let arrow = icons::spawn(commands, label_group, icons::Glyph::ArrowUp, 15.0, FOCUS);
+        commands.entity(arrow).insert(UiTransform::default());
+        arrow
+    });
+    let label = text(commands, label_group, font, &caption, 12.0, TEXT);
     ux::help(commands, label, ux::field_help(&field.key));
     let buttons = node(commands, header, row(2.0));
     compact(
@@ -112,7 +261,27 @@ fn numeric(
         "−",
         LayerAction::FieldStep(index, -step),
     );
-    let readout = text(commands, buttons, font, &field.text, 12.0, TEXT);
+    let readout_parent = if neutral > min && neutral < max {
+        let reset = compact(
+            commands,
+            buttons,
+            font,
+            "",
+            LayerAction::FieldNumber(index, neutral),
+        );
+        commands
+            .entity(reset)
+            .insert(AccessibleLabel(format!("Сбросить: {caption}")));
+        ux::help(
+            commands,
+            reset,
+            format!("Вернуть нейтральное значение ({neutral})."),
+        );
+        reset
+    } else {
+        buttons
+    };
+    let readout = text(commands, readout_parent, font, &field.text, 12.0, TEXT);
     commands.entity(readout).insert(Node {
         width: px(45),
         justify_content: JustifyContent::Center,
@@ -152,14 +321,14 @@ fn numeric(
         slider,
         Node {
             position_type: PositionType::Absolute,
-            left: px(7),
-            right: px(7),
-            top: px(10),
-            height: px(4),
+            left: px(THUMB * 0.5),
+            right: px(THUMB * 0.5),
+            top: px(6),
+            height: px(12),
             border_radius: BorderRadius::MAX,
             ..default()
         },
-        EDGE,
+        Color::NONE,
     );
     commands.entity(track).insert(Pickable::IGNORE);
     let thumb = surface(
@@ -167,10 +336,10 @@ fn numeric(
         slider,
         Node {
             position_type: PositionType::Absolute,
-            left: percent(((current - min) / (max - min).max(0.001)) as f32 * 94.0),
+            left: px(0),
             top: px(5),
-            width: px(14),
-            height: px(14),
+            width: px(THUMB),
+            height: px(THUMB),
             border: UiRect::all(px(2)),
             border_radius: BorderRadius::MAX,
             ..default()
@@ -184,6 +353,11 @@ fn numeric(
         index,
         readout,
         thumb,
+        track,
+        direction,
+        neutral: neutral as f32,
+        spectrum,
+        endpoints: colors.map(|color| Vec4::from_array(color.to_linear().to_f32_array())),
         step,
     });
 }
@@ -207,13 +381,37 @@ pub(super) fn build(
             ..column(12.0)
         },
     );
-    let has_primary = form
-        .fields
-        .iter()
-        .any(|f| ux::primary(form.command, &f.key));
+    if form.adjustment() == Some("colorBalance") {
+        let tabs = node(
+            commands,
+            scroll,
+            Node {
+                width: percent(100),
+                ..row(4.0)
+            },
+        );
+        for (tone, (_, label)) in ux::TONES.iter().enumerate() {
+            let tab = button(
+                commands,
+                tabs,
+                font,
+                *label,
+                act(LayerAction::BalanceTone(tone)),
+                Look::Tool,
+            );
+            commands.entity(tab).entry::<Node>().and_modify(|mut n| {
+                n.flex_grow = 1.0;
+                n.min_width = px(0);
+            });
+        }
+    }
+    let has_primary = form.fields.iter().any(|f| ux::primary(form, &f.key));
     let mut hidden = 0;
     for (index, field) in form.fields.iter().enumerate() {
         if !form.stroke_field_visible(&field.key) {
+            continue;
+        }
+        if ux::balance_axis(form, &field.key).is_some_and(|(tone, _)| tone != state.balance_tone) {
             continue;
         }
         let caption = caption(form, field);
@@ -223,7 +421,7 @@ pub(super) fn build(
         {
             continue;
         }
-        if !state.advanced && has_primary && !ux::primary(form.command, &field.key) {
+        if !state.advanced && has_primary && !ux::primary(form, &field.key) {
             hidden += 1;
             continue;
         }
@@ -336,14 +534,23 @@ pub(super) fn build(
             }
         } else if matches!(field.kind, FieldKind::Color) {
             text(commands, group, font, &caption, 12.0, TEXT);
-            let choose = button(
+            let choose = control(
                 commands,
                 group,
-                font,
-                "Выбрать цвет…",
                 Action::ImageEdit(EditAction::ColorPicker(ColorTarget::LayerField(index))),
                 Look::Regular,
+                Node {
+                    width: percent(100),
+                    height: px(32),
+                    padding: UiRect::horizontal(px(7)),
+                    border: UiRect::all(px(1)),
+                    border_radius: BorderRadius::all(px(6)),
+                    ..row(7.0)
+                },
             );
+            commands
+                .entity(choose)
+                .insert(AccessibleLabel(format!("Выбрать цвет: {caption}")));
             let color = parse_color(&field.text).unwrap_or([0.0, 0.0, 0.0, 1.0]);
             let swatch = surface(
                 commands,
@@ -361,7 +568,19 @@ pub(super) fn build(
             commands
                 .entity(swatch)
                 .insert((BorderColor::all(MUTED), Pickable::IGNORE));
-            commands.entity(choose).insert_children(0, &[swatch]);
+            let value = text(
+                commands,
+                choose,
+                font,
+                field.text.to_ascii_uppercase(),
+                12.0,
+                TEXT,
+            );
+            commands
+                .entity(value)
+                .entry::<Node>()
+                .and_modify(|mut n| n.flex_grow = 1.0);
+            icons::themed(commands, choose, icons::Glyph::ChevronDown, 14.0);
             ux::help(commands, choose, ux::field_help(&field.key));
         } else if let FieldKind::Item { .. } = field.kind {
             let header = node(
