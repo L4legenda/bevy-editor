@@ -371,6 +371,10 @@ pub fn document_with_strokes() -> Vec<u8> {
     document_options(0, None, TestMask::Strokes)
 }
 
+pub fn document_with_paint_fill() -> Vec<u8> {
+    document_options(0, None, TestMask::PaintFill)
+}
+
 pub fn document_with_mask_effects(url: &str) -> Vec<u8> {
     document_options(0, None, TestMask::Effects(url, false))
 }
@@ -441,6 +445,7 @@ enum TestMask<'a> {
     None,
     Polygon,
     Strokes,
+    PaintFill,
     Effects(&'a str, bool),
     OrderedFilters,
     Anchors,
@@ -452,6 +457,7 @@ enum TestMask<'a> {
 
 fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'_>) -> Vec<u8> {
     let strokes = matches!(mask, TestMask::Strokes);
+    let paint_fill = matches!(mask, TestMask::PaintFill);
     let anchors = matches!(mask, TestMask::Anchors);
     let udim = matches!(mask, TestMask::Udim);
     let pressure = matches!(mask, TestMask::Pressure);
@@ -571,7 +577,7 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     if matches!(mask, TestMask::Polygon) {
         write_polygon_mask(&mut w);
     } else if strokes {
-        write_strokes(&mut w, 0x400, true, None, None, false);
+        write_strokes(&mut w, 0x400, true, None, None, false, false);
     } else if let Some(url) = mask_image {
         write_mask_effects(&mut w, url, matches!(mask, TestMask::Effects(_, true)));
     } else if matches!(mask, TestMask::OrderedFilters) {
@@ -673,8 +679,8 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
             ("enabledUVTileList", 19),
         ],
     );
-    if strokes || stencil.is_some() || tip.is_some() || pressure {
-        write_strokes(&mut w, 0x500, false, stencil, tip, pressure);
+    if strokes || paint_fill || stencil.is_some() || tip.is_some() || pressure {
+        write_strokes(&mut w, 0x500, false, stencil, tip, pressure, paint_fill);
     } else if anchors {
         w.u32(0x720);
         w.class("DataStackActions", &[("items", 19)]);
@@ -938,17 +944,22 @@ fn write_strokes(
     stencil: Option<(&str, bool, Option<bool>)>,
     tip: Option<(&str, TipStroke)>,
     pressure: bool,
+    initial_fill: bool,
 ) {
     w.u32(id);
     w.class("DataStackActions", &[("items", 19)]);
     let single = stencil.is_some() || tip.is_some() || pressure;
-    w.u32(if single {
+    let actions = if single {
         1
     } else if mask {
         2
     } else {
         3
-    });
+    };
+    w.u32(actions + u32::from(initial_fill));
+    if initial_fill {
+        write_uniform(w, id + 50, 0.25);
+    }
     for (i, (kind, uv, color, opacity)) in [
         (
             "DataActionPaint",

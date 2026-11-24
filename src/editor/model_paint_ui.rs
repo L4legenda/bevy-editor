@@ -12,6 +12,7 @@ pub(in crate::editor::ui::model_viewer) use shader_code::decorate as decorate_sh
 pub(in crate::editor::ui::model_viewer) use shader_maker::Maker as ShaderMaker;
 #[cfg(test)]
 pub(super) use graph_canvas::NodePreview;
+pub(super) use graph_canvas::position_next_to_graph;
 pub(in crate::editor::ui::model_viewer) use graph_canvas::refresh as refresh_graph;
 use bevy::{
     asset::RenderAssetUsages,

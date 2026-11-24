@@ -765,6 +765,58 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_limits_uniform_paint_fills_to_uv_islands_and_padding() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-paint-fill-{}",
+            bevy::asset::uuid::Uuid::new_v4(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("PaintFill.spp");
+        fs::write(
+            &source,
+            fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad_with_margin()),
+                ("paint/document.bin", fixture::document_with_paint_fill()),
+            ]),
+        )
+        .unwrap();
+        let (filename, report) = convert(&source, &root).unwrap();
+        assert!(
+            report.label.contains("заливок по геометрии: 1"),
+            "{}",
+            report.label
+        );
+        let glb = Glb::load(&root.join(filename)).unwrap();
+        let surface = glb
+            .paint_surface(&glb.json["meshes"][0]["primitives"][0])
+            .unwrap()
+            .unwrap();
+        let layer = surface
+            .stack
+            .layers
+            .iter()
+            .find(|layer| layer.name == "Scratches")
+            .unwrap();
+        assert_eq!(layer.kind, LayerKind::Paint);
+        let color = layer.channels[0].as_ref().unwrap();
+        let pixel = |x, y| {
+            let index = ((y * surface.size + x) * 4) as usize;
+            &color[index..index + 4]
+        };
+        let edge = surface.size / 4;
+        let y = surface.size / 2;
+        let inside = pixel(edge + 6, y);
+        assert_eq!(inside, [137, 137, 137, 255]);
+        assert_eq!(pixel(edge - 1, y), inside);
+        assert_eq!(pixel(edge - 3, y), [0, 0, 0, 0]);
+        assert!(color.chunks_exact(4).any(|pixel| {
+            pixel[3] > 0 && pixel[1] > pixel[0].saturating_add(80)
+        }));
+        assert!(layer.channels[1].is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn spp_import_reads_version_zero_layers_and_rejects_truncated_documents() {
         let root = std::env::temp_dir()
             .join(format!("bevy-spp-v0-{}", bevy::asset::uuid::Uuid::new_v4(),));

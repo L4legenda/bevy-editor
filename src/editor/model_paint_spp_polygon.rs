@@ -1,4 +1,4 @@
-//! Replay recorded polygon selections into the imported mask's UV image.
+//! Replay recorded polygon selections into the imported layer's UV image.
 use super::{FillMode, Object, SurfaceTrace};
 use bevy::prelude::*;
 use std::{collections::BTreeSet, ops::Range};
@@ -11,6 +11,7 @@ pub(in crate::editor) struct PolygonReplay {
     pub(super) center: Vec3,
     parts: Vec<(String, Range<usize>)>,
     uv_offsets: Vec<Vec2>,
+    uv_tiles: Vec<Vec2>,
     visibility_tolerance: f32,
 }
 
@@ -20,13 +21,19 @@ impl PolygonReplay {
             (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
             |(min, max), point| (min.min(point), max.max(point)),
         );
+        let uv_offsets: Vec<_> = (0..object.materials.len())
+            .map(|slot| object.uv_offset(slot))
+            .collect();
+        let mut uv_tiles = uv_offsets.clone();
+        uv_tiles.push(Vec2::ZERO);
+        uv_tiles.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then_with(|| a.y.total_cmp(&b.y)));
+        uv_tiles.dedup();
         Self {
             trace: SurfaceTrace::build(std::slice::from_ref(object), &Default::default(), true),
             center: (min + max) * 0.5,
             parts,
-            uv_offsets: (0..object.materials.len())
-                .map(|slot| object.uv_offset(slot))
-                .collect(),
+            uv_offsets,
+            uv_tiles,
             // Material Painter measures 0.005 in a mesh normalized to a span of 2.
             visibility_tolerance: (max - min).max_element() * 0.0025,
         }
@@ -74,6 +81,16 @@ impl PolygonReplay {
         self.uv_triangles(excluded, size)
     }
 
+    pub(in crate::editor) fn set_triangles(&self, slot: usize, size: u32) -> Vec<[Vec2; 3]> {
+        let indices = self
+            .trace
+            .attributes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, triangle)| (triangle.slot == slot).then_some(index));
+        self.uv_triangles(indices, size)
+    }
+
     fn uv_triangles(&self, indices: impl IntoIterator<Item = usize>, size: u32) -> Vec<[Vec2; 3]> {
         let topology = self.trace.topology.as_ref().unwrap();
         let attributes = &self.trace.attributes;
@@ -104,7 +121,7 @@ impl PolygonReplay {
         let inverse = duplicate * Mat4::from_cols_array(&hit.proj_view_inv);
         let to_uv = |p: Vec2| {
             let p = duplicate.transform_point3((p * 2. - Vec2::ONE).extend(0.));
-            Vec2::new(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5) - self.uv_offset(slot)
+            Vec2::new(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5)
         };
         let points: Vec<_> = hit.points.iter().copied().map(Vec2::from_array).collect();
         if points.iter().any(|p| !p.is_finite()) {
@@ -118,11 +135,19 @@ impl PolygonReplay {
         let mut seeds = Vec::new();
         match points.as_slice() {
             [p] if hit.uv_space => {
-                seeds.extend(
-                    topology
-                        .pick_uv(to_uv(*p), attributes, matches)
-                        .map(|(i, _)| i),
-                );
+                // Material Painter takes the first containing triangle in mesh order,
+                // then limits the resulting selection to the current texture set.
+                let global = to_uv(*p);
+                let seed = self
+                    .uv_tiles
+                    .iter()
+                    .filter_map(|&offset| {
+                        topology.pick_first_uv(global - offset, attributes, |i| {
+                            self.uv_offset(attributes[i].slot) == offset
+                        })
+                    })
+                    .min();
+                seeds.extend(seed);
             }
             [p] => {
                 if let Some((origin, direction)) = ray(inverse, *p) {
@@ -140,7 +165,8 @@ impl PolygonReplay {
             }
             [a, b] => {
                 let [a, b] = if hit.uv_space {
-                    [to_uv(*a), to_uv(*b)]
+                    let offset = self.uv_offset(slot);
+                    [to_uv(*a) - offset, to_uv(*b) - offset]
                 } else {
                     [*a, *b]
                 };
@@ -183,7 +209,7 @@ impl PolygonReplay {
             _ => return,
         }
         let mut parts = BTreeSet::new();
-        for seed in seeds.into_iter().filter(|&i| matches(i)) {
+        for seed in seeds {
             if mode == FillMode::Object {
                 let face = trace.bvh.triangle(seed).face;
                 parts.insert(self.parts.partition_point(|(_, part)| part.end <= face));
@@ -261,6 +287,7 @@ pub(super) fn ray(inverse: Mat4, point: Vec2) -> Option<(Vec3, Vec3)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::model_document::MaterialSlot;
     use crate::editor::model_mesh::{Corner, Face, Geometry};
 
     #[test]
@@ -309,5 +336,90 @@ mod tests {
         hit.through = true;
         assert!(!replay.triangles(&hit, 0, 128).is_empty());
         assert!(replay.triangles(&hit, 2, 128).is_empty());
+    }
+
+    #[test]
+    fn spp_polygon_pick_uses_recorded_mesh_order_across_materials_and_udim_tiles() {
+        let mut geometry = Geometry::default();
+        let local_uv = [Vec2::ZERO, Vec2::X, Vec2::Y];
+        for (face, slot) in [0, 1, 2, 1].into_iter().enumerate() {
+            let start = geometry.positions.len();
+            geometry
+                .positions
+                .extend(local_uv.map(|uv| uv.extend(face as f32 * 0.1)));
+            let offset = if slot == 0 { Vec2::X } else { Vec2::ZERO };
+            geometry.faces.push(Face {
+                corners: local_uv
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &uv)| {
+                        let mut corner = Corner::new(start + index);
+                        corner.uv = uv + offset;
+                        corner
+                    })
+                    .collect(),
+                material: slot,
+                smooth: false,
+            });
+        }
+        let materials = [1002, 1001, 1001]
+            .into_iter()
+            .map(|tile| MaterialSlot {
+                material: Handle::default(),
+                source: serde_json::json!({ "extras": { "bevy_editor_udim": tile } }),
+                paint: None,
+                authored: None,
+                bake_fixes: Default::default(),
+            })
+            .collect();
+        let object = Object {
+            id: 0,
+            source_node: None,
+            name: "Overlapping UV".into(),
+            geometry: geometry.into(),
+            transform: Transform::IDENTITY,
+            materials,
+            hidden: false,
+        };
+        let replay = PolygonReplay::new(
+            &object,
+            vec![
+                ("Right tile".into(), 0..1),
+                ("Shared object".into(), 1..3),
+                ("Overlay".into(), 3..4),
+            ],
+        );
+        let attributes = &replay.trace.attributes;
+        let topology = replay.trace.topology.as_ref().unwrap();
+        assert_eq!(
+            topology
+                .pick_uv(Vec2::splat(0.2), attributes, |index| {
+                    attributes[index].slot == 1
+                })
+                .unwrap()
+                .0,
+            3
+        );
+
+        let mut hit = DecalHit {
+            value: 1.,
+            granularity: 0,
+            points: vec![[0.2, 0.8]],
+            proj_view_inv: Mat4::IDENTITY.to_cols_array(),
+            through: false,
+            uv_space: true,
+            duplicate: None,
+        };
+        let select = |hit: &DecalHit, slot, mode| {
+            let mut selected = BTreeSet::new();
+            replay.select(hit, slot, mode, Mat4::IDENTITY, &mut selected);
+            selected
+        };
+        assert_eq!(select(&hit, 1, FillMode::Triangle), BTreeSet::from([1]));
+        assert!(select(&hit, 2, FillMode::Triangle).is_empty());
+        assert_eq!(select(&hit, 2, FillMode::Object), BTreeSet::from([2]));
+        hit.points = vec![[1.2, 0.8]];
+        assert_eq!(select(&hit, 0, FillMode::Triangle), BTreeSet::from([0]));
+        assert!(select(&hit, 1, FillMode::Triangle).is_empty());
     }
 }

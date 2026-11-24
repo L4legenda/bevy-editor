@@ -125,7 +125,7 @@ pub(super) fn available(id: &str) -> bool {
     visible(id, &current.archived)
 }
 
-fn source_path(directory: &Path, id: &str) -> Result<PathBuf, String> {
+pub(super) fn source_path(directory: &Path, id: &str) -> Result<PathBuf, String> {
     let stem = id
         .strip_prefix("user/")
         .filter(|stem| !matches!(*stem, "" | "." | "..") && !stem.contains(['/', '\\', ':', '\0']))
@@ -173,12 +173,38 @@ pub(super) fn update(
         .ok_or("Пользовательский узел больше недоступен")?;
     atomic_write(&path, source.as_bytes(), Revision::of(expected.as_bytes()))
         .map_err(|error| format!("Не удалось изменить узел · {error}"))?;
+    replace(index, definition);
+    Ok(())
+}
+
+/// Accept an externally saved source after the editor has validated that exact text.
+pub(super) fn accept_external(directory: &Path, id: &str, source: &str) -> Result<(), String> {
+    let _file = FILE_EDIT.lock().unwrap_or_else(|error| error.into_inner());
+    let library = library();
+    let index = library
+        .defs
+        .iter()
+        .position(|entry| entry.id == id)
+        .filter(|_| available(id))
+        .ok_or("Пользовательский узел больше недоступен")?;
+    if library.defs[index].source == source {
+        return Ok(());
+    }
+    let path = source_path(directory, id)?;
+    let bytes = material_graph::file::read_limited(&path, SOURCE_LIMIT)?;
+    if bytes != source.as_bytes() {
+        return Err("Исходник снова изменился на диске".into());
+    }
+    replace(index, def::parse(id, source)?);
+    Ok(())
+}
+
+fn replace(index: usize, definition: NodeDef) {
     let mut current = current().write().unwrap_or_else(|error| error.into_inner());
     let mut library = append(&current.library, []);
     library.defs[index] = definition;
     current.library = Arc::new(library);
     current.revision += 1;
-    Ok(())
 }
 
 pub(super) fn remove(directory: &Path, id: &str, expected: &str) -> Result<PathBuf, String> {

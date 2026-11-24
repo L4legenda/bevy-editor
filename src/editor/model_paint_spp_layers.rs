@@ -38,6 +38,7 @@ pub(super) fn estimated_planes(layers: &[LayerInfo]) -> usize {
                             ActionKind::Paint {
                                 brush: Some(brush), ..
                             } if action.enabled => Some(&brush.sources),
+                            ActionKind::Fill { sources, .. } if action.enabled => Some(sources),
                             _ => None,
                         })
                         .flatten(),
@@ -255,11 +256,22 @@ impl Rebuild<'_> {
                 _ if original.kind == SourceKind::Paint || content_strokes => {
                     for action in original.content.iter().filter(|action| action.enabled) {
                         if let ActionKind::Fill { sources, .. } = &action.kind {
+                            let mut triangles = None;
+                            let mut painted = false;
                             for source in sources {
                                 match source {
                                     SourceInfo::Uniform { channels, color } => {
-                                        partial |=
-                                            self.solid_channels(&mut layer, *channels, *color);
+                                        let Some((replay, slot)) = self.polygon_replay else {
+                                            partial = true;
+                                            continue;
+                                        };
+                                        let triangles = triangles.get_or_insert_with(|| {
+                                            replay.set_triangles(slot, self.size)
+                                        });
+                                        let (applied, omitted) = self
+                                            .paint_fill(&mut layer, *channels, *color, triangles);
+                                        painted |= applied;
+                                        partial |= omitted;
                                     }
                                     SourceInfo::Reference {
                                         channels,
@@ -277,6 +289,7 @@ impl Rebuild<'_> {
                                     _ => partial = true,
                                 }
                             }
+                            self.summary.polygon_fills += usize::from(painted);
                         } else if let Some(stroke) = stroke_parts(action) {
                             partial |= self.paint_stroke(&mut layer, action.channels, stroke);
                         } else if let ActionKind::Anchor { uid } = action.kind {
@@ -334,6 +347,55 @@ impl Rebuild<'_> {
             }
         }
         omitted
+    }
+
+    fn paint_plane<'a>(&mut self, plane: &'a mut Option<Arc<Vec<u8>>>) -> Option<&'a mut Vec<u8>> {
+        if plane.as_ref().is_none_or(|p| Arc::strong_count(p) > 1) {
+            if !self.reserve(self.size as usize * self.size as usize * 4) {
+                return None;
+            }
+            *plane = Some(
+                plane
+                    .as_ref()
+                    .map_or_else(|| solid(self.size, [0; 4]), |old| Arc::new((**old).clone())),
+            );
+        }
+        plane.as_mut().map(Arc::make_mut)
+    }
+
+    fn paint_fill(
+        &mut self,
+        layer: &mut Layer,
+        channels: u64,
+        value: [f32; 3],
+        triangles: &[[Vec2; 3]],
+    ) -> (bool, bool) {
+        if triangles.is_empty() {
+            return (false, true);
+        }
+        let mut omitted = channels & !CHANNELS.iter().fold(0, |mask, (bit, ..)| mask | bit) != 0;
+        let mut targets = Vec::new();
+        for (index, ((bit, ..), plane)) in CHANNELS.iter().zip(&mut layer.channels).enumerate() {
+            if channels & bit == 0 {
+                continue;
+            }
+            if let Some(pixels) = self.paint_plane(plane) {
+                let [r, g, b] = rgb(index, value);
+                targets.push((pixels, [r, g, b, 255]));
+            } else {
+                omitted = true;
+            }
+        }
+        let mut applied = false;
+        if !targets.is_empty() {
+            PolygonReplay::rasterize(triangles, self.size, |pixel| {
+                for (plane, color) in &mut targets {
+                    plane[pixel * 4..pixel * 4 + 4].copy_from_slice(color);
+                }
+                applied = true;
+            });
+        }
+        (applied, omitted || !applied)
     }
 
     fn coverage(&mut self, stroke: &RecordedStroke<'_>) -> Option<StrokeCoverage> {
@@ -441,18 +503,10 @@ impl Rebuild<'_> {
             {
                 continue;
             }
-            let plane = &mut layer.channels[i];
-            if plane.as_ref().is_none_or(|p| Arc::strong_count(p) > 1) {
-                if !self.reserve((self.size * self.size * 4) as usize) {
-                    partial = true;
-                    continue;
-                }
-                *plane = Some(match plane.as_ref() {
-                    Some(old) => Arc::new((**old).clone()),
-                    None => solid(self.size, [0; 4]),
-                });
-            }
-            let pixels = Arc::make_mut(plane.as_mut().unwrap());
+            let Some(pixels) = self.paint_plane(&mut layer.channels[i]) else {
+                partial = true;
+                continue;
+            };
             let color = colors[i].unwrap_or_default();
             for (index, weight) in coverage.pixels(stroke.opacity) {
                 let target = &mut pixels[index..index + 4];

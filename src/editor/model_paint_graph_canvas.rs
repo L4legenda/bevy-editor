@@ -9,6 +9,11 @@ use material_painter_graph::{Graph, Kind, Library};
 use std::sync::Arc;
 
 const WIDTH: f32 = 176.;
+
+pub(in crate::editor::ui::model_viewer::paint) fn position_next_to_graph(graph: &Graph) -> IVec2 {
+    let right = graph.nodes.iter().map(|node| node.pos[0]).fold(0.0, f32::max);
+    Vec2::new(right + WIDTH + 44., 0.).round().as_ivec2()
+}
 const SEGMENTS: usize = 8;
 const PORT_Y: f32 = 45.;
 const ROW: f32 = 21.;

@@ -10,6 +10,34 @@ use bevy::input::{
 };
 
 #[test]
+fn shader_insertion_keeps_the_open_graph_target_and_rejects_incompatible_nodes() {
+    let library = material_graph::library();
+    let texture = library.defs.iter().position(|node| node.id == "color").unwrap();
+    let shading = library.defs.iter().position(|node| node.id == "shade_output").unwrap();
+    let revision = node_library::revision();
+    let mut session = Session::default();
+    let mut layer = Layer::new("Материал".into(), LayerKind::Fill);
+    let graph = material_graph::mask_starter();
+    let mut fill = texture_fill::Fill::default();
+    fill.graph = Some(Arc::new(material_graph::encode(&graph)));
+    layer.texture_fill = Some(Arc::new(fill));
+    session.stack = Stack { layers: vec![layer], selected: 0 };
+    session.binding = Some((1, 0));
+    session.edit(PaintAction::Panel(Panel::Shader));
+    assert!(session.insert_shader_node(texture, revision).is_err());
+    session.edit(PaintAction::Panel(Panel::Layers));
+    session.edit(PaintAction::GraphCanvas);
+    session.edit(PaintAction::Panel(Panel::Shader));
+    assert!(session.insert_shader_node(shading, revision).is_err());
+    session.binding = Some((2, 0));
+    assert!(session.insert_shader_node(texture, revision).is_err());
+    session.binding = Some((1, 0));
+    assert_eq!(session.insert_shader_node(texture, revision).unwrap(),
+        PaintAction::GraphEdit(material_graph::Edit::Add(texture, ui::position_next_to_graph(&graph))));
+    assert!(session.graph_canvas_open());
+}
+
+#[test]
 fn paint_workspace_groups_move_and_fade_as_blocks() {
     let mut session = Session::default();
     session.edit(PaintAction::Add(LayerKind::Folder));
@@ -2849,6 +2877,67 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     assert_eq!(source(&app).trim(), "// @param amount: float(0, 1) = 0.5");
     click_label(&mut app, "Вернуть исходник");
     assert_eq!(source(&app), updated);
+    paint_message(&mut app, PaintAction::Panel(Panel::Layers));
+    paint_message(&mut app, PaintAction::AddGraphMaterial(0));
+    let started = Instant::now();
+    loop {
+        frame(&mut app);
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        if !session.smart_loading {
+            assert!(session.graph().is_some(), "{}", app.world().resource::<Editor>().status);
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 45, "Не загрузился граф материала");
+    }
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    assert!(app.world().resource::<PaintState>().sessions[&0].graph_canvas_open());
+    paint_message(&mut app, PaintAction::Panel(Panel::Shader));
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Shader);
+    click_label(&mut app, "Добавить в граф");
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!(session.panel, Panel::Layers);
+        assert!(session.graph_canvas_open());
+        let graph = material_graph::read(session.graph().unwrap()).unwrap();
+        let inserted = graph.node(session.graph_node.unwrap()).unwrap();
+        assert_eq!(inserted.def, texture_def.id);
+        assert!(inserted.params.is_empty());
+    }
+    paint_message(&mut app, PaintAction::Undo);
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        let graph = material_graph::read(session.graph().unwrap()).unwrap();
+        assert!(graph.nodes.iter().all(|node| node.def != texture_def.id));
+    }
+    paint_message(&mut app, PaintAction::Panel(Panel::Shader));
+    let node_path = node_library::source_path(&directory, &texture_def.id).unwrap();
+    let external = updated.replace("0.0, 0.0, 1.0, 1.0", "0.0, 1.0, 0.0, 1.0");
+    let wait_catalog = |app: &mut App, expected: &str| {
+        let started = Instant::now();
+        while material_graph::library().find(&texture_def.id).unwrap().source != expected {
+            frame(app);
+            assert!(started.elapsed().as_secs() < 30, "Библиотека не подхватила исходник");
+        }
+    };
+    std::fs::write(&node_path, &external).unwrap();
+    wait(&mut app, "WGSL обновлён с диска");
+    assert_eq!(source(&app), external);
+    wait_catalog(&mut app, &external);
+    assert_eq!(texture_pixel(&mut app), [0, 255, 0, 255]);
+
+    let local = updated.replace("0.0, 0.0, 1.0, 1.0", "1.0, 0.0, 1.0, 1.0");
+    set_source(&mut app, &local);
+    std::fs::write(&node_path, &updated).unwrap();
+    wait(&mut app, "локальные правки остались в редакторе");
+    assert_eq!(source(&app), local);
+    ctrl(&mut app, KeyCode::KeyS, "s");
+    wait(&mut app, "Не удалось изменить узел");
+    assert_eq!(std::fs::read_to_string(&node_path).unwrap(), updated);
+    assert_eq!(source(&app), local);
+    click_label(&mut app, "Вернуть исходник");
+    wait(&mut app, "WGSL обновлён с диска");
+    assert_eq!(source(&app), updated);
+    wait_catalog(&mut app, &updated);
     click_label(&mut app, "Убрать из палитры…");
     wait(&mut app, "Убрать узел из палитры?");
     assert!(node_library::available(&texture_def.id));
@@ -2923,26 +3012,19 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     let unlit = shader_preview::presets().iter().position(|graph| graph.name == "Unlit").unwrap();
     paint_message(&mut app, PaintAction::PreviewShader(Some(unlit)));
     paint_message(&mut app, PaintAction::GraphCanvas);
-    click_label(&mut app, "Добавить узел");
-    {
-        let choice = labelled(&mut app, "Test shading");
-        let world = app.world_mut();
-        let mut choices = world.query::<(&AccessibleLabel, &ChildOf, &ComputedNode)>();
-        let parent = choices.iter(world).find(|(label, _, node)| {
-            label.0 == "Test shading" && node.size().min_element() > 0.
-        }).unwrap().1.parent();
-        let node = world.get::<ComputedNode>(parent).unwrap();
-        let y = world.get::<UiGlobalTransform>(parent).unwrap().affine().translation.y
-            * node.inverse_scale_factor();
-        world.get_mut::<bevy::ui::ScrollPosition>(parent).unwrap().0.y = (choice.center().y - y).max(0.);
-    }
-    warm(&mut app, 4);
-    click_label(&mut app, "Test shading");
+    paint_message(&mut app, PaintAction::Panel(Panel::Shader));
+    click_label(&mut app, "Добавить в граф");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Shader);
+    click_label(&mut app, "Вернуть исходник");
+    click_label(&mut app, "Добавить в граф");
     let (node, output) = {
         let state = app.world().resource::<PaintState>();
         let graph = material_graph::read(state.sessions[&0].graph().unwrap()).unwrap();
-        (graph.nodes.iter().find(|node| node.def == shading_def.id).unwrap().id,
-            graph.nodes.iter().find(|node| node.def == "shade_output").unwrap().id)
+        let inserted = graph.nodes.iter().find(|node| node.def == shading_def.id).unwrap();
+        assert_eq!(state.sessions[&0].graph_node, Some(inserted.id));
+        assert!(inserted.pos[0] > graph.nodes.iter().filter(|node| node.id != inserted.id)
+            .map(|node| node.pos[0]).fold(0., f32::max));
+        (inserted.id, graph.nodes.iter().find(|node| node.def == "shade_output").unwrap().id)
     };
     paint_message(&mut app, PaintAction::GraphEdit(material_graph::Edit::Connect(node, output, 0)));
     let pixel = model_pixel(&mut app);

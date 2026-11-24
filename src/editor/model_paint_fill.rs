@@ -259,15 +259,34 @@ impl Topology {
         data: &[Attributes],
         target: impl Fn(usize) -> bool,
     ) -> Option<(usize, Vec3)> {
+        // The last drawn triangle wins in overlapping charts, as in the UV ID pass.
+        self.uv_hits(uv, data, target)
+            .max_by_key(|&(index, _)| index)
+    }
+
+    pub fn pick_first_uv(
+        &self,
+        uv: Vec2,
+        data: &[Attributes],
+        target: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        self.uv_hits(uv, data, target).map(|(index, _)| index).min()
+    }
+
+    fn uv_hits<'a>(
+        &'a self,
+        uv: Vec2,
+        data: &'a [Attributes],
+        target: impl Fn(usize) -> bool + 'a,
+    ) -> impl Iterator<Item = (usize, Vec3)> + 'a {
         let cell = uv_cell(uv);
         let local = &self.uv_bins[cell.y as usize * UV_GRID + cell.x as usize];
-        // The last drawn triangle wins in overlapping charts, as in the UV ID pass.
         local
             .iter()
             .chain(&self.wide_uv)
             .copied()
-            .filter(|&index| target(index))
-            .filter_map(|index| {
+            .filter(move |&index| target(index))
+            .filter_map(move |index| {
                 let [a, b, c] = data[index].uv;
                 let d = (b - a).perp_dot(c - a);
                 if d.abs() <= 1e-12 {
@@ -279,7 +298,6 @@ impl Topology {
                 let [a, b, c] = data[index].points;
                 (u.min(v).min(w) >= -1e-6).then_some((index, a * w + b * u + c * v))
             })
-            .max_by_key(|&(index, _)| index)
     }
 
     pub fn select(

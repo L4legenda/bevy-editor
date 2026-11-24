@@ -461,6 +461,7 @@ pub(in crate::editor) enum PaintAction {
     GraphRebake,
     GraphCanvas,
     GraphEdit(material_graph::Edit),
+    ShaderToGraph { model: usize, definition: usize, library_revision: usize },
     ImportShelfMaterial,
     SaveShelfMaterial,
     ExportShelfMaterial,
@@ -684,6 +685,7 @@ impl PaintAction {
             Self::GraphRebake => "Обновить графы по запечённым картам.",
             Self::GraphCanvas => "Открыть или закрыть холст графа.",
             Self::GraphEdit(_) => "Изменить схему материала.",
+            Self::ShaderToGraph { .. } => "Добавить узел WGSL в открытый граф.",
             Self::ImportShelfMaterial => "Импортировать пресет Material Painter из .mpsmart или ZIP-пакета.",
             Self::ExportShelfMaterial => "Экспортировать заливку или группу в файл .mpsmart.",
             Self::ExportShelfPackage => "Экспортировать заливку или группу с узлами WGSL в ZIP-пакет.",
@@ -702,6 +704,13 @@ impl PaintAction {
         }
     }
 }
+struct ShaderGraphReturn {
+    panel: Panel,
+    material: (Option<(usize, usize)>, usize, bool),
+    shader: Option<usize>,
+    payload: Arc<serde_json::Value>,
+}
+
 struct Session {
     stack: Stack,
     undo: Vec<Stack>,
@@ -712,6 +721,7 @@ struct Session {
     category: Category,
     graph_node: Option<u64>,
     graph_canvas: bool,
+    shader_graph_return: Option<ShaderGraphReturn>,
     folder_view: Option<folder_graph::View>,
     preview_shader: Option<usize>,
     path_trace: bool,
@@ -835,6 +845,7 @@ impl Default for Session {
             category: Category::Materials,
             graph_node: None,
             graph_canvas: false,
+            shader_graph_return: None,
             folder_view: None,
             preview_shader: None,
             path_trace: false,
@@ -1785,6 +1796,16 @@ impl Session {
                 if value == self.panel {
                     return;
                 }
+                self.shader_graph_return = if value == Panel::Shader && self.graph_canvas_open() {
+                    self.graph().map(|payload| ShaderGraphReturn {
+                        panel: self.panel,
+                        material: (self.binding, self.stack.selected, self.editing_mask),
+                        shader: self.preview_shader,
+                        payload: payload.clone(),
+                    })
+                } else {
+                    None
+                };
                 self.set_menu = false;
                 if value == Panel::Maps {
                     self.preview_3d = Preview3d::Material;
@@ -2197,6 +2218,7 @@ impl Session {
             PaintAction::AddSmartMaterial(_) | PaintAction::AddGraphMaterial(_) | PaintAction::AddGraphMask
             | PaintAction::ImportGraphFile | PaintAction::ImportShaderGraph | PaintAction::ExportGraphFile | PaintAction::ExportGraphPackage
             | PaintAction::GraphAdjust(..) | PaintAction::GraphEdit(_) | PaintAction::GraphBitmapPick(_) | PaintAction::GraphRebake
+            | PaintAction::ShaderToGraph { .. }
             | PaintAction::DropMaterial(ShelfMaterial::Smart(_) | ShelfMaterial::User(_), _)
             | PaintAction::DropMaterialOnSet(..)
             | PaintAction::ImportShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage | PaintAction::SaveShelfMaterial | PaintAction::SaveShelfMask | PaintAction::ApplyShelfMaterial(_)
@@ -2337,10 +2359,14 @@ impl Session {
     }
 
     fn graph_data(&self) -> Option<(&Arc<serde_json::Value>, &Arc<texture_fill::GraphImages>)> {
-        if self.panel == Panel::Preview {
-            return self.editing_shader().map(shader_preview::Document::data);
+        self.graph_data_for(self.panel)
+    }
+
+    fn graph_data_for(&self, panel: Panel) -> Option<(&Arc<serde_json::Value>, &Arc<texture_fill::GraphImages>)> {
+        if panel == Panel::Preview {
+            return self.shader_graphs.get(&self.preview_shader?).map(shader_preview::Document::data);
         }
-        if let Some(view) = self.active_folder_view() {
+        if let Some(view) = self.folder_view_for(panel) {
             Some((&view.payload, &view.images))
         } else if self.editing_mask {
             let graph = self.stack.layers.get(self.stack.selected)?.mask.as_ref()?.graph.as_ref()?;
@@ -2352,14 +2378,23 @@ impl Session {
     }
 
     fn active_folder_view(&self) -> Option<&folder_graph::View> {
+        self.folder_view_for(self.panel)
+    }
+
+    fn folder_view_for(&self, panel: Panel) -> Option<&folder_graph::View> {
         let view = self.folder_view.as_ref()?;
-        (self.panel == Panel::Layers && self.graph_canvas && !self.editing_mask
+        (panel == Panel::Layers && self.graph_canvas && !self.editing_mask
             && self.stack.layers.get(self.stack.selected).is_some_and(|layer|
                 layer.kind == LayerKind::Folder && layer.graph_id == Some(view.folder)))
             .then_some(view)
     }
 
     fn refresh_folder_view(&mut self) {
+        if self.panel == Panel::Shader
+            && self.shader_graph_return.as_ref().is_some_and(|target| target.panel == Panel::Layers)
+        {
+            return;
+        }
         if self.panel != Panel::Layers || !self.graph_canvas || self.editing_mask
             || !folder_graph::is_group(&self.stack)
         {
@@ -2455,6 +2490,41 @@ impl Session {
         } else {
             None
         }
+    }
+
+    fn shader_graph_destination(&self, shading: bool) -> Option<&ShaderGraphReturn> {
+        let target = self.shader_graph_return.as_ref()?;
+        if self.panel != Panel::Shader || shading != (target.panel == Panel::Preview) {
+            return None;
+        }
+        let same = if shading {
+            self.shader_canvas && self.preview_shader == target.shader
+        } else {
+            self.graph_canvas && !self.busy && !self.smart_loading && self.resize_request.is_none()
+                && (self.binding, self.stack.selected, self.editing_mask) == target.material
+        };
+        (same && self.graph_data_for(target.panel)
+            .is_some_and(|(payload, _)| Arc::ptr_eq(payload, &target.payload)))
+            .then_some(target)
+    }
+
+    fn insert_shader_node(&mut self, definition: usize, library_revision: usize) -> Result<PaintAction, String> {
+        let library = material_graph::library();
+        let node = library.defs.get(definition)
+            .filter(|node| library_revision == node_library::revision() && node_library::available(&node.id))
+            .ok_or("Библиотека узлов изменилась · выберите узел ещё раз")?;
+        let target = self.shader_graph_destination(node.shading)
+            .ok_or("Открытый граф изменился или не подходит для этого узла")?;
+        let mut graph = material_graph::read(&target.payload)?;
+        let edit = material_graph::Edit::Add(definition, ui::position_next_to_graph(&graph));
+        if self.folder_view_for(target.panel).is_some()
+            && !folder_graph::can_edit(&self.stack, &graph, edit)
+        {
+            return Err("Этот узел недоступен в графе группы".into());
+        }
+        edit.apply_for(&mut graph, None, node.shading)?;
+        self.edit(PaintAction::Panel(target.panel));
+        Ok(PaintAction::GraphEdit(edit))
     }
 
     fn finish_shader_import(&mut self, active: bool) {
@@ -3077,6 +3147,22 @@ pub(super) fn actions(
         .chain(deferred_drop.map(|action| (action, true)))
     {
         if let Action::ModelView(ModelViewAction::Paint(mut action)) = action {
+            if let PaintAction::ShaderToGraph { model, definition, library_revision } = action {
+                if model != index || editor.browser_popup || editor.hdri_library_open {
+                    continue;
+                }
+                if paint.smart_import.is_some() {
+                    editor.status = "Дождитесь завершения операции с материалом".into();
+                    continue;
+                }
+                match session.insert_shader_node(definition, library_revision) {
+                    Ok(edit) => action = edit,
+                    Err(error) => {
+                        editor.status = error;
+                        continue;
+                    }
+                }
+            }
             if let PaintAction::DropMaterialOnSet(material, id, slot) = action {
                 let key = (id, slot);
                 let Some(doc) = editing.documents.get_mut(&index) else { continue };
