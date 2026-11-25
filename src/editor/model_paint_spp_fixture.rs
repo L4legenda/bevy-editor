@@ -421,7 +421,11 @@ pub fn document_with_mirror_mask(url: &str) -> Vec<u8> {
 }
 
 pub fn document_with_height_adjust(bitmap: Option<&str>) -> Vec<u8> {
-    document_options(0, bitmap, TestMask::HeightAdjust)
+    document_options(0, bitmap, TestMask::HeightAdjust(None))
+}
+
+pub fn document_with_procedural_height(url: &str) -> Vec<u8> {
+    document_options(0, None, TestMask::HeightAdjust(Some(url)))
 }
 
 pub fn document_with_anchors() -> Vec<u8> {
@@ -512,7 +516,7 @@ enum TestMask<'a> {
     OrderedFilters,
     TonalFilters,
     Mirror(&'a str),
-    HeightAdjust,
+    HeightAdjust(Option<&'a str>),
     Anchors,
     Udim,
     Stencil(&'a str, bool, Option<bool>, Option<u32>),
@@ -526,7 +530,7 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     let anchors = matches!(mask, TestMask::Anchors);
     let udim = matches!(mask, TestMask::Udim);
     let pressure = matches!(mask, TestMask::Pressure);
-    let height_adjust = matches!(mask, TestMask::HeightAdjust);
+    let height_adjust = matches!(mask, TestMask::HeightAdjust(_));
     let stencil = match mask {
         TestMask::Stencil(url, uv, inverted, wrap) => Some((url, uv, inverted, wrap)),
         _ => None,
@@ -633,6 +637,14 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         w.u32(0x305);
         w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
         w.string(url);
+    } else if let TestMask::HeightAdjust(Some(url)) = mask {
+        w.u32(0x304);
+        w.class("DataSourceProcedural", &[("channelTypes", 12), ("procedural", 18)]);
+        w.out.extend(2u64.to_le_bytes());
+        w.u32(0x305);
+        w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
+        w.string(url);
+        w.u32(0);
     } else if height_adjust {
         w.u32(0x304);
         w.class("DataSourceUniform", &[("channelTypes", 12), ("color", 3)]);

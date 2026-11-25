@@ -54,6 +54,8 @@ mod materials;
 use materials::{MATERIALS, MaterialType};
 #[path = "model_paint_presets.rs"]
 pub(super) mod presets;
+#[path = "model_paint_online.rs"]
+mod online;
 pub(in crate::editor) use presets::{ProjectGraph, project_fill, project_graph, project_mask};
 
 pub(in crate::editor) fn project_preview_shader(
@@ -160,6 +162,7 @@ pub(in crate::editor) enum Preview3d {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::editor) enum Category {
     Materials,
+    Online,
     Smart,
     Brushes,
     Textures,
@@ -421,6 +424,15 @@ pub(in crate::editor) enum PaintAction {
     Preview3d(Preview3d),
     PreviewMaterial(PreviewEdit),
     Category(Category),
+    OnlineProvider(online::Provider),
+    OnlineRefresh,
+    OnlinePage(usize),
+    OnlineResolution(u32),
+    OnlineMaterial(online::Provider, usize),
+    InstallCommunity(usize),
+    CommunityGraph(usize),
+    ShareCommunityGraph,
+    ShareCommunityMaterial,
     BrushTip(Option<usize>),
     ImportBrushTip,
     SaveBrushDefaults,
@@ -762,6 +774,15 @@ impl PaintAction {
             Self::Resolution(_) => "Изменить размер карт этого набора. Слои и маски масштабируются, история набора сбрасывается.",
             Self::Channel(_) => "Выбрать канал материала.",
             Self::Category(_) => "Открыть категорию библиотеки.",
+            Self::OnlineProvider(_) => "Выбрать источник сетевых материалов.",
+            Self::OnlineRefresh => "Заново загрузить каталог материалов.",
+            Self::OnlinePage(_) => "Открыть страницу результатов поиска.",
+            Self::OnlineResolution(_) => "Выбрать разрешение скачиваемых карт.",
+            Self::OnlineMaterial(..) => "Добавить материал как слой заливки.",
+            Self::InstallCommunity(_) => "Скачать и добавить пакет в библиотеку рисования.",
+            Self::CommunityGraph(_) => "Добавить загруженный граф как слой заливки.",
+            Self::ShareCommunityGraph => "Подготовить ZIP-пакет графа на условиях CC0 и открыть форму сообщества.",
+            Self::ShareCommunityMaterial => "Подготовить ZIP-пакет материала на условиях CC0 и открыть форму сообщества.",
             Self::BrushTip(_) => "Выбрать форму отпечатка кисти и ластика.",
             Self::ImportBrushTip => "Загрузить наконечник из изображения.",
             Self::SaveBrushDefaults => "Сохранить размер, жёсткость, шаг кисти и отступ UV-заливки для следующих запусков.",
@@ -1261,7 +1282,8 @@ impl Session {
                     && self.stack.layers.get(target.unwrap_or(self.stack.selected)).is_some();
             }
             PaintAction::Preset(i) => return i < MATERIALS.len(),
-            PaintAction::SaveShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage => {
+            PaintAction::SaveShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage
+            | PaintAction::ShareCommunityMaterial => {
                 return !self.busy && self.stack.layers.get(self.stack.selected).is_some_and(|layer| {
                     layer.kind == LayerKind::Fill || (layer.kind == LayerKind::Folder
                         && self.stack.layers[self.stack.block(self.stack.selected)].iter().any(|l| l.kind == LayerKind::Fill))
@@ -1270,6 +1292,11 @@ impl Session {
             PaintAction::SaveShelfMask => return !self.busy && self.has_mask(),
             PaintAction::ApplyShelfMaterial(i) => {
                 return self.can_insert_material(ShelfMaterial::User(i), Some(self.insertion()));
+            }
+            PaintAction::OnlineMaterial(..) => {
+                return self.binding.is_some() && !self.busy && !self.smart_loading
+                    && self.resize_request.is_none() && self.stack.layers.len() < MAX_LAYERS
+                    && self.insertion().1 <= MAX_LAYER_DEPTH;
             }
             PaintAction::ApplyShelfMask(_, target) => {
                 return self.binding.is_some() && !self.busy && !self.smart_loading && self.resize_request.is_none()
@@ -1292,12 +1319,16 @@ impl Session {
             PaintAction::ImportShaderGraph => {
                 return self.panel == Panel::Preview && self.shader_import.is_none();
             }
-            PaintAction::ImportGraphFile => {
+            PaintAction::ImportGraphFile | PaintAction::CommunityGraph(_) => {
                 return self.binding.is_some() && !self.busy && !self.smart_loading
                     && self.resize_request.is_none() && self.stack.layers.len() < MAX_LAYERS;
             }
             PaintAction::ExportGraphFile | PaintAction::ExportGraphPackage => {
                 return !self.smart_loading && self.graph().is_some() && self.active_folder_view().is_none();
+            }
+            PaintAction::ShareCommunityGraph => {
+                return !self.smart_loading && self.panel != Panel::Preview && self.editing_shader().is_none()
+                    && self.graph().is_some() && self.active_folder_view().is_none();
             }
             PaintAction::GraphCanvas => return self.graph().is_some()
                 || (self.panel == Panel::Layers && !self.editing_mask
@@ -2409,6 +2440,10 @@ impl Session {
             | PaintAction::ImportShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage | PaintAction::SaveShelfMaterial | PaintAction::SaveShelfMask | PaintAction::ApplyShelfMaterial(_)
             | PaintAction::ApplyShelfMask(..) | PaintAction::ApplyGenerator(..)
             | PaintAction::ShelfClearSearch | PaintAction::ShelfTypeMenu | PaintAction::ShelfType(_) => unreachable!(),
+            PaintAction::OnlineProvider(_) | PaintAction::OnlineRefresh | PaintAction::OnlinePage(_)
+            | PaintAction::OnlineResolution(_) | PaintAction::OnlineMaterial(..)
+            | PaintAction::InstallCommunity(_) | PaintAction::CommunityGraph(_)
+            | PaintAction::ShareCommunityGraph | PaintAction::ShareCommunityMaterial => unreachable!(),
             PaintAction::AddMaterial(value)
             | PaintAction::DropMaterial(ShelfMaterial::Basic(value), _) => {
                 let insertion = match action {
@@ -2964,6 +2999,9 @@ pub(in crate::editor) struct PaintState {
     tips: tips::Library,
     shelf: ShelfFilter,
     library: presets::Library,
+    online: online::Shelf,
+    community: online::community::Library,
+    community_submission: Option<bevy::tasks::Task<Result<online::community::Submission, String>>>,
     texture_import: Option<TextureImport>,
     smart_import: Option<SmartImport>,
     shelf_drop: Option<(usize, sets::SetKey, ShelfMaterial)>,
@@ -3193,6 +3231,34 @@ pub(super) fn actions(
             Err(error) => editor.status = format!("Не удалось экспортировать граф · {error}"),
         }
     }
+    if let Some(result) = paint.community_submission.as_mut()
+        .and_then(|job| bevy::tasks::block_on(bevy::tasks::poll_once(job)))
+    {
+        paint.community_submission = None;
+        match result {
+            Ok(submission) => {
+                let mut status = format!("Пакет CC0 подготовлен · {}", submission.path.display());
+                if submission.omitted > 0 {
+                    status.push_str(&format!(" · Пропущено данных UV и ссылок на карты: {}", submission.omitted));
+                }
+                if submission.adjusted > 0 {
+                    status.push_str(&format!(" · Адаптировано настроек: {}", submission.adjusted));
+                }
+                if !cfg!(test) {
+                    if let Some(folder) = submission.path.parent()
+                        && let Err(error) = crate::project_manager::reveal_folder(folder)
+                    {
+                        status.push_str(&format!(" · Не удалось открыть папку · {error}"));
+                    }
+                    if let Err(error) = online::community::open_form(&submission.submit_url()) {
+                        status.push_str(&format!(" · Не удалось открыть форму отправки · {error}"));
+                    }
+                }
+                editor.status = status;
+            }
+            Err(error) => editor.status = format!("Не удалось подготовить пакет сообщества · {error}"),
+        }
+    }
     if let Some(result) = paint.library.poll_export() {
         editor.status = match result {
             Ok(report) => {
@@ -3207,6 +3273,24 @@ pub(super) fn actions(
             }
             Err(error) => format!("Не удалось экспортировать материал · {error}"),
         };
+    }
+    paint.online.update();
+    if let Some(result) = paint.community.poll() {
+        match result {
+            Ok(installed) => {
+                if let Some((entry, omitted)) = installed.smart {
+                    paint.library.upsert(entry);
+                    if omitted > 0 {
+                        editor.status = format!("Добавлен материал «{}» · Пропущено данных: {omitted}", installed.record.name);
+                    } else {
+                        editor.status = format!("В библиотеку добавлен материал «{}»", installed.record.name);
+                    }
+                } else {
+                    editor.status = format!("В библиотеку добавлен ресурс «{}»", installed.record.name);
+                }
+            }
+            Err(error) => editor.status = format!("Библиотека сообщества · {error}"),
+        }
     }
     if let Some(result) = paint.library.poll() {
         match result {
@@ -3824,6 +3908,103 @@ pub(super) fn actions(
                     continue;
                 }
                 PaintAction::Category(Category::Smart | Category::Generators) => paint.library.ensure(),
+                PaintAction::Category(Category::Online) => {
+                    paint.library.ensure();
+                    paint.community.ensure(paint.library.root.clone());
+                    let provider = paint.online.provider;
+                    paint.online.show(provider, false);
+                }
+                PaintAction::Category(Category::Graphs) => {
+                    paint.library.ensure();
+                    paint.community.ensure(paint.library.root.clone());
+                }
+                PaintAction::OnlineProvider(provider) => {
+                    paint.online.show(provider, false);
+                    continue;
+                }
+                PaintAction::OnlineRefresh => {
+                    let provider = paint.online.provider;
+                    paint.online.show(provider, true);
+                    continue;
+                }
+                PaintAction::OnlinePage(page) => {
+                    paint.online.page = page;
+                    paint.online.revision += 1;
+                    continue;
+                }
+                PaintAction::OnlineResolution(resolution) => {
+                    if matches!(resolution, 1 | 2 | 4) {
+                        paint.online.resolution = resolution;
+                        paint.online.revision += 1;
+                    }
+                    continue;
+                }
+                PaintAction::OnlineMaterial(provider, entry) => {
+                    if paint.smart_import.is_none() && session.available(action)
+                        && provider != online::Provider::Community
+                        && provider == paint.online.provider
+                        && let Some(binding) = session.binding
+                        && let Some(asset) = paint.online.entries.get(entry).cloned()
+                    {
+                        let resolution = paint.online.resolution();
+                        session.smart_loading = true;
+                        session.revision += 1;
+                        paint.smart_import = Some(SmartImport {
+                            model: index, binding, set: session.set, stack: session.stack.clone(),
+                            action, mask: false, folder_graph: false, insertion: session.insertion(),
+                            size: session.texture_size, maps: None, surface: None,
+                            task: bevy::tasks::IoTaskPool::get().spawn(async move {
+                                online::material(provider, &asset, resolution)
+                            }),
+                        });
+                    }
+                    continue;
+                }
+                PaintAction::InstallCommunity(i) => {
+                    if paint.online.provider == online::Provider::Community
+                        && let Some(entry) = paint.online.entries.get(i).cloned()
+                    {
+                        if let Some(root) = paint.library.root.clone() {
+                            paint.community.start(root, entry);
+                        } else {
+                            editor.status = "Папка библиотеки рисования недоступна".into();
+                        }
+                    }
+                    continue;
+                }
+                PaintAction::ShareCommunityGraph | PaintAction::ShareCommunityMaterial => {
+                    if !session.available(action) { continue; }
+                    if paint.community_submission.is_some() {
+                        editor.status = "Дождитесь подготовки предыдущего пакета".into();
+                        continue;
+                    }
+                    paint.library.ensure();
+                    let Some(root) = paint.library.root.clone() else {
+                        editor.status = "Папка библиотеки рисования недоступна".into();
+                        continue;
+                    };
+                    let draft = if action == PaintAction::ShareCommunityGraph {
+                        let Some((payload, images)) = session.graph_data() else { continue; };
+                        let preview = if session.editing_mask {
+                            session.stack.layers.get(session.stack.selected)
+                                .and_then(|layer| layer.mask.as_ref()?.graph.as_ref()?.output.clone())
+                        } else {
+                            session.active_texture_fill().and_then(|fill| fill.images.iter().flatten().next().cloned())
+                        };
+                        online::community::Draft::Graph { payload: payload.clone(), images: images.clone(), preview }
+                    } else {
+                        let selected = &session.stack.layers[session.stack.selected];
+                        online::community::Draft::Smart(presets::Capture::Material {
+                            name: selected.name.clone(),
+                            layers: session.stack.layers[session.stack.block(session.stack.selected)].to_vec(),
+                        })
+                    };
+                    editor.status = "Подготовка пакета сообщества…".into();
+                    paint.community_submission = Some(bevy::tasks::IoTaskPool::get().spawn(async move {
+                        online::community::prepare(&root, draft)
+                    }));
+                    continue;
+                }
                 PaintAction::ShelfClearSearch => {
                     paint.shelf.clear = true;
                     continue;
@@ -3897,6 +4078,7 @@ pub(super) fn actions(
                     continue;
                 }
                 PaintAction::AddGraphMaterial(_) | PaintAction::AddGraphMask | PaintAction::ImportGraphFile
+                | PaintAction::CommunityGraph(_)
                 | PaintAction::GraphAdjust(..) | PaintAction::GraphEdit(_) | PaintAction::GraphBitmapPick(_) => {
                     if paint.smart_import.is_none()
                         && session.available(action)
@@ -3990,6 +4172,13 @@ pub(super) fn actions(
                         let surface = editing.documents.get(&index)
                             .and_then(|doc| material_graph::surface::Source::capture(doc, binding)).map(Arc::new);
                         let directory = editor.project.asset_root.clone();
+                        let community_graph = if let PaintAction::CommunityGraph(i) = action {
+                            let Some(path) = paint.community.records.get(i)
+                                .filter(|record| record.kind == online::community::Kind::Graph)
+                                .and_then(|record| record.path(paint.library.root.as_deref()?))
+                            else { continue; };
+                            Some(path)
+                        } else { None };
                         let mask_layer = mask.then(|| session.stack.layers[session.stack.selected].clone());
                         #[cfg(test)]
                         let test_path = if matches!(action, PaintAction::GraphBitmapPick(_)) {
@@ -4043,6 +4232,11 @@ pub(super) fn actions(
                                         let Some(path) = crate::editor::asset_monitor::choose_file_path(&directory)
                                             .map_err(|error| error.to_string())? else { return Ok(Vec::new()) };
                                         let (graph, images) = material_graph::file::load(&path)?;
+                                        material_graph::prepare_graph(graph, &images, size, inputs, &device, &queue)
+                                    }
+                                    (PaintAction::CommunityGraph(_), _) => {
+                                        let path = community_graph.as_ref().ok_or("Граф из библиотеки недоступен")?;
+                                        let (graph, images) = material_graph::file::load(path)?;
                                         material_graph::prepare_graph(graph, &images, size, inputs, &device, &queue)
                                     }
                                     _ => Err("Граф материала не найден".into()),

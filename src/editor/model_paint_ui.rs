@@ -289,6 +289,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     content: Entity,
     stacks: [Entity; 5],
     layer_thumbs: layer_thumbs::Cache,
+    online_previews: online::Previews,
     shelf: Entity,
     shelf_layout: ShelfLayout,
     shelf_input: Entity,
@@ -1936,6 +1937,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     let mut category_buttons = Vec::new();
     for (name, category) in [
         ("Материалы", Category::Materials),
+        ("Онлайн", Category::Online),
         ("Умные материалы", Category::Smart),
         ("Кисти", Category::Brushes),
         ("Текстуры", Category::Textures),
@@ -2255,6 +2257,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         content: viewer.content,
         stacks,
         layer_thumbs: layer_thumbs::Cache::new(&mut images),
+        online_previews: online::Previews::default(),
         shelf,
         shelf_layout: ShelfLayout {
             home: shelf_home, root: shelf_root, handle: shelf_handle, header: heading,
@@ -2405,6 +2408,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     let shelf_docked = sidebar.shelf_in_sidebar();
+    if ui.shelf_layout.docked != shelf_docked {
+        ui.shelf_stamp = None;
+    }
     let (menu, types, cards) = (ui.shelf_type_menu, ui.shelf_types, ui.shelf);
     ui.shelf_layout.arrange(shelf_docked, menu, types, cards, &mut nodes);
     if let Ok(mut root) = nodes.get_mut(ui.shelf_layout.root) {
@@ -2464,6 +2470,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ui.graph_settings_stamp = None;
         ui.layer_thumbs.begin_list();
         ui.layer_thumbs.end_list();
+        ui.online_previews.clear();
+        ui.online_previews.update(false, &mut images);
         ui.shelf_stamp = None;
         paint.shelf.menu = false;
         ui.texture_value = None;
@@ -2889,6 +2897,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     "Экспортировать в .mpsmart", PaintAction::ExportShelfMaterial,
                 );
                 button(&mut commands, tools, font, "ZIP…", PaintAction::ExportShelfPackage);
+                button(&mut commands, tools, font, "Пакет CC0…", PaintAction::ShareCommunityMaterial);
                 if let Some(layer) = session.stack.layers.get(session.stack.selected) {
                     layer_name(&mut commands, stack, font, index, session, layer);
                 }
@@ -3965,7 +3974,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             *target = shelf_image(preview);
         }
     }
-    let shelf_stamp = (shelf_content_stamp, session.category, shelf_filter.revision, paint.library.revision);
+    let shelf_stamp = (shelf_content_stamp, session.category, shelf_filter.revision,
+        paint.library.revision.wrapping_add(paint.online.revision).wrapping_add(paint.community.revision));
     if ui.shelf_stamp != Some(shelf_stamp) {
         if ui.shelf_stamp.is_none_or(|(previous, category, revision, _)| {
             previous.0 != index || category != session.category || revision != shelf_filter.revision
@@ -3976,6 +3986,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         let font = &interface.font;
         let mut shown = 0;
         let shelf = ui.shelf;
+        if session.category != Category::Online {
+            ui.online_previews.clear();
+        }
         for (i, entry) in paint.library.entries.iter().enumerate().rev() {
             if !shelf_filter.matches(&entry.name) {
                 continue;
@@ -4020,6 +4033,81 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             shown += 1;
         }
         match session.category {
+            Category::Online => {
+                let online = &paint.online;
+                let controls = node(&mut commands, shelf, column(4.));
+                let providers = node(&mut commands, controls, row(4.));
+                for provider in [online::Provider::PolyHaven, online::Provider::AmbientCg, online::Provider::Community] {
+                    let name = if provider == online.provider { format!("✓ {}", provider.name()) } else { provider.name().into() };
+                    button(&mut commands, providers, font, &name, PaintAction::OnlineProvider(provider));
+                }
+                button(&mut commands, controls, font, "Обновить каталог", PaintAction::OnlineRefresh);
+                if online.provider != online::Provider::Community {
+                    let resolutions = node(&mut commands, controls, row(4.));
+                    for resolution in [1, 2, 4] {
+                        let marker = if resolution == online.resolution() { "✓ " } else { "" };
+                        button(&mut commands, resolutions, font, &format!("{marker}{resolution}K"), PaintAction::OnlineResolution(resolution));
+                    }
+                }
+                if online.provider == online::Provider::PolyHaven {
+                    text(&mut commands, controls, font, "Powered by Poly Haven", 10., MUTED);
+                }
+                let matching: Vec<_> = online.entries.iter().enumerate()
+                    .filter(|(_, entry)| entry.matches(&shelf_filter.query)).collect();
+                let page_count = matching.len().div_ceil(online::PAGE);
+                let page = online.page.min(page_count.saturating_sub(1));
+                if online.job.is_some() {
+                    text(&mut commands, controls, font, "Загрузка каталога…", 12., MUTED);
+                } else if let Some(error) = &online.error {
+                    text(&mut commands, controls, font, error, 12., MUTED);
+                } else if matching.is_empty() {
+                    let message = if online.provider == online::Provider::Community {
+                        if online.entries.is_empty() { "В каталоге сообщества пока нет ресурсов" }
+                        else { "Ресурсы не найдены" }
+                    } else { "Материалы не найдены" };
+                    text(&mut commands, controls, font, message, 12., MUTED);
+                }
+                if session.smart_loading {
+                    text(&mut commands, controls, font, "Загрузка текстур…", 12., MUTED);
+                }
+                if online.provider == online::Provider::Community && paint.community.busy() {
+                    text(&mut commands, controls, font, "Установка пакета…", 12., MUTED);
+                }
+                if page_count > 1 {
+                    if page > 0 {
+                        button(&mut commands, controls, font, "Предыдущая", PaintAction::OnlinePage(page - 1));
+                    }
+                    text(&mut commands, controls, font, &format!("{} / {page_count}", page + 1), 11., MUTED);
+                    if page + 1 < page_count {
+                        button(&mut commands, controls, font, "Следующая", PaintAction::OnlinePage(page + 1));
+                    }
+                }
+                let results = node(&mut commands, shelf, if shelf_docked { column(4.) } else { row(4.) });
+                let entries = matching.into_iter().skip(page * online::PAGE).take(online::PAGE);
+                let placeholder = ui.layer_thumbs.checker.clone();
+                if online.job.is_some() {
+                    ui.online_previews.clear();
+                } else {
+                    ui.online_previews.page(online.provider, entries.clone().map(|(_, entry)| entry), &mut images, &placeholder);
+                }
+                for (index, entry) in entries {
+                    let preview = ui.online_previews.image(online.provider, entry).unwrap_or_else(|| placeholder.clone());
+                    if let Some(package) = &entry.community {
+                        let card = material_card(&mut commands, results, font, &entry.name, preview,
+                            PaintAction::InstallCommunity(index));
+                        let installed = paint.community.installed(&entry.id);
+                        let status = if installed { "Установлено" } else { package.kind.label() };
+                        text(&mut commands, card, font, status, 10., MUTED);
+                        let label = if installed { "Пакет установлен" } else { "Установить пакет сообщества" };
+                        commands.entity(card).insert(AccessibleLabel(format!("{label} · {}", entry.name)));
+                    } else {
+                        let card = material_card(&mut commands, results, font, &entry.name, preview,
+                            PaintAction::OnlineMaterial(online.provider, index));
+                        commands.entity(card).insert(AccessibleLabel(format!("Добавить сетевой материал · {}", entry.name)));
+                    }
+                }
+                shown += 1;
+            }
             Category::Materials => {
                 let mut group = None;
                 for (i, kind) in material_results(MATERIALS, shelf_filter, |preset| (preset.name, preset.kind())) {
@@ -4161,6 +4249,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 if session.smart_loading {
                     text(&mut commands, tools, font, "Расчёт материала…", 12., MUTED);
                 }
+                for (i, record) in paint.community.records.iter().enumerate() {
+                    if record.kind == online::community::Kind::Graph && shelf_filter.matches(&record.name) {
+                        shown += 1;
+                        button(&mut commands, tools, font, &record.name, PaintAction::CommunityGraph(i));
+                    }
+                }
                 for (i, recipe) in material_graph::PRESETS.iter().enumerate() {
                     if shelf_filter.matches(recipe.name) {
                         shown += 1;
@@ -4181,6 +4275,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
         ui.shelf_stamp = Some(shelf_stamp);
     }
+    ui.online_previews.update(session.category == Category::Online
+        && (!shelf_docked || sidebar.shelf_tab_visible())
+        && !editor.browser_popup && !editor.hdri_library_open, &mut images);
     if session.category == Category::Smart && ui.shelf_preview_job.is_none() {
         let user = paint.library.entries.iter().enumerate().rev().find(|(i, entry)| {
             entry.thumbnail.is_none()

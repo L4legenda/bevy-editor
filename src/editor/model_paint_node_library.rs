@@ -136,18 +136,34 @@ pub(super) fn source_path(directory: &Path, id: &str) -> Result<PathBuf, String>
 static FILE_EDIT: Mutex<()> = Mutex::new(());
 
 pub(super) fn publish(directory: &Path, source: &str) -> Result<PathBuf, String> {
+    let id = format!("user/{}", bevy::asset::uuid::Uuid::new_v4());
+    publish_as(directory, &id, source)
+}
+
+pub(super) fn publish_named(directory: &Path, filename: &Path, source: &str) -> Result<PathBuf, String> {
+    publish_as(directory, &node_id(filename)?, source)
+}
+
+fn publish_as(directory: &Path, id: &str, source: &str) -> Result<PathBuf, String> {
     if source.len() > SOURCE_LIMIT {
         return Err("Исходник WGSL слишком большой".into());
     }
     let _file = FILE_EDIT.lock().unwrap_or_else(|error| error.into_inner());
-    let id = format!("user/{}", bevy::asset::uuid::Uuid::new_v4());
-    let definition = def::parse(&id, source)?;
+    let definition = def::parse(id, source)?;
     // Load disk definitions before writing, so the newly written node is
     // appended once and existing palette indices keep their meanings.
     let catalog = current();
-    let path = source_path(directory, &id)?;
-    atomic_write(&path, source.as_bytes(), Revision::Missing).map_err(|error| error.to_string())?;
+    let path = source_path(directory, id)?;
     let mut current = catalog.write().unwrap_or_else(|error| error.into_inner());
+    if let Some(existing) = current.library.find(id) {
+        if !current.archived.contains(id) && existing.source == source
+            && material_graph::file::read_limited(&path, SOURCE_LIMIT).is_ok_and(|bytes| bytes == source.as_bytes())
+        {
+            return Ok(path);
+        }
+        return Err(format!("Узел с таким именем уже существует · {id}"));
+    }
+    atomic_write(&path, source.as_bytes(), Revision::Missing).map_err(|error| error.to_string())?;
     current.library = Arc::new(append(&current.library, [definition]));
     current.revision += 1;
     Ok(path)

@@ -39,9 +39,37 @@ const CHANNELS: [(u64, &str, CacheFormat); 7] = [
 const MAX_TEXTURE_BYTES: usize = 1024 * 1024 * 1024;
 const MIN_TEXTURE_SIZE: u32 = 128;
 const MAX_IMPORT_BAKE_SIZE: u32 = 512;
+const BASE_COLORS: [[u8; 4]; 6] = [
+    [184, 189, 199, 255],
+    [191, 191, 191, 255],
+    [0, 0, 0, 255],
+    [128, 128, 128, 255],
+    [255; 4],
+    [128, 128, 255, 255],
+];
+const BASE_CHANNELS: [usize; 8] = [0, 1, 2, 3, 4, 2, 5, 3];
 
-fn surface_bytes(size: u32) -> usize {
-    size as usize * size as usize * 4 * (8 + CHANNELS.len())
+fn plane_bytes(size: u32) -> usize {
+    size as usize * size as usize * 4
+}
+
+#[derive(Default)]
+struct TextureCache {
+    base: BTreeMap<u32, [Arc<Vec<u8>>; 8]>,
+    height_patterns: rebuild::HeightPatterns,
+}
+
+impl TextureCache {
+    fn base_plane_count(&self, size: u32) -> usize {
+        if self.base.contains_key(&size) { 0 } else { BASE_COLORS.len() }
+    }
+
+    fn base(&mut self, size: u32) -> [Arc<Vec<u8>>; 8] {
+        self.base.entry(size).or_insert_with(|| {
+            let planes = BASE_COLORS.map(|color| solid(size, color));
+            BASE_CHANNELS.map(|index| planes[index].clone())
+        }).clone()
+    }
 }
 
 fn generator_input_bytes(size: u32) -> usize {
@@ -67,6 +95,7 @@ struct Summary {
     shape_masks: usize,
     tile_masks: usize,
     height_adjustments: usize,
+    procedural_height_sources: usize,
     baked_mask_filters: usize,
     baked_mask_generators: usize,
     baked_generator_sets: usize,
@@ -137,6 +166,11 @@ impl Summary {
         }
         if self.height_adjustments > 0 {
             summary.push_str(&format!(" · поправок высоты: {}", self.height_adjustments));
+        }
+        if self.procedural_height_sources > 0 {
+            summary.push_str(&format!(
+                " · приближённых процедурных карт высоты: {}", self.procedural_height_sources,
+            ));
         }
         if self.baked_mask_filters > 0 {
             summary.push_str(&format!(
@@ -261,6 +295,7 @@ fn import(path: &Path, name: &str) -> io::Result<(Object, Summary)> {
     let mut matched_sets = Vec::new();
     let mut parts = Vec::new();
     let mut remaining = MAX_TEXTURE_BYTES;
+    let mut textures = TextureCache::default();
     for mesh in meshes {
         if mesh.triangles.is_empty() {
             continue;
@@ -390,8 +425,8 @@ fn import(path: &Path, name: &str) -> io::Result<(Object, Summary)> {
                 .or_insert_with(|| {
                     pending.remove(&key);
                     // Leave space for at least the smallest surface in each later texture set.
-                    let minimum =
-                        surface_bytes(MIN_TEXTURE_SIZE) + generator_input_bytes(MIN_TEXTURE_SIZE);
+                    let minimum = plane_bytes(MIN_TEXTURE_SIZE) * (BASE_COLORS.len() + CHANNELS.len())
+                        + generator_input_bytes(MIN_TEXTURE_SIZE);
                     let reserved = pending
                         .len()
                         .saturating_mul(minimum)
@@ -400,7 +435,7 @@ fn import(path: &Path, name: &str) -> io::Result<(Object, Summary)> {
                     let surface = decode_surface(
                         &mut file,
                         set,
-                        &mut available,
+                        (&mut available, &mut textures),
                         &mut summary,
                         (&object, slot, polygon_replay.as_ref()),
                         key.1,
@@ -509,7 +544,7 @@ fn needs_replay(layers: &[subcraft_spp::document::LayerInfo]) -> bool {
 fn decode_surface(
     file: &mut FileReader,
     set: &TextureSetInfo,
-    remaining: &mut usize,
+    (remaining, textures): (&mut usize, &mut TextureCache),
     summary: &mut Summary,
     (object, slot, replay): (&Object, usize, Option<&PolygonReplay>),
     tile: Option<Tile>,
@@ -529,9 +564,10 @@ fn decode_surface(
         .unwrap_or([set.width_log2, set.height_log2]);
     let mut size = 1u32 << width.max(height).clamp(7, 12);
     let planes = rebuild::estimated_planes(&set.layers);
+    let surface_bytes = |size| plane_bytes(size) * (textures.base_plane_count(size) + CHANNELS.len());
     let working = |size: u32| {
         surface_bytes(size)
-            .saturating_add((size as usize * size as usize * 4).saturating_mul(planes))
+            .saturating_add(plane_bytes(size).saturating_mul(planes))
             .saturating_add(if generators.is_empty() {
                 0
             } else {
@@ -579,7 +615,8 @@ fn decode_surface(
     if !has_cache && set.layers.is_empty() {
         return None;
     }
-    *remaining -= surface_bytes(size);
+    let cached_channels = layer.channels.iter().flatten().count();
+    *remaining -= plane_bytes(size) * (textures.base_plane_count(size) + cached_channels);
     let baked = if generators.is_empty() {
         None
     } else {
@@ -614,7 +651,7 @@ fn decode_surface(
         &set.layers,
         size,
         has_cache,
-        remaining,
+        (remaining, &mut textures.height_patterns),
         summary,
         &mut layers,
         (&object.geometry, slot, replay),
@@ -622,20 +659,9 @@ fn decode_surface(
         &scope,
         baked.as_ref(),
     );
-    let base = [
-        [184, 189, 199, 255],
-        [191, 191, 191, 255],
-        [0, 0, 0, 255],
-        [128, 128, 128, 255],
-        [255; 4],
-        [0, 0, 0, 255],
-        [128, 128, 255, 255],
-        [128, 128, 128, 255],
-    ]
-    .map(|value| solid(size, value));
     let mut surface = Surface {
         size,
-        base,
+        base: textures.base(size),
         stack: Stack {
             selected: if has_cache { 0 } else { layers.len() - 1 },
             layers,
@@ -1644,6 +1670,40 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_bakes_procedural_height_before_applying_adjustments() {
+        let root = std::env::temp_dir().join(format!("bevy-spp-procedural-height-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for graph in ["gradient_checker", "noise_gaussian_noise", "noise_directional_scratches"] {
+            let source = root.join(format!("{graph}.spp"));
+            let url = format!("starter/{graph}/{graph}");
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad()),
+                ("paint/document.bin", fixture::document_with_procedural_height(&url)),
+            ])).unwrap();
+            let (filename, report) = convert(&source, &root).unwrap();
+            assert!(report.overview.contains("поправок высоты: 3"), "{}", report.overview);
+            assert!(report.overview.contains("приближённых процедурных карт высоты: 1"), "{}", report.overview);
+            let glb = Glb::load(&root.join(filename)).unwrap();
+            let surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+            let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
+            let fill = layer.texture_fill.as_ref().unwrap();
+            assert_eq!(fill.settings.height_strength, -0.75);
+            assert_eq!(fill.settings.height_offset, -0.0625);
+            let image = fill.images[3].as_ref().unwrap().pixels();
+            let levels: std::collections::HashSet<_> = image.pixels().map(|p| p[0]).collect();
+            assert!(levels.len() > 16, "{graph} only generated {} shades", levels.len());
+            if graph == "gradient_checker" {
+                let gray = |x, y| image.get_pixel(x, y)[0];
+                assert_eq!(gray(32, 16), gray(32, 80));
+                assert!(gray(32, 16) < gray(96, 16));
+                assert_eq!(gray(144, 16), gray(208, 16));
+                assert!(gray(144, 16) < gray(144, 80));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn spp_import_preserves_tonal_mask_filters_in_glb() {
         use crate::editor::model_paint_data::mask::FilterKind;
         let root = std::env::temp_dir().join(format!(
@@ -2361,6 +2421,20 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_reuses_default_planes_across_same_size_surfaces() {
+        let mut textures = TextureCache::default();
+        assert_eq!(textures.base_plane_count(128), 6);
+        let first = textures.base(128);
+        assert_eq!(textures.base_plane_count(128), 0);
+        let second = textures.base(128);
+        assert!(first.iter().zip(&second).all(|(a, b)| Arc::ptr_eq(a, b)));
+        assert!(Arc::ptr_eq(&first[2], &first[5]));
+        assert!(Arc::ptr_eq(&first[3], &first[7]));
+        assert_eq!(textures.base_plane_count(256), 6);
+        assert_eq!(textures.base(256)[0].len(), plane_bytes(256));
+    }
+
+    #[test]
     fn spp_import_uses_the_exact_cache_for_each_udim_tile() {
         let root = std::env::temp_dir().join(format!(
             "bevy-spp-udim-{}",
@@ -2451,18 +2525,31 @@ mod tests {
             }
             if name == "FrenchRestaurantTable" {
                 assert!(status.contains("градиентных масок:"), "{status}");
-                assert!(status.contains("плиточных масок:"), "{status}");
+                let tile_masks = status.split(" · ")
+                    .find_map(|part| part.strip_prefix("плиточных масок: "))
+                    .and_then(|count| count.parse::<usize>().ok());
+                assert!(tile_masks.is_some_and(|count| count >= 20), "{status}");
+                assert!(status.contains("приближённых процедурных карт высоты:"), "{status}");
             }
             let path = root.join(output);
             let glb = Glb::load(&path).unwrap();
             let primitives = glb.json["meshes"][0]["primitives"].as_array().unwrap();
             assert_eq!(primitives.len(), primitive_count);
             let mut table_tiles = BTreeMap::new();
+            let mut adjusted_height_sources = HashSet::new();
             let mut source_file = FileReader::open(&source).unwrap();
             let metadata = source_file.project().unwrap();
             for primitive in primitives {
                 let surface = glb.paint_surface(primitive).unwrap().unwrap();
                 assert!(surface.stack.valid_hierarchy());
+                for layer in &surface.stack.layers {
+                    if let Some(fill) = &layer.texture_fill
+                        && let Some(height) = &fill.images[3]
+                        && [0.2_f32, 0.035, 0.65].contains(&fill.settings.height_strength)
+                    {
+                        adjusted_height_sources.insert(height.name.clone());
+                    }
+                }
                 if primitive["name"] == "Table" {
                     let tile = primitive["extras"]["bevy_editor_udim"].as_u64().unwrap() as u32;
                     let index = tile - 1001;
@@ -2481,6 +2568,11 @@ mod tests {
                 }
             }
             if name == "FrenchRestaurantTable" {
+                assert_eq!(adjusted_height_sources, HashSet::from([
+                    "gradient_checker (SPP).png".to_owned(),
+                    "noise_gaussian_noise (SPP).png".to_owned(),
+                    "noise_directional_scratches (SPP).png".to_owned(),
+                ]));
                 assert_eq!(
                     table_tiles.keys().copied().collect::<Vec<_>>(),
                     [1001, 1002, 1011, 1012]

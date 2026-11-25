@@ -806,6 +806,10 @@ impl Mask {
     }
 
     pub fn effective(&self) -> &[u8] {
+        self.effective_plane()
+    }
+
+    pub fn effective_plane(&self) -> &Arc<Vec<u8>> {
         if !self.has_operations() {
             return &self.pixels;
         }

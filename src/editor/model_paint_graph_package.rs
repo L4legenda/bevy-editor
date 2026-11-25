@@ -8,7 +8,7 @@ use std::{
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 const ZIP_EXT: &str = "zip";
-const ENTRY_LIMIT: usize = 384;
+pub(in crate::editor::ui::model_viewer::paint) const ENTRY_LIMIT: usize = 384;
 
 pub(in crate::editor::ui::model_viewer::paint) fn safe_name(name: &str) -> String {
     let name = name
@@ -28,6 +28,11 @@ pub(in crate::editor::ui::model_viewer::paint) fn safe_name(name: &str) -> Strin
     } else {
         name.into()
     }
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn submission_id(kind: &str, name: &str) -> String {
+    let hash = blake3::hash(format!("{kind}\n{name}").as_bytes()).to_hex();
+    format!("{}-{}", safe_name(name), &hash[..10])
 }
 
 pub(in crate::editor::ui::model_viewer::paint) fn matches(path: &Path) -> bool {
@@ -316,6 +321,34 @@ pub(in crate::editor::ui::model_viewer::paint) fn export(
     payload: &Value,
     images: &GraphImages,
 ) -> Result<PathBuf, String> {
+    export_as(directory, payload, images, GraphPackage::Local)
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn export_submission(
+    directory: &Path,
+    payload: &Value,
+    images: &GraphImages,
+    thumbnail: Option<&[u8]>,
+) -> Result<PathBuf, String> {
+    export_as(
+        directory,
+        payload,
+        images,
+        GraphPackage::Submission(thumbnail),
+    )
+}
+
+enum GraphPackage<'a> {
+    Local,
+    Submission(Option<&'a [u8]>),
+}
+
+fn export_as(
+    directory: &Path,
+    payload: &Value,
+    images: &GraphImages,
+    format: GraphPackage<'_>,
+) -> Result<PathBuf, String> {
     let mut graph = read(payload)?;
     let library = library();
     if let Some(node) = graph
@@ -324,6 +357,10 @@ pub(in crate::editor::ui::model_viewer::paint) fn export(
         .find(|node| library.find(&node.def).is_none())
     {
         return Err(format!("Не найден исходник узла · {}", node.def));
+    }
+    let submission = matches!(format, GraphPackage::Submission(_));
+    if submission && !graph.nodes.is_empty() {
+        graph.validate_texture_graph(&library)?;
     }
     let mut bitmaps = BTreeMap::<String, Arc<Bitmap>>::new();
     let mut relocated = HashMap::<PathBuf, PathBuf>::new();
@@ -346,16 +383,27 @@ pub(in crate::editor::ui::model_viewer::paint) fn export(
     let mut sources = BTreeMap::new();
     split_sources(&mut payload, &mut sources);
     check_sources(&sources)?;
-    let id = safe_name(&graph.name);
+    let id = if submission {
+        submission_id("graph", &graph.name)
+    } else {
+        safe_name(&graph.name)
+    };
     let main = format!("{id}.mpgraph");
     let files: Vec<_> = std::iter::once(main.as_str())
         .chain(sources.keys().map(String::as_str))
         .chain(bitmaps.keys().map(String::as_str))
         .collect();
-    let info = serde_json::json!({
+    let preview = match format {
+        GraphPackage::Local => None,
+        GraphPackage::Submission(preview) => preview,
+    };
+    let mut info = serde_json::json!({
         "id": id, "name": graph.name, "kind": "graph", "path": format!("items/{id}"),
-        "files": files, "author": "", "description": "", "tags": [], "thumb": null,
+        "files": files, "author": "", "description": "", "tags": [], "thumb": preview.map(|_| "thumb.png"),
     });
+    if submission {
+        info["license"] = serde_json::json!("CC0");
+    }
     let graph_bytes = serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?;
     if graph_bytes.len() > MANIFEST_LIMIT {
         return Err("Граф слишком большой для ZIP-пакета".into());
@@ -370,6 +418,9 @@ pub(in crate::editor::ui::model_viewer::paint) fn export(
             &serde_json::to_vec_pretty(&info).map_err(|error| error.to_string())?,
         )?;
         write(&main, &graph_bytes)?;
+        if let Some(preview) = preview {
+            write("thumb.png", preview)?;
+        }
         for (name, source) in &sources {
             write(name, source.as_bytes())?;
         }

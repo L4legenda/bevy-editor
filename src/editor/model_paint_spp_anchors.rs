@@ -14,6 +14,17 @@ pub(super) enum Anchor {
 pub(super) struct Anchors(HashMap<i64, Option<Anchor>>);
 
 impl Anchors {
+    pub fn into_planes(self) -> impl Iterator<Item = Plane> {
+        self.0.into_values().flatten().flat_map(|anchor| match anchor {
+            Anchor::Mask(plane) => {
+                let mut planes = [const { None }; CHANNELS.len()];
+                planes[0] = Some(plane);
+                planes
+            }
+            Anchor::Content(planes) => planes,
+        }).flatten()
+    }
+
     pub fn requested(layers: &[LayerInfo]) -> Self {
         let mut result = Self::default();
         result.collect(layers);

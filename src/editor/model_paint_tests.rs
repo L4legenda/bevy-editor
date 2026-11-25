@@ -3089,6 +3089,149 @@ fn gpu_graph_mask_keeps_painted_alpha_filters_and_graph_on_save() {
 }
 
 #[test]
+#[ignore = "requires GPU; applies an installed community graph through the shelf without network access"]
+fn gpu_community_graph_from_installed_package_applies_as_a_fill() {
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let root = std::env::temp_dir().join(format!("bevy-community-ui-{}", bevy::asset::uuid::Uuid::new_v4()));
+    let entries = online::community::catalog(&serde_json::json!({"version": 1, "items": [
+        {"id": "blue", "name": "Community blue", "kind": "graph", "path": "items/blue", "files": ["blue.mpgraph", "nodes/tint.wgsl"]}
+    ]})).unwrap();
+    let graph = serde_json::json!({"name": "Community blue", "res": 64, "next_id": 3, "nodes": [
+        {"id": 1, "def": "user/tint", "pos": [0, 0]},
+        {"id": 2, "def": "output", "pos": [200, 0], "links": {"input": 1}}
+    ]});
+    let shader = "// @name Community blue\n// @output color\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.15, 0.25, 0.8, 1.0); }\n";
+    online::community::install(&root, &entries[0], |url, _| {
+        if url.ends_with(".wgsl") { Ok(shader.as_bytes().to_vec()) }
+        else { serde_json::to_vec(&graph).map_err(|error| error.to_string()) }
+    }).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<PaintState>().library.root = Some(root.clone());
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 12);
+    paint_click(&mut app, window, PaintAction::Category(Category::Graphs));
+    set_shelf_query(&mut app, "Community blue");
+    let started = std::time::Instant::now();
+    while app.world().resource::<PaintState>().community.records.is_empty() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "Installed community graph did not appear");
+    }
+    warm(&mut app, 4);
+    paint_click(&mut app, window, PaintAction::CommunityGraph(0));
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        let layer = &session.stack.layers[session.stack.selected];
+        if let Some(fill) = &layer.texture_fill
+            && layer.name == "Community blue"
+        {
+            let graph = material_graph::read(fill.graph.as_ref().unwrap()).unwrap();
+            let id = &graph.node(1).unwrap().def;
+            assert!(node_library::is_embedded(id));
+            assert!(fill.images[0].as_ref().unwrap().pixels().get_pixel(0, 0)[2] > 128);
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 60, "{}", app.world().resource::<Editor>().status);
+    }
+    paint_message(&mut app, PaintAction::ShareCommunityGraph);
+    let started = std::time::Instant::now();
+    while app.world().resource::<PaintState>().community_submission.is_some() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 60, "Community share package did not finish");
+    }
+    let output = std::fs::read_dir(root.join("online/community/submissions"))
+        .unwrap_or_else(|error| panic!("{error} · {}", app.world().resource::<Editor>().status))
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "zip"))
+        .unwrap_or_else(|| panic!("{}", app.world().resource::<Editor>().status));
+    let (shared, _) = material_graph::file::load(&output.path()).unwrap();
+    assert_eq!(shared.name, "Community blue");
+    paint_message(&mut app, PaintAction::Undo);
+    assert!(!app.world().resource::<PaintState>().sessions[&0].stack.layers.iter().any(|layer| layer.name == "Community blue"));
+    drop(app);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires HTTPS and GPU; downloads and applies a real Poly Haven material from the paint shelf"]
+fn gpu_online_material_applies_as_an_editable_glb_fill() {
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 12);
+    paint_click(&mut app, window, PaintAction::Category(Category::Online));
+    let started = std::time::Instant::now();
+    let index = loop {
+        frame(&mut app);
+        let shelf = &app.world().resource::<PaintState>().online;
+        if let Some(error) = &shelf.error { panic!("{error}"); }
+        if let Some(index) = shelf.entries.iter().position(|entry| entry.matches("brick_wall_001")) { break index; }
+        assert!(started.elapsed().as_secs() < 60, "Online shelf did not load");
+    };
+    set_shelf_query(&mut app, "brick_wall_001");
+    let action = PaintAction::OnlineMaterial(online::Provider::PolyHaven, index);
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let mut cards = world.query::<(&Control, &Children)>();
+        let loaded = cards.iter(world).any(|(control, children)| {
+            matches!(control.action, Action::ModelView(ModelViewAction::Paint(value)) if value == action)
+                && children.iter().any(|child| {
+                    world.get::<ImageNode>(child).and_then(|node| world.resource::<Assets<Image>>().get(&node.image))
+                        .is_some_and(|image| image.width() == 128)
+                })
+        });
+        if loaded { break; }
+        assert!(started.elapsed().as_secs() < 90, "Online card thumbnail did not load");
+    }
+    paint_click(&mut app, window, action);
+    let started = std::time::Instant::now();
+    let (name, texture) = loop {
+        frame(&mut app);
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        let layer = &session.stack.layers[session.stack.selected];
+        if let Some(fill) = &layer.texture_fill
+            && [0, 1, 3, 6].into_iter().all(|slot| fill.images[slot].is_some())
+        {
+            break (layer.name.clone(), fill.images[0].as_ref().unwrap().bytes.clone());
+        }
+        assert!(started.elapsed().as_secs() < 90, "{}", app.world().resource::<Editor>().status);
+    };
+    paint_ready(&mut app);
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    let bytes = doc.source.encode(&doc.objects, &doc.original).unwrap();
+    let path = std::env::temp_dir().join(format!("bevy-online-fill-{}.glb", bevy::asset::uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).unwrap();
+    let glb = crate::editor::model_document::glb::Glb::load(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let restored = glb.json["meshes"].as_array().unwrap().iter().flat_map(|mesh| {
+        mesh["primitives"].as_array().into_iter().flatten()
+    }).find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
+    let layer = restored.stack.layers.iter().find(|layer| layer.name == name).unwrap();
+    assert_eq!(layer.texture_fill.as_ref().unwrap().images[0].as_ref().unwrap().bytes, texture);
+    paint_message(&mut app, PaintAction::Undo);
+    assert!(!app.world().resource::<PaintState>().sessions[&0].stack.layers.iter().any(|layer| layer.name == name));
+}
+
+#[test]
 #[ignore = "requires GPU; applies a graph from the shelf, edits a node, undoes the edit and reopens the GLB"]
 fn gpu_model_paint_graph_presets_and_node_edit_survive_glb() {
     use bevy::render::renderer::{RenderDevice, RenderQueue};

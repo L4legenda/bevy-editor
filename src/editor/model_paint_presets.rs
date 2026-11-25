@@ -813,17 +813,29 @@ pub(super) struct Export {
 }
 
 pub(super) fn export_material(directory: &Path, capture: Capture) -> Result<Export, String> {
-    export_material_as(directory, capture, false)
+    export_material_as(directory, capture, ExportFormat::Material)
 }
 
 pub(super) fn export_material_package(
     directory: &Path,
     capture: Capture,
 ) -> Result<Export, String> {
-    export_material_as(directory, capture, true)
+    export_material_as(directory, capture, ExportFormat::Package)
 }
 
-fn export_material_as(directory: &Path, capture: Capture, package: bool) -> Result<Export, String> {
+pub(super) fn export_community_package(directory: &Path, capture: Capture) -> Result<Export, String> {
+    export_material_as(directory, capture, ExportFormat::Community)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Material,
+    Package,
+    Community,
+}
+
+fn export_material_as(directory: &Path, capture: Capture, format: ExportFormat) -> Result<Export, String> {
+    let package = format != ExportFormat::Material;
     let Captured {
         manifest,
         images,
@@ -865,16 +877,23 @@ fn export_material_as(directory: &Path, capture: Capture, package: bool) -> Resu
         if inner.len() as u64 > MAX_FILE {
             return Err("Файл пресета превышает допустимый размер".into());
         }
-        let id = package::safe_name(&manifest.name);
+        let id = if format == ExportFormat::Community {
+            package::submission_id("smart", &manifest.name)
+        } else {
+            package::safe_name(&manifest.name)
+        };
         let main = format!("{id}.mpsmart");
         let files: Vec<_> = std::iter::once(main.as_str())
             .chain(sources.keys().map(String::as_str))
             .collect();
-        let info = serde_json::json!({
+        let mut info = serde_json::json!({
             "id": id, "name": manifest.name, "kind": "smart", "path": format!("items/{id}"),
             "files": files, "author": "", "description": "", "tags": [],
             "thumb": thumbnail.as_ref().map(|_| "thumb.png"),
         });
+        if format == ExportFormat::Community {
+            info["license"] = serde_json::json!("CC0");
+        }
         publish(directory, &manifest, "zip", |file| {
             let mut zip = zip::ZipWriter::new(file);
             package::add_entry(
@@ -1135,7 +1154,9 @@ impl Library {
             match result {
                 Ok(entries) => {
                     for entry in entries {
-                        self.upsert(entry);
+                        if !self.entries.iter().any(|known| known.path == entry.path) {
+                            self.upsert(entry);
+                        }
                     }
                 }
                 Err(error) => return Some(Err(error)),
@@ -1156,7 +1177,7 @@ impl Library {
         }
     }
 
-    fn upsert(&mut self, entry: Entry) {
+    pub(super) fn upsert(&mut self, entry: Entry) {
         // Keep indices stable for controls and drag payloads during asynchronous refresh.
         if let Some(old) = self.entries.iter_mut().find(|old| old.path == entry.path) {
             *old = entry;

@@ -81,6 +81,10 @@ impl Progress {
 }
 
 fn allowed_url(url: &reqwest::Url) -> bool {
+    if url.host_str() == Some("raw.githubusercontent.com") {
+        return url.scheme() == "https"
+            && url.path().starts_with("/alla2001/material-painter-community/main/");
+    }
     url.scheme() == "https"
         && matches!(
             url.host_str(),
@@ -149,22 +153,32 @@ fn bounded_read(
     }
 }
 
-fn get(url: &str, limit: u64, progress: Option<&Progress>) -> Result<Vec<u8>, String> {
+pub(super) fn get(url: &str, limit: u64, progress: Option<&Progress>) -> Result<Vec<u8>, String> {
+    get_with_timeout(url, limit, progress, None)
+}
+
+fn get_with_timeout(
+    url: &str,
+    limit: u64,
+    progress: Option<&Progress>,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, String> {
     let url = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
     if !allowed_url(&url) {
-        return Err("Неизвестный источник HDRI".into());
+        return Err("Неизвестный источник ресурса".into());
     }
     if let Some(progress) = progress {
         progress.check()?;
     }
-    let response = client()?
-        .get(url)
+    let request = client()?.get(url);
+    let request = if let Some(timeout) = timeout { request.timeout(timeout) } else { request };
+    let response = request
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|error| format!("Не удалось получить данные: {error}"))?;
     if let Some(size) = response.content_length() {
         if size > limit {
-            return Err("Выберите меньшее разрешение HDRI".into());
+            return Err("Выберите меньшее разрешение ресурса".into());
         }
         if let Some(progress) = progress {
             progress.total.store(size, Ordering::Relaxed);
@@ -173,12 +187,12 @@ fn get(url: &str, limit: u64, progress: Option<&Progress>) -> Result<Vec<u8>, St
     bounded_read(response, limit, progress)
 }
 
-fn json(url: &str) -> Result<Value, String> {
+pub(super) fn json(url: &str) -> Result<Value, String> {
     serde_json::from_slice(&get(url, MAX_JSON, None)?)
         .map_err(|error| format!("Неверный ответ каталога: {error}"))
 }
 
-fn clean_name(value: Option<&Value>, fallback: &str) -> String {
+pub(super) fn clean_name(value: Option<&Value>, fallback: &str) -> String {
     let name: String = value
         .and_then(Value::as_str)
         .unwrap_or(fallback)
@@ -193,7 +207,7 @@ fn clean_name(value: Option<&Value>, fallback: &str) -> String {
     }
 }
 
-fn strings(value: Option<&Value>) -> Vec<String> {
+pub(super) fn strings(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
         .into_iter()
@@ -320,7 +334,7 @@ fn directory(root: &Path, relative: &Path) -> Result<PathBuf, String> {
     Ok(current)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let temporary = path.with_extension(format!(
         "part-{}-{}",
@@ -490,14 +504,21 @@ pub(super) fn thumbnail(
     entry: &CatalogEntry,
 ) -> Result<super::image_previews::DecodedImage, String> {
     let file = thumbnail_file(root, entry)?;
-    if file.is_file() {
-        if let Ok(decoded) =
-            super::image_previews::decode_image(&file, bevy::prelude::UVec2::new(256, 160))
-        {
-            return Ok(decoded);
-        }
+    public_thumbnail(&entry.thumbnail, Some(&file), bevy::prelude::UVec2::new(256, 160))
+}
+
+pub(super) fn public_thumbnail(
+    url: &str,
+    cache: Option<&Path>,
+    bounds: bevy::prelude::UVec2,
+) -> Result<super::image_previews::DecodedImage, String> {
+    if let Some(file) = cache
+        && file.is_file()
+        && let Ok(decoded) = super::image_previews::decode_image(file, bounds)
+    {
+        return Ok(decoded);
     }
-    let bytes = get(&entry.thumbnail, 2 * 1024 * 1024, None)?;
+    let bytes = get_with_timeout(url, 2 * 1024 * 1024, None, Some(Duration::from_secs(15)))?;
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
@@ -506,16 +527,25 @@ pub(super) fn thumbnail(
     limits.max_image_width = Some(2048);
     limits.max_image_height = Some(2048);
     reader.limits(limits);
-    let image = reader
-        .decode()
-        .map_err(|error| error.to_string())?
-        .thumbnail(256, 160);
-    let mut png = Cursor::new(Vec::new());
-    image
-        .write_to(&mut png, image::ImageFormat::Png)
-        .map_err(|error| error.to_string())?;
-    atomic_write(&file, &png.into_inner())?;
-    super::image_previews::decode_image(&file, bevy::prelude::UVec2::new(256, 160))
+    let image = reader.decode().map_err(|error| error.to_string())?;
+    let original = bevy::prelude::UVec2::new(image.width(), image.height());
+    let image = if original.x > bounds.x || original.y > bounds.y {
+        image.thumbnail(bounds.x, bounds.y)
+    } else {
+        image
+    };
+    if let Some(file) = cache {
+        let mut png = Cursor::new(Vec::new());
+        if image.write_to(&mut png, image::ImageFormat::Png).is_ok() {
+            let _ = atomic_write(file, &png.into_inner());
+        }
+    }
+    let rgba = image.into_rgba8();
+    Ok(super::image_previews::DecodedImage {
+        size: bevy::prelude::UVec2::new(rgba.width(), rgba.height()),
+        rgba: rgba.into_raw(),
+        original,
+    })
 }
 
 pub(super) fn download(

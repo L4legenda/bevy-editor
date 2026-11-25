@@ -15,6 +15,9 @@ use crate::editor::model_paint_data::{
 #[path = "model_paint_spp_anchors.rs"]
 mod anchors;
 use anchors::{Anchor, Anchors};
+#[path = "model_paint_spp_height_patterns.rs"]
+mod height_patterns;
+use height_patterns::Pattern as HeightPattern;
 use bevy::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use subcraft_spp::{
@@ -24,6 +27,8 @@ use subcraft_spp::{
         LevelsInfo, SourceInfo, StrokeInfo, UvTransform, channel_bits,
     },
 };
+
+pub(super) type HeightPatterns = Vec<(GraphRef, Arc<Bitmap>)>;
 
 pub(super) fn estimated_planes(layers: &[LayerInfo]) -> usize {
     layers
@@ -49,6 +54,11 @@ pub(super) fn estimated_planes(layers: &[LayerInfo]) -> usize {
                     SourceInfo::Uniform { channels, .. }
                     | SourceInfo::Bitmap { channels, .. }
                     | SourceInfo::Reference { channels, .. } => Some(*channels),
+                    SourceInfo::Procedural { channels, graph }
+                        if layer.kind == SourceKind::Fill && HeightPattern::of(graph).is_some() =>
+                    {
+                        Some(channels & channel_bits::HEIGHT)
+                    }
                     _ => None,
                 })
                 .fold(0, |bits, source| bits | source);
@@ -67,7 +77,7 @@ pub(super) fn add(
     source: &[LayerInfo],
     size: u32,
     has_cache: bool,
-    remaining: &mut usize,
+    (remaining, height_patterns): (&mut usize, &mut HeightPatterns),
     summary: &mut Summary,
     target: &mut Vec<Layer>,
     (mesh, slot, replay): (&MeshData, usize, Option<&PolygonReplay>),
@@ -85,6 +95,7 @@ pub(super) fn add(
         size,
         solids: HashMap::new(),
         bitmaps: HashMap::new(),
+        height_patterns,
         polygon_replay: replay.map(|replay| (replay, slot)),
         anchors: Anchors::requested(source),
         mesh,
@@ -105,6 +116,12 @@ pub(super) fn add(
     {
         *rebuild.remaining += plane.len() * size_of::<u32>();
     }
+    for plane in std::mem::take(&mut rebuild.anchors).into_planes() {
+        rebuild.release_plane(plane);
+    }
+    for (_, plane) in std::mem::take(&mut rebuild.solids) {
+        rebuild.release_plane(plane);
+    }
     let mut group = Layer::new("Слои Substance Painter".into(), LayerKind::Folder);
     group.visible = !has_cache;
     target.push(group);
@@ -117,6 +134,7 @@ struct Rebuild<'a> {
     size: u32,
     solids: HashMap<[u8; 4], Arc<Vec<u8>>>,
     bitmaps: HashMap<String, Option<Arc<Bitmap>>>,
+    height_patterns: &'a mut HeightPatterns,
     polygon_replay: Option<(&'a PolygonReplay, usize)>,
     anchors: Anchors,
     mesh: &'a MeshData,
@@ -137,6 +155,12 @@ impl Rebuild<'_> {
         }
         *self.remaining -= bytes;
         true
+    }
+
+    fn release_plane(&mut self, plane: Arc<Vec<u8>>) {
+        if Arc::strong_count(&plane) == 1 {
+            *self.remaining += plane.len();
+        }
     }
 
     fn plane(&mut self, rgba: [u8; 4]) -> Option<Arc<Vec<u8>>> {
@@ -633,9 +657,43 @@ impl Rebuild<'_> {
                 omitted |=
                     self.reference_channels(layer, Some(fill), *channels, *anchor, levels.as_ref());
             }
+            SourceInfo::Procedural { channels, graph } if channels & channel_bits::HEIGHT != 0 => {
+                if let Some(bitmap) = self.height_pattern(graph) {
+                    fill.images[3] = Some(bitmap);
+                    reset_height(&mut fill.settings);
+                    self.summary.procedural_height_sources += 1;
+                }
+                // The portable texture approximates the original graph's output.
+                omitted = true;
+            }
             _ => omitted = true,
         }
         omitted
+    }
+
+    fn height_pattern(&mut self, graph: &GraphRef) -> Option<Arc<Bitmap>> {
+        let pattern = HeightPattern::of(graph)?;
+        let plane_bytes = self.size as usize * self.size as usize * 4;
+        if let Some((_, bitmap)) = self.height_patterns.iter().find(|(reference, _)| reference == graph) {
+            let bitmap = bitmap.clone();
+            return self.reserve(plane_bytes).then_some(bitmap);
+        }
+        let size = pattern.size(graph);
+        let budget = plane_bytes + size as usize * size as usize * 12;
+        if !self.reserve(budget) {
+            return None;
+        }
+        match pattern.bitmap(graph, size) {
+            Ok(bitmap) => {
+                let bitmap = Arc::new(bitmap);
+                self.height_patterns.push((graph.clone(), bitmap.clone()));
+                Some(bitmap)
+            }
+            Err(_) => {
+                *self.remaining += budget;
+                None
+            }
+        }
     }
 
     fn adjust_height(
@@ -941,6 +999,9 @@ impl Rebuild<'_> {
         if let Some((default_on, names)) = &original.mesh_filter {
             omitted |= !self.geometry_mask(&mut mask, *default_on, names);
         }
+        if let Some(before_paint) = before_paint {
+            self.release_plane(before_paint);
+        }
         self.summary.masks += 1;
         layer.mask = Some(Arc::new(mask));
         omitted
@@ -988,11 +1049,20 @@ impl Rebuild<'_> {
             .all(|generator| !generator.missing_bake_inputs(self.baked.map(Arc::as_ref)))
     }
 
-    fn flatten_mask(&mut self, mask: &mut Mask) {
+    fn flatten_mask(&mut self, mask: &mut Mask, before_paint: &mut Option<Arc<Vec<u8>>>) {
         self.summary.baked_mask_generators += usize::from(mask.generator.is_some())
             + mask.layers.iter().filter(|layer| layer.generator.is_some()).count();
         self.bind_import_mask(mask);
-        *mask = Mask::new(Arc::new(mask.effective().to_vec()), Vec::new());
+        let pixels = mask.effective_plane().clone();
+        if Arc::ptr_eq(&pixels, &mask.pixels) {
+            // No pixel operation ran, so the reserved output plane was unnecessary.
+            *self.remaining += pixels.len();
+        }
+        let previous = std::mem::replace(mask, Mask::new(pixels, Vec::new()));
+        self.release_plane(previous.pixels);
+        if let Some(before_paint) = before_paint.take() {
+            self.release_plane(before_paint);
+        }
     }
 
     fn geometry_mask(&mut self, mask: &mut Mask, default_on: bool, names: &[String]) -> bool {
@@ -1224,8 +1294,9 @@ impl Rebuild<'_> {
         }
         self.summary.baked_mask_filters += filters.len();
         *mask.edit_filters() = std::mem::take(filters);
-        self.flatten_mask(mask);
-        *base = None;
+        self.flatten_mask(mask, base);
+        // One plane remains in the mask. The work space is available to the next action.
+        *self.remaining += mask.pixels.len();
         true
     }
 
@@ -1251,8 +1322,7 @@ impl Rebuild<'_> {
         }
         if !mask.layers.is_empty() {
             // Earlier fill effects become the mask underneath these brush actions.
-            self.flatten_mask(mask);
-            *base = None;
+            self.flatten_mask(mask, base);
         }
         if base.is_none() {
             *base = Some(mask.pixels.clone());
