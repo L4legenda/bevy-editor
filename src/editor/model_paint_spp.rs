@@ -262,11 +262,7 @@ pub(super) fn project_name(source: &Path) -> String {
 pub(super) fn publish_project(target: &Path, name: &str, format: &str, bytes: &[u8]) -> io::Result<PathBuf> {
     use bevy_scene_format::{Revision, atomic_write};
     for number in 1.. {
-        let file = if number == 1 {
-            format!("{name}_{format}.glb")
-        } else {
-            format!("{name}_{format}_{number}.glb")
-        };
+        let file = project_output_name(name, format, number);
         let path = target.join(&file);
         if path.exists() {
             continue;
@@ -278,6 +274,14 @@ pub(super) fn publish_project(target: &Path, name: &str, format: &str, bytes: &[
         }
     }
     unreachable!()
+}
+
+pub(super) fn project_output_name(name: &str, format: &str, number: usize) -> String {
+    if number == 1 {
+        format!("{name}_{format}.glb")
+    } else {
+        format!("{name}_{format}_{number}.glb")
+    }
 }
 
 fn import(path: &Path, name: &str) -> io::Result<(Object, Summary)> {

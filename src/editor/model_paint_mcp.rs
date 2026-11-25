@@ -1,9 +1,11 @@
 //! MCP access to the material slots, layer edits and history of the paint workspace.
 use super::*;
 use crate::editor::model_document::Document;
-pub(in crate::editor) use bake::{BakeArgs, BakeTarget, McpBake};
+use crate::editor::model_paint_data::mask::MaskBlend;
+pub(in crate::editor) use bake::{BakeArgs, BakeLevelsArgs, BakeTarget, McpBake};
 pub(in crate::editor) use engine::McpPaintInput;
 pub(in crate::editor) use export::{ExportArgs, McpOutput, OutputReply};
+pub(in crate::editor) use mcp_preview::offscreen::{RenderArgs, render};
 pub(in crate::editor) use mcp_preview::{
     CageArgs, CaptureArgs, CaptureReply, McpPreview, ViewArgs as PaintViewArgs, cage, capture,
     set_view,
@@ -100,10 +102,54 @@ enum Edit {
     ApplyGenerator {
         index: usize,
         generator: GeneratorKind,
+        #[serde(default)]
+        parameters: GeneratorPatch,
+    },
+    UpdateGenerator {
+        index: usize,
+        /// Omit to edit the mask's main generator.
+        mask_layer: Option<usize>,
+        parameters: GeneratorPatch,
+    },
+    AddMaskLayer {
+        index: usize,
+        source: MaskLayerSource,
+        #[serde(default)]
+        parameters: MaskLayerPatch,
+    },
+    UpdateMaskLayer {
+        index: usize,
+        mask_layer: usize,
+        parameters: MaskLayerPatch,
+    },
+    MoveMaskLayer {
+        index: usize,
+        from: usize,
+        to: usize,
+    },
+    RemoveMaskLayer {
+        index: usize,
+        mask_layer: usize,
     },
     AddMaskFilter {
         index: usize,
         filter: FilterKind,
+        #[serde(default)]
+        parameters: FilterPatch,
+    },
+    UpdateMaskFilter {
+        index: usize,
+        filter_index: usize,
+        parameters: FilterPatch,
+    },
+    MoveMaskFilter {
+        index: usize,
+        from: usize,
+        to: usize,
+    },
+    RemoveMaskFilter {
+        index: usize,
+        filter_index: usize,
     },
     Undo,
     Redo,
@@ -145,6 +191,133 @@ enum MaskBase {
     Remove,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct GeneratorPatch {
+    /// Inspector control indices, ranges and defaults are listed in list_paint_presets.
+    controls: Option<BTreeMap<String, f32>>,
+    invert: Option<bool>,
+    edge_width: Option<u16>,
+    id_tolerance: Option<u8>,
+    id_color: Option<[u8; 3]>,
+    /// Index in the target mask's available baked ID palette.
+    id_region: Option<usize>,
+    weights: Option<BTreeMap<String, i16>>,
+}
+
+fn control_index(key: &str) -> Result<usize, String> {
+    key.parse::<usize>().ok().filter(|index| index.to_string() == key)
+        .ok_or_else(|| format!("Invalid control index '{key}'"))
+}
+
+impl GeneratorPatch {
+    fn apply(&self, mut generator: Generator, palette: &[[u8; 3]]) -> Result<Generator, String> {
+        if self.id_color.is_some() && self.id_region.is_some() {
+            return Err("Choose either id_color or id_region".into());
+        }
+        for (key, &value) in self.controls.iter().flatten() {
+            let index = control_index(key)?;
+            let Some(&(_, min, max, _)) = generator.controls().get(index) else {
+                return Err(format!("Unknown control {index} for this generator"));
+            };
+            if !(min..=max).contains(&value) {
+                return Err(format!("Generator control {index} must be between {min} and {max}"));
+            }
+            generator.set_value(index, value);
+        }
+        generator.invert = self.invert.unwrap_or(generator.invert);
+        generator.edge_width = self.edge_width.unwrap_or(generator.edge_width);
+        generator.id_tolerance = self.id_tolerance.unwrap_or(generator.id_tolerance);
+        generator.id_color = match self.id_region {
+            Some(index) => Some(*palette.get(index).ok_or("Unknown baked ID region for this mask")?),
+            None => self.id_color.or(generator.id_color),
+        };
+        for (name, &weight) in self.weights.iter().flatten() {
+            let input = serde_json::from_value::<GeneratorInput>(Value::String(name.clone()))
+                .map_err(|_| format!("Unknown generator input '{name}'"))?;
+            if !(-Generator::WEIGHT_LIMIT..=Generator::WEIGHT_LIMIT).contains(&weight) {
+                return Err(format!("Weight for '{name}' must be between -250 and 250"));
+            }
+            generator.set_weight(input, weight);
+        }
+        if !generator.valid() {
+            return Err("Invalid generator settings; edge_width must be 2–500 and id_tolerance 1–100".into());
+        }
+        Ok(generator)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct FilterPatch {
+    enabled: Option<bool>,
+    /// Inspector control indices and ranges are listed in list_paint_presets.
+    controls: Option<BTreeMap<String, f32>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum MaskLayerSource {
+    Fill,
+    Generator {
+        generator: GeneratorKind,
+        #[serde(default)]
+        parameters: GeneratorPatch,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct MaskLayerPatch {
+    enabled: Option<bool>,
+    blend: Option<MaskBlend>,
+    opacity_percent: Option<u8>,
+    value_percent: Option<u8>,
+}
+
+impl MaskLayerPatch {
+    fn apply(self, layer: &mut MaskLayer) -> Result<(), String> {
+        if self.value_percent.is_some() && layer.generator.is_some() {
+            return Err("value_percent is only available for fill mask layers".into());
+        }
+        layer.enabled = self.enabled.unwrap_or(layer.enabled);
+        layer.blend = self.blend.unwrap_or(layer.blend);
+        layer.opacity = self.opacity_percent.unwrap_or(layer.opacity);
+        layer.value = self.value_percent.unwrap_or(layer.value);
+        if layer.opacity > 100 || layer.value > 100 {
+            return Err("Mask layer opacity and value must be between 0 and 100 percent".into());
+        }
+        Ok(())
+    }
+}
+
+impl FilterPatch {
+    fn apply(&self, mut filter: Filter) -> Result<Filter, String> {
+        filter.enabled = self.enabled.unwrap_or(filter.enabled);
+        for (key, &value) in self.controls.iter().flatten() {
+            let index = control_index(key)?;
+            let Some(&(_, _, min, max)) = filter.kind.controls().get(index) else {
+                return Err(format!("Unknown control {index} for this filter"));
+            };
+            if !(min..=max).contains(&value) {
+                return Err(format!("Filter control {index} must be between {min} and {max}"));
+            }
+            filter.set_value(index, value);
+            if filter.value(index) != value {
+                return Err(format!("Filter control {index} requires a discrete value"));
+            }
+        }
+        if !filter.valid() {
+            return Err("Invalid mask filter settings".into());
+        }
+        Ok(filter)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
@@ -155,6 +328,8 @@ pub(in crate::editor) struct StrokeArgs {
     samples: Vec<StrokeSample>,
     #[serde(default)]
     brush: BrushValues,
+    /// Override stroke behavior for this command without changing the editor's brush.
+    style: Option<StrokeOptions>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -163,11 +338,22 @@ pub(in crate::editor) struct StrokeArgs {
 pub(in crate::editor) struct FillArgs {
     workspace: PaintWorkspace,
     target: RasterTarget,
-    /// Normalized position used to pick the starting face.
-    position: [f32; 2],
+    /// Normalized position used to pick the starting face. Use either position or region.
+    position: Option<[f32; 2]>,
+    region: Option<FillRegion>,
     mode: Option<FillMode>,
+    angle_degrees: Option<f32>,
+    padding_px: Option<f32>,
     #[serde(default)]
     brush: BrushValues,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum FillRegion {
+    Rectangle { start: [f32; 2], end: [f32; 2], through: Option<bool> },
+    Lasso { points: Vec<[f32; 2]>, through: Option<bool> },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -261,6 +447,33 @@ pub(super) struct BrushValues {
     pub erase: bool,
     pub mask_value: Option<u8>,
     pub channels: Option<PaintColors>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(super) struct StrokeOptions {
+    pub projection: Option<BrushProjection>,
+    pub symmetry: Option<Symmetry>,
+    pub paint_through: Option<bool>,
+    pub angle_limit_degrees: Option<f32>,
+    /// Tip name from list_paint_presets, or "round" for the built-in round stamp.
+    pub tip: Option<String>,
+    pub tip_angle_degrees: Option<f32>,
+    pub follow_stroke: Option<bool>,
+    /// Grain name from list_paint_presets, or "none" to disable grain.
+    pub grain: Option<String>,
+    pub grain_strength_percent: Option<f32>,
+    pub grain_scale: Option<f32>,
+    pub grain_angle_degrees: Option<f32>,
+    pub grain_invert: Option<bool>,
+    pub grain_uv: Option<bool>,
+    pub scatter_percent: Option<f32>,
+    pub size_jitter_percent: Option<f32>,
+    pub angle_jitter_percent: Option<f32>,
+    pub stabilizer_px: Option<f32>,
+    pub pressure_size: Option<bool>,
+    pub pressure_flow: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -572,8 +785,19 @@ fn prepare_material(
 }
 
 pub(super) enum RasterOperation<'a> {
-    Stroke(&'a [StrokeSample]),
-    Fill([f32; 2], Option<FillMode>),
+    Stroke(&'a [StrokeSample], Option<&'a StrokeOptions>),
+    Fill(FillSource<'a>, FillSettings),
+}
+
+pub(super) enum FillSource<'a> {
+    Point([f32; 2]),
+    Region(&'a FillRegion),
+}
+
+pub(super) struct FillSettings {
+    pub mode: Option<FillMode>,
+    pub angle: Option<f32>,
+    pub padding: Option<f32>,
 }
 
 pub(super) fn model_index(editor: &Editor) -> Result<usize, String> {
@@ -654,6 +878,22 @@ pub(in crate::editor) fn cancel_bake(
             .map_or_else(|| doc.paint_set_index(), |session| session.set)
     });
     input.cancel(editor, doc, index, set)
+}
+
+pub(in crate::editor) fn set_bake_levels(
+    input: &mut McpBake,
+    editor: &Editor,
+    editing: &mut editing::State,
+    paint: &mut PaintState,
+    args: BakeLevelsArgs,
+) -> Result<Value, String> {
+    let index = bake_model_index(editor, args.target)?;
+    let doc = editing.documents.get_mut(&index).ok_or("Wait for the model to load")?;
+    if doc.mode != Mode::Paint {
+        return Err("Switch the model to Painting mode first".into());
+    }
+    let session = paint.sessions.get_mut(&index).ok_or("Wait for Painting mode to load")?;
+    input.set_levels(index, doc, session, args)
 }
 
 fn output_document<'a>(
@@ -896,7 +1136,7 @@ pub(in crate::editor) fn stroke(
         args.workspace,
         args.target,
         args.brush,
-        RasterOperation::Stroke(&args.samples),
+        RasterOperation::Stroke(&args.samples, args.style.as_ref()),
     )
 }
 
@@ -907,6 +1147,11 @@ pub(in crate::editor) fn fill(
     paint: &mut PaintState,
     args: FillArgs,
 ) -> Result<Value, String> {
+    let source = match (args.position, &args.region) {
+        (Some(position), None) => FillSource::Point(position),
+        (None, Some(region)) => FillSource::Region(region),
+        _ => return Err("Specify either a fill position or a region".into()),
+    };
     raster(
         input,
         editor,
@@ -915,7 +1160,9 @@ pub(in crate::editor) fn fill(
         args.workspace,
         args.target,
         args.brush,
-        RasterOperation::Fill(args.position, args.mode),
+        RasterOperation::Fill(source, FillSettings {
+            mode: args.mode, angle: args.angle_degrees, padding: args.padding_px,
+        }),
     )
 }
 
@@ -960,7 +1207,7 @@ fn raster(
         return Err("Close the open editor overlay before painting".into());
     }
     let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, workspace)?;
-    input.submit(index, doc, session, &paint.tips, target, brush, operation)?;
+    input.submit(index, doc, session, &mut paint.tips, target, brush, operation)?;
     Ok(snapshot(index, doc, Some(session), &paint.tips))
 }
 
@@ -1053,23 +1300,158 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             };
             apply_to_layer(session, index, action)?;
         }
-        Edit::ApplyGenerator { index, generator } => {
+        Edit::ApplyGenerator { index, generator, parameters } => {
             check_layer(session, index)?;
-            let custom = doc.custom_bakes.first().map(|recipe| recipe.id);
-            if generator == GeneratorKind::CustomMap && custom.is_none() {
-                return Err("Create a custom bake map before using that generator".into());
+            if !session.available(PaintAction::ApplyGenerator(generator, Some(index))) {
+                return Err("The target layer is unavailable for generator changes".into());
             }
-            session.apply_generator(generator, Some(index), custom);
+            let mask = session.stack.layers[index].mask.as_deref();
+            let value = parameters.apply(new_generator(doc, generator)?, mask_palette(mask))?;
+            if mask.and_then(|mask| mask.generator) != Some(value) {
+                session.apply_generator_value(value, Some(index));
+            }
             session.stack.reveal_selection();
         }
-        Edit::AddMaskFilter { index, filter } => {
-            apply_to_layer(session, index, PaintAction::AddFilter(filter))?
+        Edit::UpdateGenerator { index, mask_layer, parameters } => {
+            edit_mask(session, index, false, |mask| {
+                let previous = match mask_layer {
+                    Some(index) => mask.layers.get(index).ok_or("Unknown mask layer index")?.generator,
+                    None => mask.generator,
+                }.ok_or("There is no generator on the requested mask target")?;
+                let value = parameters.apply(previous, mask_palette(Some(mask)))?;
+                match mask_layer {
+                    Some(index) => mask.edit_layers()[index].generator = Some(value),
+                    None => *mask.edit_generator() = Some(value),
+                }
+                Ok(())
+            })?;
+        }
+        Edit::AddMaskLayer { index, source, parameters } => {
+            edit_mask(session, index, true, |mask| {
+                if mask.layers.len() >= MAX_MASK_LAYERS {
+                    return Err("The mask already has the maximum number of layers".into());
+                }
+                let mut layer = MaskLayer::default();
+                if let MaskLayerSource::Generator { generator, parameters } = source {
+                    layer.generator = Some(parameters.apply(new_generator(doc, generator)?, mask_palette(Some(mask)))?);
+                    layer.blend = MaskBlend::Multiply;
+                }
+                parameters.apply(&mut layer)?;
+                mask.edit_layers().push(layer);
+                Ok(())
+            })?;
+        }
+        Edit::UpdateMaskLayer { index, mask_layer, parameters } => {
+            edit_mask(session, index, false, |mask| {
+                let layer = mask.edit_layers().get_mut(mask_layer).ok_or("Unknown mask layer index")?;
+                parameters.apply(layer)
+            })?;
+        }
+        Edit::MoveMaskLayer { index, from, to } => {
+            edit_mask(session, index, false, |mask| {
+                let layers = mask.edit_layers();
+                if from >= layers.len() || to >= layers.len() {
+                    return Err("Unknown mask layer index".into());
+                }
+                let layer = layers.remove(from);
+                layers.insert(to, layer);
+                Ok(())
+            })?;
+        }
+        Edit::RemoveMaskLayer { index, mask_layer } => {
+            edit_mask(session, index, false, |mask| {
+                let layers = mask.edit_layers();
+                if mask_layer >= layers.len() {
+                    return Err("Unknown mask layer index".into());
+                }
+                layers.remove(mask_layer);
+                Ok(())
+            })?;
+        }
+        Edit::AddMaskFilter { index, filter, parameters } => {
+            let filter = parameters.apply(Filter::new(filter))?;
+            edit_mask_filters(session, index, true, |filters| {
+                if filters.len() >= MAX_FILTERS {
+                    return Err("The mask already has the maximum number of filters".into());
+                }
+                filters.push(filter);
+                Ok(())
+            })?;
+        }
+        Edit::UpdateMaskFilter { index, filter_index, parameters } => {
+            edit_mask_filters(session, index, false, |filters| {
+                let filter = filters.get_mut(filter_index).ok_or("Unknown mask filter index")?;
+                *filter = parameters.apply(*filter)?;
+                Ok(())
+            })?;
+        }
+        Edit::MoveMaskFilter { index, from, to } => {
+            edit_mask_filters(session, index, false, |filters| {
+                if from >= filters.len() || to >= filters.len() {
+                    return Err("Unknown mask filter index".into());
+                }
+                let filter = filters.remove(from);
+                filters.insert(to, filter);
+                Ok(())
+            })?;
+        }
+        Edit::RemoveMaskFilter { index, filter_index } => {
+            edit_mask_filters(session, index, false, |filters| {
+                if filter_index >= filters.len() {
+                    return Err("Unknown mask filter index".into());
+                }
+                filters.remove(filter_index);
+                Ok(())
+            })?;
         }
         Edit::Undo => apply_action(session, PaintAction::Undo)?,
         Edit::Redo => apply_action(session, PaintAction::Redo)?,
     }
     if !crate::editor::model_paint_data::same_layer_list(&before, &session.stack) {
         doc.paint_pending = true;
+    }
+    Ok(())
+}
+
+fn mask_palette(mask: Option<&Mask>) -> &[[u8; 3]] {
+    mask.and_then(|mask| mask.context.as_deref()).map_or(&[], |context| context.id_palette())
+}
+
+fn new_generator(doc: &Document, kind: GeneratorKind) -> Result<Generator, String> {
+    let mut generator = Generator::new(kind);
+    if kind == GeneratorKind::CustomMap {
+        let recipe = doc.custom_bakes.first().ok_or("Create a custom bake map before using that generator")?;
+        generator.custom[0] = custom::Input { id: recipe.id, weight: 100 };
+    }
+    Ok(generator)
+}
+
+fn edit_mask_filters(
+    session: &mut Session,
+    index: usize,
+    select: bool,
+    edit: impl FnOnce(&mut Vec<Filter>) -> Result<(), String>,
+) -> Result<(), String> {
+    edit_mask(session, index, select, |mask| edit(mask.edit_filters()))
+}
+
+fn edit_mask(
+    session: &mut Session,
+    index: usize,
+    select: bool,
+    edit: impl FnOnce(&mut Mask) -> Result<(), String>,
+) -> Result<(), String> {
+    check_layer(session, index)?;
+    let mask = session.stack.layers[index].mask.as_ref().ok_or("The layer has no mask")?;
+    let mut updated = (**mask).clone();
+    edit(&mut updated)?;
+    if !updated.same_settings(mask) {
+        if select && session.stack.selected != index {
+            session.select_layer(index);
+        }
+        session.checkpoint();
+        session.stack.layers[index].mask = Some(Arc::new(updated));
+        session.revision += 1;
     }
     Ok(())
 }
@@ -1199,7 +1581,18 @@ fn layer_rows(stack: &Stack) -> Vec<Value> {
         let mask = layer.mask.as_ref().map(|mask| json!({
             "generator": mask.generator,
             "filter_count": mask.filters.len(),
+            "filters": mask.filters.iter().enumerate().map(|(index, filter)| json!({
+                "index": index, "kind": filter.kind, "enabled": filter.enabled,
+                "controls": (0..filter.kind.controls().len()).map(|index| filter.value(index)).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
             "layer_count": mask.layers.len(),
+            "layer_generators": mask.layers.iter().map(|layer| layer.generator).collect::<Vec<_>>(),
+            "layers_bottom_to_top": mask.layers.iter().enumerate().map(|(index, layer)| json!({
+                "index": index, "kind": if layer.generator.is_some() { "generator" } else { "fill" },
+                "enabled": layer.enabled, "blend": layer.blend, "opacity_percent": layer.opacity,
+                "value_percent": layer.generator.is_none().then_some(layer.value), "generator": layer.generator,
+            })).collect::<Vec<_>>(),
+            "id_palette": mask_palette(Some(mask)),
             "has_graph": mask.graph.is_some(),
         }));
         json!({
@@ -1247,32 +1640,58 @@ fn brush(session: &Session, tips: &tips::Library) -> Value {
         "pressure_flow": session.pressure_flow,
         "projection": session.projection,
         "symmetry": session.symmetry,
+        "paint_through": session.paint_through,
+        "angle_limit_degrees": session.angle_limit,
         "tip": session.tip.and_then(|i| tips.entries.get(i)).map(|tip| &tip.name),
+        "tip_angle_degrees": session.tip_angle,
+        "follow_stroke": session.follow_stroke,
         "grain": session.grain.and_then(|i| tips.grains.get(i)).map(|grain| &grain.name),
+        "grain_strength_percent": session.grain_strength,
+        "grain_scale": session.grain_scale,
+        "grain_angle_degrees": session.grain_angle,
+        "grain_invert": session.grain_invert,
+        "grain_uv": session.grain_uv,
+        "scatter_percent": session.brush_scatter,
+        "size_jitter_percent": session.brush_size_jitter,
+        "angle_jitter_percent": session.brush_angle_jitter,
         "target": if session.editing_mask && session.has_mask() { "mask" } else { "material" },
         "channels": channels,
         "fill_mode": session.fill_mode,
     })
 }
 
-pub(in crate::editor) fn catalog(paint: &PaintState) -> Value {
+pub(in crate::editor) fn catalog(paint: &PaintState, export_presets: Vec<Value>) -> Value {
     json!({
         "channels": CHANNEL_KEYS,
         "materials": MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "smart_materials": SMART_MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "textures": tips::texture_names(),
         "local_presets": paint.library.entries().map(|(index, entry)| json!({"index": index, "name": entry.name})).collect::<Vec<_>>(),
-        "generators": GeneratorKind::ALL.map(|kind| json!({"id": kind, "label": kind.label()})),
-        "generator_inputs": GeneratorInput::ALL.map(|input| json!({"id": input as usize, "label": input.label()})),
+        "generators": GeneratorKind::ALL.map(|kind| {
+            let generator = Generator::new(kind);
+            json!({"id": kind, "label": kind.label(), "controls": generator.controls().iter().enumerate()
+                .map(|(index, &(label, min, max, _))| json!({"index": index, "label": label,
+                    "min": min, "max": max, "default": generator.value(index)})).collect::<Vec<_>>()})
+        }),
+        "generator_inputs": GeneratorInput::ALL.map(|input| json!({"id": input as usize, "key": input, "label": input.label()})),
+        "mask_blend_modes": MaskBlend::ALL.map(|mode| json!({"id": mode, "label": mode.label()})),
+        "mask_filters": FilterKind::ALL.map(|kind| json!({"id": kind, "label": kind.label(),
+            "controls": kind.controls().iter().enumerate().map(|(index, &(label, default, min, max))|
+                json!({"index": index, "label": label, "min": min, "max": max, "default": default})
+            ).collect::<Vec<_>>()
+        })),
         "blend_modes": Blend::ALL.map(|blend| json!({"id": blend, "label": blend.label()})),
         "brush_tips": paint.tips.names(),
+        "brush_grains": paint.tips.grain_names(),
+        "brush_projections": [BrushProjection::Screen, BrushProjection::Surface, BrushProjection::Uv],
+        "brush_symmetry": [Symmetry::Off, Symmetry::X, Symmetry::Y, Symmetry::Z],
         "fill_modes": FillMode::OPTIONS.map(|(label, mode)| json!({"id": mode, "label": label})),
         "fill_projections": texture_fill::Projection::ALL,
         "fill_opacity_sources": texture_fill::OpacitySource::ALL,
         "paint_tone_maps": crate::ToneMap::ALL,
         "bake_qualities": crate::editor::model_bake_settings::Quality::ALL,
         "bake_maps": bake::BakeMap::ALL.map(|map| json!({"id": map, "label": map.label(), "requires_high_poly": map.requires_high_poly()})),
-        "export_presets": export::Template::ALL.map(|preset| json!({"id": preset, "label": preset.label()})),
+        "export_presets": export_presets,
     })
 }
 
@@ -1490,10 +1909,12 @@ mod tests {
             Edit::ApplyGenerator {
                 index: 0,
                 generator: GeneratorKind::Clouds,
+                parameters: GeneratorPatch::default(),
             },
             Edit::AddMaskFilter {
                 index: 0,
                 filter: FilterKind::Levels,
+                parameters: FilterPatch::default(),
             },
             Edit::MoveLayer {
                 from: 0,

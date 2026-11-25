@@ -121,6 +121,18 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Import a local Material Painter .mpp as a new editable GLB and open it in Painting mode",
+        annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn import_paint_project(
+        &self,
+        Parameters(args): Parameters<PaintImportArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintImport(args), context).await
+    }
+
+    #[tool(
         description = "Replace the active model geometry with an OBJ, FBX or built-in primitive while preserving matching paint sets, or undo or redo a replacement. Returns after the editor applies the change",
         annotations(destructive_hint = true, open_world_hint = false)
     )]
@@ -168,7 +180,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Queue a polygon fill from a normalized viewport or UV position on a paint layer or mask. Returns queued paint state",
+        description = "Queue a polygon fill from a normalized point, rectangle or lasso in the 3D or UV view on a paint layer or mask",
         annotations(destructive_hint = true, open_world_hint = false)
     )]
     async fn poly_fill(
@@ -252,6 +264,18 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Set or reset non-destructive levels for a ready baked scalar map, including black point, white point and gamma",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn set_bake_levels(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::BakeLevelsArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::BakeLevels(args), context).await
+    }
+
+    #[tool(
         description = "Set the live paint viewport's camera, layout, channel or baked-map preview, path tracing, exposure and post-processing",
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
@@ -285,6 +309,18 @@ impl EditorServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call(Command::PaintCapture(args), context).await
+    }
+
+    #[tool(
+        description = "Render the active painted model to a separate PNG with its own camera, size and optional transparent background",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn render_paint_view(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::RenderArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintRender(args), context).await
     }
 
     #[tool(

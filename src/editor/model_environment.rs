@@ -819,7 +819,7 @@ pub(super) fn synchronize(
                 let entity = crate::lighting::spawn_light(&mut commands, &effective);
                 commands.entity(entity).insert((
                     PreviewSceneLight,
-                    RenderLayers::layer(LAYER),
+                    RenderLayers::from_layers(&[LAYER, REQUEST_MODEL_LAYER]),
                     ChildOf(stage),
                 ));
             }

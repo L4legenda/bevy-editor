@@ -35,7 +35,7 @@ mod mesh;
 #[path = "model_paint_mcp_bake.rs"]
 mod mcp_bake;
 #[cfg(feature = "mcp")]
-pub(in crate::editor) use mcp_bake::{BakeArgs, BakeTarget, McpBake};
+pub(in crate::editor) use mcp_bake::{BakeArgs, BakeLevelsArgs, BakeTarget, McpBake};
 #[path = "model_paint_bake_levels.rs"]
 pub(super) mod levels;
 pub(in crate::editor) use levels::import_levels;
@@ -965,6 +965,27 @@ impl State {
             .map(|(_, _, image)| image)
     }
 
+    fn apply_levels(
+        &mut self, model: usize, doc: &mut Document, binding: (usize, usize),
+        map: BakeMap, current: levels::Levels,
+    ) -> Result<bool, String> {
+        let (object, slot) = binding;
+        let index = doc.objects.iter().position(|item| item.id == object).ok_or("Unknown bake object")?;
+        let previous = doc.objects[index].materials.get(slot).ok_or("Unknown bake material slot")?;
+        if levels::get(previous, map) == current { return Ok(false); }
+        let before = doc.snapshot();
+        let material = &mut doc.objects[index].materials[slot];
+        levels::set(material, map, current)?;
+        self.fix_preview = None;
+        for (key, maps) in &mut self.cache {
+            if (key.model, key.object, key.slot) == (model, object, slot) {
+                *maps = Arc::new(Maps::new(maps.raw.clone(), Some(material)));
+            }
+        }
+        doc.checkpoint(before);
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub fn preview(&self, map: BakeMap) -> Option<&Handle<Image>> {
         if let BakeMap::Custom(id) = map && let Some(image) = self.live.image(id) {
@@ -1298,12 +1319,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
             {
                 continue;
             }
-            let before = doc.snapshot();
             let (object, slot) = binding;
-            let Some(material) = doc.objects.iter_mut().find(|item| item.id == object)
-                .and_then(|item| item.materials.get_mut(slot)) else { continue };
-            let previous = levels::get(material, map);
-            let mut current = previous;
+            let Some(material) = doc.objects.iter().find(|item| item.id == object)
+                .and_then(|item| item.materials.get(slot)) else { continue };
+            let mut current = levels::get(material, map);
             match action {
                 PaintAction::BakeAdjustLevels(_, field, amount) => {
                     let multiplier = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) { 5 } else { 1 };
@@ -1311,20 +1330,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
                 _ => current = levels::Levels::default(),
             }
-            if current != previous {
-                match levels::set(material, map, current) {
-                    Ok(()) => {
-                        state.fix_preview = None;
-                        for (key, maps) in &mut state.cache {
-                            if (key.model, key.object, key.slot) == (index, object, slot) {
-                                *maps = Arc::new(Maps::new(maps.raw.clone(), Some(material)));
-                            }
-                        }
-                        doc.checkpoint(before);
-                        session.revision += 1;
-                    }
-                    Err(error) => editor.status = error,
-                }
+            match state.apply_levels(index, doc, binding, map, current) {
+                Ok(true) => session.revision += 1,
+                Ok(false) => {}
+                Err(error) => editor.status = error,
             }
             continue;
         }

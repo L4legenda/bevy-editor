@@ -19,6 +19,7 @@ pub(in crate::editor) use gradient::{GradientMapping, GradientProjection, Gradie
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(Deserialize, Serialize, rmcp::schemars::JsonSchema), serde(rename_all = "snake_case"), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum GeneratorInput {
     Edges,
     Convexity,

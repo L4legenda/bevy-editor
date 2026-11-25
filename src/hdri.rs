@@ -151,6 +151,13 @@ pub(crate) struct CameraEnvironment {
     background: bool,
 }
 
+impl CameraEnvironment {
+    #[cfg(feature = "mcp")]
+    pub(crate) fn without_background(&self) -> Self {
+        Self { background: false, ..self.clone() }
+    }
+}
+
 /// Optional preview backdrop, independent of the lighting and reflection maps.
 #[derive(Component, Clone, Copy)]
 pub(crate) struct EnvironmentBackdrop {

@@ -1,5 +1,6 @@
 //! MCP access to the live editor. All scene changes run on Bevy's main thread.
 mod server;
+mod paint_import;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -65,7 +66,10 @@ impl mesh_tools::Reply for MeshReply {
 }
 
 fn png_payload(image: image::DynamicImage) -> Reply {
-    let image = image.thumbnail(1600, 1000);
+    encode_png(image.thumbnail(1600, 1000))
+}
+
+fn encode_png(image: image::DynamicImage) -> Reply {
     let mut output = std::io::Cursor::new(Vec::new());
     image.write_to(&mut output, image::ImageFormat::Png).map_err(|error| error.to_string())?;
     Ok(Payload::Image {
@@ -96,7 +100,7 @@ impl Bridge {
     async fn request(&self, command: Command) -> Reply {
         let timeout = if matches!(
             command,
-            Command::PaintSave(_) | Command::PaintExport(_) | Command::PaintReplaceMesh(_)
+            Command::PaintSave(_) | Command::PaintExport(_) | Command::PaintReplaceMesh(_) | Command::PaintImport(_)
         ) {
             Duration::from_secs(300)
         } else {
@@ -188,9 +192,33 @@ fn process(
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
     mut focus: Option<ResMut<InputFocus>>,
-    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint): (Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>, Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>, Local<Option<PendingPaintEdit>>),
+    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint, mut importing, mut browser, mut previews): (
+        Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>,
+        Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>,
+        Local<Option<PendingPaintEdit>>, Local<Option<paint_import::Pending>>,
+        Option<ResMut<super::browser::Browser>>, Option<ResMut<super::thumbnails::Thumbnails>>,
+    ),
 ) {
     let Some(inbox) = inbox else { return };
+    let input_busy = |editor: &Editor, pointer: &viewport::PointerState| {
+        editor.pending.is_some()
+            || editor.camera_navigation.is_some()
+            || pointer.dragging()
+            || numeric.as_ref().is_some_and(|numeric| {
+                numeric.has_changes(editor) || numeric.error_message().is_some()
+            })
+            || lighting.as_ref().is_some_and(|lighting| {
+                lighting.name_has_changes(editor) || lighting.is_control_active()
+            })
+            || drag.as_ref().is_some_and(|drag| drag.active())
+            || mouse.as_ref().is_some_and(|mouse| {
+                mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
+            })
+    };
+    if importing.is_some() && let Some((editing, browser)) = model_editing.as_deref_mut().zip(browser.as_deref_mut()) {
+        let busy = input_busy(&editor, &pointer);
+        paint_import::poll(&mut importing, &mut editor, editing, browser, previews.as_deref_mut(), busy);
+    }
     if pending_paint.as_ref().is_some_and(|pending| pending.job.reply.is_closed() || Instant::now() >= pending.job.deadline) {
         *pending_paint = None;
     }
@@ -214,24 +242,19 @@ fn process(
             continue;
         }
         let mutates = job.command.mutates();
-        let busy = editor.pending.is_some()
-            || editor.camera_navigation.is_some()
-            || pointer.dragging()
-            || numeric.as_ref().is_some_and(|numeric| {
-                numeric.has_changes(&editor) || numeric.error_message().is_some()
-            })
-            || lighting.as_ref().is_some_and(|lighting| {
-                lighting.name_has_changes(&editor) || lighting.is_control_active()
-            })
-            || drag.as_ref().is_some_and(|drag| drag.active())
-            || mouse.as_ref().is_some_and(|mouse| {
-                mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
-            });
-        if mutates && busy {
+        if mutates && input_busy(&editor, &pointer) {
             let _ = job.reply.send(Err(
                 "Finish the active edit, drag, camera navigation or confirmation dialog first"
                     .into(),
             ));
+            continue;
+        }
+        if let Command::PaintImport(args) = &job.command {
+            if browser.is_some() && model_editing.is_some() && paint.is_some() && editor.ready {
+                paint_import::start(&mut importing, &editor, args.clone(), job);
+            } else {
+                let _ = job.reply.send(Err("Wait for the project asset browser and paint workspace to load".into()));
+            }
             continue;
         }
         if let Command::PaintEdit(args) = &job.command
@@ -278,13 +301,18 @@ fn process(
             }
             continue;
         }
-        if let Command::PaintCapture(args) = job.command {
+        if matches!(job.command, Command::PaintCapture(_) | Command::PaintRender(_)) {
+            let encode = if matches!(job.command, Command::PaintRender(_)) { encode_png } else { png_payload };
             let reply: mcp_state::CaptureReply = Box::new(move |result| {
                 if !job.reply.is_closed() {
-                    let _ = job.reply.send(result.and_then(png_payload));
+                    let _ = job.reply.send(result.and_then(encode));
                 }
             });
-            mcp_state::capture(&mut commands, &editor, args, reply);
+            match job.command {
+                Command::PaintCapture(args) => mcp_state::capture(&mut commands, &editor, args, reply),
+                Command::PaintRender(args) => mcp_state::render(&mut commands, &editor, args, reply),
+                _ => unreachable!(),
+            }
             continue;
         }
         if matches!(job.command, Command::Capture) {
@@ -344,7 +372,7 @@ fn process(
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, _)| open_paint_model(&mut editor, editing, args))
         } else if matches!(job.command, Command::PaintPresets) {
-            paint.as_deref().map(mcp_state::catalog)
+            paint.as_deref().map(|paint| mcp_state::catalog(paint, paint_io.p1().template_catalog()))
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
         } else if let Command::PaintEdit(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
@@ -374,6 +402,10 @@ fn process(
             model_editing.as_deref_mut().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::cancel_bake(&mut paint_io.p2(), &mut editor, editing, paint, args))
+        } else if let Command::BakeLevels(args) = job.command {
+            model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                .ok_or_else(|| "This editor has no model paint workspace".to_string())
+                .and_then(|(editing, paint)| mcp_state::set_bake_levels(&mut paint_io.p2(), &editor, editing, paint, args))
         } else if let Command::PaintView(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
@@ -771,7 +803,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }
-        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) => {
+        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
             Err("This operation requires the live editor".into())
         }
     }

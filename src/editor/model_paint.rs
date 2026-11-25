@@ -176,7 +176,7 @@ pub(in crate::editor) enum Category {
     Graphs,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema), serde(rename_all = "snake_case"), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Symmetry {
     #[default]
     Off,
@@ -186,7 +186,7 @@ pub(in crate::editor) enum Symmetry {
 }
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema), serde(rename_all = "snake_case"), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum BrushProjection {
     #[default]
     Screen = 0,
@@ -1840,15 +1840,19 @@ impl Session {
     }
 
     fn apply_generator(&mut self, kind: GeneratorKind, target: Option<usize>, custom_map: Option<u64>) {
-        if !self.available(PaintAction::ApplyGenerator(kind, target)) {
-            return;
-        }
-        self.checkpoint();
-        self.stack.selected = target.unwrap_or(self.stack.selected);
         let mut generator = Generator::new(kind);
         if let Some(id) = custom_map.filter(|_| kind == GeneratorKind::CustomMap) {
             generator.custom[0] = custom::Input { id, weight: 100 };
         }
+        self.apply_generator_value(generator, target);
+    }
+
+    fn apply_generator_value(&mut self, generator: Generator, target: Option<usize>) {
+        if !self.available(PaintAction::ApplyGenerator(generator.kind, target)) {
+            return;
+        }
+        self.checkpoint();
+        self.stack.selected = target.unwrap_or(self.stack.selected);
         let mask = Arc::make_mut(self.stack.layers[self.stack.selected].mask.get_or_insert_with(|| {
             Arc::new(Mask::new(crate::editor::model_paint_data::solid(
                 self.texture_size, [255, 0, 0, 255],

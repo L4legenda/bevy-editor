@@ -50,7 +50,7 @@ impl Levels {
         })
     }
 
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         self.black <= 100 && self.white <= 100 && (10..=400).contains(&self.gamma)
     }
 }

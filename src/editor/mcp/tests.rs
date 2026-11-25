@@ -37,7 +37,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 33);
+    assert_eq!(tools.tools.len(), 36);
     for name in [
         "get_editor_state",
         "get_paint_state",
@@ -50,11 +50,13 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
         "save_model",
         "export_textures",
         "bake_maps",
+        "set_bake_levels",
         "get_bake_state",
         "cancel_bake",
         "set_paint_view",
         "cage_preview",
         "capture_paint_view",
+        "render_paint_view",
         "set_transform",
         "add_model",
         "save_scene",
@@ -70,6 +72,14 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     let presets = result.structured_content.unwrap();
     assert_eq!(presets["channels"].as_array().unwrap().len(), 8);
     assert_eq!(presets["brush_tips"].as_array().unwrap().len(), 24);
+    assert_eq!(presets["brush_grains"].as_array().unwrap().len(), 25);
+    let clouds = presets["generators"].as_array().unwrap().iter()
+        .find(|item| item["id"] == "Clouds").unwrap();
+    assert_eq!(clouds["controls"][0]["default"], 50.0);
+    assert!(presets["generator_inputs"].as_array().unwrap().iter().any(|input| input["key"] == "noise"));
+    let levels = presets["mask_filters"].as_array().unwrap().iter()
+        .find(|item| item["id"] == "Levels").unwrap();
+    assert_eq!(levels["controls"][4]["default"], 100.0);
 
     let peer = client.peer().clone();
     let request = serde_json::from_value(json!({ "name": "get_paint_state" })).unwrap();
@@ -615,6 +625,7 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let tools = client.request(&mut app, "tools/list", json!({}));
     for name in [
         "open_paint_model",
+        "import_paint_project",
         "replace_paint_mesh",
         "select_surface",
         "paint_stroke",
@@ -747,6 +758,42 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     }
 
     wait_for_paint(&mut client, &mut app);
+    let export_baked = |client: &mut StdioClient, app: &mut App| {
+        let reply = client.tool(app, "export_textures", json!({"model_id":0,"folder":".",
+            "template":"baked","format":"png","bit_depth":8,"padding":"none","size":64
+        }));
+        let file = reply["structuredContent"]["files"].as_array().unwrap().iter()
+            .filter_map(Value::as_str).find(|file| file.contains("PartRandom")).unwrap();
+        image::open(file).unwrap().to_rgba8()
+    };
+    let original_bake = export_baked(&mut client, &mut app);
+    let center = original_bake.get_pixel(32, 32).0;
+    assert!(center[0] > 0 && center[3] == 255, "{center:?}");
+    let set_levels = |client: &mut StdioClient, app: &mut App, patch: Value| {
+        let mut args = json!({"target":{"model_id":0,"set":0}, "map":"part_random"});
+        args.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+        client.tool(app, "set_bake_levels", args)["structuredContent"]["levels"][0].clone()
+    };
+    let adjust = set_levels(&mut client, &mut app, json!({"black_percent":100,"gamma_percent":160}));
+    assert_eq!(adjust, json!({"map":"part_random","black_percent":100,"white_percent":100,"gamma_percent":160}));
+    let invalid_levels = client.request(&mut app, "tools/call", json!({
+        "name":"set_bake_levels", "arguments":{"target":{"model_id":0}, "map":"part_random",
+            "black_percent":10,"gamma_percent":0}
+    }));
+    assert_eq!(invalid_levels["isError"], true, "{invalid_levels}");
+    let status = client.tool(&mut app, "get_bake_state", json!({"model_id":0,"set":0}));
+    assert_eq!(status["structuredContent"]["levels"][0], adjust);
+    assert_eq!(export_baked(&mut client, &mut app).get_pixel(32, 32).0, [0,0,0,255]);
+    let graded = client.tool(&mut app, "save_model", json!({"model_id":0,"copy_name":"bake-levels.glb"}));
+    let graded = Glb::load(Path::new(graded["structuredContent"]["path"].as_str().unwrap())).unwrap();
+    let primitives = graded.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().unwrap());
+    assert!(primitives.into_iter().any(|primitive| {
+        primitive["extras"]["bevy_editor_bake_levels"] == json!([["part_random",{"black":100,"white":100,"gamma":160}]])
+    }));
+    assert_eq!(set_levels(&mut client, &mut app, json!({"reset":true}))["gamma_percent"], 100);
+    assert_eq!(export_baked(&mut client, &mut app), original_bake);
+
     let added = client.tool(
         &mut app,
         "edit_paint",
@@ -763,10 +810,20 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         .as_u64()
         .unwrap() as usize;
     let before = wait_for_paint(&mut client, &mut app);
+    let invalid_style = client.request(&mut app, "tools/call", json!({
+        "name": "paint_stroke", "arguments": {
+            "workspace": {"model_id": 0, "set": 0}, "target": {"layer": layer, "space": "uv"},
+            "samples": [{"position": [0.5, 0.5]}], "style": {"paint_through": true},
+        }
+    }));
+    assert_eq!(invalid_style["isError"], true, "{invalid_style}");
+    let still_before = wait_for_paint(&mut client, &mut app);
+    assert_eq!(still_before["undo_steps"], before["undo_steps"]);
     let paint = client.tool(&mut app, "paint_stroke", json!({
         "workspace": {"model_id": 0, "set": 0}, "target": {"layer": layer, "space": "uv"},
         "samples": [{"position": [0.5, 0.5]}],
         "brush": {"size_px": 96, "channels": {"base_color": [210, 10, 170]}, "hardness_percent": 100, "flow_percent": 100},
+        "style": {"tip": "Квадрат", "tip_angle_degrees": 0, "pressure_size": false, "pressure_flow": false},
     }));
     assert_eq!(paint["structuredContent"]["paint_busy"], true);
     let painted = wait_for_paint(&mut client, &mut app);
@@ -774,6 +831,17 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         painted["undo_steps"].as_u64().unwrap(),
         before["undo_steps"].as_u64().unwrap() + 1
     );
+    assert_eq!(painted["brush"], before["brush"]);
+    {
+        let editing = app.world().resource::<editing::State>();
+        let surface = editing.documents[&0].objects[0].materials[0].paint.as_ref().unwrap();
+        let pixels = surface.stack.layers[layer].channel(0).unwrap();
+        let side = surface.size as usize;
+        let center = side / 2;
+        let alpha = |x, y| pixels[(y * side + x) * 4 + 3];
+        assert!(alpha(center + 19, center + 19) > 200, "square tip must paint inside its corner");
+        assert!(alpha(center + 38, center) < 10, "the tip's transparent margin sits inside the round radius");
+    }
     let capture = client.tool(&mut app, "capture_paint_view", json!({"model_id": 0}));
     let png = capture["content"]
         .as_array()
@@ -793,6 +861,48 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
                 && pixel[2] > pixel[1].saturating_add(25))
     );
     let original = client.tool(&mut app, "set_paint_view", json!({"model_id": 0}));
+    let render = |client: &mut StdioClient, app: &mut App, settings| {
+        let reply = client.tool(app, "render_paint_view", settings);
+        let png = reply["content"].as_array().unwrap().iter().find(|item| item["type"] == "image").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(png["data"].as_str().unwrap()).unwrap();
+        image::load_from_memory(&bytes).unwrap().to_rgba8()
+    };
+    let independent = render(&mut client, &mut app, json!({"model_id": 0,
+        "width": 173, "height": 123, "transparent": true,
+        "camera": {"center": [0, 0, 0], "yaw_degrees": 0, "pitch_degrees": 0, "distance": 4, "orthographic": true}
+    }));
+    assert_eq!(independent.dimensions(), (173, 123));
+    assert_eq!(independent.get_pixel(0, 0)[3], 0);
+    assert_eq!(independent.get_pixel(86, 61)[3], 255);
+    assert!(independent.pixels().any(|pixel| pixel[0] > pixel[1].saturating_add(35)
+        && pixel[2] > pixel[1].saturating_add(25)));
+    let diagnostic = |client: &mut StdioClient, app: &mut App, preview| {
+        render(client, app, json!({"model_id": 0,
+            "width": 173, "height": 123, "transparent": true, "preview": preview,
+            "camera": {"center": [0, 0, 0], "yaw_degrees": 0, "pitch_degrees": 0, "distance": 4, "orthographic": true}
+        }))
+    };
+    let channel = diagnostic(&mut client, &mut app, json!({"mode": "channel", "channel": "roughness"}));
+    let baked = diagnostic(&mut client, &mut app, json!({"mode": "baked", "map": "part_random"}));
+    for output in [&channel, &baked] {
+        let [red, green, blue, alpha] = output.get_pixel(86, 61).0;
+        assert_eq!(alpha, 255);
+        assert!(red.abs_diff(green) <= 3 && red.abs_diff(blue) <= 3, "{red} {green} {blue}");
+        assert_eq!(output.get_pixel(0, 0)[3], 0);
+    }
+    assert_ne!(channel.get_pixel(86, 61), baked.get_pixel(86, 61));
+    let shifted = render(&mut client, &mut app, json!({"model_id": 0,
+        "width": 173, "height": 123, "transparent": true,
+        "camera": {"center": [4, 0, 0], "yaw_degrees": 0, "pitch_degrees": 0, "distance": 4, "orthographic": true}
+    }));
+    assert_eq!(shifted.get_pixel(86, 61)[3], 0);
+    let opaque = render(&mut client, &mut app, json!({"model_id": 0, "width": 1731, "height": 311}));
+    assert_eq!(opaque.dimensions(), (1731, 311));
+    assert_eq!(opaque.get_pixel(0, 0)[3], 255);
+    let invalid_render = client.request(&mut app, "tools/call", json!({
+        "name": "render_paint_view", "arguments": {"model_id": 0, "width": 4097}
+    }));
+    assert_eq!(invalid_render["isError"], true, "{invalid_render}");
     let invalid = client.request(&mut app, "tools/call", json!({
         "name": "set_paint_view", "arguments": {"model_id": 0, "yaw_degrees": 45, "post": {"contrast": 5}}
     }));
@@ -819,6 +929,32 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         before[0] > before[1].saturating_add(35) && before[2] > before[1].saturating_add(25)
             && after[0].abs_diff(after[1]) < 4 && after[0].abs_diff(after[2]) < 4
     }));
+
+    wait_for_paint(&mut client, &mut app);
+    let settings = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": 0, "wireframe": true,
+        "uv_overlay": {"show_wire": true, "wire_opacity": 0.75, "show_seams_2d": true, "show_seams_3d": true},
+        "material": {"height_strength": 2, "emission_strength": 4, "ao_strength": 0.25, "use_baked_normal": true},
+    }));
+    let settings = &settings["structuredContent"];
+    assert_eq!(settings["wireframe"], true);
+    assert_eq!(settings["uv_overlay"]["show_seams_3d"], true);
+    assert_eq!(settings["material"]["height_strength"], 2.0);
+    wait_for_paint(&mut client, &mut app);
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "set_paint_view", "arguments": {"model_id": 0, "wireframe": false,
+            "uv_overlay": {"wire_opacity": 0.01}, "material": {"emission_strength": 0}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    assert!(invalid.to_string().contains("wire_opacity must be between"), "{invalid}");
+    let unchanged = client.tool(&mut app, "set_paint_view", json!({"model_id": 0}));
+    assert_eq!(unchanged["structuredContent"], *settings);
+    let modified = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": 0, "material": {"automatic_height": true},
+    }));
+    assert!(modified["structuredContent"]["material"]["height_strength"].is_null());
+    assert_eq!(modified["structuredContent"]["material"]["emission_strength"], 4.0);
+    wait_for_paint(&mut client, &mut app);
 
     open(&mut client, &mut app, "models/blue_block.glb", 1);
     wait_for_mode(&mut app, 1);
@@ -962,6 +1098,15 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let saved_post = &glb.json["extras"]["bevy_editor_paint_post"]["effects"];
     assert_eq!(saved_post["saturation"], 0.0);
     assert_eq!(saved_post["bloom_threshold"], 2.0);
+    let saved_uv = &glb.json["extras"]["bevy_editor_paint_uv"];
+    assert_eq!(saved_uv["show_wire_3d"], true);
+    assert_eq!(saved_uv["wire_opacity"], 0.75);
+    assert_eq!(saved_uv["show_seams_2d"], true);
+    let saved_material = &glb.json["extras"]["bevy_editor_paint_preview"];
+    assert!(saved_material["height_strength"].is_null());
+    assert_eq!(saved_material["emission_strength"], 4.0);
+    assert_eq!(saved_material["ao_strength"], 0.25);
+    assert_eq!(saved_material["use_baked_normal"], true);
     let mesh = glb.json["nodes"]
         .as_array()
         .unwrap()
@@ -1002,6 +1147,30 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         .unwrap();
     let exported = image::open(color).unwrap().to_rgba8();
     assert_eq!(exported.get_pixel(256, 256).0, [210, 10, 170, 255]);
+
+    let recipe_file = project.asset_root.join("stdio-export-template.json");
+    fs::write(&recipe_file, br#"[
+        {"name":"Other","maps":[{"name":"Other","layout":"Grayscale","channels":[{"src":"Zero"}]}]},
+        {"name":"Packed Stdio","maps":[{"name":"$mesh_packed","layout":"RGBA","force_16":true,
+          "channels":[{"src":"One"},{"src":"Zero"},{"src":"One"},{"src":"One"}]}]}
+    ]"#).unwrap();
+    let without_name = client.request(&mut app, "tools/call", json!({
+        "name":"export_textures", "arguments":{"model_id":0,"folder":".","template_file":"stdio-export-template.json"}
+    }));
+    assert_eq!(without_name["isError"], true, "{without_name}");
+    let packed = client.tool(&mut app, "export_textures", json!({
+        "model_id":0,"folder":".","template_file":"stdio-export-template.json", "template_name":"packed stdio",
+        "prefix":"RecipeCheck", "size":64, "format":"png", "bit_depth":8,
+        "normal":{"use_baked":false,"height_strength":0}
+    }));
+    let files = packed["structuredContent"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    let packed_path = Path::new(files[0].as_str().unwrap());
+    assert_eq!(packed_path.file_name().unwrap(), "RecipeCheck_packed.png");
+    let packed = image::open(packed_path).unwrap();
+    let packed = packed.as_rgba16().unwrap();
+    assert_eq!(packed.dimensions(), (64,64));
+    assert_eq!(packed.get_pixel(32,32).0, [65535,0,65535,65535]);
 
     let catalog = client.tool(&mut app, "list_paint_presets", json!({}));
     let catalog = &catalog["structuredContent"];
@@ -1057,6 +1226,96 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     edit(&mut client, &mut app, json!({"operation":"redo"}));
     let redone = edit(&mut client, &mut app, json!({"operation":"redo"}));
     assert_eq!(redone["layers_bottom_to_top"], textured["layers_bottom_to_top"]);
+    let generated = edit(&mut client, &mut app, json!({
+        "operation":"apply_generator", "index":folder_index, "generator":"Clouds",
+        "parameters":{"controls":{"0":73,"2":5}, "weights":{"noise":150}, "invert":true}
+    }));
+    let generator = &generated["layers_bottom_to_top"][folder_index]["mask"]["generator"];
+    assert_eq!(generator["values"][0], 73.0);
+    assert_eq!(generator["invert"], true);
+    assert_eq!(generated["undo_steps"].as_u64().unwrap(), redone["undo_steps"].as_u64().unwrap() + 1);
+    let invalid_generator = client.request(&mut app, "tools/call", json!({
+        "name":"edit_paint", "arguments":{"model_id":0, "set":0, "edit":{
+            "operation":"update_generator", "index":folder_index, "parameters":{"invert":false,"weights":{"noise":500}}
+        }}
+    }));
+    assert_eq!(invalid_generator["isError"], true, "{invalid_generator}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["layers_bottom_to_top"], generated["layers_bottom_to_top"]);
+    assert_eq!(unchanged["undo_steps"], generated["undo_steps"]);
+    let updated_generator = edit(&mut client, &mut app, json!({
+        "operation":"update_generator", "index":folder_index,
+        "parameters":{"controls":{"0":62}, "invert":false}
+    }));
+    assert_eq!(updated_generator["undo_steps"].as_u64().unwrap(), generated["undo_steps"].as_u64().unwrap() + 1);
+    let undone = edit(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(undone["layers_bottom_to_top"], generated["layers_bottom_to_top"]);
+    let redone = edit(&mut client, &mut app, json!({"operation":"redo"}));
+    assert_eq!(redone["layers_bottom_to_top"], updated_generator["layers_bottom_to_top"]);
+    let levels = edit(&mut client, &mut app, json!({
+        "operation":"add_mask_filter", "index":folder_index, "filter":"Levels",
+        "parameters":{"controls":{"3":10,"4":80}}
+    }));
+    assert_eq!(levels["undo_steps"].as_u64().unwrap(), redone["undo_steps"].as_u64().unwrap() + 1);
+    let blur = edit(&mut client, &mut app, json!({
+        "operation":"add_mask_filter", "index":folder_index, "filter":"Blur",
+        "parameters":{"controls":{"0":3,"1":1}}
+    }));
+    let invalid_filter = client.request(&mut app, "tools/call", json!({
+        "name":"edit_paint", "arguments":{"model_id":0, "set":0, "edit":{
+            "operation":"update_mask_filter", "index":folder_index, "filter_index":1,
+            "parameters":{"enabled":false, "controls":{"1":0.5}}
+        }}
+    }));
+    assert_eq!(invalid_filter["isError"], true, "{invalid_filter}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["layers_bottom_to_top"], blur["layers_bottom_to_top"]);
+    assert_eq!(unchanged["undo_steps"], blur["undo_steps"]);
+    let moved = edit(&mut client, &mut app, json!({
+        "operation":"move_mask_filter", "index":folder_index, "from":1,"to":0
+    }));
+    assert_eq!(moved["layers_bottom_to_top"][folder_index]["mask"]["filters"][0]["kind"], "Blur");
+    let disabled = edit(&mut client, &mut app, json!({
+        "operation":"update_mask_filter", "index":folder_index, "filter_index":0,
+        "parameters":{"enabled":false}
+    }));
+    let removed = edit(&mut client, &mut app, json!({
+        "operation":"remove_mask_filter", "index":folder_index, "filter_index":1
+    }));
+    assert_eq!(removed["layers_bottom_to_top"][folder_index]["mask"]["filter_count"], 1);
+    let restored_filters = edit(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(restored_filters["layers_bottom_to_top"], disabled["layers_bottom_to_top"]);
+    let fill_mask = edit(&mut client, &mut app, json!({
+        "operation":"add_mask_layer", "index":folder_index, "source":{"kind":"fill"},
+        "parameters":{"value_percent":35,"opacity_percent":75,"blend":"Add"}
+    }));
+    assert_eq!(fill_mask["undo_steps"].as_u64().unwrap(), restored_filters["undo_steps"].as_u64().unwrap() + 1);
+    let procedural_mask = edit(&mut client, &mut app, json!({
+        "operation":"add_mask_layer", "index":folder_index,
+        "source":{"kind":"generator","generator":"Clouds","parameters":{"controls":{"0":58}}}
+    }));
+    assert_eq!(procedural_mask["layers_bottom_to_top"][folder_index]["mask"]["layers_bottom_to_top"][1]["blend"], "Multiply");
+    let invalid_layer = client.request(&mut app, "tools/call", json!({
+        "name":"edit_paint", "arguments":{"model_id":0,"set":0,"edit":{
+            "operation":"update_mask_layer","index":folder_index,"mask_layer":1,
+            "parameters":{"enabled":false,"opacity_percent":101}
+        }}
+    }));
+    assert_eq!(invalid_layer["isError"], true, "{invalid_layer}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["layers_bottom_to_top"], procedural_mask["layers_bottom_to_top"]);
+    assert_eq!(unchanged["undo_steps"], procedural_mask["undo_steps"]);
+    edit(&mut client, &mut app, json!({"operation":"move_mask_layer","index":folder_index,"from":1,"to":0}));
+    edit(&mut client, &mut app, json!({
+        "operation":"update_generator","index":folder_index,"mask_layer":0,"parameters":{"controls":{"0":63}}
+    }));
+    let updated_mask = edit(&mut client, &mut app, json!({
+        "operation":"update_mask_layer","index":folder_index,"mask_layer":1,"parameters":{"enabled":false}
+    }));
+    let removed_mask = edit(&mut client, &mut app, json!({"operation":"remove_mask_layer","index":folder_index,"mask_layer":0}));
+    assert_eq!(removed_mask["layers_bottom_to_top"][folder_index]["mask"]["layer_count"], 1);
+    let restored_mask = edit(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(restored_mask["layers_bottom_to_top"], updated_mask["layers_bottom_to_top"]);
     let saved = client.tool(&mut app, "save_model", json!({"model_id": 0, "copy_name": "stdio-materials.glb"}));
     let glb = Glb::load(Path::new(saved["structuredContent"]["path"].as_str().unwrap())).unwrap();
     let surface = glb.json["meshes"].as_array().unwrap().iter()
@@ -1067,9 +1326,114 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let height = surface.stack.layers[folder_index].texture_fill.as_ref().unwrap().images[3].as_ref().unwrap();
     assert_eq!(height.name, format!("{texture}.png"));
     assert_eq!(height.pixels().dimensions(), (1024, 1024));
+    let generator = surface.stack.layers[folder_index].mask.as_ref().unwrap().generator.unwrap();
+    assert_eq!((generator.values[0], generator.values[2], generator.invert), (62.0, 5.0, false));
+    assert_eq!(generator.weight(crate::editor::model_paint_data::mask::GeneratorInput::Noise), 150);
+    let filters = &surface.stack.layers[folder_index].mask.as_ref().unwrap().filters;
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].kind, crate::editor::model_paint_data::mask::FilterKind::Blur);
+    assert!(!filters[0].enabled && filters[0].wrap);
+    assert_eq!(filters[1].output, [10.0, 80.0]);
+    let mask_layers = &surface.stack.layers[folder_index].mask.as_ref().unwrap().layers;
+    assert_eq!(mask_layers.len(), 2);
+    assert_eq!(mask_layers[0].generator.unwrap().value(0), 63.0);
+    assert_eq!((mask_layers[1].value, mask_layers[1].opacity, mask_layers[1].enabled), (35, 75, false));
     let reset = client.tool(&mut app, "set_paint_view", json!({"model_id": 0, "reset_post": true}));
     assert_eq!(reset["structuredContent"]["post"]["overridden"], false);
     assert_eq!(reset["structuredContent"]["post"]["effects"], original["structuredContent"]["post"]["effects"]);
+
+    let source = scratch.0.join("Sample.mpp");
+    let models = scratch.0.join("assets/models");
+    fs::write(&source, crate::editor::model_paint_mpp::mcp_fixture()).unwrap();
+    let original_collision = models.join("Sample_MPP.glb");
+    let block_bytes = fs::read(models.join("block.glb")).unwrap();
+    fs::write(&original_collision, &block_bytes).unwrap();
+    let outside = client.request(&mut app, "tools/call", json!({
+        "name": "import_paint_project", "arguments": {"source": source, "folder": "../models"}
+    }));
+    assert_eq!(outside["isError"], true, "{outside}");
+    let hidden_folder = scratch.0.join("assets/.hidden");
+    fs::create_dir(&hidden_folder).unwrap();
+    let hidden = client.request(&mut app, "tools/call", json!({
+        "name": "import_paint_project", "arguments": {"source": source, "folder": ".hidden"}
+    }));
+    assert_eq!(hidden["isError"], true, "{hidden}");
+    assert!(fs::read_dir(hidden_folder).unwrap().next().is_none());
+    let broken_mpp = scratch.0.join("Broken.mpp");
+    fs::write(&broken_mpp, b"broken").unwrap();
+    let invalid_import = client.request(&mut app, "tools/call", json!({
+        "name": "import_paint_project", "arguments": {"source": broken_mpp, "folder": "models"}
+    }));
+    assert_eq!(invalid_import["isError"], true, "{invalid_import}");
+    assert_eq!(app.world().resource::<Editor>().viewing_model, Some(0));
+    assert!(!models.join("Broken_MPP.glb").exists());
+    let imported = client.tool(&mut app, "import_paint_project", json!({"source": source, "folder": "models"}));
+    let imported = &imported["structuredContent"];
+    assert_eq!(Path::new(imported["asset"].as_str().unwrap()), Path::new("models/Sample_MPP_2.glb"));
+    assert_eq!(imported["status"], "opening");
+    assert!(imported["report"]["warnings"].is_array());
+    let model = imported["model_id"].as_u64().unwrap() as usize;
+    wait_for_mode(&mut app, model);
+    let imported_state = wait_for_paint(&mut client, &mut app);
+    assert_eq!(imported_state["resolution"], 128);
+    assert_eq!(imported_state["layers_bottom_to_top"][0]["name"], "Imported pigment");
+    assert_eq!(fs::read(original_collision).unwrap(), block_bytes);
+    assert!(fs::read_dir(&models).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".mpp-import-")));
+
+    fs::write(models.join("fill-region.obj"), concat!(
+        "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\n",
+        "v -1 -1 -1\nv 1 -1 -1\nv 1 1 -1\nv -1 1 -1\n",
+        "vt 0.05 0.05\nvt 0.45 0.05\nvt 0.45 0.95\nvt 0.05 0.95\n",
+        "vt 0.55 0.05\nvt 0.95 0.05\nvt 0.95 0.95\nvt 0.55 0.95\n",
+        "f 1/1 2/2 3/3 4/4\nf 5/5 6/6 7/7 8/8\n",
+    )).unwrap();
+    client.tool(&mut app, "replace_paint_mesh", json!({"workspace": {"model_id": model, "set": 0},
+        "replacement": {"kind": "file", "path": "models/fill-region.obj"}
+    }));
+    assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 4);
+    client.tool(&mut app, "edit_paint", json!({"model_id": model,"set":0,
+        "edit": {"operation":"add_layer","kind":"Paint"}
+    }));
+    let started = wait_for_paint(&mut client, &mut app);
+    let layer = started["layers_bottom_to_top"].as_array().unwrap().iter()
+        .find(|layer| layer["selected"] == true).unwrap()["index"].as_u64().unwrap() as usize;
+    let invalid_fill = client.request(&mut app, "tools/call", json!({
+        "name": "poly_fill", "arguments": {"workspace": {"model_id": model, "set": 0},
+            "target": {"layer":layer,"space":"uv"}, "position":[0.25,0.5],
+            "region": {"kind":"rectangle","start":[0,0],"end":[0.5,1]}}
+    }));
+    assert_eq!(invalid_fill["isError"], true, "{invalid_fill}");
+    let fill = |client: &mut StdioClient, app: &mut App, space, region, color| {
+        client.tool(app, "poly_fill", json!({"workspace":{"model_id":model,"set":0},
+            "target":{"layer":layer,"space":space}, "region":region,
+            "mode":"polygon", "padding_px":0, "brush":{"channels":{"base_color":color},"opacity_percent":100}
+        }));
+        wait_for_paint(client, app)
+    };
+    let read = |app: &App, x: f32| {
+        let editing = app.world().resource::<editing::State>();
+        let surface = editing.documents[&model].objects[0].materials[0].paint.as_ref().unwrap();
+        let texels = surface.stack.layers[layer].channel(0).unwrap();
+        let side = surface.size as usize;
+        let offset = (side / 2 * side + (x * side as f32) as usize) * 4;
+        <[u8; 4]>::try_from(&texels[offset..offset + 4]).unwrap()
+    };
+    let left = fill(&mut client, &mut app, "uv", json!({"kind":"rectangle","start":[0,0],"end":[0.49,1]}), [180, 15, 20]);
+    assert_eq!(left["undo_steps"].as_u64().unwrap(), started["undo_steps"].as_u64().unwrap() + 1);
+    assert_eq!(read(&app, 0.25), [180, 15, 20, 255]);
+    assert_eq!(read(&app, 0.75)[3], 0);
+    fill(&mut client, &mut app, "uv", json!({"kind":"lasso","points":[[0.5,0],[1,0],[1,1],[0.5,1]]}), [12, 180, 25]);
+    assert_eq!(read(&app, 0.25), [180, 15, 20, 255]);
+    assert_eq!(read(&app, 0.75), [12, 180, 25, 255]);
+    client.tool(&mut app, "set_paint_view", json!({"model_id": model, "layout":"three",
+        "center":[0,0,-0.5], "distance":4, "yaw_degrees":0, "pitch_degrees":0, "orthographic":true
+    }));
+    fill(&mut client, &mut app, "viewport", json!({"kind":"rectangle","start":[0,0],"end":[1,1],"through":false}), [20, 25, 180]);
+    assert_eq!(read(&app, 0.25), [20, 25, 180, 255]);
+    assert_eq!(read(&app, 0.75), [12, 180, 25, 255]);
+    fill(&mut client, &mut app, "viewport", json!({"kind":"lasso","points":[[0,0],[1,0],[1,1],[0,1]],"through":true}), [40, 70, 160]);
+    assert_eq!(read(&app, 0.25), [40, 70, 160, 255]);
+    assert_eq!(read(&app, 0.75), [40, 70, 160, 255]);
     client.close();
     drop(server);
 }

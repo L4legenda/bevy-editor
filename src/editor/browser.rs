@@ -636,6 +636,13 @@ fn ignored_directory(name: &str) -> bool {
     )
 }
 
+#[cfg(feature = "mcp")]
+pub(super) fn discovers_models_in(folder: &Path) -> bool {
+    folder.iter().all(|name| name.to_str().is_some_and(|name| {
+        !name.starts_with('.') && !ignored_directory(name)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

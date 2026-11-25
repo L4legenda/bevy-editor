@@ -1,7 +1,8 @@
 //! Convert MCP points into the same queued strokes as pointer input.
 use super::*;
 use crate::editor::ui::model_viewer::paint::mcp_state::{
-    BrushValues, PaintSpace, RasterOperation, RasterTarget, StrokeSample, SurfaceSeed,
+    BrushValues, FillRegion, FillSource, PaintSpace, RasterOperation, RasterTarget, StrokeOptions,
+    StrokeSample, SurfaceSeed,
 };
 use crate::editor::ui::model_viewer::paint::surface_selection::{self, Selection, Source};
 
@@ -10,6 +11,7 @@ pub(in crate::editor) struct McpPaintInput<'w, 's> {
     runtime: Option<ResMut<'w, Runtime>>,
     gpu_queue: Option<ResMut<'w, gpu::Queue>>,
     viewer: Option<Res<'w, Viewer>>,
+    images: Option<ResMut<'w, Assets<Image>>>,
     canvas: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<Canvas>>,
 }
 
@@ -107,7 +109,7 @@ impl McpPaintInput<'_, '_> {
         model: usize,
         doc: &mut Document,
         session: &mut Session,
-        tips: &tips::Library,
+        tips: &mut tips::Library,
         target: RasterTarget,
         values: BrushValues,
         operation: RasterOperation<'_>,
@@ -154,6 +156,7 @@ impl McpPaintInput<'_, '_> {
             slot,
             session,
             tips,
+            self.images.as_deref_mut(),
             camera_map(viewer, rect),
             target,
             values,
@@ -187,7 +190,8 @@ fn queue_operation(
     object: &Object,
     slot: usize,
     session: &mut Session,
-    tips: &tips::Library,
+    tips: &mut tips::Library,
+    images: Option<&mut Assets<Image>>,
     camera: CameraMap,
     target: RasterTarget,
     values: BrushValues,
@@ -221,15 +225,36 @@ fn queue_operation(
     )?;
     let opacity = brush_value(values.opacity_percent, Parameter::Opacity, session.opacity)?;
     let spacing = brush_value(values.spacing_percent, Parameter::Spacing, session.spacing)?;
-    let (stamps, fill_mode) = match operation {
-        RasterOperation::Stroke(samples) => (
-            stroke_stamps(samples, camera.rect, session, size * spacing / 100.)?,
-            None,
-        ),
-        RasterOperation::Fill(position, mode) => (
-            vec![Stamp::from(point(position, camera.rect)?)],
-            Some(mode.unwrap_or(session.fill_mode)),
-        ),
+    let uv = target.space == PaintSpace::Uv;
+    let mut style = StrokeStyle::from(&*session);
+    let (points, fill) = match operation {
+        RasterOperation::Stroke(samples, options) => {
+            let mut dynamics = (session.stabilizer, session.pressure_size, session.pressure_flow);
+            if let Some(options) = options {
+                override_style(&mut style, options, tips, uv)?;
+                dynamics = (
+                    brush_value(options.stabilizer_px, Parameter::Stabilizer, dynamics.0)?,
+                    options.pressure_size.unwrap_or(dynamics.1),
+                    options.pressure_flow.unwrap_or(dynamics.2),
+                );
+            }
+            let stamps = stroke_stamps(samples, camera.rect, size * spacing / 100., dynamics)?;
+            if style.tip.is_some() && tips.entries.is_empty() || style.grain.is_some() && tips.grains.is_empty() {
+                let images = images.ok_or("Brush textures are unavailable")?;
+                if style.tip.is_some() { tips.ensure(images); }
+                if style.grain.is_some() { tips.ensure_grains(images); }
+            }
+            (RasterPoints::Stamps(stamps), None)
+        }
+        RasterOperation::Fill(source, settings) => {
+            let points = match source {
+                FillSource::Point(position) => RasterPoints::Stamps(vec![Stamp::from(point(position, camera.rect)?)]),
+                FillSource::Region(region) => RasterPoints::Region(fill_region(region, camera.rect, uv, session.fill_through)?),
+            };
+            let angle = brush_value(settings.angle, Parameter::FillAngle, session.fill_angle)?;
+            let padding = brush_value(settings.padding, Parameter::FillPadding, session.fill_padding)?;
+            (points, Some((settings.mode.unwrap_or(session.fill_mode), angle, padding)))
+        }
     };
 
     if session.stack.selected != target.layer || session.editing_mask != target.mask {
@@ -240,13 +265,14 @@ fn queue_operation(
         };
         session.edit(select);
     }
-    let uv = target.space == PaintSpace::Uv;
-    let mut brush = brush_for(session, tips, object, uv, values.erase, fill_mode.is_some());
+    let mut brush = brush_for_style(session, tips, object, uv, values.erase, fill.is_some(), style);
     brush.radius = size * 0.5;
     brush.flow = flow / 100.;
     brush.hardness = hardness / 100.;
-    if let Some(mode) = fill_mode {
+    if let Some((mode, angle, padding)) = fill {
         brush.fill_mode = mode;
+        brush.fill_angle = angle;
+        brush.fill_padding = padding;
     }
     if let Some(colors) = colors {
         let channels = colors.iter().enumerate().fold(0, |bits, (i, color)| {
@@ -276,9 +302,99 @@ fn queue_operation(
         &session.set_appearance.visibility,
     ));
     live.queue.push_back(Event::Begin(brush));
-    live.enqueue_stamps(stamps, map);
+    match points {
+        RasterPoints::Stamps(stamps) => live.enqueue_stamps(stamps, map),
+        RasterPoints::Region(region) => live.queue.push_back(Event::Region(region, map)),
+    }
     live.queue.push_back(Event::End);
     Ok(())
+}
+
+enum RasterPoints {
+    Stamps(Vec<Stamp>),
+    Region(fill_drag::Region),
+}
+
+fn fill_region(region: &FillRegion, rect: Rect, uv: bool, default_through: bool) -> Result<fill_drag::Region, String> {
+    let through = match region {
+        FillRegion::Rectangle { through, .. } | FillRegion::Lasso { through, .. } => *through,
+    };
+    if uv && through == Some(true) {
+        return Err("Selecting hidden surfaces requires the 3D viewport".into());
+    }
+    let through = !uv && through.unwrap_or(default_through);
+    match region {
+        FillRegion::Rectangle { start, end, .. } => {
+            let start = point(*start, rect)?;
+            let end = point(*end, rect)?;
+            if start.x == end.x || start.y == end.y {
+                return Err("A fill rectangle must have nonzero width and height".into());
+            }
+            Ok(fill_drag::Region::rectangle(start, end, through))
+        }
+        FillRegion::Lasso { points, .. } => {
+            let max = fill_drag::MAX_POINTS;
+            if !(3..=max).contains(&points.len()) {
+                return Err(format!("Provide between 3 and {max} lasso points"));
+            }
+            let outline: Vec<_> = points.iter().map(|&p| point(p, rect)).collect::<Result<_, _>>()?;
+            let origin = outline[0];
+            let spans_area = outline.iter().find(|&&p| p != origin).is_some_and(|&p| {
+                outline.iter().any(|&q| (p - origin).perp_dot(q - origin) != 0.)
+            });
+            if !spans_area {
+                return Err("A fill lasso must enclose an area".into());
+            }
+            Ok(fill_drag::Region::lasso(outline, through))
+        }
+    }
+}
+
+fn override_style(style: &mut StrokeStyle, options: &StrokeOptions, tips: &tips::Library, uv: bool) -> Result<(), String> {
+    style.projection = options.projection.unwrap_or(style.projection);
+    style.symmetry = options.symmetry.unwrap_or(style.symmetry);
+    style.paint_through = options.paint_through.unwrap_or(style.paint_through);
+    if (uv || style.projection != BrushProjection::Screen) && options.paint_through == Some(true) {
+        return Err("Paint-through requires screen projection in the 3D viewport".into());
+    }
+    if uv && (options.projection == Some(BrushProjection::Surface)
+        || options.symmetry.is_some_and(|axis| axis != Symmetry::Off))
+    {
+        return Err("Surface projection and model symmetry require the 3D viewport".into());
+    }
+    style.angle_limit = brush_value(options.angle_limit_degrees, Parameter::BrushAngleLimit, style.angle_limit)?;
+    if let Some(name) = &options.tip {
+        style.tip = brush_texture(name, "round", "tip", tips.names())?;
+    }
+    style.tip_angle = brush_value(options.tip_angle_degrees, Parameter::TipAngle, style.tip_angle)?;
+    style.follow_stroke = options.follow_stroke.unwrap_or(style.follow_stroke);
+    if let Some(name) = &options.grain {
+        style.grain = brush_texture(name, "none", "grain", tips.grain_names())?;
+    }
+    style.grain_strength = brush_value(options.grain_strength_percent, Parameter::GrainStrength, style.grain_strength)?;
+    style.grain_scale = brush_value(options.grain_scale, Parameter::GrainScale, style.grain_scale)?;
+    style.grain_angle = brush_value(options.grain_angle_degrees, Parameter::GrainAngle, style.grain_angle)?;
+    style.grain_invert = options.grain_invert.unwrap_or(style.grain_invert);
+    style.grain_uv = options.grain_uv.unwrap_or(style.grain_uv);
+    for (percent, parameter, factor) in [
+        (options.scatter_percent, Parameter::BrushScatter, &mut style.variation.scatter),
+        (options.size_jitter_percent, Parameter::BrushSizeJitter, &mut style.variation.size),
+        (options.angle_jitter_percent, Parameter::BrushAngleJitter, &mut style.variation.angle),
+    ] {
+        if let Some(percent) = percent {
+            *factor = brush_value(Some(percent), parameter, 0.)? / 100.;
+        }
+    }
+    Ok(())
+}
+
+fn brush_texture(name: &str, disabled: &str, kind: &str, names: Vec<&str>) -> Result<Option<usize>, String> {
+    let key = name.to_lowercase();
+    if key == disabled {
+        return Ok(None);
+    }
+    names.iter().position(|name| name.to_lowercase() == key).map(Some)
+        .ok_or_else(|| format!("Unknown brush {kind} '{name}'; use list_paint_presets"))
 }
 
 fn brush_value(input: Option<f32>, parameter: Parameter, fallback: f32) -> Result<f32, String> {
@@ -302,8 +418,8 @@ fn point(position: [f32; 2], rect: Rect) -> Result<Vec2, String> {
 fn stroke_stamps(
     samples: &[StrokeSample],
     rect: Rect,
-    session: &Session,
     spacing: f32,
+    (stabilizer, pressure_size, pressure_flow): (f32, bool, bool),
 ) -> Result<Vec<Stamp>, String> {
     const MAX_SAMPLES: usize = 512;
     const MAX_STAMPS: usize = 16_384;
@@ -324,9 +440,9 @@ fn stroke_stamps(
         first,
         pressure,
         spacing,
-        session.stabilizer,
-        session.pressure_size,
-        session.pressure_flow,
+        stabilizer,
+        pressure_size,
+        pressure_flow,
     );
     let mut stamps = vec![path.first()];
     for entry in &samples[1..] {

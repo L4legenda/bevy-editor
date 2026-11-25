@@ -2,7 +2,7 @@
 use super::Brush;
 use bevy::prelude::*;
 
-const MAX_POINTS: usize = 384;
+pub(super) const MAX_POINTS: usize = 384;
 
 pub(super) struct Drag {
     pub brush: Brush,
@@ -73,20 +73,26 @@ impl Drag {
         } else {
             Vec::new()
         };
-        let mut bounds = Rect::from_corners(self.start, self.end);
-        for &point in &outline {
-            bounds.min = bounds.min.min(point);
-            bounds.max = bounds.max.max(point);
-        }
-        Some(Region {
-            bounds,
-            outline,
-            through: self.through,
+        Some(if outline.is_empty() {
+            Region::rectangle(self.start, self.end, self.through)
+        } else {
+            Region::lasso(outline, self.through)
         })
     }
 }
 
 impl Region {
+    pub(super) fn rectangle(start: Vec2, end: Vec2, through: bool) -> Self {
+        Self { bounds: Rect::from_corners(start, end), outline: Vec::new(), through }
+    }
+
+    pub(super) fn lasso(outline: Vec<Vec2>, through: bool) -> Self {
+        let bounds = outline.iter().fold(Rect::from_corners(outline[0], outline[0]), |bounds, &point| Rect {
+            min: bounds.min.min(point), max: bounds.max.max(point),
+        });
+        Self { bounds, outline, through }
+    }
+
     pub fn contains(&self, point: Vec2) -> bool {
         if !self.bounds.contains(point) {
             return false;

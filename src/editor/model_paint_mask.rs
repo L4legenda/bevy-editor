@@ -423,6 +423,7 @@ pub(in crate::editor) enum MaskPass {
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum MaskBlend {
     #[default]
     Normal,
@@ -434,6 +435,9 @@ pub(in crate::editor) enum MaskBlend {
 }
 
 impl MaskBlend {
+    #[cfg(feature = "mcp")]
+    pub const ALL: [Self; 6] = [Self::Normal, Self::Multiply, Self::Add, Self::Subtract, Self::Lighten, Self::Darken];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Обычный",

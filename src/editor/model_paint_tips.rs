@@ -176,6 +176,12 @@ impl Library {
         }
     }
 
+    #[cfg(feature = "mcp")]
+    pub(super) fn grain_names(&self) -> Vec<&str> {
+        if self.grains.is_empty() { GRAIN_LABELS.to_vec() }
+        else { self.grains.iter().map(|grain| grain.name.as_str()).collect() }
+    }
+
     pub fn ensure(&mut self, images: &mut Assets<Image>) {
         Self::fill(&mut self.entries, images, ATLAS, COLUMNS, &LABELS);
     }

@@ -938,6 +938,11 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
 }
 
 pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, ImportDetails)> {
+    let (name, bytes, report) = prepare_conversion(source, target)?;
+    Ok((publish_project(target, &name, "MPP", &bytes)?, report))
+}
+
+pub(super) fn prepare_conversion(source: &Path, target: &Path) -> io::Result<(String, Vec<u8>, ImportDetails)> {
     let name = project_name(source);
     let Imported {
         object,
@@ -972,7 +977,24 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
         Some(&bake.cage),
     )
     .map_err(io::Error::other)?;
-    Ok((publish_project(target, &name, "MPP", &bytes)?, report))
+    Ok((name, bytes, report))
+}
+
+#[cfg(all(test, feature = "mcp"))]
+pub(super) fn mcp_fixture() -> Vec<u8> {
+    let vertices = [[0., 0.], [1., 0.], [0., 1.]]
+        .into_iter()
+        .flat_map(|[x, y]| {
+            [x, y, 0., 0., 0., 1., x, y, 1., 0., 0., 1.].into_iter().flat_map(f32::to_le_bytes)
+        }).collect();
+    let indices = [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+    tests::native_file(json!({
+        "app": "Material Painter", "version": 3,
+        "mesh": {"vertices": 0, "indices": 1},
+        "texture_sets": [{"name": "Sample", "tris": [0, 1], "resolution": 128,
+            "layers_bottom_to_top": [{"id": 1, "name": "Imported pigment",
+                "content": {"kind": "fill", "fill": {"color": [0.25, 0.5, 0.75]}}}] }],
+    }), &[vertices, indices])
 }
 
 #[cfg(test)]
@@ -989,7 +1011,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
     }
 
-    fn native_file(manifest: Value, raw_blobs: &[Vec<u8>]) -> Vec<u8> {
+    pub(super) fn native_file(manifest: Value, raw_blobs: &[Vec<u8>]) -> Vec<u8> {
         let text = serde_json::to_vec(&manifest).unwrap();
         let mut file = MAGIC.to_vec();
         file.extend((text.len() as u64).to_le_bytes());

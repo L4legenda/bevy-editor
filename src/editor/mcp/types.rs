@@ -105,6 +105,7 @@ pub(super) enum Command {
     State,
     PaintState,
     PaintOpen(PaintOpenArgs),
+    PaintImport(PaintImportArgs),
     PaintReplaceMesh(super::mcp_state::MeshArgs),
     PaintPresets,
     PaintEdit(super::mcp_state::EditArgs),
@@ -116,9 +117,11 @@ pub(super) enum Command {
     BakeStatus(super::mcp_state::BakeTarget),
     BakeStart(super::mcp_state::BakeArgs),
     BakeCancel(super::mcp_state::BakeTarget),
+    BakeLevels(super::mcp_state::BakeLevelsArgs),
     PaintView(super::mcp_state::PaintViewArgs),
     CagePreview(super::mcp_state::CageArgs),
     PaintCapture(super::mcp_state::CaptureArgs),
+    PaintRender(super::mcp_state::RenderArgs),
     Scenes,
     Objects(Page),
     Assets(Page),
@@ -145,6 +148,16 @@ pub(super) struct PaintOpenArgs {
     pub asset: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(super) struct PaintImportArgs {
+    /// Absolute local path of a Material Painter .mpp project.
+    pub source: std::path::PathBuf,
+    /// Existing directory relative to the current project's assets root. Defaults to that root.
+    pub folder: Option<std::path::PathBuf>,
+}
+
 impl Command {
     pub fn mutates(&self) -> bool {
         if let Self::CagePreview(args) = self {
@@ -152,7 +165,7 @@ impl Command {
         }
         !matches!(
             self,
-            Self::State | Self::PaintState | Self::PaintPresets | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_)
+            Self::State | Self::PaintState | Self::PaintPresets | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_) | Self::PaintRender(_)
         )
     }
 }

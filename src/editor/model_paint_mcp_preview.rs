@@ -1,6 +1,6 @@
 //! MCP controls the current model viewport and reads its composed GPU image.
 use super::*;
-use crate::editor::model_document::ModelCamera;
+use crate::editor::model_document::{ModelCamera, PaintPreview, PaintUv};
 use bevy::{
     ecs::system::SystemParam,
     render::{
@@ -13,6 +13,9 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+#[path = "model_paint_mcp_render.rs"]
+pub(in crate::editor::ui::model_viewer) mod offscreen;
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -28,11 +31,84 @@ pub(in crate::editor) struct ViewArgs {
     layout: Option<View>,
     preview: Option<MapPreview>,
     path_trace: Option<bool>,
+    /// Show the model's 3D wireframe in the raster viewport.
+    wireframe: Option<bool>,
+    uv_overlay: Option<UvOverlayPatch>,
+    material: Option<MaterialPreviewPatch>,
     exposure_stops: Option<f32>,
     post: Option<PostPatch>,
     /// Remove the model's local grading override and start from the environment settings.
     #[serde(default)]
     reset_post: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct UvOverlayPatch {
+    show_wire: Option<bool>,
+    /// UV wire opacity as a fraction from 0.05 to 1.
+    wire_opacity: Option<f32>,
+    show_seams_2d: Option<bool>,
+    show_seams_3d: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct MaterialPreviewPatch {
+    /// Set an explicit relief strength from 0 to 8.
+    height_strength: Option<f32>,
+    /// Use resolution-dependent relief strength instead of an explicit value.
+    #[serde(default)]
+    automatic_height: bool,
+    emission_strength: Option<f32>,
+    use_baked_normal: Option<bool>,
+    /// Ambient occlusion strength as a fraction from 0 to 1.
+    ao_strength: Option<f32>,
+}
+
+fn preview_value(key: &str, parameter: PreviewParameter, value: f32, scale: f32) -> Result<f32, String> {
+    let (min, max) = (parameter.min() / scale, parameter.max() / scale);
+    if !(min..=max).contains(&value) {
+        return Err(format!("{key} must be between {min} and {max}"));
+    }
+    Ok(value)
+}
+
+impl ViewArgs {
+    fn overlay_patch(&self, mut uv: PaintUv) -> Result<PaintUv, String> {
+        uv.show_wire_3d = self.wireframe.unwrap_or(uv.show_wire_3d);
+        if let Some(patch) = &self.uv_overlay {
+            uv.show_wire = patch.show_wire.unwrap_or(uv.show_wire);
+            uv.show_seams_2d = patch.show_seams_2d.unwrap_or(uv.show_seams_2d);
+            uv.show_seams_3d = patch.show_seams_3d.unwrap_or(uv.show_seams_3d);
+            if let Some(value) = patch.wire_opacity {
+                uv.wire_opacity = preview_value("wire_opacity", PreviewParameter::UvWireOpacity, value, 100.)?;
+            }
+        }
+        Ok(uv)
+    }
+
+    fn material_patch(&self, mut material: PaintPreview) -> Result<PaintPreview, String> {
+        let Some(patch) = &self.material else { return Ok(material) };
+        if patch.automatic_height && patch.height_strength.is_some() {
+            return Err("Choose either height_strength or automatic_height".into());
+        }
+        if patch.automatic_height {
+            material.height_strength = None;
+        } else if let Some(value) = patch.height_strength {
+            material.height_strength = Some(preview_value("height_strength", PreviewParameter::Height, value, 1.)?);
+        }
+        if let Some(value) = patch.emission_strength {
+            material.emission_strength = preview_value("emission_strength", PreviewParameter::Emission, value, 1.)?;
+        }
+        if let Some(value) = patch.ao_strength {
+            material.ao_strength = preview_value("ao_strength", PreviewParameter::Occlusion, value, 100.)?;
+        }
+        material.use_baked_normal = patch.use_baked_normal.unwrap_or(material.use_baked_normal);
+        Ok(material)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -170,6 +246,11 @@ pub(in crate::editor) fn set_view(
     }
     let previous = viewer.camera();
     let camera = camera_patch(previous, &args)?;
+    let uv = args.overlay_patch(doc.paint_uv)?;
+    let material = args.material_patch(doc.paint_preview)?;
+    if (uv, material) != (doc.paint_uv, doc.paint_preview) && !doc.can_store_paint_preview() {
+        return Err("This model cannot store the requested preview settings".into());
+    }
     let preview = args.preview.as_ref().map(preview_mode).transpose()?;
     if preview.is_some_and(|mode| !session.available(PaintAction::Preview3d(mode))) {
         return Err("The requested map is not available for the active texture set".into());
@@ -209,10 +290,11 @@ pub(in crate::editor) fn set_view(
     if previous != camera {
         viewer.restore_camera(camera);
         doc.model_camera = Some(camera);
-        doc.ui_revision += 1;
     }
-    if doc.paint_post != next_post {
+    if (doc.paint_post, doc.paint_uv, doc.paint_preview) != (next_post, uv, material) || previous != camera {
         doc.paint_post = next_post;
+        doc.paint_uv = uv;
+        doc.paint_preview = material;
         doc.ui_revision += 1;
     }
     if let Some(layout) = args.layout.filter(|&layout| layout != session.view) {
@@ -235,33 +317,54 @@ pub(in crate::editor) fn set_view(
         "fov_degrees": camera.fov.to_degrees(), "orthographic": camera.orthographic},
         "channel": session.diagnostic_channel().and_then(|index| mcp_state::CHANNEL_KEYS.get(index)),
         "bake_map": session.diagnostic_bake(),
+        "wireframe": uv.show_wire_3d, "uv_overlay": {"show_wire": uv.show_wire,
+            "wire_opacity": uv.wire_opacity, "show_seams_2d": uv.show_seams_2d, "show_seams_3d": uv.show_seams_3d},
+        "material": material,
         "post": {"overridden": doc.paint_post.is_some(), "effects": post.effects,
             "tone_map": post.effects.curve.unwrap_or_else(|| env.trace_light(None).2)}}),
     )
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct CameraPatch {
+    center: Option<[f32; 3]>,
+    distance: Option<f32>,
+    yaw_degrees: Option<f32>,
+    pitch_degrees: Option<f32>,
+    fov_degrees: Option<f32>,
+    orthographic: Option<bool>,
+}
+
 fn camera_patch(previous: ModelCamera, args: &ViewArgs) -> Result<ModelCamera, String> {
-    let camera = ModelCamera {
-        center: args.center.unwrap_or(previous.center),
-        distance: args.distance.unwrap_or(previous.distance),
-        yaw: args
-            .yaw_degrees
-            .map(|yaw| yaw.rem_euclid(360.).to_radians())
-            .unwrap_or(previous.yaw),
-        pitch: args
-            .pitch_degrees
-            .map(f32::to_radians)
-            .unwrap_or(previous.pitch),
-        fov: args
-            .fov_degrees
-            .map(f32::to_radians)
-            .unwrap_or(previous.fov),
-        orthographic: args.orthographic.unwrap_or(previous.orthographic),
-    };
-    if !camera.valid() {
-        return Err("Invalid model camera; use finite coordinates, positive distance, pitch within ±90° and FOV from 1° to 175°".into());
+    CameraPatch {
+        center: args.center,
+        distance: args.distance,
+        yaw_degrees: args.yaw_degrees,
+        pitch_degrees: args.pitch_degrees,
+        fov_degrees: args.fov_degrees,
+        orthographic: args.orthographic,
+    }.apply(previous)
+}
+
+impl CameraPatch {
+    fn apply(&self, previous: ModelCamera) -> Result<ModelCamera, String> {
+        let camera = ModelCamera {
+            center: self.center.unwrap_or(previous.center),
+            distance: self.distance.unwrap_or(previous.distance),
+            yaw: self.yaw_degrees
+                .map(|yaw| yaw.rem_euclid(360.).to_radians())
+                .unwrap_or(previous.yaw),
+            pitch: self.pitch_degrees.map(f32::to_radians).unwrap_or(previous.pitch),
+            fov: self.fov_degrees.map(f32::to_radians).unwrap_or(previous.fov),
+            orthographic: self.orthographic.unwrap_or(previous.orthographic),
+        };
+        if !camera.valid() {
+            return Err("Invalid model camera; use finite coordinates, positive distance, pitch within ±90° and FOV from 1° to 175°".into());
+        }
+        Ok(camera)
     }
-    Ok(camera)
 }
 
 fn preview_mode(preview: &MapPreview) -> Result<Preview3d, String> {

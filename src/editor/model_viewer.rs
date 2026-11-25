@@ -11,6 +11,8 @@ use bevy::{
 };
 
 const LAYER: usize = 8;
+const GUIDES_LAYER: usize = 24;
+const REQUEST_MODEL_LAYER: usize = 25;
 const FOV: f32 = crate::editor::viewport::EDITOR_FOV;
 
 #[path = "model_environment.rs"]
@@ -251,7 +253,7 @@ impl Plugin for ModelViewerPlugin {
         );
         app.add_systems(Update, shading::refresh.after(crate::editor::ui::refresh));
         #[cfg(feature = "mcp")]
-        app.add_systems(PostUpdate, paint::mcp_preview::capture_requests);
+        app.add_systems(PostUpdate, (paint::mcp_preview::capture_requests, paint::mcp_preview::offscreen::render_requests));
         app.add_systems(
             PostUpdate,
             editing::input::draw.after(bevy::transform::TransformSystems::Propagate),
@@ -598,14 +600,14 @@ fn actions(
         &mut commands,
         &mut grid_assets.0,
         &mut grid_assets.1,
-        LAYER,
+        GUIDES_LAYER,
     );
     commands.entity(grid).insert((ModelGrid, ChildOf(stage)));
     let background = crate::editor::viewport_background::spawn(
         &mut commands,
         &mut grid_assets.0,
         &mut grid_assets.2,
-        LAYER,
+        GUIDES_LAYER,
     );
     commands
         .entity(background)
@@ -622,7 +624,7 @@ fn actions(
                 ..default()
             },
             RenderTarget::Image(ui.image.clone().into()),
-            RenderLayers::layer(LAYER),
+            RenderLayers::from_layers(&[LAYER, GUIDES_LAYER]),
             Transform::from_xyz(3.0, 2.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
             Projection::Perspective(PerspectiveProjection {
                 fov: FOV,
@@ -645,7 +647,7 @@ fn actions(
         environment::KeyLight,
         DirectionalLight::default(),
         Transform::IDENTITY,
-        RenderLayers::layer(LAYER),
+            RenderLayers::from_layers(&[LAYER, REQUEST_MODEL_LAYER]),
         ChildOf(stage),
     ));
 }
@@ -922,34 +924,40 @@ fn navigate(
     }
     if let Ok((mut transform, mut projection)) = cameras.single_mut() {
         *transform = view_pose(&viewer);
-        let mut next = viewport::free_projection_with_fov(viewer.orthographic, viewer.distance, viewer.fov());
-        let near = (viewer.radius * 0.001).max(0.000001);
-        let far = (viewer.distance + viewer.radius * 100.0).max(10000.0);
-        match &mut next {
-            Projection::Perspective(p) => {
-                p.near = near;
-                p.far = far;
-            }
-            Projection::Orthographic(p) => {
-                let depth = orthographic_depth(&viewer);
-                p.near = -depth;
-                p.far = depth;
-            }
-            _ => {}
-        }
-        *projection = next;
+        *projection = model_projection(viewer.camera(), viewer.radius);
     }
 }
 
 fn view_pose(viewer: &Viewer) -> Transform {
+    model_pose(viewer.camera())
+}
+
+fn model_pose(camera: ModelCamera) -> Transform {
     let direction = Vec3::new(
-        viewer.yaw.sin() * viewer.pitch.cos(),
-        viewer.pitch.sin(),
-        viewer.yaw.cos() * viewer.pitch.cos(),
+        camera.yaw.sin() * camera.pitch.cos(),
+        camera.pitch.sin(),
+        camera.yaw.cos() * camera.pitch.cos(),
     );
-    Transform::from_translation(viewer.center + direction * viewer.distance).with_rotation(
-        Quat::from_euler(EulerRot::YXZ, viewer.yaw, -viewer.pitch, 0.0),
+    Transform::from_translation(Vec3::from_array(camera.center) + direction * camera.distance).with_rotation(
+        Quat::from_euler(EulerRot::YXZ, camera.yaw, -camera.pitch, 0.0),
     )
+}
+
+fn model_projection(camera: ModelCamera, radius: f32) -> Projection {
+    let mut projection = viewport::free_projection_with_fov(camera.orthographic, camera.distance, camera.fov);
+    match &mut projection {
+        Projection::Perspective(p) => {
+            p.near = (radius * 0.001).max(0.000001);
+            p.far = (camera.distance + radius * 100.0).max(10000.0);
+        }
+        Projection::Orthographic(p) => {
+            let depth = (radius * 100.0).max(camera.distance * 2.0).max(0.000001);
+            p.near = -depth;
+            p.far = depth;
+        }
+        _ => {}
+    }
+    projection
 }
 
 fn view_height(viewer: &Viewer, depth: f32) -> f32 {

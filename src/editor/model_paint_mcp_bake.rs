@@ -43,6 +43,20 @@ pub(in crate::editor) struct BakeArgs {
     preview: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct BakeLevelsArgs {
+    pub(in crate::editor::ui::model_viewer::paint) target: BakeTarget,
+    map: BakeMap,
+    black_percent: Option<u16>,
+    white_percent: Option<u16>,
+    /// Gamma × 100. 100 leaves the curve linear.
+    gamma_percent: Option<u16>,
+    #[serde(default)]
+    reset: bool,
+}
+
 #[derive(SystemParam)]
 pub(in crate::editor) struct McpBake<'w> {
     state: Option<ResMut<'w, State>>,
@@ -51,6 +65,31 @@ pub(in crate::editor) struct McpBake<'w> {
 }
 
 impl McpBake<'_> {
+    pub(in crate::editor::ui::model_viewer::paint) fn set_levels(
+        &mut self, model: usize, doc: &mut Document, session: &mut Session, args: BakeLevelsArgs,
+    ) -> Result<Value, String> {
+        let state = self.state.as_deref_mut().ok_or("The bake engine is unavailable")?;
+        if state.running.is_some() || state.picking.is_some() || state.clearing_cache.is_some()
+            || doc.paint_busy || doc.paint_pending || session.busy || session.resize_request.is_some()
+        {
+            return Err("Wait for the current bake or paint operation to finish".into());
+        }
+        let set = args.target.set.unwrap_or(session.set);
+        let (object, slot) = doc.paint_target(set).ok_or("Unknown texture set")?;
+        let binding = (object.id, slot);
+        let material = &object.materials[slot];
+        if !levels::supports(args.map)
+            || !state.maps(model, doc, binding, doc.paint_size(material)).is_some_and(|maps| maps.has_map(args.map))
+        {
+            return Err("Choose an available baked scalar map that supports levels".into());
+        }
+        let new = args.resolve(levels::get(material, args.map))?;
+        if state.apply_levels(model, doc, binding, args.map, new)? {
+            session.revision += 1;
+        }
+        status(state, model, doc, set)
+    }
+
     pub(in crate::editor::ui::model_viewer::paint) fn start(
         &mut self,
         editor: &mut Editor,
@@ -145,6 +184,28 @@ impl McpBake<'_> {
             .as_deref()
             .ok_or("The bake engine is unavailable")?;
         status(state, model, doc, set)
+    }
+}
+
+impl BakeLevelsArgs {
+    fn resolve(&self, previous: levels::Levels) -> Result<levels::Levels, String> {
+        let changed = self.black_percent.is_some() || self.white_percent.is_some() || self.gamma_percent.is_some();
+        if self.reset && changed {
+            return Err("Choose either reset or explicit level values".into());
+        }
+        let levels = if self.reset {
+            levels::Levels::default()
+        } else {
+            levels::Levels {
+                black: self.black_percent.unwrap_or(previous.black),
+                white: self.white_percent.unwrap_or(previous.white),
+                gamma: self.gamma_percent.unwrap_or(previous.gamma),
+            }
+        };
+        if !levels.valid() {
+            return Err("Black and white points must be 0–100 percent and gamma must be 10–400 percent".into());
+        }
+        Ok(levels)
     }
 }
 
@@ -254,6 +315,10 @@ fn status(state: &State, model: usize, doc: &Document, set: usize) -> Result<Val
         "error": error,
         "from_disk_cache": from_disk,
         "maps": available,
+        "levels": available.iter().copied().filter(|&map| levels::supports(map)).map(|map| {
+            let levels = levels::get(&object.materials[slot], map);
+            json!({"map": map, "black_percent": levels.black, "white_percent": levels.white, "gamma_percent": levels.gamma})
+        }).collect::<Vec<_>>(),
         "settings": doc.bake_settings,
         "report": maps.map(|maps| json!({
             "uv_texels": maps.filled,

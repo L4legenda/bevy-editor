@@ -19,12 +19,27 @@ pub(in crate::editor) struct ExportArgs {
     all_sets: bool,
     prefix: Option<String>,
     template: Option<Template>,
+    /// Built-in identifier, display name, or a saved recipe name. With template_file, selects a recipe from that file.
+    template_name: Option<String>,
+    /// A portable Material Painter export template JSON file, absolute or relative to the asset root.
+    template_file: Option<PathBuf>,
     format: Option<Format>,
     /// Bits per channel: 8, 16, or 32 (float).
     bit_depth: Option<u8>,
     size: Option<u32>,
+    #[serde(default)]
+    native_size: bool,
     padding: Option<Padding>,
     padding_width: Option<u32>,
+    normal: Option<NormalPatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct NormalPatch {
+    height_strength: Option<f32>,
+    use_baked: Option<bool>,
 }
 
 #[derive(SystemParam)]
@@ -38,6 +53,19 @@ pub(in crate::editor) struct McpOutput<'w, 's> {
 }
 
 impl McpOutput<'_, '_> {
+    pub(in crate::editor) fn template_catalog(&self) -> Vec<Value> {
+        let builtins =
+            Template::ALL.map(|template| json!({"id": template, "label": template.label()}));
+        builtins
+            .into_iter()
+            .chain(self.preferences.iter().flat_map(|store| {
+                store
+                    .recipe_labels()
+                    .map(|(template, label)| json!({"id": template, "label": label}))
+            }))
+            .collect()
+    }
+
     pub(in crate::editor::ui::model_viewer::paint) fn stroke_active(&self) -> bool {
         self.runtime
             .as_deref()
@@ -92,9 +120,23 @@ impl McpOutput<'_, '_> {
             .preferences
             .as_deref()
             .ok_or("Export preferences are unavailable")?;
-        let settings = export_settings(preferences.settings(), &args)?;
+        let mut settings = export_settings(preferences.settings(), &args)?;
+        if args.template.is_some() && (args.template_name.is_some() || args.template_file.is_some())
+        {
+            return Err("Choose template or template_name/template_file".into());
+        }
+        let source = args
+            .template_file
+            .as_deref()
+            .map(|path| output_folder(&editor.project.asset_root, path))
+            .transpose()?;
+        if source.is_some() {
+            settings.template = Template::Custom(0);
+        } else if let Some(name) = &args.template_name {
+            settings.template = named_template(preferences, name)?;
+        }
         let recipe = match settings.template {
-            Template::Custom(index) => Some(
+            Template::Custom(index) if source.is_none() => Some(
                 preferences
                     .recipe(index)
                     .ok_or("Unknown export template")?
@@ -128,6 +170,10 @@ impl McpOutput<'_, '_> {
         });
         let project = editor.project.title.clone();
         Ok(move || {
+            let recipe = match source {
+                Some(path) => Some(load_template(&path, args.template_name.as_deref())?),
+                None => recipe,
+            };
             let folder = folder.canonicalize().map_err(|error| error.to_string())?;
             if !folder.is_dir() {
                 return Err("The export destination must be an existing folder".into());
@@ -137,6 +183,52 @@ impl McpOutput<'_, '_> {
             Ok(json!({"folder": report.path, "files": report.paths}))
         })
     }
+}
+
+fn named_template(preferences: &prefs::Store, name: &str) -> Result<Template, String> {
+    let name = name.trim().to_lowercase();
+    if let Some(template) = Template::ALL.into_iter().find(|template| {
+        serde_json::to_value(template)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_str)
+            == Some(name.as_str())
+    }) {
+        return Ok(template);
+    }
+    let mut matches = Template::ALL
+        .into_iter()
+        .map(|template| (template, template.label()))
+        .chain(preferences.recipe_labels())
+        .filter(|(_, label)| label.to_lowercase() == name);
+    let (template, _) = matches
+        .next()
+        .ok_or("Unknown export template name; use list_paint_presets")?;
+    if matches.next().is_some() {
+        return Err("The export template name is ambiguous; use a template id".into());
+    }
+    Ok(template)
+}
+
+fn load_template(path: &Path, name: Option<&str>) -> Result<recipe::Recipe, String> {
+    let mut recipes = recipe::load(path)
+        .map_err(|error| error.to_string())?
+        .into_iter();
+    if let Some(name) = name {
+        let name = name.trim().to_lowercase();
+        let mut matches = recipes.filter(|recipe| recipe.name.to_lowercase() == name);
+        let recipe = matches
+            .next()
+            .ok_or("The template file has no recipe with that name")?;
+        if matches.next().is_some() {
+            return Err("The template file contains duplicate recipe names".into());
+        }
+        return Ok(recipe);
+    }
+    if recipes.len() != 1 {
+        return Err("Supply template_name when the file contains multiple recipes".into());
+    }
+    Ok(recipes.next().unwrap())
 }
 
 fn output_folder(root: &Path, path: &Path) -> Result<PathBuf, String> {
@@ -177,10 +269,27 @@ fn export_settings(
         return Err("That image format does not support the requested bit depth".into());
     }
     if let Some(size) = args.size {
-        if !crate::editor::model_paint_data::RESOLUTIONS.contains(&size) {
-            return Err("Export resolution must be 512, 1024, 2048 or 4096".into());
+        if args.native_size {
+            return Err("Choose either size or native_size".into());
+        }
+        if !(16..=8192).contains(&size) {
+            return Err("Export resolution must be between 16 and 8192 pixels".into());
         }
         settings.file.size = Some(size);
+    }
+    if args.native_size {
+        settings.file.size = None;
+    }
+    if let Some(normal) = &args.normal {
+        if let Some(strength) = normal.height_strength {
+            if !(0.0..=8.0).contains(&strength) {
+                return Err("Normal height strength must be between 0 and 8".into());
+            }
+            settings.file.normal.height_strength = strength;
+        }
+        if let Some(use_baked) = normal.use_baked {
+            settings.file.normal.use_baked = use_baked;
+        }
     }
     if let Some(padding) = args.padding {
         settings.padding = padding;
@@ -192,4 +301,35 @@ fn export_settings(
         settings.width = width;
     }
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_export_resolves_saved_templates_and_builtin_ids() {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("export.json");
+        std::fs::write(
+            &profile,
+            br#"{"recipes":[{"name":"Saved Metal","maps":[
+            {"name":"Metal","layout":"Grayscale","channels":[{"src":"Metallic"}]}
+        ]}]}"#,
+        )
+        .unwrap();
+        let preferences = prefs::Store::open(Some(profile));
+        assert_eq!(
+            named_template(&preferences, "SAVED Metal").unwrap(),
+            Template::Custom(0)
+        );
+        assert_eq!(
+            named_template(&preferences, "unity_urp").unwrap(),
+            Template::UnityUrp
+        );
+        assert_eq!(
+            named_template(&preferences, "Unreal Engine").unwrap(),
+            Template::Unreal
+        );
+    }
 }

@@ -944,6 +944,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     mut baked: ResMut<bake::State>,
     recovery: Res<editing::recovery::Preferences>,
     mut messages: ParamSet<(MessageReader<Action>, MessageWriter<Action>)>,
+    #[cfg(feature = "mcp")] render_requests: Query<&mcp_preview::offscreen::RenderRequest>,
 ) {
     let replies = std::mem::take(&mut *gpu_queue.replies.lock().unwrap());
     for reply in replies {
@@ -1039,7 +1040,11 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
                 runtime.lives.entry(key).or_insert_with(|| Live::new(doc, object, slot, &images, &materials));
             }
-            if session.diagnostic_channel().is_some()
+            #[cfg(feature = "mcp")]
+            let render_channels = render_requests.iter().any(|request| request.needs_channels(index));
+            #[cfg(not(feature = "mcp"))]
+            let render_channels = false;
+            if (session.diagnostic_channel().is_some() || render_channels)
                 && !runtime.lives.iter().any(|((model, _, _), live)| *model == index && live.task.is_some())
                 && let Some((object, slot)) = doc.objects.iter()
                     .flat_map(|object| (0..object.materials.len()).map(move |slot| (object, slot)))
@@ -1369,7 +1374,54 @@ pub(in crate::editor::ui::model_viewer) fn update(
     }
 }
 
+#[derive(Clone, Copy)]
+struct StrokeStyle {
+    projection: BrushProjection,
+    symmetry: Symmetry,
+    paint_through: bool,
+    angle_limit: f32,
+    tip: Option<usize>,
+    tip_angle: f32,
+    follow_stroke: bool,
+    grain: Option<usize>,
+    grain_strength: f32,
+    grain_scale: f32,
+    grain_angle: f32,
+    grain_invert: bool,
+    grain_uv: bool,
+    variation: stroke::Variation,
+}
+
+impl From<&Session> for StrokeStyle {
+    fn from(session: &Session) -> Self {
+        Self {
+            projection: session.projection,
+            symmetry: session.symmetry,
+            paint_through: session.paint_through,
+            angle_limit: session.angle_limit,
+            tip: session.tip,
+            tip_angle: session.tip_angle,
+            follow_stroke: session.follow_stroke,
+            grain: session.grain,
+            grain_strength: session.grain_strength,
+            grain_scale: session.grain_scale,
+            grain_angle: session.grain_angle,
+            grain_invert: session.grain_invert,
+            grain_uv: session.grain_uv,
+            variation: stroke::Variation {
+                scatter: session.brush_scatter / 100.,
+                size: session.brush_size_jitter / 100.,
+                angle: session.brush_angle_jitter / 100.,
+            },
+        }
+    }
+}
+
 fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool, erase: bool, fill: bool) -> Brush {
+    brush_for_style(session, tips, object, uv, erase, fill, StrokeStyle::from(session))
+}
+
+fn brush_for_style(session: &Session, tips: &tips::Library, object: &Object, uv: bool, erase: bool, fill: bool, style: StrokeStyle) -> Brush {
     let masking = session.editing_mask && session.has_mask();
     let channel = session.stroke_channels().trailing_zeros() as usize;
     let percent_byte = |value: f32| (value * 2.55).round() as u8;
@@ -1398,17 +1450,17 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
     } else {
         session.brush_color()
     };
-    let texture = session
+    let texture = style
         .grain
         .and_then(|i| tips.grains.get(i))
-        .filter(|_| session.grain_strength > 0. && !fill);
+        .filter(|_| style.grain_strength > 0. && !fill);
     let projection = if uv || fill {
         BrushProjection::Screen
     } else {
-        session.projection
+        style.projection
     };
-    let grain_uv = session.grain_uv || projection == BrushProjection::Uv;
-    let symmetry = !uv && session.symmetry != Symmetry::Off && !fill;
+    let grain_uv = style.grain_uv || projection == BrushProjection::Uv;
+    let symmetry = !uv && style.symmetry != Symmetry::Off && !fill;
     let mut mirror = [0.; 4];
     let mut extent = 1.;
     if symmetry || texture.is_some() {
@@ -1420,7 +1472,7 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
             .max_element()
             .max(1e-6);
         if symmetry {
-            let normal = object.transform.rotation * session.symmetry.normal();
+            let normal = object.transform.rotation * style.symmetry.normal();
             let center = object.transform.transform_point((min + max) * 0.5);
             mirror = normal.extend(normal.dot(center)).to_array();
         }
@@ -1455,33 +1507,29 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
         fill_mode: session.fill_mode,
         fill_angle: session.fill_angle,
         fill_padding: session.fill_padding,
-        variation: stroke::Variation {
-            scatter: session.brush_scatter / 100.,
-            size: session.brush_size_jitter / 100.,
-            angle: session.brush_angle_jitter / 100.,
-        },
+        variation: style.variation,
         tip: if fill {
             None
         } else {
-            session
+            style
                 .tip
                 .and_then(|i| tips.entries.get(i))
                 .map(|tip| BrushTip {
                     image: tip.image.id(),
-                    angle: session.tip_angle.to_radians(),
-                    follow: session.follow_stroke,
+                    angle: style.tip_angle.to_radians(),
+                    follow: style.follow_stroke,
                 })
         },
         grain: texture.map(|image| BrushGrain {
             image: image.image.id(),
-            strength: session.grain_strength / 100.,
+            strength: style.grain_strength / 100.,
             repeat: if grain_uv {
-                session.grain_scale
+                style.grain_scale
             } else {
-                session.grain_scale / extent
+                style.grain_scale / extent
             },
-            angle: session.grain_angle.to_radians(),
-            invert: session.grain_invert,
+            angle: style.grain_angle.to_radians(),
+            invert: style.grain_invert,
             uv: grain_uv,
         }),
         mirror,
@@ -1489,8 +1537,8 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
         paint_through: !uv
             && !fill
             && projection == BrushProjection::Screen
-            && session.paint_through,
-        facing_limit: session.angle_limit.to_radians().cos(),
+            && style.paint_through,
+        facing_limit: style.angle_limit.to_radians().cos(),
     }
 }
 
