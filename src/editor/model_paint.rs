@@ -29,6 +29,7 @@ pub(in crate::editor) use bake::{import_bake_map_bits, import_generator_inputs, 
 pub(super) mod pathtrace;
 #[path = "model_paint_post.rs"]
 pub(super) mod post;
+pub(in crate::editor) use post::DocumentPost;
 
 #[path = "model_paint_materials.rs"]
 mod materials;
@@ -63,6 +64,8 @@ use smart::SMART_MATERIALS;
 mod tips;
 #[path = "model_paint_ui.rs"]
 mod ui;
+#[path = "model_paint_uv_seams.rs"]
+pub(super) mod uv_seams;
 #[path = "model_paint_sets.rs"]
 pub(super) mod sets;
 pub(super) use ui::{ShaderMaker, decorate_shader_code, refresh, refresh_graph, refresh_shader_maker, setup};
@@ -322,11 +325,63 @@ pub(in crate::editor) enum ShelfPlacement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::editor) enum PreviewParameter {
+    Height,
+    Emission,
+    Occlusion,
+    UvWireOpacity,
+}
+
+impl PreviewParameter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Height => "Сила рельефа",
+            Self::Emission => "Сила свечения",
+            Self::Occlusion => "Сила AO, %",
+            Self::UvWireOpacity => "Непрозрачность UV-сетки, %",
+        }
+    }
+
+    fn min(self) -> f32 {
+        if self == Self::UvWireOpacity { 5. } else { 0. }
+    }
+
+    fn max(self) -> f32 {
+        match self {
+            Self::Height => 8.,
+            Self::Emission => 20.,
+            Self::Occlusion | Self::UvWireOpacity => 100.,
+        }
+    }
+
+    fn value(self, doc: &crate::editor::model_document::Document) -> f32 {
+        let preview = doc.paint_preview;
+        match self {
+            Self::Height => preview.height_strength.unwrap_or(1.),
+            Self::Emission => preview.emission_strength,
+            Self::Occlusion => preview.ao_strength * 100.,
+            Self::UvWireOpacity => doc.paint_uv.wire_opacity * 100.,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::editor) enum PreviewEdit {
+    Value { model: usize, parameter: PreviewParameter, value: f32 },
+    AutomaticHeight,
+    BakedNormal,
+    UvWire,
+    UvSeams2d,
+    UvSeams3d,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum PaintAction {
     Tool(PaintTool),
     Panel(Panel),
     View(View),
     Preview3d(Preview3d),
+    PreviewMaterial(PreviewEdit),
     Category(Category),
     BrushTip(Option<usize>),
     ImportBrushTip,
@@ -562,6 +617,12 @@ impl PaintAction {
             Self::PreviewMask => "Показать маску вместо материала в UV-виде.",
             Self::PathTrace => "F10 · Переключить трассировку света в 3D-предпросмотре.",
             Self::PostPanel => "Показать настройки цвета и эффектов 3D-предпросмотра.",
+            Self::PreviewMaterial(PreviewEdit::AutomaticHeight) => "Переключить автоматическую силу рельефа.",
+            Self::PreviewMaterial(PreviewEdit::BakedNormal) => "Объединять запечённые нормали с нормалями из слоёв.",
+            Self::PreviewMaterial(PreviewEdit::UvWire) => "Показать контуры граней поверх карты в UV-виде.",
+            Self::PreviewMaterial(PreviewEdit::UvSeams2d) => "Подсветить границы островов и отмеченные швы поверх UV-карты.",
+            Self::PreviewMaterial(PreviewEdit::UvSeams3d) => "Подсветить UV-швы на видимой стороне 3D-модели.",
+            Self::PreviewMaterial(PreviewEdit::Value { .. }) => "Изменить предпросмотр материала.",
             Self::TraceSamples(_) => "Число отсчётов на пиксель. Дополнительные отсчёты уменьшают шум.",
             Self::TraceBounces(_) => "Предельное число отражений света.",
             Self::TraceGround => "Добавить плоскость под моделью для теней в трассированном виде.",
@@ -2066,6 +2127,7 @@ impl Session {
                 }
             }
             PaintAction::PostPanel => self.post_panel = !self.post_panel,
+            PaintAction::PreviewMaterial(_) => {}
             PaintAction::TraceSamples(direction) => {
                 let samples = self.trace_settings.samples;
                 self.trace_settings.samples = if direction < 0 { samples / 2 } else { samples * 2 }
@@ -3253,6 +3315,39 @@ pub(super) fn actions(
     {
         let session = paint.sessions.get_mut(&index).unwrap();
         if let Action::ModelView(ModelViewAction::Paint(mut action)) = action {
+            if let PaintAction::PreviewMaterial(edit) = action {
+                if !editor.browser_popup && !editor.hdri_library_open
+                    && let Some(doc) = editing.documents.get_mut(&index)
+                    && doc.can_store_paint_preview()
+                {
+                    let preview = &mut doc.paint_preview;
+                    let previous = (*preview, doc.paint_uv);
+                    match edit {
+                        PreviewEdit::AutomaticHeight => {
+                            preview.height_strength = if preview.height_strength.is_some() { None } else { Some(1.) };
+                        }
+                        PreviewEdit::BakedNormal => preview.use_baked_normal = !preview.use_baked_normal,
+                        PreviewEdit::UvWire => doc.paint_uv.show_wire = !doc.paint_uv.show_wire,
+                        PreviewEdit::UvSeams2d => doc.paint_uv.show_seams_2d = !doc.paint_uv.show_seams_2d,
+                        PreviewEdit::UvSeams3d => doc.paint_uv.show_seams_3d = !doc.paint_uv.show_seams_3d,
+                        PreviewEdit::Value { model, parameter, value }
+                            if model == index && (parameter.min()..=parameter.max()).contains(&value) =>
+                        {
+                            match parameter {
+                                PreviewParameter::Height => preview.height_strength = Some(value),
+                                PreviewParameter::Emission => preview.emission_strength = value,
+                                PreviewParameter::Occlusion => preview.ao_strength = value / 100.,
+                                PreviewParameter::UvWireOpacity => doc.paint_uv.wire_opacity = value / 100.,
+                            }
+                        }
+                        PreviewEdit::Value { .. } => {}
+                    }
+                    if (*preview, doc.paint_uv) != previous {
+                        doc.ui_revision += 1;
+                    }
+                }
+                continue;
+            }
             if let PaintAction::ShaderToGraph { model, definition, library_revision } = action {
                 if model != index || editor.browser_popup || editor.hdri_library_open {
                     continue;

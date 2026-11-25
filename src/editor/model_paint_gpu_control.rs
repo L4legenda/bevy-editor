@@ -181,6 +181,7 @@ impl Controller {
             object: map.object as u32 + 1,
             slot: map.slot as u32,
             relief_factor: work.preview.relief_factor(work.surface.size),
+            baked_preview: work.baked_preview.clone(),
             fix: None,
         });
         true

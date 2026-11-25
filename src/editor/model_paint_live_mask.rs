@@ -11,6 +11,7 @@ struct Source {
     offset: Vec2,
     template: Handle<StandardMaterial>,
     preview: crate::editor::model_document::PaintPreview,
+    baked_preview: Option<Arc<composite::PreviewBake>>,
 }
 
 impl Source {
@@ -22,6 +23,7 @@ impl Source {
             && self.offset == other.offset
             && self.template == other.template
             && self.preview == other.preview
+            && composite::same_preview_bake(self.baked_preview.as_ref(), other.baked_preview.as_ref())
     }
 
     fn current(&self, model: usize, doc: &Document, binding: (usize, usize)) -> bool {
@@ -162,13 +164,14 @@ fn compose_preview(
             Arc::make_mut(mask).bind(context.clone());
         }
     }
-    (reduced, compose_maps(&surface, source.preview))
+    (reduced, compose_maps(&surface, source.preview, source.baked_preview.as_deref()))
 }
 
 pub(in crate::editor::ui::model_viewer) fn update(
     editor: Res<Editor>,
     editing: Res<editing::State>,
     paint: Res<PaintState>,
+    runtime: Res<Runtime>,
     mut baked: ResMut<bake::State>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -209,15 +212,18 @@ pub(in crate::editor::ui::model_viewer) fn update(
         {
             return None;
         }
+        let key = (model, binding.0, binding.1);
+        let live = runtime.lives.get(&key);
         Some((
             Source {
-                key: (model, binding.0, binding.1),
+                key,
                 surface: surface.clone(),
                 geometry: object.geometry.clone(),
                 transform: object.transform,
                 offset: object.uv_offset(binding.1),
-                template: slot.material.clone(),
+                template: live.map_or_else(|| slot.material.clone(), |live| live.origin.material.clone()),
                 preview: doc.paint_preview,
+                baked_preview: live.and_then(|live| live.gpu.as_ref()?.baked_preview.clone()),
             },
             plane,
         ))
@@ -262,6 +268,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             updates,
             &source.template,
             source.preview.emission_strength,
+            source.baked_preview.as_ref(),
             &mut images,
             &mut materials,
             &mut uploads,

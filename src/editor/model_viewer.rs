@@ -157,6 +157,7 @@ impl Plugin for ModelViewerPlugin {
                     .after(environment::refresh),
             )
             .add_systems(Update, paint::refresh_graph.after(paint::refresh))
+            .add_systems(Update, paint::uv_seams::sync.after(paint::sets::refresh))
             .add_systems(Update, paint::refresh_shader_maker.after(paint::refresh))
             .add_systems(Update, paint::decorate_shader_code.after(paint::refresh_shader_maker))
             .add_systems(Last, editing::update_recovery)

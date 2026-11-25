@@ -162,6 +162,7 @@ fn model_paint_benchmark_40k_triangles() {
         Work {
             surface,
             preview: Default::default(),
+            baked_preview: None,
             stroke: None,
         },
         vec![

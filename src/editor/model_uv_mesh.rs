@@ -186,6 +186,51 @@ pub(super) fn apply(
     Ok(result)
 }
 
+type UvEdgeUse = (usize, Vec2, Vec2);
+
+fn uv_edge_uses(mesh: &Geometry) -> BTreeMap<Edge, Vec<UvEdgeUse>> {
+    let mut edges = BTreeMap::<Edge, Vec<UvEdgeUse>>::new();
+    for (face, polygon) in mesh.faces.iter().enumerate() {
+        for (a, b) in polygon.corners.iter().zip(polygon.corners.iter().cycle().skip(1)) {
+            let (a, b) = if a.vertex < b.vertex { (a, b) } else { (b, a) };
+            edges.entry(Edge::new(a.vertex, b.vertex)).or_default().push((face, a.uv, b.uv));
+        }
+    }
+    edges
+}
+
+fn uv_split(adjacent: &[UvEdgeUse], mut shared: impl FnMut(usize, usize)) -> bool {
+    let mut seam = adjacent.len() == 1;
+    for (i, &(face, a, b)) in adjacent.iter().enumerate() {
+        for &(neighbor, c, d) in &adjacent[..i] {
+            if a.abs_diff_eq(c, 0.000001) && b.abs_diff_eq(d, 0.000001) {
+                shared(face, neighbor);
+            } else {
+                seam = true;
+            }
+        }
+    }
+    seam
+}
+
+/// Paint overlays also include edges explicitly marked as seams in the UV editor.
+pub(super) fn seam_faces(mesh: &Geometry) -> impl Iterator<Item = (Edge, Vec<usize>)> + '_ {
+    uv_edge_uses(mesh).into_iter().filter_map(|(edge, adjacent)| {
+        (mesh.uv_seams.contains(&edge) || uv_split(&adjacent, |_, _| {}))
+            .then(|| (edge, adjacent.into_iter().map(|(face, _, _)| face).collect()))
+    })
+}
+
+pub(super) fn has_face_uv(face: &crate::editor::model_mesh::Face) -> bool {
+    let Some(origin) = face.corners.first().map(|corner| corner.uv) else {
+        return false;
+    };
+    let area = face.corners.iter().zip(face.corners.iter().cycle().skip(1))
+        .map(|(a, b)| (a.uv - origin).perp_dot(b.uv - origin))
+        .sum::<f32>();
+    area.is_finite() && area.abs() > 1e-8
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Atlas {
     pub islands: Vec<usize>,
@@ -211,16 +256,8 @@ impl Atlas {
             }
             i
         }
-        let mut edges: BTreeMap<Edge, Vec<(usize, Vec2, Vec2)>> = BTreeMap::new();
         let mut atlas = Self::default();
-        for (fi, f) in mesh.faces.iter().enumerate() {
-            for (a, b) in f.corners.iter().zip(f.corners.iter().cycle().skip(1)) {
-                let (a, b) = if a.vertex < b.vertex { (a, b) } else { (b, a) };
-                edges
-                    .entry(Edge::new(a.vertex, b.vertex))
-                    .or_default()
-                    .push((fi, a.uv, b.uv));
-            }
+        for f in &mesh.faces {
             let origin = offset(f.material);
             if f.corners
                 .iter()
@@ -235,21 +272,13 @@ impl Atlas {
                     * 0.5;
             }
         }
-        for (edge, adjacent) in &edges {
-            let mut seam = adjacent.len() == 1;
-            for (i, &(fi, a, b)) in adjacent.iter().enumerate() {
-                for &(fj, c, d) in &adjacent[..i] {
-                    if a.abs_diff_eq(c, 0.000001) && b.abs_diff_eq(d, 0.000001) {
-                        let x = root(&mut parent, fi);
-                        let y = root(&mut parent, fj);
-                        parent[y] = x;
-                    } else {
-                        seam = true;
-                    }
-                }
-            }
-            if seam {
-                atlas.seams.push(*edge);
+        for (edge, adjacent) in uv_edge_uses(mesh) {
+            if uv_split(&adjacent, |face, neighbor| {
+                let x = root(&mut parent, face);
+                let y = root(&mut parent, neighbor);
+                parent[y] = x;
+            }) {
+                atlas.seams.push(edge);
             }
         }
         let mut ids = BTreeMap::new();

@@ -189,6 +189,7 @@ fn gpu_compare_complex_paint() {
             0,
             4.,
             None,
+            None,
         );
         let pose = Transform::from_xyz(0., 0., 4.);
         let view = View {

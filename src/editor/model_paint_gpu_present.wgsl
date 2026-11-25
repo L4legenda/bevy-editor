@@ -10,6 +10,21 @@ struct Params {
 @group(0) @binding(5) var out0:texture_storage_2d<rgba8unorm,write>;
 @group(0) @binding(6) var out1:texture_storage_2d<rgba8unorm,write>;
 @group(0) @binding(7) var<storage,read> tiles:array<u32>;
+@group(0) @binding(8) var<storage,read> baked_normal:array<u32>;
+
+fn composite_normal(pixel:vec2<u32>, paint:vec3<f32>)->vec3<f32> {
+    let size=baked_normal[0];
+    if(size==0u){return paint;}
+    let uv=(2u*pixel+vec2<u32>(1u))*size/(2u*u.settings.x);
+    let base=unpack4x8unorm(baked_normal[1u+uv.y*size+uv.x]);
+    if(base.a==0.0){return paint;}
+    if((pack4x8unorm(vec4<f32>(paint,0.0)) & 0x00ffffffu)==0x00ff8080u){return base.rgb;}
+    let b=normalize(base.rgb*2.0-1.0);
+    let p=normalize(paint*2.0-1.0);
+    let combined=vec3<f32>(b.xy+p.xy,b.z*p.z);
+    let n=select(vec3<f32>(0.0,0.0,1.0),normalize(combined),dot(combined,combined)>0.0);
+    return unpack4x8unorm(pack4x8unorm(vec4<f32>(n*0.5+0.5,1.0))).rgb;
+}
 fn h(p:vec2<i32>,from_current:bool)->f32 {
     let q=clamp(p,vec2<i32>(0),vec2<i32>(i32(u.settings.x)-1));let i=u32(q.y)*u.settings.x+u32(q.x);
     if(from_current){return unpack4x8unorm(composite[i]).r;}
@@ -41,9 +56,10 @@ fn display(p:vec3<u32>){
     if(channel==1u){a=vec4<f32>(1.0,v.r,textureLoad(rm_map,at,0).b,1.0);}
     if(channel==2u){a=vec4<f32>(1.0,textureLoad(rm_map,at,0).g,v.r,1.0);}
     if(channel==3u||channel==6u){
-        let normal=select(v,unpack4x8unorm(auxiliary[i]),channel==3u);
+        let paint=select(v,unpack4x8unorm(auxiliary[i]),channel==3u);
+        let normal=composite_normal(p.xy,paint.rgb);
         if(u.forward.w==0.0){
-            a=vec4<f32>(normal.rgb,1.0);
+            a=vec4<f32>(normal,1.0);
         }else{
             let dx=(h(at+vec2<i32>(1,0),channel==3u)-h(at-vec2<i32>(1,0),channel==3u))*u.forward.w;
             let dy=(h(at+vec2<i32>(0,1),channel==3u)-h(at-vec2<i32>(0,1),channel==3u))*u.forward.w;

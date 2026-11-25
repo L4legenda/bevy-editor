@@ -416,7 +416,8 @@ fn capture(
             )
         };
         let view = pose.to_matrix().inverse();
-        let (lighting, exposure, curve) = env.trace_light(key_light.single().ok());
+        let (lighting, _, curve) = env.trace_light(key_light.single().ok());
+        let post = env.paint_post(Some(doc));
         Some(Arc::new(Request {
             serial: main.serial,
             output: main.output.as_ref()?.2.id(),
@@ -431,9 +432,9 @@ fn capture(
             },
             lighting,
             grade: Grade {
-                exposure,
+                exposure: post.exposure,
                 curve,
-                effects: env.post,
+                effects: post.effects,
             },
             settings: super::Settings {
                 emission_strength: doc.paint_preview.emission_strength,
@@ -524,16 +525,20 @@ fn sync_raster_grade(
                 .get(&index)
                 .is_some_and(|session| !session.diagnostic_3d() && session.view != View::Two)
     }) && canvas.image == ui.image;
+    let doc = editor.viewing_model.and_then(|index| editing.documents.get(&index));
+    let post = env.paint_post(doc);
+    let (_, camera_exposure, curve) = env.trace_light(None);
+    let exposure = post.exposure - camera_exposure;
     for (entity, mut tone, dithering, previous) in &mut cameras {
-        if raster && env.post.enabled() {
+        if raster && (post.effects.enabled() || exposure != 0.) {
             let original_dither =
                 previous.map_or_else(|| dithering.as_deref().copied(), |grade| grade.1);
             let grade = RasterGrade(
                 Grade {
                     // Raster PBR already receives exposure from the model camera.
-                    exposure: 0.0,
-                    curve: env.trace_light(None).2,
-                    effects: env.post,
+                    exposure,
+                    curve,
+                    effects: post.effects,
                 },
                 original_dither,
             );

@@ -1037,6 +1037,7 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     app.world_mut().resource_mut::<Viewer>().yaw -= 0.3;
     use super::environment::{EnvironmentAction, Setting};
     use super::post::Field;
+    let preferences = app.world().resource::<environment::Settings>().clone();
     for _ in 0..5 {
         paint_message(&mut app, PaintAction::TraceSamples(-1));
     }
@@ -1062,17 +1063,31 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
         world.query::<(Entity, &AccessibleLabel)>().iter(world)
             .find(|(_, label)| label.0 == "Просмотр: Насыщенность").unwrap().0
     };
+    scroll_to_paint_entity(&mut app, saturation_slider);
+    assert!(app.world().get::<bevy::ui::InteractionDisabled>(saturation_slider).is_none());
     app.world_mut().trigger(bevy::ui_widgets::ValueChange::<f32> {
         source: saturation_slider, value: 0.0, is_final: false,
     });
     move_pointer(&mut app, window, Vec2::new(8.0, 512.0));
     capture_when(&mut app, &target, &output.join("viewport-graded.png"), gray);
     assert_eq!(samples(app.world()), Some(before_grade), "post effects reuse the accumulated HDR frame");
+    assert_eq!(*app.world().resource::<environment::Settings>(), preferences);
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    assert_eq!(Field::Saturation.value(doc.paint_post.unwrap().effects), 0.0);
     paint_message(&mut app, PaintAction::PreviewShader(None));
     assert_eq!(canvas_image(&mut app), raster);
     capture_when(&mut app, &target, &output.join("viewport-raster-graded.png"), gray);
     app.world_mut().write_message(saturation(1.0));
     capture_when(&mut app, &target, &output.join("viewport-raster-reset.png"), |image| !gray(image));
+    let exposure = Action::ModelView(ModelViewAction::Environment(
+        EnvironmentAction::Set(Setting::PaintExposure, 1.5, true),
+    ));
+    app.world_mut().write_message(exposure);
+    warm(&mut app, 4);
+    let world = app.world_mut();
+    let grade = world.query::<&super::post::RasterGrade>().single(world).unwrap();
+    assert_eq!(grade.0.exposure, 1.5 - preferences.paint_post(None).exposure);
+    assert_eq!(*world.resource::<environment::Settings>(), preferences);
 }
 
 #[test]
@@ -4425,6 +4440,256 @@ fn gpu_model_paint_texture_fill_reprojects_and_undoes() {
     assert!(pixels(&app) == before_variation);
 }
 #[test]
+#[ignore = "requires GPU; checks independent 2D and depth-tested 3D UV seam controls"]
+fn gpu_paint_uv_seams_show_island_borders_in_2d_and_depth_test_in_3d() {
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+    let (mut app, window, target) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let start = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 20);
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let object = &mut doc.objects[0];
+        let mut mesh = Geometry::default();
+        for (slot, (extent, z)) in [(0.9, 0.25), (0.35, -0.25)].into_iter().enumerate() {
+            let vertices = [Vec2::new(-extent, -extent), Vec2::new(extent, -extent),
+                Vec2::new(extent, extent), Vec2::new(-extent, extent)];
+            mesh.positions.extend(vertices.map(|vertex| vertex.extend(z)));
+            let uvs = [Vec2::new(0.2, 0.8), Vec2::new(0.8, 0.8),
+                Vec2::new(0.8, 0.2), Vec2::new(0.2, 0.2)];
+            for triangle in [[0, 1, 2], [0, 2, 3]] {
+                mesh.faces.push(Face {
+                    corners: triangle.map(|index| {
+                        let mut corner = Corner::new(4 * slot + index);
+                        corner.uv = uvs[index];
+                        corner
+                    }).into(),
+                    material: slot,
+                    smooth: false,
+                });
+            }
+        }
+        object.materials.push(object.materials[0].clone());
+        object.geometry = mesh.into();
+        object.transform = Transform::IDENTITY;
+        doc.mode = Mode::Paint;
+        doc.revision += 1;
+    }
+    paint_ready(&mut app);
+    {
+        let mut viewer = app.world_mut().resource_mut::<Viewer>();
+        viewer.center = Vec3::ZERO;
+        viewer.distance = 4.;
+        viewer.yaw = 0.;
+        viewer.pitch = 0.;
+        viewer.orthographic = false;
+    }
+    paint_message(&mut app, PaintAction::Panel(Panel::Preview));
+    paint_message(&mut app, PaintAction::View(View::Three));
+    let viewport = labelled(&mut app, "3D-вид модели");
+    let points = {
+        let viewer = app.world().resource::<Viewer>();
+        [Vec3::new(0.9, 0., 0.25), Vec3::new(0.35, 0., -0.25)]
+            .map(|point| editing::input::project(viewer, viewport, point).unwrap().round().as_uvec2())
+    };
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Wireframe)));
+    warm(&mut app, 4);
+    assert!(app.world().resource::<editing::State>().wireframe);
+    let output = std::env::temp_dir().join(format!("bevy-uv-seams-{}", bevy::asset::uuid::Uuid::new_v4()));
+    std::fs::create_dir(&output).unwrap();
+    let base = capture_when(&mut app, &target, &output.join("before.png"), |_| true);
+    let toggle_3d = PaintAction::PreviewMaterial(PreviewEdit::UvSeams3d);
+    scroll_to_paint_control(&mut app, toggle_3d);
+    paint_click(&mut app, window, toggle_3d);
+    let changed = |image: &image::RgbaImage, p: UVec2| {
+        (p.y - 3..=p.y + 3).any(|y| (p.x - 3..=p.x + 3).any(|x| {
+            let pixel = image.get_pixel(x, y);
+            let original = base.get_pixel(x, y);
+            pixel[0] > pixel[1].saturating_add(45) &&
+                pixel[1].abs_diff(original[1]) > 25
+        }))
+    };
+    let image = capture_when(&mut app, &target, &output.join("seams-3d.png"), |image| changed(image, points[0]));
+    assert!(!changed(&image, points[1]), "the front surface must occlude seams on the rear surface");
+    {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<&ChildOf, With<uv_seams::Overlay>>();
+        assert_eq!(query.iter(world).count(), 2);
+        assert!(!world.resource::<editing::State>().documents[&0].paint_uv.show_seams_2d);
+    }
+
+    paint_message(&mut app, PaintAction::View(View::Split));
+    let toggle_2d = PaintAction::PreviewMaterial(PreviewEdit::UvSeams2d);
+    scroll_to_paint_control(&mut app, toggle_2d);
+    paint_click(&mut app, window, toggle_2d);
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let (node, image) = world.query_filtered::<(&Node, &ImageNode), With<ui::UvSeams2d>>()
+            .single(world).unwrap();
+        if node.display == Display::Flex {
+            let map = world.resource::<Assets<Image>>().get(&image.image).unwrap();
+            let data = map.data.as_ref().unwrap();
+            let size = map.size().x;
+            let x = size / 2;
+            let border_y = (0.2 * (size - 1) as f32).round() as u32;
+            assert!(data[((border_y * size + x) * 4 + 3) as usize] > 127);
+            assert_eq!(data[((x * size + x) * 4 + 3) as usize], 0);
+            let wire = world.query_filtered::<&Node, With<ui::UvWire>>().single(world).unwrap();
+            assert_eq!(wire.display, Display::None);
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 20, "2D seams were not prepared");
+    }
+    scroll_to_paint_control(&mut app, toggle_3d);
+    paint_click(&mut app, window, toggle_3d);
+    warm(&mut app, 3);
+    {
+        let world = app.world_mut();
+        assert_eq!(world.query_filtered::<Entity, With<uv_seams::Overlay>>().iter(world).count(), 0);
+        let layer = world.query_filtered::<&Node, With<ui::UvSeams2d>>().single(world).unwrap();
+        assert_eq!(layer.display, Display::Flex);
+    }
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
+#[ignore = "requires GPU; checks rendered UV wireframes on two UDIM tiles and during viewport navigation"]
+fn gpu_paint_uv_wire_overlay_tracks_udim_and_navigation() {
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+    let (mut app, window, target) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let start = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 20);
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let object = &mut doc.objects[0];
+        let mut mesh = Geometry::default();
+        for (face, (offset, min, max)) in [
+            (Vec2::ZERO, Vec2::new(0.18, 0.20), Vec2::new(0.63, 0.43)),
+            (Vec2::new(2., -1.), Vec2::new(0.27, 0.62), Vec2::new(0.82, 0.88)),
+        ].into_iter().enumerate() {
+            mesh.positions.extend([Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y]
+                .map(|point| point + Vec3::Z * face as f32));
+            mesh.faces.push(Face {
+                corners: [min, Vec2::new(max.x, min.y), max, Vec2::new(min.x, max.y)]
+                    .into_iter().enumerate().map(|(i, uv)| {
+                        let mut corner = Corner::new(face * 4 + i);
+                        corner.uv = offset + uv;
+                        corner
+                    }).collect(),
+                material: 0,
+                smooth: false,
+            });
+        }
+        object.geometry = mesh.into();
+        crate::editor::model_document::udim::import(object, true);
+        assert_eq!(object.materials[0].udim().unwrap().number(), 1001);
+        assert_eq!(object.materials[1].udim().unwrap().number(), 1013);
+        doc.mode = Mode::Paint;
+        doc.revision += 1;
+    }
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::View(View::Two));
+    paint_message(&mut app, PaintAction::Panel(Panel::Preview));
+    paint_message(&mut app, PaintAction::Channel(1));
+    let toggle = PaintAction::PreviewMaterial(PreviewEdit::UvWire);
+    scroll_to_paint_control(&mut app, toggle);
+    paint_click(&mut app, window, toggle);
+    paint_message(&mut app, PaintAction::PreviewMaterial(PreviewEdit::Value {
+        model: 0, parameter: PreviewParameter::UvWireOpacity, value: 80.,
+    }));
+
+    fn rect(world: &World, entity: Entity) -> Rect {
+        let node = world.get::<ComputedNode>(entity).unwrap();
+        let pose = world.get::<UiGlobalTransform>(entity).unwrap();
+        Rect::from_center_size(
+            pose.affine().translation * node.inverse_scale_factor(),
+            node.size() * node.inverse_scale_factor(),
+        )
+    }
+
+    let first_top = Vec2::new(0.4, 0.2);
+    let second_top = Vec2::new(0.55, 0.62);
+    let wire_ready = |app: &mut App, present: Vec2, absent: Vec2| {
+        let start = std::time::Instant::now();
+        loop {
+            frame(app);
+            let world = app.world_mut();
+            let entity = world.query_filtered::<Entity, With<ui::UvWire>>().single(world).unwrap();
+            let wire = world.get::<ImageNode>(entity).unwrap();
+            let map = world.resource::<Assets<Image>>().get(&wire.image).unwrap();
+            let opaque_at = |uv: Vec2| {
+                let p = (uv * (map.size().as_vec2() - Vec2::ONE)).round().as_uvec2();
+                let i = ((p.y * map.size().x + p.x) * 4 + 3) as usize;
+                map.data.as_ref().and_then(|data| data.get(i)).is_some_and(|alpha| *alpha > 127)
+            };
+            if world.get::<Node>(entity).unwrap().display == Display::Flex && opaque_at(present) {
+                assert!(!opaque_at(absent));
+                assert_eq!(wire.color, Color::WHITE.with_alpha(0.8));
+                let parent = world.get::<ChildOf>(entity).unwrap().parent();
+                let clip = world.get::<bevy::ui::CalculatedClip>(entity).unwrap();
+                assert_eq!(clip, world.get::<bevy::ui::CalculatedClip>(parent).unwrap());
+                let canvas = rect(world, parent);
+                let wire = rect(world, entity);
+                assert!(wire.min.distance(canvas.min) < 1.);
+                assert!(wire.max.distance(canvas.max) < 1.);
+                return canvas;
+            }
+            assert!(start.elapsed().as_secs() < 20, "UV wireframe texture was not ready");
+        }
+    };
+    let first = wire_ready(&mut app, first_top, second_top);
+    let pixel = (first.min + first_top * first.size()).round().as_uvec2();
+    let output = std::env::temp_dir().join(format!("bevy-uv-wire-{}", bevy::asset::uuid::Uuid::new_v4()));
+    std::fs::create_dir(&output).unwrap();
+    let has_gold = |image: &image::RgbaImage| {
+        (pixel.y.saturating_sub(2)..=pixel.y + 2).any(|y| {
+            let p = image.get_pixel(pixel.x, y);
+            p[0].saturating_sub(p[2]) > 25
+        })
+    };
+    capture_when(&mut app, &target, &output.join("uv-wire.png"), has_gold);
+    paint_click(&mut app, window, toggle);
+    capture_when(&mut app, &target, &output.join("uv-wire-hidden.png"), |image| !has_gold(image));
+    std::fs::remove_dir_all(output).unwrap();
+    paint_click(&mut app, window, toggle);
+    paint_message(&mut app, PaintAction::Set(1));
+    let second = wire_ready(&mut app, second_top, first_top);
+
+    move_pointer(&mut app, window, second.center());
+    app.world_mut().write_message(bevy::input::mouse::MouseWheel {
+        window, unit: bevy::input::mouse::MouseScrollUnit::Line, x: 0., y: 5.,
+        phase: bevy::input::touch::TouchPhase::Moved,
+    });
+    let zoomed = wire_ready(&mut app, second_top, first_top);
+    assert!(zoomed.width() > second.width() * 1.5);
+    let press = |app: &mut App, state| {
+        app.world_mut().write_message(bevy::input::mouse::MouseButtonInput {
+            window, button: MouseButton::Middle, state,
+        });
+        frame(app);
+    };
+    let delta = Vec2::new(23., 15.);
+    press(&mut app, ButtonState::Pressed);
+    move_pointer(&mut app, window, zoomed.center() + delta);
+    press(&mut app, ButtonState::Released);
+    let panned = wire_ready(&mut app, second_top, first_top);
+    assert!(panned.center().distance(zoomed.center() + delta) < 2.);
+}
+
+#[test]
 #[ignore = "requires GPU; verifies UDIM set painting, resizing, visibility, highlighting and GLB persistence"]
 fn gpu_texture_set_resolution_is_independent_and_saved() {
     use crate::editor::{model_document::glb::Glb, model_mesh::{Corner, Face, Geometry}};
@@ -5767,12 +6032,54 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         doc.paint_preview = crate::editor::model_document::PaintPreview {
             height_strength: Some(0.),
             emission_strength: 3.25,
-            ..default()
+            use_baked_normal: true,
+            ao_strength: 0.5,
         };
+        doc.auto_bake_pending = false;
         doc.mode = Mode::Paint;
         doc.revision += 1;
     }
-    warm(&mut app, 6);
+    app.world_mut().resource_scope(|world, mut maps: Mut<bake::State>| {
+        let doc = &world.resource::<editing::State>().documents[&0];
+        maps.insert_test_preview(doc, (doc.objects[0].id, 0), 512);
+    });
+    let read = |app: &mut App, image, offset: usize| {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        app.world_mut().spawn(Readback::texture(image))
+            .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
+                let pixel: [u8; 4] = event.data[offset..offset + 4].try_into().unwrap();
+                let _ = send.try_send(pixel);
+                commands.entity(event.entity).try_despawn();
+            });
+        let now = std::time::Instant::now();
+        loop {
+            frame(app);
+            if let Ok(pixel) = receive.try_recv() {
+                break pixel;
+            }
+            assert!(now.elapsed().as_secs() < 15, "No composited GPU texture");
+        }
+    };
+    let start = std::time::Instant::now();
+    let baked_normal = loop {
+        frame(&mut app);
+        let world = app.world();
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let materials = world.resource::<Assets<StandardMaterial>>();
+        let runtime = world.resource::<engine::Runtime>();
+        if let Some(material) = runtime.working_material(0, doc.objects[0].id, 0)
+            .and_then(|handle| materials.get(handle))
+            && let Some(ao) = &material.occlusion_texture
+        {
+            let images = world.resource::<Assets<Image>>();
+            assert_eq!(material.occlusion_channel, bevy::mesh::UvChannel::Uv0);
+            assert_eq!(images.get(ao).unwrap().data.as_ref().unwrap()[0], 159);
+            assert!(!doc.paint_pending && doc.objects[0].materials[0].paint.is_none());
+            break material.normal_map_texture.clone().unwrap();
+        }
+        assert!(start.elapsed().as_secs() < 15, "Baked material preview was not prepared");
+    };
+    assert_eq!(read(&mut app, baked_normal, 0), [204, 128, 229, 255]);
     paint_ready(&mut app);
     paint_message(&mut app, PaintAction::View(View::Two));
     paint_message(&mut app, PaintAction::MultiChannelBrush);
@@ -5887,30 +6194,13 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
             material.normal_map_texture.clone().unwrap(),
         ]
     };
-    let read = |app: &mut App, image, offset: usize| {
-        let (send, receive) = std::sync::mpsc::sync_channel(1);
-        app.world_mut().spawn(Readback::texture(image))
-            .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
-                let pixel: [u8; 4] = event.data[offset..offset + 4].try_into().unwrap();
-                let _ = send.try_send(pixel);
-                commands.entity(event.entity).try_despawn();
-            });
-        let now = std::time::Instant::now();
-        loop {
-            frame(app);
-            if let Ok(pixel) = receive.try_recv() {
-                break pixel;
-            }
-            assert!(now.elapsed().as_secs() < 15, "No composited GPU texture");
-        }
-    };
     assert_eq!(read(&mut app, material_maps[0].clone(), center), [120, 50, 220, 89]);
     assert_eq!(read(&mut app, material_maps[1].clone(), center), [255, 102, 153, 255]);
     let height = current(&app).unwrap().composite(3);
     let edge = ((256 * 512 + 1)..(257 * 512 - 1))
         .find(|&i| height[(i - 1) * 4] != height[(i + 1) * 4])
         .expect("stroke must have a height slope");
-    assert_eq!(read(&mut app, material_maps[2].clone(), edge * 4), [128, 128, 255, 255]);
+    assert_eq!(read(&mut app, material_maps[2].clone(), edge * 4), [204, 128, 229, 255]);
     paint_message(&mut app, PaintAction::Undo);
     assert!(current(&app).is_none_or(|surface| surface.stack.layers[0].channels.iter().all(Option::is_none)));
     paint_message(&mut app, PaintAction::Redo);
@@ -6007,6 +6297,48 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
     assert_eq!(thumbnail_pixels(&mut app, PaintAction::Select(0), |pixels| pixels == raw_color), raw_color);
     paint_message(&mut app, PaintAction::Redo);
     assert_eq!(current(&app).unwrap().stack, expected_stack);
+
+    paint_message(&mut app, PaintAction::Panel(Panel::Preview));
+    let edit = |app: &mut App, parameter: PreviewParameter, text: &str| {
+        let entity = {
+            let world = app.world_mut();
+            let label = format!("Рисование: {}", parameter.label());
+            world.query::<(Entity, &AccessibleLabel, &bevy::text::EditableText)>().iter(world)
+                .find(|(_, name, _)| name.0 == label).unwrap().0
+        };
+        app.world_mut().resource_mut::<bevy::input_focus::InputFocus>()
+            .set(entity, bevy::input_focus::FocusCause::Auto);
+        frame(app);
+        app.world_mut().get_mut::<bevy::text::EditableText>(entity).unwrap().editor_mut().set_text(text);
+        fill_modifier(app, window, KeyCode::Enter, Key::Enter, ButtonState::Pressed);
+        fill_modifier(app, window, KeyCode::Enter, Key::Enter, ButtonState::Released);
+        paint_ready(app);
+    };
+    edit(&mut app, PreviewParameter::Height, "1,50");
+    edit(&mut app, PreviewParameter::Emission, "4,75");
+    edit(&mut app, PreviewParameter::Occlusion, "25.50");
+    let normal_toggle = PaintAction::PreviewMaterial(PreviewEdit::BakedNormal);
+    scroll_to_paint_control(&mut app, normal_toggle);
+    paint_click(&mut app, window, normal_toggle);
+    paint_ready(&mut app);
+    let normal = {
+        let world = app.world();
+        let doc = &world.resource::<editing::State>().documents[&0];
+        assert_eq!(doc.paint_preview.height_strength, Some(1.5));
+        assert_eq!(doc.paint_preview.emission_strength, 4.75);
+        assert!((doc.paint_preview.ao_strength - 0.255).abs() < 1e-6);
+        assert!(!doc.paint_preview.use_baked_normal);
+        assert_eq!(doc.objects[0].materials[0].paint.as_ref().unwrap().stack, expected_stack);
+        let runtime = world.resource::<engine::Runtime>();
+        let handle = runtime.working_material(0, doc.objects[0].id, 0).unwrap();
+        let materials = world.resource::<Assets<StandardMaterial>>();
+        let material = materials.get(handle).unwrap();
+        assert_eq!(material.emissive, LinearRgba::new(4.75, 4.75, 4.75, 1.));
+        let ao = world.resource::<Assets<Image>>().get(material.occlusion_texture.as_ref().unwrap()).unwrap();
+        assert_eq!(ao.data.as_ref().unwrap()[0], 206);
+        material.normal_map_texture.clone().unwrap()
+    };
+    assert_eq!(read(&mut app, normal, 0), [128, 128, 255, 255]);
 }
 
 #[test]

@@ -14,6 +14,57 @@ pub(super) struct Updates {
     pub transparent: Option<bool>,
 }
 pub(super) const PREVIEW: [usize; 8] = [0, 4, 5, 6, 7, 3, 2, 8];
+
+pub(super) struct PreviewBake {
+    pub maps: Arc<bake::Maps>,
+    pub normal: Option<Vec<u8>>,
+    pub ao: Option<Vec<u8>>,
+}
+
+impl PreviewBake {
+    pub fn available(maps: &bake::Maps, preview: crate::editor::model_document::PaintPreview) -> bool {
+        (preview.use_baked_normal && maps.has_map(bake::BakeMap::ProjectedNormal))
+            || (preview.ao_strength > 0. && maps.has_map(bake::BakeMap::Occlusion))
+    }
+
+    pub fn new(maps: Arc<bake::Maps>, preview: crate::editor::model_document::PaintPreview) -> Self {
+        let normal = if preview.use_baked_normal {
+            maps.projected_tangent_normals().map(|sample| {
+                // The GPU and CPU use the same byte layout and nearest-texel mapping.
+                let mut data = Vec::with_capacity(4 + maps.size.pow(2) as usize * 4);
+                data.extend_from_slice(&maps.size.to_le_bytes());
+                for index in 0..maps.size.pow(2) as usize {
+                    data.extend_from_slice(&sample(index).map_or([0; 4], |[x, y, z]| [x, y, z, 255]));
+                }
+                data
+            })
+        } else {
+            None
+        };
+        let ao = (preview.ao_strength > 0. && maps.has_map(bake::BakeMap::Occlusion)).then(|| {
+            maps.rgba(bake::BakeMap::Occlusion).chunks_exact(4).map(|value| {
+                if value[3] == 0 { 255 }
+                else { (255. - (255. - f32::from(value[0])) * preview.ao_strength).round() as u8 }
+            }).collect()
+        });
+        Self { maps, normal, ao }
+    }
+
+    fn normal_at(&self, x: u32, y: u32, size: u32) -> Option<[u8; 3]> {
+        let data = self.normal.as_ref()?;
+        let scaled = |coord| (2 * coord + 1) * self.maps.size / (2 * size);
+        let index = (1 + scaled(y) * self.maps.size + scaled(x)) as usize * 4;
+        (data[index + 3] != 0).then(|| data[index..index + 3].try_into().unwrap())
+    }
+}
+pub(super) fn same_preview_bake(a: Option<&Arc<PreviewBake>>, b: Option<&Arc<PreviewBake>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 pub(super) fn union(a: Option<URect>, b: Option<URect>) -> Option<URect> {
     match (a, b) {
         (Some(a), Some(b)) => Some(URect {
@@ -24,7 +75,12 @@ pub(super) fn union(a: Option<URect>, b: Option<URect>) -> Option<URect> {
         (a, None) => a,
     }
 }
+#[cfg(test)]
 pub(super) fn prepare(surface: &Surface, dirty: Dirty, relief_factor: f32) -> Updates {
+    prepare_preview(surface, dirty, relief_factor, None)
+}
+
+pub(super) fn prepare_preview(surface: &Surface, dirty: Dirty, relief_factor: f32, baked: Option<&PreviewBake>) -> Updates {
     let mut updates = Updates {
         textures: std::array::from_fn(|_| None),
         transparent: None,
@@ -68,7 +124,7 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty, relief_factor: f32) -> Up
                 }
                 rm
             }
-            2 => normal_rect(surface, rect, relief_factor),
+            2 => normal_rect(surface, rect, relief_factor, baked),
             3 => surface.composite_rect(5, rect),
             _ => surface.composite_rect([1, 2, 3, 4, 7][target - 4], rect),
         };
@@ -88,8 +144,18 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty, relief_factor: f32) -> Up
     }
     updates
 }
-fn normal_rect(surface: &Surface, rect: URect, relief_factor: f32) -> Vec<u8> {
+fn normal_rect(surface: &Surface, rect: URect, relief_factor: f32, baked: Option<&PreviewBake>) -> Vec<u8> {
     let mut out = surface.composite_rect(6, rect);
+    if let Some(baked) = baked.filter(|maps| maps.normal.is_some()) {
+        for (index, pixel) in out.chunks_exact_mut(4).enumerate() {
+            let x = rect.min.x + index as u32 % rect.width();
+            let y = rect.min.y + index as u32 / rect.width();
+            if let Some(base) = baked.normal_at(x, y, surface.size) {
+                let [r, g, b] = [pixel[0], pixel[1], pixel[2]];
+                pixel[..3].copy_from_slice(&blend_normal(base, [r, g, b]));
+            }
+        }
+    }
     if relief_factor == 0. || !surface.has_channel(3) {
         return out;
     }
@@ -120,4 +186,17 @@ fn normal_rect(surface: &Surface, rect: URect, relief_factor: f32) -> Vec<u8> {
         }
     }
     out
+}
+
+fn blend_normal(base: [u8; 3], paint: [u8; 3]) -> [u8; 3] {
+    if paint == [128, 128, 255] {
+        return base;
+    }
+    let decode = |value: [u8; 3]| {
+        (Vec3::from_array(value.map(f32::from)) / 127.5 - Vec3::ONE).normalize_or(Vec3::Z)
+    };
+    let b = decode(base);
+    let p = decode(paint);
+    Vec3::new(b.x + p.x, b.y + p.y, b.z * p.z).normalize_or(Vec3::Z)
+        .to_array().map(|value| ((value * 0.5 + 0.5) * 255.).round() as u8)
 }

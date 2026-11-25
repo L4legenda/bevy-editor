@@ -799,7 +799,8 @@ impl State {
             };
             let Some(material) = object.materials.get(slot) else { continue };
             let size = doc.paint_size(material);
-            if material.paint.as_ref().is_some_and(|surface| surface.baked.is_some())
+            let needs_preview_ao = doc.paint_preview.ao_strength > 0. && MapSelection(doc.bake_settings.map_bits).contains(BakeMap::Occlusion);
+            if (!needs_preview_ao && material.paint.as_ref().is_some_and(|surface| surface.baked.is_some()))
                 || self.maps(model, doc, binding, size).is_some()
                 || !engine::projection::has_uv(object, slot)
             {
@@ -809,6 +810,34 @@ impl State {
         }
         self.automatic.remove(&model);
         None
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_test_preview(&mut self, doc: &Document, binding: (usize, usize), size: u32) {
+        let key = Key::new(0, doc, binding, size).unwrap();
+        let pixels = (size * size) as usize;
+        let mut values = [255; mesh::COMPONENTS];
+        values[0] = 63;
+        let maps = Arc::new(mesh::Maps {
+            size,
+            filled: pixels,
+            values: vec![values; pixels],
+            covered: vec![1; pixels],
+            projection: Some(vec![[204, 128, 229, 128, 255]; pixels]),
+            hits: pixels,
+            filled_misses: 0,
+            cage_fit: None,
+            gpu_rays: false,
+            gpu_projection: false,
+            gpu_denoise: false,
+            gpu_padding: false,
+            selection: MapSelection::ALL,
+            edge_reach: 1.,
+            inputs: Default::default(),
+            custom: vec![],
+        });
+        let maps = Maps::new(maps, key.material(doc));
+        self.cache.push_back((key, Arc::new(maps)));
     }
 
     #[cfg(test)]

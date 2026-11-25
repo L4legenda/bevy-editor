@@ -89,6 +89,7 @@ pub(super) enum Command {
         object: u32,
         slot: u32,
         relief_factor: f32,
+        baked_preview: Option<Arc<composite::PreviewBake>>,
         fix: Option<(Vec<u8>, bool)>,
     },
     Begin {
@@ -417,6 +418,7 @@ impl Pipelines {
                 output(5),
                 output(6),
                 storage(7, true),
+                storage(8, true),
             ],
         );
         let tiles_layout = device.create_bind_group_layout(
@@ -703,6 +705,7 @@ struct Context {
     composition: Composition,
     additional: Vec<StrokeChannel>,
     auxiliary: Buffer,
+    baked_normal: Buffer,
     relief_factor: f32,
     mask_compositions: Vec<Composition>,
     mask_filter: Option<MaskFilters>,
@@ -1236,6 +1239,7 @@ impl Context {
         object: u32,
         slot: u32,
         relief_factor: f32,
+        baked_normal: Option<&[u8]>,
         fix: Option<(Vec<u8>, bool)>,
     ) -> Self {
         let size = surface.size;
@@ -1423,6 +1427,9 @@ impl Context {
             composition,
             additional,
             auxiliary,
+            baked_normal: buffer(
+                device, "paint baked normal", baked_normal.unwrap_or(&[0; 4]), BufferUsages::STORAGE,
+            ),
             relief_factor,
             mask_compositions,
             mask_filter,
@@ -2141,6 +2148,10 @@ impl Context {
                     binding: 7,
                     resource: self.tiles.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 8,
+                    resource: self.baked_normal.as_entire_binding(),
+                },
             ],
         );
         if !full {
@@ -2261,6 +2272,7 @@ fn execute(
                 object,
                 slot,
                 relief_factor,
+                baked_preview,
                 fix,
             } => {
                 contexts.insert(
@@ -2277,6 +2289,7 @@ fn execute(
                         object,
                         slot,
                         relief_factor,
+                        baked_preview.as_ref().and_then(|bake| bake.normal.as_deref()),
                         fix,
                     ),
                 );

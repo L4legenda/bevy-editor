@@ -154,6 +154,54 @@ impl Effects {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(in crate::editor) struct DocumentPost {
+    pub(in crate::editor::ui::model_viewer) exposure: f32,
+    pub(in crate::editor::ui::model_viewer) effects: Effects,
+}
+
+impl DocumentPost {
+    pub(in crate::editor::ui::model_viewer) const EXPOSURE_RANGE: (f32, f32) = (-5.0, 3.0);
+
+    pub(in crate::editor) fn valid(self) -> bool {
+        let (min, max) = Self::EXPOSURE_RANGE;
+        (min..=max).contains(&self.exposure) && self.effects.valid()
+    }
+
+    pub(in crate::editor) fn from_mpp(view: &serde_json::Value) -> Option<Self> {
+        use crate::ToneMap;
+        let fields = [
+            ("contrast", Field::Contrast), ("saturation", Field::Saturation),
+            ("temperature", Field::Temperature), ("tint", Field::Tint),
+            ("bloom", Field::Bloom), ("bloom_threshold", Field::BloomThreshold),
+            ("vignette", Field::Vignette), ("chromatic", Field::Chromatic),
+            ("sharpen", Field::Sharpen), ("grain", Field::Grain),
+        ];
+        let curve = match view["tonemap"].as_str() {
+            Some("Aces") => Some(ToneMap::AcesFitted),
+            Some("Agx") => Some(ToneMap::AgX),
+            Some("Neutral") => Some(ToneMap::KhronosPbrNeutral),
+            Some("Filmic") => Some(ToneMap::BlenderFilmic),
+            Some("Linear") => Some(ToneMap::Linear),
+            _ => None,
+        };
+        // MPP stores a brightness multiplier. The editor controls exposure in stops.
+        let exposure = view["exposure"].as_f64().filter(|value| *value > 0.)
+            .map(|value| value.clamp(0.05, 8.).log2() as f32);
+        let mut effects = Effects { curve, ..Effects::default() };
+        let mut present = exposure.is_some() || curve.is_some();
+        for (name, field) in fields {
+            if let Some(value) = view[name].as_f64() {
+                let (min, max) = field.range();
+                field.set(&mut effects, value.clamp(f64::from(min), f64::from(max)) as f32);
+                present = true;
+            }
+        }
+        present.then_some(Self { exposure: exposure.unwrap_or(0.), effects })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Grade {
     pub exposure: f32,

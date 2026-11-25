@@ -1,6 +1,6 @@
 //! Model workspace lighting starts with the same defaults as a new scene.
 use super::*;
-use super::paint::post::{Effects, Field as PostField};
+use super::paint::post::{DocumentPost, Effects, Field as PostField};
 use bevy::{
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     ui_widgets::{
@@ -18,6 +18,7 @@ pub(in crate::editor) enum Setting {
     Intensity,
     Rotation,
     Exposure,
+    PaintExposure,
     Blur,
     BackgroundBrightness,
     KeyIntensity,
@@ -35,7 +36,7 @@ impl Setting {
             Self::Rotation => {
                 "Поворот окружения вокруг модели. Позволяет проверить отражения и освещение с разных направлений."
             }
-            Self::Exposure => {
+            Self::Exposure | Self::PaintExposure => {
                 "Общая яркость предпросмотра. Положительные значения делают изображение светлее, отрицательные — темнее."
             }
             Self::Blur => "Размытие видимого фона. На освещение модели не влияет.",
@@ -52,11 +53,24 @@ impl Setting {
             Self::Post(field) => field.hint(),
         }
     }
+    fn is_paint_post(self) -> bool {
+        matches!(self, Self::PaintExposure | Self::Post(_))
+    }
+
+    fn post_value(self, post: DocumentPost) -> f32 {
+        match self {
+            Self::PaintExposure => post.exposure,
+            Self::Post(field) => field.value(post.effects),
+            _ => unreachable!("only post-processing sliders read the model grade"),
+        }
+    }
+
     fn range(self) -> (f32, f32) {
         match self {
             Self::Intensity => (0.0, 4.0),
             Self::Rotation | Self::KeyAzimuth => (-180.0, 180.0),
             Self::Exposure => (-4.0, 3.0),
+            Self::PaintExposure => DocumentPost::EXPOSURE_RANGE,
             Self::Blur => (0.0, 1.0),
             Self::BackgroundBrightness => (0.0, 2.0),
             Self::KeyIntensity => (0.0, 8.0),
@@ -69,7 +83,7 @@ impl Setting {
         match self {
             Self::Intensity => settings.lighting.hdri_brightness / LIGHT_SCALE,
             Self::Rotation => settings.lighting.hdri_rotation,
-            Self::Exposure => {
+            Self::Exposure | Self::PaintExposure => {
                 crate::SceneLighting::editor_default().exposure_ev100
                     - settings.lighting.exposure_ev100
             }
@@ -91,7 +105,7 @@ impl Setting {
         match self {
             Self::Intensity => settings.lighting.hdri_brightness = value * LIGHT_SCALE,
             Self::Rotation => settings.lighting.hdri_rotation = value,
-            Self::Exposure => {
+            Self::Exposure | Self::PaintExposure => {
                 settings.lighting.exposure_ev100 =
                     crate::SceneLighting::editor_default().exposure_ev100 - value
             }
@@ -150,6 +164,13 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub(super) fn paint_post(&self, doc: Option<&crate::editor::model_document::Document>) -> DocumentPost {
+        doc.and_then(|doc| doc.paint_post).unwrap_or(DocumentPost {
+            exposure: Setting::Exposure.value(self),
+            effects: self.post,
+        })
+    }
+
     pub(super) fn tone_mapper(&self) -> bevy::render::view::Tonemapping {
         self.lighting.tonemapping.into()
     }
@@ -339,7 +360,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         ("Поворот окружения, °", Setting::Rotation),
         ("Экспозиция, EV", Setting::Exposure),
     ] {
-        scalar(&mut commands, panel, font, label, field, &settings);
+        scalar(&mut commands, panel, font, label, field, field.value(&settings));
     }
     let tone_row = node(&mut commands, panel, column(0.0));
     inspector::searchable(
@@ -393,7 +414,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         font,
         "Размытие фона",
         Setting::Blur,
-        &settings,
+        Setting::Blur.value(&settings),
     );
     scalar(
         &mut commands,
@@ -401,7 +422,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         font,
         "Яркость фона",
         Setting::BackgroundBrightness,
-        &settings,
+        Setting::BackgroundBrightness.value(&settings),
     );
     let heading = text(
         &mut commands,
@@ -441,7 +462,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         ("Направление света, °", Setting::KeyAzimuth),
         ("Высота света, °", Setting::KeyElevation),
     ] {
-        scalar(&mut commands, panel, font, label, field, &settings);
+        scalar(&mut commands, panel, font, label, field, field.value(&settings));
     }
     let reset_row = node(&mut commands, panel, column(0.0));
     inspector::searchable(&mut commands, reset_row, "сбросить просмотр reset defaults");
@@ -472,7 +493,7 @@ fn scalar(
     font: &Handle<Font>,
     label: &str,
     setting: Setting,
-    settings: &Settings,
+    value: f32,
 ) {
     let parent = node(commands, parent, column(0.0));
     inspector::searchable(commands, parent, label);
@@ -500,7 +521,7 @@ fn scalar(
                 ..default()
             },
             SliderRange::new(min, max),
-            SliderValue(setting.value(settings)),
+            SliderValue(value),
             SliderStep(if max > 10.0 { 1.0 } else { 0.01 }),
             TabIndex(0),
             Hovered::default(),
@@ -560,13 +581,13 @@ pub(super) fn paint_post_controls(
     commands: &mut Commands,
     parent: Entity,
     font: &Handle<Font>,
-    settings: &Settings,
+    post: DocumentPost,
 ) {
-    scalar(commands, parent, font, "Экспозиция", Setting::Exposure, settings);
+    scalar(commands, parent, font, "Экспозиция", Setting::PaintExposure, post.exposure);
     let tone = button(commands, parent, font, "", action(EnvironmentAction::PostTone), Look::Regular);
     caption(commands, tone, Caption::PostTone);
     for (field, label) in PostField::ALL {
-        scalar(commands, parent, font, label, Setting::Post(field), settings);
+        scalar(commands, parent, font, label, Setting::Post(field), field.value(post.effects));
     }
     button(
         commands, parent, font, "Сбросить обработку изображения",
@@ -593,7 +614,7 @@ pub(super) fn actions(
     editor: Res<Editor>,
     mut settings: ResMut<Settings>,
     mut panel: Option<ResMut<PanelUi>>,
-    editing: Option<Res<editing::State>>,
+    mut editing: Option<ResMut<editing::State>>,
 ) {
     if editor.viewing_model.is_none()
         || editor.pending.is_some()
@@ -619,6 +640,39 @@ pub(super) fn actions(
                     panel.model_open = !panel.model_open;
                 }
             }
+            continue;
+        }
+        let paint_post = match action {
+            EnvironmentAction::Set(field, ..) => field.is_paint_post(),
+            EnvironmentAction::PostTone | EnvironmentAction::ResetPost => true,
+            _ => false,
+        };
+        if paint_post
+            && let Some(doc) = editor.viewing_model.and_then(|index| editing.as_deref_mut()?.documents.get_mut(&index))
+                .filter(|doc| doc.mode == crate::editor::model_document::Mode::Paint)
+        {
+            if doc.can_store_paint_preview() {
+                let mut post = settings.paint_post(Some(doc));
+                match action {
+                    EnvironmentAction::Set(Setting::PaintExposure, value, _) if value.is_finite() => {
+                        let (min, max) = DocumentPost::EXPOSURE_RANGE;
+                        post.exposure = value.clamp(min, max);
+                    }
+                    EnvironmentAction::Set(Setting::Post(field), value, _) if value.is_finite() => {
+                        field.set(&mut post.effects, value);
+                    }
+                    EnvironmentAction::PostTone => post.effects.cycle_curve(),
+                    EnvironmentAction::ResetPost => post = DocumentPost::default(),
+                    _ => continue,
+                }
+                if doc.paint_post != Some(post) {
+                    doc.paint_post = Some(post);
+                    doc.ui_revision += 1;
+                }
+            }
+            continue;
+        }
+        if matches!(action, EnvironmentAction::Set(Setting::PaintExposure, ..)) {
             continue;
         }
         save = true;
@@ -868,17 +922,17 @@ pub(super) fn refresh(
             Display::None
         };
     }
-    let enabled = shown
-        && open
-        && preview_lighting
-        && editor.pending.is_none()
-        && editor.viewing_image.is_none()
-        && !editor.hdri_library_open;
+    let preview_enabled = shown && preview_lighting && editor.pending.is_none()
+        && editor.viewing_image.is_none() && !editor.hdri_library_open;
+    let paint_doc = editor.viewing_model.and_then(|index| editing.documents.get(&index))
+        .filter(|doc| doc.mode == Mode::Paint);
+    let post = settings.paint_post(paint_doc);
     for mut panel in &mut panels {
         panel.display = if shown { Display::Flex } else { Display::None };
     }
     for (entity, control, computed) in &controls {
-        let value = control.setting.value(&settings);
+        let paint_control = control.setting.is_paint_post();
+        let value = if paint_control { control.setting.post_value(post) } else { control.setting.value(&settings) };
         let (min, max) = control.setting.range();
         let position = (value - min) / (max - min);
         if let Ok(mut thumb) = nodes.get_mut(control.thumb) {
@@ -886,7 +940,12 @@ pub(super) fn refresh(
                 (computed.size().x * computed.inverse_scale_factor() - 14.0).max(0.0) * position,
             );
         }
-        let enabled = enabled && !computed.is_empty();
+        let enabled = preview_enabled && !computed.is_empty()
+            && if paint_control {
+                paint_doc.is_some_and(|doc| doc.can_store_paint_preview())
+            } else {
+                open
+            };
         if let Ok(mut label) = labels.get_mut(control.readout) {
             label.0 = format!("{value:.2}");
         }
@@ -923,7 +982,7 @@ pub(super) fn refresh(
                 }
             }
             Caption::ToneMap => format!("Цвет: {}", settings.lighting.tonemapping.label()),
-            Caption::PostTone => format!("Тональная компрессия · {}", settings.post.curve.map_or("Окружение", |curve| curve.label())),
+            Caption::PostTone => format!("Тональная компрессия · {}", post.effects.curve.map_or("Окружение", |curve| curve.label())),
         };
         for child in children.iter() {
             if let Ok(mut label) = labels.get_mut(child) {

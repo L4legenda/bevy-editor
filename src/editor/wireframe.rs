@@ -15,19 +15,27 @@ use bevy::{
 pub(super) struct WireMaterial {
     #[uniform(0)]
     tint: Vec4,
+    sorting_bias: f32,
 }
 
 impl Default for WireMaterial {
     fn default() -> Self {
         Self {
             tint: Vec4::new(0.035, 0.027, 0.016, 1.0),
+            sorting_bias: 0.0,
         }
     }
 }
 
 impl WireMaterial {
     pub(super) fn colored(tint: Vec4) -> Self {
-        Self { tint }
+        Self { tint, sorting_bias: 0.0 }
+    }
+
+    pub(super) fn after_other_lines(mut self) -> Self {
+        // Transparent meshes are sorted back to front. The depth test still uses the mesh's clip position.
+        self.sorting_bias = f32::INFINITY;
+        self
     }
 }
 
@@ -49,6 +57,10 @@ impl Material for WireMaterial {
 
     fn enable_prepass() -> bool {
         false
+    }
+
+    fn depth_bias(&self) -> f32 {
+        self.sorting_bias
     }
     fn enable_shadows() -> bool {
         false

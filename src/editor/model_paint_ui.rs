@@ -1,4 +1,6 @@
 use super::*;
+#[path = "model_paint_uv_overlay.rs"]
+mod uv_overlay;
 #[path = "model_paint_graph_canvas.rs"]
 mod graph_canvas;
 #[path = "model_paint_shader_maker.rs"]
@@ -223,6 +225,15 @@ fn hide_paint_drop(
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct Value(Parameter);
 
+#[derive(Component, Clone, Copy)]
+pub(in crate::editor::ui::model_viewer) struct PreviewValue(PreviewParameter);
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct UvWire;
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct UvSeams2d;
+
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub(in crate::editor::ui::model_viewer) enum HistoryPreference {
     Recovery,
@@ -262,6 +273,9 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     side: Entity,
     workspace_parent: Entity,
     uv_image: Handle<Image>,
+    uv_canvas: Entity,
+    uv_wire: Entity,
+    uv_seams: Entity,
     uv_info: Entity,
     content: Entity,
     stacks: [Entity; 5],
@@ -289,8 +303,8 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     stack_context: [Option<(usize, Option<sets::SetKey>)>; 5],
     texture_value: Option<TextureValue>,
     bake_option_field: Option<(usize, Entity, bake::BakeControl)>,
-    uv_stamp: Option<(usize, usize, usize, u64)>,
-    uv_job: Option<Task<((usize, usize, usize, u64), image::RgbaImage, bool)>>,
+    preview_field: Option<(usize, Entity)>,
+    uv_overlay: uv_overlay::Overlay,
     swatches: Vec<Handle<Image>>,
     smart_swatches: Vec<Handle<Image>>,
     generator_swatches: Vec<Handle<Image>>,
@@ -1684,15 +1698,14 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     register_paint_drop(&mut commands, *canvas, PaintDropZone::View3d);
     register_paint_drop(&mut commands, uv_view, PaintDropZone::ViewUv);
     let uv_image = images.add(Image::from_dynamic(
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            512,
-            512,
-            image::Rgba([35, 36, 44, 255]),
-        )),
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(64, 64, |x, y| {
+            let value = if (x / 4 + y / 4) % 2 == 0 { 45 } else { 54 };
+            image::Rgba([value, value, value + 7, 255])
+        })),
         true,
         RenderAssetUsages::default(),
     ));
-    commands.spawn((
+    let uv_canvas = commands.spawn((
         ImageNode::new(uv_image.clone()),
         engine::TextureCanvas,
         Node {
@@ -1701,7 +1714,27 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         },
         Pickable::IGNORE,
         ChildOf(uv_view),
-    ));
+    )).id();
+    let overlay = |commands: &mut Commands| {
+        commands.spawn((
+            ImageNode::default(),
+            Node {
+                display: Display::None,
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: percent(100),
+                height: percent(100),
+                ..default()
+            },
+            Pickable::IGNORE,
+            ChildOf(uv_canvas),
+        )).id()
+    };
+    let uv_wire = overlay(&mut commands);
+    commands.entity(uv_wire).insert(UvWire);
+    let uv_seams = overlay(&mut commands);
+    commands.entity(uv_seams).insert((UvSeams2d, ZIndex(1)));
     let shelf_home = surface(
         &mut commands,
         viewer.overlay,
@@ -2152,6 +2185,9 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         side: interface.side,
         workspace_parent: viewer.content,
         uv_image,
+        uv_canvas,
+        uv_wire,
+        uv_seams,
         uv_info,
         content: viewer.content,
         stacks,
@@ -2182,52 +2218,13 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         stack_context: [None; 5],
         texture_value: None,
         bake_option_field: None,
-        uv_stamp: None,
-        uv_job: None,
+        preview_field: None,
+        uv_overlay: uv_overlay::Overlay::default(),
         swatches,
         smart_swatches,
         generator_swatches,
         showing: false,
     });
-}
-
-fn raster(
-    mesh: &crate::editor::model_document::MeshData,
-    material: usize,
-    offset: Vec2,
-) -> (image::RgbaImage, bool) {
-    let mut image = image::RgbaImage::from_fn(512, 512, |x, y| {
-        let value = if (x / 32 + y / 32) % 2 == 0 { 45 } else { 54 };
-        image::Rgba([value, value, value + 7, 255])
-    });
-    let mut has_uv = false;
-    for face in mesh.faces.iter().filter(|face| face.material == material) {
-        let area = face
-            .corners
-            .iter()
-            .zip(face.corners.iter().cycle().skip(1))
-            .map(|(a, b)| a.uv.perp_dot(b.uv))
-            .sum::<f32>()
-            .abs();
-        has_uv |= area > 1e-8;
-        for (a, b) in face.corners.iter().zip(face.corners.iter().cycle().skip(1)) {
-            if !a.uv.is_finite() || !b.uv.is_finite() {
-                continue;
-            }
-            let a = a.uv - offset;
-            let b = b.uv - offset;
-            let a = Vec2::new(a.x, 1. - a.y).clamp(Vec2::ZERO, Vec2::ONE) * 507.
-                + Vec2::splat(2.);
-            let b = Vec2::new(b.x, 1. - b.y).clamp(Vec2::ZERO, Vec2::ONE) * 507.
-                + Vec2::splat(2.);
-            let steps = (b - a).abs().max_element().ceil().max(1.) as usize;
-            for i in 0..=steps {
-                let p = a.lerp(b, i as f32 / steps as f32).round();
-                image.put_pixel(p.x as u32, p.y as u32, image::Rgba([225, 184, 119, 255]));
-            }
-        }
-    }
-    (image, has_uv)
 }
 
 pub(in crate::editor::ui::model_viewer) fn refresh(
@@ -2246,6 +2243,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         Query<&mut EditableText, With<ShelfSearch>>,
         Query<&LayerNameField>,
         Query<(Entity, &HistoryPreference, &mut EditableText, &mut BorderColor)>,
+        Query<(Entity, &PreviewValue, &mut EditableText, &mut BorderColor)>,
     )>,
     buttons: Query<
         (
@@ -2255,12 +2253,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             &BorderColor,
             Option<&bevy::ui::InteractionDisabled>,
         ),
-        (Without<Value>, Without<HistoryPreference>),
+        (Without<Value>, Without<HistoryPreference>, Without<PreviewValue>),
     >,
     mut images: ResMut<Assets<Image>>,
     rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>),
-    baked: Res<bake::State>,
-    mut texture_nodes: Query<&mut ImageNode, With<engine::TextureCanvas>>,
+    (baked, mut preview_edits): (Res<bake::State>, MessageWriter<Action>),
+    mut texture_nodes: Query<&mut ImageNode, Or<(With<engine::TextureCanvas>, With<UvWire>, With<UvSeams2d>)>>,
 ) {
     let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys) = rendering;
     let doc = editor
@@ -2404,6 +2402,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         paint.shelf.menu = false;
         ui.texture_value = None;
         ui.bake_option_field = None;
+        ui.preview_field = None;
+        ui.uv_overlay = uv_overlay::Overlay::default();
         return;
     }
     let index = editor.viewing_model.unwrap();
@@ -2552,6 +2552,33 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             session.set_value(edit.parameter, edit.value);
         }
     }
+    if let Some((model, entity)) = ui.preview_field
+        && (model != index || focus.get() != Some(entity))
+    {
+        ui.preview_field = None;
+        if model == index && !keys.just_pressed(KeyCode::Escape)
+            && let Ok((_, field, input, _)) = fields.p4().get_mut(entity)
+            && let Some(value) = field.parse(&input)
+            && value != field.display_value(doc)
+        {
+            preview_edits.write(Action::ModelView(ModelViewAction::Paint(
+                PaintAction::PreviewMaterial(PreviewEdit::Value { model, parameter: field.0, value }),
+            )));
+        }
+    }
+    for (entity, field, mut input, mut border) in &mut fields.p4() {
+        if focus.get() == Some(entity) {
+            ui.preview_field = Some((index, entity));
+            let valid = field.parse(&input).is_some();
+            border.set_if_neq(BorderColor::all(if valid { FOCUS } else { ERROR }));
+        } else {
+            let value = format!("{:.2}", field.display_value(doc));
+            if input.value().to_string() != value {
+                input.editor_mut().set_text(&value);
+            }
+            border.set_if_neq(BorderColor::all(EDGE));
+        }
+    }
     let recovery = recovery_preferences.settings();
     for (entity, &preference, mut input, mut border) in &mut fields.p3() {
         if focus.get() == Some(entity) {
@@ -2578,7 +2605,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         {
             session.panel = panel.0;
         }
-        let available = session.available(button.0);
+        let available = match button.0 {
+            PaintAction::PreviewMaterial(_) => doc.can_store_paint_preview(),
+            action => session.available(action),
+        };
         if available && disabled.is_some() {
             commands
                 .entity(entity)
@@ -2593,6 +2623,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             PaintAction::ShelfType(kind) => shelf_filter.material == kind,
             PaintAction::ShelfTypeMenu => shelf_filter.menu,
             PaintAction::ToggleRecovery => recovery.enabled,
+            PaintAction::PreviewMaterial(PreviewEdit::AutomaticHeight) => doc.paint_preview.height_strength.is_none(),
+            PaintAction::PreviewMaterial(PreviewEdit::BakedNormal) => doc.paint_preview.use_baked_normal,
+            PaintAction::PreviewMaterial(PreviewEdit::UvWire) => doc.paint_uv.show_wire,
+            PaintAction::PreviewMaterial(PreviewEdit::UvSeams2d) => doc.paint_uv.show_seams_2d,
+            PaintAction::PreviewMaterial(PreviewEdit::UvSeams3d) => doc.paint_uv.show_seams_3d,
             PaintAction::EditExportTemplate { recipe, output, channel, edit } => {
                 use export::recipe::Edit;
                 export_preferences.recipe(recipe).and_then(|recipe| recipe.maps.get(output))
@@ -2680,7 +2715,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     }
     for (i, panel) in sidebar::PANELS.into_iter().enumerate() {
         if !visible_panels[i] || ui.stamps[i] == Some(panel_stamps[i])
-            || editing_texture_value || editing_layer_name || editing_bake_option
+            || editing_texture_value || editing_layer_name || editing_bake_option || ui.preview_field.is_some()
         {
             continue;
         }
@@ -3737,11 +3772,28 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 ] {
                     button(&mut commands, stack, font, name, PaintAction::View(view));
                 }
+                if doc.can_store_paint_preview() {
+                    text(&mut commands, stack, font, "Карты материала", 12., TEXT);
+                    button(&mut commands, stack, font, "Автоматический рельеф",
+                        PaintAction::PreviewMaterial(PreviewEdit::AutomaticHeight));
+                    button(&mut commands, stack, font, "Запечённые нормали",
+                        PaintAction::PreviewMaterial(PreviewEdit::BakedNormal));
+                    for parameter in [PreviewParameter::Height, PreviewParameter::Emission, PreviewParameter::Occlusion] {
+                        preview_number(&mut commands, stack, font, parameter);
+                    }
+                    button(&mut commands, stack, font, "UV-сетка",
+                        PaintAction::PreviewMaterial(PreviewEdit::UvWire));
+                    preview_number(&mut commands, stack, font, PreviewParameter::UvWireOpacity);
+                    button(&mut commands, stack, font, "UV-швы в 2D",
+                        PaintAction::PreviewMaterial(PreviewEdit::UvSeams2d));
+                    button(&mut commands, stack, font, "UV-швы на 3D-модели",
+                        PaintAction::PreviewMaterial(PreviewEdit::UvSeams3d));
+                }
                 space_mouse::controls(&mut commands, stack, font, &space_mouse);
                 let title = if session.post_panel { "− Обработка изображения" } else { "+ Обработка изображения" };
                 button(&mut commands, stack, font, title, PaintAction::PostPanel);
                 if session.post_panel {
-                    environment::paint_post_controls(&mut commands, stack, font, &environment_settings);
+                    environment::paint_post_controls(&mut commands, stack, font, environment_settings.paint_post(Some(doc)));
                 }
                 text(&mut commands, stack, font, "Шейдер 3D-вида", 12., TEXT);
                 button(&mut commands, stack, font, "PBR сцены", PaintAction::PreviewShader(None));
@@ -4066,7 +4118,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         .nth(session.set)
         .or_else(|| doc.active().map(|object| (object, 0)));
     if let Some((object, slot)) = selected {
-        if let Ok(mut image) = texture_nodes.single_mut() {
+        if let Ok(mut image) = texture_nodes.get_mut(ui.uv_canvas) {
             let bake_view = (session.panel == Panel::Maps).then_some(session.bake_view).flatten();
             let live_mask = session.bake_live_masks && session.show_mask && session.has_mask()
                 && matches!(bake_view, Some(bake::BakeMap::Custom(_)));
@@ -4091,39 +4143,58 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 image.image = handle;
             }
         }
-        let stamp = (index, object.id, slot, doc.revision);
-        if ui.uv_stamp != Some(stamp) {
-            let mesh = object.geometry.clone();
-            let offset = object.uv_offset(slot);
-            ui.uv_stamp = Some(stamp);
-            ui.uv_job = Some(AsyncComputeTaskPool::get().spawn(async move {
-                let (image, has_uv) = raster(&mesh, slot, offset);
-                (stamp, image, has_uv)
-            }));
+    } else if let Ok(mut image) = texture_nodes.get_mut(ui.uv_canvas)
+        && image.image != ui.uv_image
+    {
+        image.image = ui.uv_image.clone();
+    }
+    let overlay_source = selected.map(|(object, slot)| uv_overlay::Source {
+        key: (index, object.id, slot),
+        mesh: object.geometry.clone(),
+        offset: object.uv_offset(slot),
+    });
+    let uv_visible = !custom_workspace && session.view != View::Three;
+    let show_wire = uv_visible && doc.paint_uv.show_wire;
+    let show_seams = uv_visible && doc.paint_uv.show_seams_2d;
+    if let Some(drawn) = ui.uv_overlay.update(overlay_source, show_wire, show_seams) {
+        for (entity, layer) in [(ui.uv_wire, drawn.wire), (ui.uv_seams, drawn.seams)] {
+            if let Some(layer) = layer && let Ok(mut image) = texture_nodes.get_mut(entity) {
+                image.image = images.add(Image::from_dynamic(
+                    image::DynamicImage::ImageRgba8(layer), true, RenderAssetUsages::default(),
+                ));
+            }
         }
     }
-    if let Some((stamp, image, has_uv)) =
-        ui.uv_job.as_mut().and_then(|job| block_on(poll_once(job)))
-    {
-        ui.uv_job = None;
-        if ui.uv_stamp == Some(stamp) {
-            if let Ok(mut info) = labels.get_mut(ui.uv_info) {
-                info.0 = if has_uv {
-                    let tile = selected.and_then(|(object, slot)| object.materials.get(slot))
-                        .and_then(|material| material.udim())
-                        .map_or_else(|| "UV 0–1".to_owned(), |tile| format!("UDIM {}", tile.number()));
-                    format!("{} × {} · {tile}", session.texture_size, session.texture_size)
-                } else {
-                    "UV-развёртка отсутствует".into()
-                };
+    for (entity, visible) in [
+        (ui.uv_wire, show_wire && ui.uv_overlay.wire_ready),
+        (ui.uv_seams, show_seams && ui.uv_overlay.seams_ready),
+    ] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if visible { Display::Flex } else { Display::None };
+            if node.display != display {
+                node.display = display;
             }
-            if let Some(mut target) = images.get_mut(&ui.uv_image) {
-                *target = Image::from_dynamic(
-                    image::DynamicImage::ImageRgba8(image),
-                    true,
-                    RenderAssetUsages::default(),
-                );
+        }
+    }
+    if let Ok(mut image) = texture_nodes.get_mut(ui.uv_wire) {
+        let tint = Color::WHITE.with_alpha(doc.paint_uv.wire_opacity);
+        if image.color != tint {
+            image.color = tint;
+        }
+    }
+    if session.panel != Panel::Maps && let Ok(mut info) = labels.get_mut(ui.uv_info) {
+        let label = match ui.uv_overlay.has_uv {
+            Some(true) => {
+                let tile = selected.and_then(|(object, slot)| object.materials.get(slot))
+                    .and_then(|material| material.udim())
+                    .map_or_else(|| "UV 0–1".to_owned(), |tile| format!("UDIM {}", tile.number()));
+                format!("{} × {} · {tile}", session.texture_size, session.texture_size)
             }
+            Some(false) => "UV-развёртка отсутствует".into(),
+            None => "Подготовка UV…".into(),
+        };
+        if info.0 != label {
+            info.0 = label;
         }
     }
     if session.panel == Panel::Maps && let Ok(mut info) = labels.get_mut(ui.uv_info) {
@@ -4153,6 +4224,38 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             info.0 = summary;
         }
     }
+}
+
+impl PreviewValue {
+    fn parse(&self, input: &EditableText) -> Option<f32> {
+        input.value().to_string().trim().replace(',', ".").parse::<f32>().ok()
+            .filter(|value| (self.0.min()..=self.0.max()).contains(value))
+    }
+
+    fn display_value(&self, doc: &crate::editor::model_document::Document) -> f32 {
+        (self.0.value(doc) * 100.).round() / 100.
+    }
+}
+
+fn preview_number(commands: &mut Commands, parent: Entity, font: &Handle<Font>, parameter: PreviewParameter) {
+    let step = match parameter {
+        PreviewParameter::Occlusion | PreviewParameter::UvWireOpacity => 0.5,
+        _ => 0.05,
+    };
+    let number = Number::decimal(parameter.min(), parameter.max(), step, 2).finish();
+    let field = number_line(commands, parent, font, parameter.label(), number, false);
+    commands.entity(field).insert(PreviewValue(parameter))
+        .entry::<Node>().and_modify(|mut node| node.width = px(64));
+    commands.entity(field).observe(
+        |mut event: On<FocusedInput<KeyboardInput>>, mut focus: ResMut<InputFocus>| {
+            if event.input.state == ButtonState::Pressed && !event.input.repeat
+                && matches!(event.input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
+            {
+                focus.clear();
+                event.propagate(false);
+            }
+        },
+    );
 }
 
 fn history_number(

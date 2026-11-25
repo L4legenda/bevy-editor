@@ -9,6 +9,7 @@ use bevy::{
     asset::RenderAssetUsages,
     ecs::system::SystemParam,
     input_focus::InputFocus,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
     ui_widgets::TextInput,
 };
@@ -116,6 +117,7 @@ impl Live {
 struct Work {
     surface: Surface,
     preview: crate::editor::model_document::PaintPreview,
+    baked_preview: Option<Arc<composite::PreviewBake>>,
     #[cfg(test)]
     stroke: Option<Stroke>,
 }
@@ -124,6 +126,7 @@ impl Work {
         Self {
             surface,
             preview,
+            baked_preview: None,
             #[cfg(test)]
             stroke: None,
         }
@@ -139,6 +142,9 @@ struct Gpu {
     images: [Handle<Image>; composite::IMAGE_COUNT],
     preview: [Handle<Image>; 8],
     trace_revision: u64,
+    baked_preview: Option<Arc<composite::PreviewBake>>,
+    original_occlusion: (Option<Handle<Image>>, bevy::mesh::UvChannel),
+    emission_strength: f32,
 }
 #[cfg(test)]
 struct Stroke {
@@ -547,7 +553,7 @@ fn take_events(queue: &mut VecDeque<Event>) -> Vec<Event> {
     events
 }
 fn compose(work: Work) -> Batch {
-    let maps = compose_maps(&work.surface, work.preview);
+    let maps = compose_maps(&work.surface, work.preview, work.baked_preview.as_deref());
     Batch {
         work,
         maps: Some(maps),
@@ -555,12 +561,16 @@ fn compose(work: Work) -> Batch {
     }
 }
 
-fn compose_maps(surface: &Surface, preview: crate::editor::model_document::PaintPreview) -> Updates {
+fn compose_maps(
+    surface: &Surface,
+    preview: crate::editor::model_document::PaintPreview,
+    baked: Option<&composite::PreviewBake>,
+) -> Updates {
     let rect = URect {
         min: UVec2::ZERO,
         max: UVec2::splat(surface.size),
     };
-    let mut maps = composite::prepare(surface, [Some(rect); 8], preview.relief_factor(surface.size));
+    let mut maps = composite::prepare_preview(surface, [Some(rect); 8], preview.relief_factor(surface.size), baked);
     let mask = surface.stack
         .layers
         .get(surface.stack.selected)
@@ -579,7 +589,7 @@ pub(in crate::editor::ui::model_viewer) struct SurfacePreview(Updates);
 
 impl SurfacePreview {
     pub fn prepare(surface: &Surface) -> Self {
-        Self(compose_maps(surface, Default::default()))
+        Self(compose_maps(surface, Default::default(), None))
     }
 
     pub fn upload(
@@ -590,7 +600,7 @@ impl SurfacePreview {
         uploads: &mut crate::editor::image_texture::TextureUploads,
     ) {
         let mut gpu = None;
-        upload_textures(&mut gpu, self.0, &slot.material, 1., images, materials, uploads);
+        upload_textures(&mut gpu, self.0, &slot.material, 1., None, images, materials, uploads);
         slot.material = gpu.unwrap().material;
     }
 }
@@ -792,12 +802,15 @@ fn upload(
     live: &mut Live,
     updates: Updates,
     slot: &mut crate::editor::model_document::MaterialSlot,
-    emission_strength: f32,
+    work: &Work,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     uploads: &mut crate::editor::image_texture::TextureUploads,
 ) {
-    upload_textures(&mut live.gpu, updates, &slot.material, emission_strength, images, materials, uploads);
+    upload_textures(
+        &mut live.gpu, updates, &live.origin.material, work.preview.emission_strength,
+        work.baked_preview.as_ref(), images, materials, uploads,
+    );
     slot.material = live.gpu.as_ref().unwrap().material.clone();
 }
 
@@ -806,6 +819,7 @@ fn upload_textures(
     mut updates: Updates,
     template: &Handle<StandardMaterial>,
     emission_strength: f32,
+    baked_preview: Option<&Arc<composite::PreviewBake>>,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     uploads: &mut crate::editor::image_texture::TextureUploads,
@@ -829,13 +843,18 @@ fn upload_textures(
             }
             images.add(image)
         });
-        let material = materials.add(materials.get(template).cloned().unwrap_or_default());
+        let template = materials.get(template).cloned().unwrap_or_default();
+        let original_occlusion = (template.occlusion_texture.clone(), template.occlusion_channel.clone());
+        let material = materials.add(template);
         let preview = std::array::from_fn(|c| textures[composite::PREVIEW[c]].clone());
         *output = Some(Gpu {
             material,
             images: textures,
             preview,
             trace_revision: 0,
+            baked_preview: None,
+            original_occlusion,
+            emission_strength,
         });
     } else {
         let gpu = output.as_mut().unwrap();
@@ -848,9 +867,30 @@ fn upload_textures(
             }
         }
     }
-    let gpu = output.as_ref().unwrap();
-    if fresh || updates.transparent.is_some() {
+    let gpu = output.as_mut().unwrap();
+    let bake_changed = !composite::same_preview_bake(gpu.baked_preview.as_ref(), baked_preview);
+    if bake_changed {
+        gpu.baked_preview = baked_preview.cloned();
+        if let Some(mut material) = materials.get_mut(&gpu.material) {
+            let occlusion = baked_preview.and_then(|bake| bake.ao.as_ref().map(|ao| (bake.maps.size, ao)));
+            (material.occlusion_texture, material.occlusion_channel) = if let Some((size, ao)) = occlusion {
+                let texture = Image::new(
+                    Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                    TextureDimension::D2, ao.clone(), TextureFormat::R8Unorm, RenderAssetUsages::default(),
+                );
+                (Some(images.add(texture)), bevy::mesh::UvChannel::Uv0)
+            } else {
+                gpu.original_occlusion.clone()
+            };
+        }
+    }
+    let emission_changed = gpu.emission_strength != emission_strength;
+    gpu.emission_strength = emission_strength;
+    if fresh || emission_changed || updates.transparent.is_some() {
         if let Some(mut m) = materials.get_mut(&gpu.material) {
+            if fresh || emission_changed {
+                m.emissive = LinearRgba::new(emission_strength, emission_strength, emission_strength, 1.);
+            }
             if fresh {
                 m.base_color = Color::WHITE;
                 m.base_color_texture = Some(gpu.images[0].clone());
@@ -859,7 +899,6 @@ fn upload_textures(
                 m.metallic_roughness_texture = Some(gpu.images[1].clone());
                 m.normal_map_texture = Some(gpu.images[2].clone());
                 m.flip_normal_map_y = false;
-                m.emissive = LinearRgba::new(emission_strength, emission_strength, emission_strength, 1.);
                 m.emissive_texture = Some(gpu.images[3].clone());
                 m.reflectance = 2.;
                 m.specular_texture = Some(gpu.images[composite::SPECULAR_MATERIAL].clone());
@@ -1087,7 +1126,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         live,
                         updates,
                         material,
-                        result.work.preview.emission_strength,
+                        &result.work,
                         &mut images,
                         &mut materials,
                         &mut uploads,
@@ -1186,7 +1225,28 @@ pub(in crate::editor::ui::model_viewer) fn update(
             let textures_changed = source.is_some_and(|object| {
                 work.surface.texture_fills_need_binding(&object.geometry, slot, object.uv_offset(slot), object.transform)
             });
-            let recompose = composite_changed || generators_changed || textures_changed || bake_changed.is_some();
+            let preview_idle = live.queue.is_empty() && !live.controller.busy();
+            let preview = if preview_idle { doc.paint_preview } else { work.preview };
+            let preview_changed = work.preview != preview;
+            let preview_bake_change = if preview_idle {
+                let maps = (preview.use_baked_normal || preview.ao_strength > 0.)
+                    .then(|| baked.maps(index, doc, (object, slot), work.surface.size))
+                    .flatten()
+                    .filter(|maps| composite::PreviewBake::available(maps, preview));
+                let same = match (work.baked_preview.as_ref(), maps) {
+                    (Some(current), Some(next)) => Arc::ptr_eq(&current.maps, next),
+                    (None, None) => true,
+                    _ => false,
+                };
+                let bake_settings_changed = maps.is_some()
+                    && (preview.use_baked_normal != work.preview.use_baked_normal
+                        || preview.ao_strength != work.preview.ao_strength);
+                (!same || bake_settings_changed).then(|| maps.cloned())
+            } else {
+                None
+            };
+            let recompose = composite_changed || generators_changed || textures_changed
+                || bake_changed.is_some() || preview_bake_change.is_some() || preview_changed;
             if stack_changed || recompose {
                 if stack_changed || bake_changed.is_some() {
                     doc.paint_pending = true;
@@ -1205,6 +1265,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
                             work.surface.bind_generators(&mesh, slot, uv_offset, transform);
                         }
                         work.surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
+                    }
+                    work.preview = preview;
+                    if let Some(maps) = preview_bake_change {
+                        work.baked_preview = maps.map(|maps| Arc::new(composite::PreviewBake::new(maps, work.preview)));
                     }
                     if recompose {
                         compose(work)
@@ -2161,6 +2225,7 @@ mod tests {
             Work {
                 surface,
                 preview: Default::default(),
+                baked_preview: None,
                 stroke: None,
             },
             map,

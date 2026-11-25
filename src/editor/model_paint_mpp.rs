@@ -1,11 +1,11 @@
 //! Import Material Painter's MPP manifest and compressed layer data into an editable GLB.
 use super::{
-    model_document::{MaterialSlot, ModelCamera, Object, PaintPreview, MODEL_CAMERA_EXTRA, PAINT_PREVIEW_EXTRA, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
+    model_document::{MaterialSlot, ModelCamera, Object, PaintPreview, PaintUv, MODEL_CAMERA_EXTRA, PAINT_PREVIEW_EXTRA, PAINT_UV_EXTRA, PAINT_POST_EXTRA, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
     model_mesh::{Corner, Face, Geometry},
     model_paint_data::{Blend, CHANNEL_COUNT, Layer, LayerKind, MAX_LAYERS, Stack, Surface, solid},
     model_paint_spp::{ImportDetails, project_name, publish_project},
     ui::model_viewer::paint::{
-        ProjectGraph, project_fill, project_graph, project_mask, project_preview_shader,
+        DocumentPost, ProjectGraph, project_fill, project_graph, project_mask, project_preview_shader,
     },
 };
 use bevy::prelude::*;
@@ -693,6 +693,8 @@ struct Imported {
     preview: Option<Value>,
     camera: Option<ModelCamera>,
     paint_preview: PaintPreview,
+    paint_uv: PaintUv,
+    paint_post: Option<DocumentPost>,
     active_set: usize,
     report: ImportDetails,
 }
@@ -822,7 +824,16 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
     let paint_preview = PaintPreview {
         height_strength: Some(manifest["view"]["height_strength"].as_f64().unwrap_or(1.).clamp(0., 8.) as f32),
         emission_strength: manifest["view"]["emission"].as_f64().unwrap_or(2.).clamp(0., 20.) as f32,
+        use_baked_normal: manifest["view"]["use_baked_normal"].as_bool().unwrap_or(true),
+        ao_strength: manifest["view"]["ao_strength"].as_f64().unwrap_or(0.6).clamp(0., 1.) as f32,
     };
+    let paint_uv = PaintUv {
+        show_wire: manifest["view"]["show_wire"].as_bool().unwrap_or(true),
+        wire_opacity: manifest["view"]["uv_wire_opacity"].as_f64().unwrap_or(0.45).clamp(0.05, 1.) as f32,
+        show_seams_2d: manifest["view"]["show_seams_2d"].as_bool().unwrap_or(true),
+        show_seams_3d: manifest["view"]["show_seams_3d"].as_bool().unwrap_or(false),
+    };
+    let paint_post = DocumentPost::from_mpp(&manifest["view"]);
     let preview = if preview_ref.is_null() {
         None
     } else {
@@ -914,6 +925,8 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
         preview,
         camera,
         paint_preview,
+        paint_uv,
+        paint_post,
         active_set,
         report: ImportDetails {
             label,
@@ -931,6 +944,8 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
         preview,
         camera,
         paint_preview,
+        paint_uv,
+        paint_post,
         active_set,
         report,
     } = import(source, &name).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -947,6 +962,10 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
                 root["extras"][MODEL_CAMERA_EXTRA] = json!(camera);
             }
             root["extras"][PAINT_PREVIEW_EXTRA] = json!(paint_preview);
+            root["extras"][PAINT_UV_EXTRA] = json!(paint_uv);
+            if let Some(post) = paint_post {
+                root["extras"][PAINT_POST_EXTRA] = json!(post);
+            }
             bake.write(root, &model)
         },
         Some(&bake.cage),
@@ -1067,6 +1086,9 @@ mod tests {
         });
         let view = json!({
             "preview_shader": 5, "height_strength": 2.5, "emission": 4.25,
+            "use_baked_normal": false, "ao_strength": 0.35,
+            "show_wire": false, "uv_wire_opacity": 0.58, "show_seams_2d": false, "show_seams_3d": true,
+            "exposure": 0.25, "tonemap": "Filmic", "saturation": 0.4, "bloom": 0.7, "grain": 0.15,
             "camera": {
                 "target": [0.6, -0.4, 0.2], "distance": 8, "yaw": 1.2, "pitch": -0.4, "fov": 0.85
             }
@@ -1353,8 +1375,17 @@ mod tests {
         assert_eq!(doc.model_camera, Some(camera));
         let paint_preview = PaintPreview {
             height_strength: Some(2.5), emission_strength: 4.25,
+            use_baked_normal: false, ao_strength: 0.35,
         };
         assert_eq!(doc.paint_preview, paint_preview);
+        let paint_uv = PaintUv { show_wire: false, wire_opacity: 0.58, show_seams_2d: false, show_seams_3d: true };
+        assert_eq!(doc.paint_uv, paint_uv);
+        let paint_post = serde_json::to_value(doc.paint_post.unwrap()).unwrap();
+        assert_eq!(paint_post["exposure"], -2.0);
+        assert_eq!(paint_post["effects"]["curve"], "blender_filmic");
+        for (key, value) in [("saturation", 0.4_f64), ("bloom", 0.7), ("grain", 0.15)] {
+            assert!((paint_post["effects"][key].as_f64().unwrap() - value).abs() < 1e-6);
+        }
         assert!(!doc.dirty());
         Arc::make_mut(doc.preview_shader.as_mut().unwrap())["name"] = json!("Updated look");
         assert!(doc.dirty());
@@ -1363,6 +1394,8 @@ mod tests {
         let reopened = Glb::load(&path).unwrap();
         assert_eq!(reopened.json["extras"][MODEL_CAMERA_EXTRA], json!(camera));
         assert_eq!(reopened.json["extras"][PAINT_PREVIEW_EXTRA], json!(paint_preview));
+        assert_eq!(reopened.json["extras"][PAINT_UV_EXTRA], json!(paint_uv));
+        assert_eq!(reopened.json["extras"][PAINT_POST_EXTRA], paint_post);
         assert_eq!(
             reopened.json["extras"][PREVIEW_SHADER_EXTRA]["name"],
             "Updated look"

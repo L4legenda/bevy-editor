@@ -383,6 +383,7 @@ impl Target {
                 object: object as u32 + 1,
                 slot: slot as u32,
                 relief_factor: 4.,
+                baked_preview: None,
                 fix: Some((ready.base, self.map == BakeMap::ProjectedNormal)),
             });
             self.gpu = Some(Live { id, trace: None });

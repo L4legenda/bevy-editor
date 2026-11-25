@@ -78,6 +78,46 @@ fn imported_bake_defaults_are_clean_and_explicit_factory_settings_survive_profil
 }
 
 #[test]
+fn paint_preview_settings_are_saved_without_changing_material_channels() {
+    use crate::editor::model_document::{PAINT_PREVIEW_EXTRA, PAINT_UV_EXTRA, PaintPreview, PaintUv};
+
+    let (mut source, object) = fixture();
+    let folder = source.path.parent().unwrap().to_path_buf();
+    source.json["extras"] = json!({"keep": 7});
+    let mut doc = Document::new(source, vec![object]);
+    let settings = PaintPreview {
+        height_strength: Some(1.25),
+        emission_strength: 4.75,
+        use_baked_normal: true,
+        ao_strength: 0.255,
+    };
+    assert!(!doc.dirty());
+    let wire = PaintUv { show_wire: true, wire_opacity: 0.68, show_seams_2d: true, show_seams_3d: true };
+    doc.paint_uv = wire;
+    assert!(doc.dirty());
+    doc.paint_preview = settings;
+    let material = doc.objects[0].materials[0].source.clone();
+    doc.save().unwrap();
+    assert!(!doc.dirty());
+    let saved = Glb::load(&doc.source.path).unwrap();
+    assert_eq!(saved.json["extras"]["keep"], 7);
+    let mut reopened = Document::new(saved, doc.objects.clone());
+    assert_eq!(reopened.paint_preview, settings);
+    assert_eq!(reopened.paint_uv, wire);
+    assert_eq!(reopened.objects[0].materials[0].source, material);
+    assert!(reopened.objects[0].materials[0].paint.is_none());
+
+    reopened.paint_preview = PaintPreview::default();
+    reopened.paint_uv = PaintUv::default();
+    assert!(reopened.dirty());
+    reopened.save().unwrap();
+    let saved = Glb::load(&reopened.source.path).unwrap();
+    assert_eq!(saved.json["extras"][PAINT_PREVIEW_EXTRA], json!(PaintPreview::default()));
+    assert_eq!(saved.json["extras"][PAINT_UV_EXTRA], json!(PaintUv::default()));
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
 fn legacy_bake_selection_retains_previously_implied_maps() {
     use crate::editor::model_bake_settings::{self as bake, BASIC_MAP_BITS, BENT_NORMAL_BIT};
 

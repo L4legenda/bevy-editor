@@ -1,5 +1,8 @@
 //! Editable model state and transactions. Scene documents never share these meshes.
-use super::model_mesh::{BevelOptions, Corner, Edge, Element, Face, Geometry, Selection};
+use super::{
+    model_mesh::{BevelOptions, Corner, Edge, Element, Face, Geometry, Selection},
+    ui::model_viewer::paint::DocumentPost,
+};
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
@@ -208,17 +211,52 @@ pub(super) const PREVIEW_SHADER_EXTRA: &str = "bevy_editor_preview_shader";
 pub(super) const PAINT_SET_EXTRA: &str = "bevy_editor_active_paint_set";
 pub(super) const MODEL_CAMERA_EXTRA: &str = "bevy_editor_model_camera";
 pub(super) const PAINT_PREVIEW_EXTRA: &str = "bevy_editor_paint_preview";
+pub(super) const PAINT_UV_EXTRA: &str = "bevy_editor_paint_uv";
+pub(super) const PAINT_POST_EXTRA: &str = "bevy_editor_paint_post";
+
+fn read_paint_post(root: &serde_json::Value) -> Option<DocumentPost> {
+    root["extras"].get(PAINT_POST_EXTRA)
+        .and_then(|value| <DocumentPost as serde::Deserialize>::deserialize(value).ok())
+        .filter(|post| post.valid())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub(super) struct PaintUv {
+    pub show_wire: bool,
+    pub wire_opacity: f32,
+    pub show_seams_2d: bool,
+    pub show_seams_3d: bool,
+}
+
+impl Default for PaintUv {
+    fn default() -> Self {
+        Self { show_wire: false, wire_opacity: 0.45, show_seams_2d: false, show_seams_3d: false }
+    }
+}
+
+impl PaintUv {
+    fn read(root: &serde_json::Value) -> Self {
+        let mut settings = root["extras"].get(PAINT_UV_EXTRA)
+            .and_then(|value| <Self as serde::Deserialize>::deserialize(value).ok())
+            .unwrap_or_default();
+        settings.wire_opacity = settings.wire_opacity.clamp(0.05, 1.);
+        settings
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub(super) struct PaintPreview {
     pub height_strength: Option<f32>,
     pub emission_strength: f32,
+    pub use_baked_normal: bool,
+    pub ao_strength: f32,
 }
 
 impl Default for PaintPreview {
     fn default() -> Self {
-        Self { height_strength: None, emission_strength: 1. }
+        Self { height_strength: None, emission_strength: 1., use_baked_normal: false, ao_strength: 0. }
     }
 }
 
@@ -229,11 +267,12 @@ impl PaintPreview {
 
     fn read(root: &serde_json::Value) -> Self {
         let mut settings = root["extras"].get(PAINT_PREVIEW_EXTRA)
-            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            .and_then(|value| <Self as serde::Deserialize>::deserialize(value).ok())
             .unwrap_or_default();
         settings.height_strength = settings.height_strength.filter(|value| value.is_finite())
             .map(|value| value.clamp(0., 8.));
         settings.emission_strength = settings.emission_strength.clamp(0., 20.);
+        settings.ao_strength = settings.ao_strength.clamp(0., 1.);
         settings
     }
 }
@@ -279,6 +318,8 @@ pub(super) struct Document {
     pub paint_set: Option<usize>,
     pub model_camera: Option<ModelCamera>,
     pub paint_preview: PaintPreview,
+    pub paint_uv: PaintUv,
+    pub paint_post: Option<DocumentPost>,
     pub cage_edits: Arc<super::model_cage_data::Edits>,
     pub saved_cage_edits: Arc<super::model_cage_data::Edits>,
     pub active: Option<usize>,
@@ -312,6 +353,8 @@ impl Document {
             .and_then(|index| usize::try_from(index).ok());
         let model_camera = ModelCamera::read(&source.json);
         let paint_preview = PaintPreview::read(&source.json);
+        let paint_uv = PaintUv::read(&source.json);
+        let paint_post = read_paint_post(&source.json);
         let cage_edits = Arc::new(objects.iter().filter_map(|object| {
             let node = source.json["nodes"].get(object.source_node?)?;
             super::model_cage_data::read(node, object).map(|edit| (object.id, edit))
@@ -327,6 +370,8 @@ impl Document {
             paint_set,
             model_camera,
             paint_preview,
+            paint_uv,
+            paint_post,
             saved_cage_edits: cage_edits.clone(),
             cage_edits,
             custom_bakes,
@@ -366,6 +411,9 @@ impl Document {
         self.paint_pending || self.objects != self.saved || self.custom_bakes != self.saved_custom_bakes
             || self.bake_settings != self.saved_bake_settings
             || self.preview_shader_dirty()
+            || self.paint_preview != PaintPreview::read(&self.source.json)
+            || self.paint_uv != PaintUv::read(&self.source.json)
+            || self.paint_post != read_paint_post(&self.source.json)
             || (!Arc::ptr_eq(&self.cage_edits, &self.saved_cage_edits)
                 && self.cage_edits != self.saved_cage_edits)
     }
@@ -376,8 +424,26 @@ impl Document {
         })
     }
 
+    pub(super) fn can_store_paint_preview(&self) -> bool {
+        let extras = &self.source.json["extras"];
+        extras.is_object() || extras.is_null()
+    }
+
     pub(super) fn source_for_save(&self) -> glb::Glb {
         let mut source = self.source.clone();
+        if self.can_store_paint_preview() && self.paint_preview != PaintPreview::read(&source.json) {
+            source.json["extras"][PAINT_PREVIEW_EXTRA] = serde_json::json!(self.paint_preview);
+        }
+        if self.can_store_paint_preview() && self.paint_uv != PaintUv::read(&source.json) {
+            source.json["extras"][PAINT_UV_EXTRA] = serde_json::json!(self.paint_uv);
+        }
+        if self.can_store_paint_preview() && self.paint_post != read_paint_post(&source.json) {
+            if let Some(settings) = self.paint_post {
+                source.json["extras"][PAINT_POST_EXTRA] = serde_json::json!(settings);
+            } else if let Some(extras) = source.json["extras"].as_object_mut() {
+                extras.remove(PAINT_POST_EXTRA);
+            }
+        }
         if let Some(graph) = &self.preview_shader {
             source.json["extras"][PREVIEW_SHADER_EXTRA] = graph.as_ref().clone();
         }
