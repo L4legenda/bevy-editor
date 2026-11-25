@@ -11,6 +11,8 @@ pub(in crate::editor) use variation::Variation;
 pub(in crate::editor) use variation::CHANNELS as VARIATION_CHANNELS;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
+#[cfg_attr(feature = "mcp", schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Projection {
     #[default]
     Uv,
@@ -91,6 +93,8 @@ impl Default for Settings {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema))]
+#[cfg_attr(feature = "mcp", schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum OpacitySource {
     #[default]
     Auto,

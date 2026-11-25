@@ -792,6 +792,33 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
             .any(|pixel| pixel[0] > pixel[1].saturating_add(35)
                 && pixel[2] > pixel[1].saturating_add(25))
     );
+    let original = client.tool(&mut app, "set_paint_view", json!({"model_id": 0}));
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "set_paint_view", "arguments": {"model_id": 0, "yaw_degrees": 45, "post": {"contrast": 5}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    let unchanged = client.tool(&mut app, "set_paint_view", json!({"model_id": 0}));
+    assert_eq!(original["structuredContent"], unchanged["structuredContent"]);
+    let post = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": 0, "post": {"saturation": 0.0, "tone_map": "linear"},
+    }));
+    assert_eq!(post["structuredContent"]["post"]["tone_map"], "linear");
+    assert_eq!(post["structuredContent"]["post"]["effects"]["saturation"], 0.0);
+    let post = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": 0, "post": {"bloom_threshold": 2.0, "inherit_tone_map": true},
+    }));
+    assert!(post["structuredContent"]["post"]["effects"]["curve"].is_null());
+    assert_eq!(post["structuredContent"]["post"]["effects"]["saturation"], 0.0);
+    assert_eq!(post["structuredContent"]["post"]["effects"]["bloom_threshold"], 2.0);
+    let gray = client.tool(&mut app, "capture_paint_view", json!({"model_id": 0}));
+    let png = gray["content"].as_array().unwrap().iter().find(|item| item["type"] == "image").unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(png["data"].as_str().unwrap()).unwrap();
+    let gray = image::load_from_memory(&bytes).unwrap().to_rgba8();
+    assert_eq!(gray.dimensions(), image.dimensions());
+    assert!(image.pixels().zip(gray.pixels()).any(|(before, after)| {
+        before[0] > before[1].saturating_add(35) && before[2] > before[1].saturating_add(25)
+            && after[0].abs_diff(after[1]) < 4 && after[0].abs_diff(after[2]) < 4
+    }));
 
     open(&mut client, &mut app, "models/blue_block.glb", 1);
     wait_for_mode(&mut app, 1);
@@ -874,6 +901,57 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     assert_eq!(replace(&mut client, &mut app, json!({"kind":"redo"}))["status"], "redone");
     assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 1);
 
+    let fill = client.tool(&mut app, "edit_paint", json!({
+        "model_id": 0, "set": 0, "edit": {"operation": "add_layer", "kind": "Fill"},
+    }));
+    let fill_index = fill["structuredContent"]["layers_bottom_to_top"].as_array().unwrap().iter()
+        .find(|row| row["selected"] == true).unwrap()["index"].as_u64().unwrap() as usize;
+    let before_fill = wait_for_paint(&mut client, &mut app);
+    let map_path = project.asset_root.join("models/stdio-roughness.png");
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([112, 112, 112, 255])).save(&map_path).unwrap();
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "edit_paint", "arguments": {
+            "model_id": 0, "set": 0, "edit": {
+                "operation": "update_layer", "index": fill_index, "name": "Invalid fill",
+                "fill": {"images": {"base_color": "models/stdio-roughness.png", "roughness": "models/missing.png"}}
+            }
+        },
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["undo_steps"], before_fill["undo_steps"]);
+    assert_eq!(unchanged["layers_bottom_to_top"][fill_index], before_fill["layers_bottom_to_top"][fill_index]);
+    let updated = client.tool(&mut app, "edit_paint", json!({
+        "model_id": 0, "set": 0, "edit": {
+            "operation": "update_layer", "index": fill_index, "name": "MCP Patina",
+            "visible": false, "fill": {
+                "channels": {"base_color": [38, 96, 118]},
+                "images": {"roughness": "models/stdio-roughness.png"},
+                "projection": "Triplanar", "tiling": 2.5, "rotation": 15,
+                "variation": {"color": 0.15, "seed": 10}
+            }
+        },
+    }));
+    assert_eq!(updated["structuredContent"]["undo_steps"].as_u64().unwrap(),
+        before_fill["undo_steps"].as_u64().unwrap() + 1);
+    let updated = wait_for_paint(&mut client, &mut app);
+    assert_eq!(updated["layers_bottom_to_top"][fill_index]["fill"]["settings"]["tiling"], 2.5);
+    assert_eq!(updated["layers_bottom_to_top"][fill_index]["fill"]["textured_channels"], json!(["roughness"]));
+    client.tool(&mut app, "edit_paint", json!({
+        "model_id": 0, "set": 0, "edit": {
+            "operation": "update_layer", "index": fill_index,
+            "fill": {"images": {"roughness": null}, "channels": {"roughness": 76}}
+        },
+    }));
+    let cleared = wait_for_paint(&mut client, &mut app);
+    assert_eq!(cleared["layers_bottom_to_top"][fill_index]["fill"]["textured_channels"], json!([]));
+    client.tool(&mut app, "edit_paint", json!({
+        "model_id": 0, "set": 0, "edit": {"operation": "undo"},
+    }));
+    let restored = wait_for_paint(&mut client, &mut app);
+    assert_eq!(restored["layers_bottom_to_top"][fill_index], updated["layers_bottom_to_top"][fill_index]);
+    fs::remove_file(&map_path).unwrap();
+
     let saved = client.tool(
         &mut app,
         "save_model",
@@ -881,6 +959,9 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     );
     let path = saved["structuredContent"]["path"].as_str().unwrap();
     let glb = Glb::load(Path::new(path)).unwrap();
+    let saved_post = &glb.json["extras"]["bevy_editor_paint_post"]["effects"];
+    assert_eq!(saved_post["saturation"], 0.0);
+    assert_eq!(saved_post["bloom_threshold"], 2.0);
     let mesh = glb.json["nodes"]
         .as_array()
         .unwrap()
@@ -897,6 +978,17 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         &[210, 10, 170, 255]
     );
     assert_eq!(&surface.stack.layers[layer].mask.as_ref().unwrap().pixels[middle..middle + 4], &[255; 4]);
+    let patched = &surface.stack.layers[fill_index];
+    assert_eq!(patched.name, "MCP Patina");
+    assert_eq!(&patched.channels[0].as_ref().unwrap()[..4], &[38, 96, 118, 255]);
+    let patched_fill = patched.texture_fill.as_ref().unwrap();
+    let settings = patched_fill.settings;
+    assert_eq!(settings.tiling, 2.5);
+    assert_eq!(settings.rotation, 15.);
+    assert_eq!(settings.variation.seed, 10.);
+    let roughness = patched_fill.images[1].as_ref().unwrap();
+    assert_eq!(roughness.name, "stdio-roughness.png");
+    assert_eq!(roughness.pixels().get_pixel(1, 1).0, [112, 112, 112, 255]);
 
     let export = client.tool(&mut app, "export_textures", json!({
         "model_id": 0, "folder": ".", "all_sets": false, "template": "separate", "format": "png", "bit_depth": 8, "size": 512,
@@ -910,6 +1002,74 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         .unwrap();
     let exported = image::open(color).unwrap().to_rgba8();
     assert_eq!(exported.get_pixel(256, 256).0, [210, 10, 170, 255]);
+
+    let catalog = client.tool(&mut app, "list_paint_presets", json!({}));
+    let catalog = &catalog["structuredContent"];
+    let texture = catalog["textures"][0].as_str().unwrap();
+    assert!(catalog["smart_materials"].as_array().unwrap().contains(&json!("Rusty Iron")));
+    let original_layers = wait_for_paint(&mut client, &mut app);
+    let misplaced = client.request(&mut app, "tools/call", json!({
+        "name": "edit_paint", "arguments": {
+            "model_id": 0, "set": 0, "edit": {"operation": "add_smart_material", "preset": "Rusty Iron",
+                "target": {"layer": fill_index, "placement": "inside"}}
+        },
+    }));
+    assert_eq!(misplaced["isError"], true, "{misplaced}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["layers_bottom_to_top"], original_layers["layers_bottom_to_top"]);
+    assert_eq!(unchanged["undo_steps"], original_layers["undo_steps"]);
+    let edit = |client: &mut StdioClient, app: &mut App, edit: Value| {
+        client.tool(app, "edit_paint", json!({"model_id": 0, "set": 0, "edit": edit}));
+        wait_for_paint(client, app)
+    };
+    let smart = edit(&mut client, &mut app, json!({
+        "operation": "add_smart_material", "preset": "Rusty Iron", "name": "Rust group",
+        "target": {"layer": fill_index, "placement": "above"}
+    }));
+    let folder = smart["layers_bottom_to_top"].as_array().unwrap().iter()
+        .find(|row| row["name"] == "Rust group").unwrap();
+    let folder_index = folder["index"].as_u64().unwrap() as usize;
+    let old_children = folder["layers_inside"].as_u64().unwrap();
+    assert!(old_children > 1);
+    assert_eq!(folder["selected"], true);
+    assert_eq!(folder_index, fill_index + old_children as usize + 1);
+    assert_eq!(smart["undo_steps"].as_u64().unwrap(), original_layers["undo_steps"].as_u64().unwrap() + 1);
+
+    let textured = edit(&mut client, &mut app, json!({
+        "operation": "add_texture", "preset": texture.to_lowercase(), "name": "Tiled relief",
+        "target": {"layer": folder_index, "placement": "inside"}
+    }));
+    let rows = textured["layers_bottom_to_top"].as_array().unwrap();
+    let relief = &rows[folder_index];
+    assert_eq!(relief["name"], "Tiled relief");
+    assert_eq!(relief["selected"], true);
+    assert_eq!(relief["folder"].as_u64().unwrap() as usize, folder_index + 1);
+    assert_eq!(relief["fill"]["textured_channels"], json!(["height"]));
+    assert_eq!(relief["fill"]["settings"]["projection"], "Triplanar");
+    assert_eq!(relief["fill"]["settings"]["tiling"], 2.0);
+    assert_eq!(rows[folder_index + 1]["layers_inside"].as_u64().unwrap(), old_children + 1);
+    assert_eq!(textured["undo_steps"].as_u64().unwrap(), smart["undo_steps"].as_u64().unwrap() + 1);
+
+    let undone = edit(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(undone["layers_bottom_to_top"], smart["layers_bottom_to_top"]);
+    let undone = edit(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(undone["layers_bottom_to_top"], original_layers["layers_bottom_to_top"]);
+    edit(&mut client, &mut app, json!({"operation":"redo"}));
+    let redone = edit(&mut client, &mut app, json!({"operation":"redo"}));
+    assert_eq!(redone["layers_bottom_to_top"], textured["layers_bottom_to_top"]);
+    let saved = client.tool(&mut app, "save_model", json!({"model_id": 0, "copy_name": "stdio-materials.glb"}));
+    let glb = Glb::load(Path::new(saved["structuredContent"]["path"].as_str().unwrap())).unwrap();
+    let surface = glb.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
+    assert_eq!(surface.stack.parents(folder_index).next(), Some(folder_index + 1));
+    assert_eq!(surface.stack.layers[folder_index + 1].name, "Rust group");
+    let height = surface.stack.layers[folder_index].texture_fill.as_ref().unwrap().images[3].as_ref().unwrap();
+    assert_eq!(height.name, format!("{texture}.png"));
+    assert_eq!(height.pixels().dimensions(), (1024, 1024));
+    let reset = client.tool(&mut app, "set_paint_view", json!({"model_id": 0, "reset_post": true}));
+    assert_eq!(reset["structuredContent"]["post"]["overridden"], false);
+    assert_eq!(reset["structuredContent"]["post"]["effects"], original["structuredContent"]["post"]["effects"]);
     client.close();
     drop(server);
 }

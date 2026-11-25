@@ -1,5 +1,5 @@
 //! Low-resolution graph evaluation and GPU copies for the open node canvas.
-use super::{Graph, Runtime, bake, file, library, mesh_maps, surface};
+use super::{Graph, Library, Runtime, bake, file, library, mesh_maps, surface};
 use crate::editor::model_paint_data::texture_fill::GraphImages;
 use bevy::{
     asset::{AssetId, RenderAssetUsages},
@@ -87,11 +87,22 @@ fn upload(
 
 struct Request {
     graph: Graph,
-    thumbnail_nodes: Option<Vec<u64>>,
+    gallery: Option<Gallery>,
     images: Arc<GraphImages>,
     paths: Vec<PathBuf>,
     maps: Option<Arc<bake::Maps>>,
     surface: Option<Arc<surface::Source>>,
+}
+
+pub(in crate::editor::ui::model_viewer::paint) struct Gallery {
+    pub nodes: Vec<u64>,
+    pub library: Option<Arc<Library>>,
+}
+
+impl PartialEq for Gallery {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes && mesh_maps::same(self.library.as_ref(), other.library.as_ref())
+    }
 }
 
 impl Request {
@@ -110,7 +121,7 @@ impl Request {
 
 impl PartialEq for Request {
     fn eq(&self, other: &Self) -> bool {
-        self.graph == other.graph && self.thumbnail_nodes == other.thumbnail_nodes
+        self.graph == other.graph && self.gallery == other.gallery
             && self.images == other.images && self.same_inputs(other)
     }
 }
@@ -148,9 +159,15 @@ impl Previews {
         self.set_request(graph, images, maps, surface, None);
     }
 
-    /// Evaluate independent preset branches once, keeping only their card images.
-    pub(in crate::editor::ui::model_viewer::paint) fn set_gallery(&mut self, graph: &Graph, thumbnail_nodes: Vec<u64>) {
-        self.set_request(graph, &Arc::default(), None, None, Some(thumbnail_nodes));
+    /// Evaluate independent gallery branches, keeping only their card images.
+    pub fn set_gallery(
+        &mut self,
+        graph: &Graph,
+        gallery: Gallery,
+        maps: Option<&Arc<bake::Maps>>,
+        surface: Option<&Arc<surface::Source>>,
+    ) {
+        self.set_request(graph, &Arc::default(), maps, surface, Some(gallery));
     }
 
     fn set_request(
@@ -159,7 +176,7 @@ impl Previews {
         images: &Arc<GraphImages>,
         maps: Option<&Arc<bake::Maps>>,
         surface: Option<&Arc<surface::Source>>,
-        thumbnail_nodes: Option<Vec<u64>>,
+        gallery: Option<Gallery>,
     ) {
         let mut graph = Graph::clone(graph);
         graph.name.clear();
@@ -183,12 +200,16 @@ impl Previews {
             .collect();
         paths.sort_unstable();
         paths.dedup();
-        let maps = maps
-            .filter(|_| surface.is_some() || !mesh_maps::used(&graph).is_empty())
-            .cloned();
+        let library = gallery.as_ref().and_then(|gallery| gallery.library.as_deref());
+        let maps = maps.filter(|_| {
+            surface.is_some() || library.map_or_else(
+                || !mesh_maps::used(&graph).is_empty(),
+                |library| !mesh_maps::used_with(&graph, library).is_empty(),
+            )
+        }).cloned();
         let request = Request {
             graph,
-            thumbnail_nodes,
+            gallery,
             images: images.clone(),
             paths,
             maps,
@@ -284,8 +305,11 @@ impl Previews {
                     })
                 });
                 if let Some(runtime) = &mut runtime {
+                    let library = request.gallery.as_ref()
+                        .and_then(|gallery| gallery.library.clone())
+                        .unwrap_or_else(library);
                     let mesh = mesh_maps::Textures::new(
-                        &mesh_maps::used(&graph),
+                        &mesh_maps::used_with(&graph, &library),
                         request.maps.as_deref(),
                         graph.res,
                         &device,
@@ -295,21 +319,21 @@ impl Previews {
                         device.wgpu_device(),
                         &queue,
                         &graph,
-                        &library(),
+                        &library,
                         &|id| mesh.get(id),
                         surface.as_ref().map(surface::Textures::inputs).as_ref(),
                         request.inputs_key(),
                         false,
                     );
-                    for node in &graph.nodes {
-                        if request.thumbnail_nodes.as_ref().is_none_or(|nodes| nodes.contains(&node.id))
-                            && let Some(texture) = runtime.thumb(node.id)
-                        {
-                            thumbs.insert(node.id, texture.clone());
+                    let gallery_ids = request.gallery.iter().flat_map(|gallery| gallery.nodes.iter().copied());
+                    let canvas_ids = graph.nodes.iter().filter(|_| request.gallery.is_none()).map(|node| node.id);
+                    for id in gallery_ids.chain(canvas_ids) {
+                        if let Some(texture) = runtime.thumb(id) {
+                            thumbs.insert(id, texture.clone());
                         }
                     }
                 }
-                let keep_runtime = request.thumbnail_nodes.is_none();
+                let keep_runtime = request.gallery.is_none();
                 Reply {
                     generation,
                     request,

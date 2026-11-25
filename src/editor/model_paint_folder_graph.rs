@@ -717,6 +717,7 @@ pub(super) fn can_edit(stack: &Stack, graph: &Graph, edit: material_graph::Edit)
                 }
         }
         Edit::Remove(id) => custom(graph, id),
+        Edit::UpdateSource(id, _) => custom(graph, id),
         Edit::Connect(from, to, index) => can_connect(from, to, index),
         Edit::Reconnect(source, target) => can_connect(source.node, target.node, target.index)
             && source.input.is_none_or(|old| can_disconnect(old.node, old.index)),

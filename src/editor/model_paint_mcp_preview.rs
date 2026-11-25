@@ -29,6 +29,66 @@ pub(in crate::editor) struct ViewArgs {
     preview: Option<MapPreview>,
     path_trace: Option<bool>,
     exposure_stops: Option<f32>,
+    post: Option<PostPatch>,
+    /// Remove the model's local grading override and start from the environment settings.
+    #[serde(default)]
+    reset_post: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct PostPatch {
+    tone_map: Option<crate::ToneMap>,
+    /// Use the environment tone mapper while retaining the other model grading settings.
+    #[serde(default)]
+    inherit_tone_map: bool,
+    contrast: Option<f32>,
+    saturation: Option<f32>,
+    temperature: Option<f32>,
+    tint: Option<f32>,
+    bloom: Option<f32>,
+    bloom_threshold: Option<f32>,
+    vignette: Option<f32>,
+    #[serde(alias = "chromatic")]
+    chromatic_aberration: Option<f32>,
+    sharpen: Option<f32>,
+    grain: Option<f32>,
+}
+
+impl PostPatch {
+    fn apply(&self, effects: &mut post::Effects) -> Result<(), String> {
+        use post::Field;
+        if self.inherit_tone_map && self.tone_map.is_some() {
+            return Err("Choose either tone_map or inherit_tone_map".into());
+        }
+        if self.inherit_tone_map {
+            effects.curve = None;
+        } else if let Some(curve) = self.tone_map {
+            effects.curve = Some(curve);
+        }
+        for (key, field, value) in [
+            ("contrast", Field::Contrast, self.contrast),
+            ("saturation", Field::Saturation, self.saturation),
+            ("temperature", Field::Temperature, self.temperature),
+            ("tint", Field::Tint, self.tint),
+            ("bloom", Field::Bloom, self.bloom),
+            ("bloom_threshold", Field::BloomThreshold, self.bloom_threshold),
+            ("vignette", Field::Vignette, self.vignette),
+            ("chromatic_aberration", Field::Chromatic, self.chromatic_aberration),
+            ("sharpen", Field::Sharpen, self.sharpen),
+            ("grain", Field::Grain, self.grain),
+        ] {
+            if let Some(value) = value {
+                let (min, max) = field.range();
+                if !(min..=max).contains(&value) {
+                    return Err(format!("{key} must be between {min} and {max}"));
+                }
+                field.set(effects, value);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -119,26 +179,40 @@ pub(in crate::editor) fn set_view(
     {
         return Err("Material and baked-map previews require the raster 3D viewport".into());
     }
-    let mut post = input
+    let env = input
         .env
         .as_deref()
-        .ok_or("Model environment settings are unavailable")?
-        .paint_post(Some(doc));
+        .ok_or("Model environment settings are unavailable")?;
+    let inherited = args.reset_post.then(|| env.paint_post(None));
+    let mut post = inherited.unwrap_or_else(|| env.paint_post(Some(doc)));
+    let effects = args.post.as_ref().filter(|patch| **patch != PostPatch::default());
+    if let Some(effects) = effects {
+        effects.apply(&mut post.effects)?;
+    }
     if let Some(exposure) = args.exposure_stops {
         post.exposure = exposure;
-        if !post.valid() || !doc.can_store_paint_preview() {
-            return Err(
-                "Exposure must be between -5 and 3 stops on a writable model preview".into(),
-            );
+        let (min, max) = DocumentPost::EXPOSURE_RANGE;
+        if !(min..=max).contains(&exposure) {
+            return Err(format!("Exposure must be between {min} and {max} stops"));
         }
+    }
+    let next_post = if args.exposure_stops.is_some() || effects.is_some() {
+        Some(post)
+    } else if args.reset_post {
+        None
+    } else {
+        doc.paint_post
+    };
+    if next_post != doc.paint_post && (!doc.can_store_paint_preview() || !post.valid()) {
+        return Err("This model cannot store the requested preview grading".into());
     }
     if previous != camera {
         viewer.restore_camera(camera);
         doc.model_camera = Some(camera);
         doc.ui_revision += 1;
     }
-    if args.exposure_stops.is_some() && doc.paint_post != Some(post) {
-        doc.paint_post = Some(post);
+    if doc.paint_post != next_post {
+        doc.paint_post = next_post;
         doc.ui_revision += 1;
     }
     if let Some(layout) = args.layout.filter(|&layout| layout != session.view) {
@@ -160,7 +234,9 @@ pub(in crate::editor) fn set_view(
         "yaw_degrees": camera.yaw.to_degrees(), "pitch_degrees": camera.pitch.to_degrees(),
         "fov_degrees": camera.fov.to_degrees(), "orthographic": camera.orthographic},
         "channel": session.diagnostic_channel().and_then(|index| mcp_state::CHANNEL_KEYS.get(index)),
-        "bake_map": session.diagnostic_bake()}),
+        "bake_map": session.diagnostic_bake(),
+        "post": {"overridden": doc.paint_post.is_some(), "effects": post.effects,
+            "tone_map": post.effects.curve.unwrap_or_else(|| env.trace_light(None).2)}}),
     )
 }
 

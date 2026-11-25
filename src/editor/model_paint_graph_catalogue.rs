@@ -31,7 +31,15 @@ impl PresetPreviews {
             }
             Some(ids[&output])
         }).collect();
-        self.previews.set_gallery(&gallery, outputs.iter().flatten().copied().collect());
+        self.previews.set_gallery(
+            &gallery,
+            material_graph::previews::Gallery {
+                nodes: outputs.iter().flatten().copied().collect(),
+                library: None,
+            },
+            None,
+            None,
+        );
         self.outputs = Some(outputs);
     }
 

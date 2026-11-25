@@ -11,6 +11,7 @@ pub(in crate::editor) use mcp_preview::{
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::{collections::BTreeMap, path::{Path, PathBuf}};
 
 pub(super) const CHANNEL_KEYS: [&str; 8] = [
     "base_color",
@@ -63,12 +64,23 @@ enum Edit {
     AddMaterial {
         preset: String,
     },
+    AddTexture {
+        preset: String,
+        name: Option<String>,
+        target: Option<MaterialTarget>,
+    },
+    AddSmartMaterial {
+        preset: String,
+        name: Option<String>,
+        target: Option<MaterialTarget>,
+    },
     UpdateLayer {
         index: usize,
         name: Option<String>,
         visible: Option<bool>,
         opacity_percent: Option<f32>,
         blend: Option<Blend>,
+        fill: Option<Box<FillPatch>>,
     },
     DuplicateLayer {
         index: usize,
@@ -104,6 +116,24 @@ enum Placement {
     Above,
     Below,
     Inside,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct MaterialTarget {
+    layer: usize,
+    placement: Placement,
+}
+
+impl MaterialTarget {
+    fn shelf(self) -> ShelfPlacement {
+        match self.placement {
+            Placement::Above => ShelfPlacement::Above(self.layer),
+            Placement::Below => ShelfPlacement::Below(self.layer),
+            Placement::Inside => ShelfPlacement::Inside(self.layer),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -260,6 +290,285 @@ impl PaintColors {
             self.specular.map(|v| [v; 3]),
         ]
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct FillPatch {
+    /// Solid channel values in the same RGB8 or scalar byte format as a brush.
+    channels: Option<PaintColors>,
+    /// Channel name to image path relative to the asset root or absolute. Null removes the image.
+    images: Option<BTreeMap<String, Option<PathBuf>>>,
+    projection: Option<texture_fill::Projection>,
+    tiling: Option<f32>,
+    rotation: Option<f32>,
+    offset: Option<[f32; 2]>,
+    sharpness: Option<f32>,
+    normal_strength: Option<f32>,
+    height_strength: Option<f32>,
+    height_offset: Option<f32>,
+    opacity_source: Option<texture_fill::OpacitySource>,
+    opacity_strength: Option<f32>,
+    emission_tint: Option<[f32; 3]>,
+    specular_strength: Option<f32>,
+    variation: Option<VariationPatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct VariationPatch {
+    color: Option<f32>,
+    roughness: Option<f32>,
+    height: Option<f32>,
+    scale: Option<f32>,
+    seed: Option<f32>,
+    parts: Option<f32>,
+}
+
+type FillImages = Vec<(usize, Option<Arc<texture_fill::Bitmap>>)>;
+
+impl FillPatch {
+    fn apply(self, layer: &mut Layer, size: u32, images: FillImages) -> Result<(), String> {
+        if layer.kind != LayerKind::Fill {
+            return Err("Fill settings require a fill layer".into());
+        }
+        let before = layer.texture_fill.as_ref().map(|fill| fill.settings).unwrap_or_default();
+        let mut settings = before;
+        settings.projection = self.projection.unwrap_or(settings.projection);
+        settings.tiling = self.tiling.unwrap_or(settings.tiling);
+        settings.rotation = self.rotation.unwrap_or(settings.rotation);
+        settings.offset = self.offset.unwrap_or(settings.offset);
+        settings.sharpness = self.sharpness.unwrap_or(settings.sharpness);
+        settings.normal_strength = self.normal_strength.unwrap_or(settings.normal_strength);
+        settings.height_strength = self.height_strength.unwrap_or(settings.height_strength);
+        settings.height_offset = self.height_offset.unwrap_or(settings.height_offset);
+        settings.opacity_source = self.opacity_source.unwrap_or(settings.opacity_source);
+        settings.opacity_strength = self.opacity_strength.unwrap_or(settings.opacity_strength);
+        settings.emission_tint = self.emission_tint.unwrap_or(settings.emission_tint);
+        settings.specular_strength = self.specular_strength.unwrap_or(settings.specular_strength);
+        if let Some(patch) = self.variation {
+            let variation = &mut settings.variation;
+            variation.color = patch.color.unwrap_or(variation.color);
+            variation.roughness = patch.roughness.unwrap_or(variation.roughness);
+            variation.height = patch.height.unwrap_or(variation.height);
+            variation.scale = patch.scale.unwrap_or(variation.scale);
+            variation.seed = patch.seed.unwrap_or(variation.seed);
+            variation.parts = patch.parts.unwrap_or(variation.parts);
+        }
+        if !settings.valid() {
+            return Err("Fill settings are outside the supported ranges".into());
+        }
+        if !images.is_empty() && layer.texture_fill.as_ref().is_some_and(|fill| fill.graph.is_some()) {
+            return Err("Edit image sources in the fill graph".into());
+        }
+        let mut images_changed = false;
+        for (index, image) in images {
+            let before = layer.texture_fill.as_ref().and_then(|fill| fill.images[index].as_ref());
+            let same = match (before, &image) {
+                (None, None) => true,
+                (Some(before), Some(after)) => before.name == after.name && before.bytes == after.bytes,
+                _ => false,
+            };
+            if !same {
+                Arc::make_mut(layer.texture_fill.get_or_insert_with(Arc::default)).images[index] = image;
+                images_changed = true;
+            }
+        }
+        if let Some(channels) = self.channels {
+            let colors = channels.colors();
+            let supplied = |index: usize| layer.texture_fill.as_ref().is_some_and(|fill| fill.images[index].is_some());
+            if colors.iter().enumerate().any(|(index, value)| value.is_some() && supplied(index)) {
+                return Err("A texture or graph supplies one of the requested solid channels".into());
+            }
+            for (index, color) in colors.into_iter().enumerate() {
+                let Some([r, g, b]) = color else { continue };
+                let rgba = [r, g, b, 255];
+                let channel = &mut layer.channels[index];
+                let same = channel.as_ref().is_some_and(|pixels| {
+                    pixels.len() == size as usize * size as usize * 4
+                        && pixels.chunks_exact(4).all(|pixel| pixel == rgba)
+                });
+                if !same {
+                    *channel = Some(crate::editor::model_paint_data::solid(size, rgba));
+                }
+            }
+        }
+        if settings.variation.height != before.variation.height && settings.variation.height != 0.
+            && layer.channels[3].is_none()
+            && layer.texture_fill.as_ref().is_none_or(|fill| fill.images[3].is_none())
+        {
+            layer.channels[3] = Some(crate::editor::model_paint_data::solid(size, [128, 128, 128, 255]));
+        }
+        if images_changed || settings != before {
+            let fill = Arc::make_mut(layer.texture_fill.get_or_insert_with(Arc::default));
+            fill.settings = settings;
+            fill.invalidate();
+            if fill.settings == texture_fill::Settings::default() && fill.graph.is_none()
+                && fill.images.iter().all(Option::is_none)
+            {
+                layer.texture_fill = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::editor) struct PaintEditJob {
+    target: EditTarget,
+    task: bevy::tasks::Task<Result<PaintEditData, String>>,
+}
+
+pub(in crate::editor) struct PreparedPaintEdit {
+    target: EditTarget,
+    data: PaintEditData,
+}
+
+pub(in crate::editor) struct PaintEditData(Prepared);
+
+enum Prepared {
+    Images(FillImages),
+    Material {
+        preset: ShelfMaterial,
+        insertion: (usize, usize),
+        selection: Option<usize>,
+        layers: Vec<Layer>,
+    },
+}
+
+struct EditTarget {
+    root: PathBuf,
+    source: PathBuf,
+    binding: Option<(usize, usize)>,
+    size: u32,
+    stack: Stack,
+}
+
+impl EditTarget {
+    fn capture(editor: &Editor, doc: &Document, session: &Session) -> Result<Self, String> {
+        if doc.paint_pending || session.smart_loading {
+            return Err("Wait for the current paint operation to finish".into());
+        }
+        Ok(Self {
+            root: editor.project.asset_root.clone(), source: doc.source.path.clone(),
+            binding: session.binding, size: session.texture_size, stack: session.stack.clone(),
+        })
+    }
+}
+
+fn load_fill_images(root: &Path, files: BTreeMap<String, Option<PathBuf>>) -> Result<FillImages, String> {
+    let mut bytes = 0;
+    let mut texels = 0;
+    let mut loaded = HashMap::<PathBuf, Arc<texture_fill::Bitmap>>::new();
+    files.into_iter().map(|(key, path)| {
+        let channel = CHANNEL_KEYS.iter().position(|name| *name == key)
+            .ok_or_else(|| format!("Unknown fill image channel '{key}'; use list_paint_presets"))?;
+        let image = if let Some(path) = path {
+            let path = root.join(path);
+            if let Some(image) = loaded.get(&path) {
+                Some(image.clone())
+            } else {
+                let bitmap = texture_fill::Bitmap::open(&path)
+                    .map_err(|error| format!("Could not load {key} image '{}' · {error}", path.display()))?;
+                material_graph::file::check_size(&mut bytes, &mut texels, loaded.len() + 1, &bitmap)
+                    .map_err(|_| "The combined fill images exceed the import limit")?;
+                let bitmap = Arc::new(bitmap);
+                loaded.insert(path, bitmap.clone());
+                Some(bitmap)
+            }
+        } else {
+            None
+        };
+        Ok((channel, image))
+    }).collect()
+}
+
+impl PaintEditJob {
+    pub(in crate::editor) fn poll(&mut self) -> Option<Result<PaintEditData, String>> {
+        bevy::tasks::block_on(bevy::tasks::poll_once(&mut self.task))
+    }
+
+    pub(in crate::editor) fn finish(self, data: PaintEditData) -> PreparedPaintEdit {
+        PreparedPaintEdit { target: self.target, data }
+    }
+}
+
+impl EditArgs {
+    pub(in crate::editor) fn needs_preparation(&self) -> bool {
+        match &self.edit {
+            Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. } => true,
+            Edit::UpdateLayer { fill: Some(fill), .. } => fill.images.as_ref().is_some_and(|images| !images.is_empty()),
+            _ => false,
+        }
+    }
+
+    fn workspace(&self) -> PaintWorkspace {
+        PaintWorkspace { model_id: self.model_id, set: self.set, revision: self.revision }
+    }
+}
+
+pub(in crate::editor) fn prepare_edit(
+    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState, args: &EditArgs,
+) -> Result<PaintEditJob, String> {
+    let (_, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace())?;
+    let target = EditTarget::capture(editor, doc, session)?;
+    let task = match &args.edit {
+        Edit::UpdateLayer { index, fill: Some(fill), .. } => {
+            let files = fill.images.clone().ok_or("No fill images were requested")?;
+            check_layer(session, *index)?;
+            let layer = &session.stack.layers[*index];
+            if layer.kind != LayerKind::Fill {
+                return Err("Fill settings require a fill layer".into());
+            }
+            if layer.texture_fill.as_ref().is_some_and(|fill| fill.graph.is_some()) {
+                return Err("Edit image sources in the fill graph".into());
+            }
+            let root = target.root.clone();
+            bevy::tasks::IoTaskPool::get().spawn(async move {
+                load_fill_images(&root, files).map(|images| PaintEditData(Prepared::Images(images)))
+            })
+        }
+        Edit::AddTexture { preset, name, target } => {
+            let index = tips::texture_index(preset).ok_or("Unknown texture preset; use list_paint_presets")?;
+            prepare_material(session, ShelfMaterial::Texture(index), name.as_deref(), *target)?
+        }
+        Edit::AddSmartMaterial { preset, name, target } => {
+            let index = SMART_MATERIALS.iter().position(|item| item.name.eq_ignore_ascii_case(preset))
+                .ok_or("Unknown smart material; use list_paint_presets")?;
+            prepare_material(session, ShelfMaterial::Smart(index), name.as_deref(), *target)?
+        }
+        _ => return Err("This paint edit does not require background preparation".into()),
+    };
+    Ok(PaintEditJob { target, task })
+}
+
+fn prepare_material(
+    session: &Session, preset: ShelfMaterial, name: Option<&str>, target: Option<MaterialTarget>,
+) -> Result<bevy::tasks::Task<Result<PaintEditData, String>>, String> {
+    let name = name.map(Session::valid_layer_name).transpose()?.map(str::to_owned);
+    let insertion = if let Some(target) = target {
+        session.shelf_insertion(target.shelf()).ok_or("Unknown layer or invalid material placement")?
+    } else {
+        session.insertion()
+    };
+    if !session.can_insert_material(preset, Some(insertion)) {
+        return Err("The material would exceed the layer count or group depth limit".into());
+    }
+    let selection = target.is_none().then_some(session.stack.selected);
+    let size = session.texture_size;
+    Ok(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+        let mut layers = match preset {
+            ShelfMaterial::Texture(index) => tips::texture_layer(index)?,
+            ShelfMaterial::Smart(index) => SMART_MATERIALS[index].prepare(size)?,
+            _ => return Err("Unsupported material preset".into()),
+        };
+        let root = layers.last_mut().ok_or("The material preset has no layers")?;
+        if let Some(name) = name {
+            root.name = name;
+        }
+        Ok(PaintEditData(Prepared::Material { preset, insertion, selection, layers }))
+    }))
 }
 
 pub(super) enum RasterOperation<'a> {
@@ -446,20 +755,53 @@ pub(in crate::editor) fn state(
     ))
 }
 
-pub(in crate::editor) fn apply(
+#[cfg(test)]
+fn apply(
     editor: &Editor,
     editing: &mut editing::State,
     paint: &mut PaintState,
     args: EditArgs,
     now: f64,
 ) -> Result<Value, String> {
-    let workspace = PaintWorkspace {
-        model_id: args.model_id,
-        set: args.set,
-        revision: args.revision,
+    apply_prepared(editor, editing, paint, args, now, None)
+}
+
+pub(in crate::editor) fn apply_prepared(
+    editor: &Editor,
+    editing: &mut editing::State,
+    paint: &mut PaintState,
+    args: EditArgs,
+    now: f64,
+    prepared: Option<PreparedPaintEdit>,
+) -> Result<Value, String> {
+    let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace())?;
+    let prepared = match prepared {
+        Some(PreparedPaintEdit { target, data }) => {
+            if target.root != editor.project.asset_root || target.source != doc.source.path
+                || target.binding != session.binding || target.size != session.texture_size
+                || doc.paint_pending || session.smart_loading
+                || !crate::editor::model_paint_data::same_layer_list(&target.stack, &session.stack)
+            {
+                return Err("The paint workspace changed during preparation; call get_paint_state again".into());
+            }
+            Some(data.0)
+        }
+        None if args.needs_preparation() => return Err("This paint edit has not been prepared".into()),
+        None => None,
     };
-    let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, workspace)?;
-    perform(doc, session, args.edit, now)?;
+    match prepared {
+        Some(Prepared::Images(images)) => perform(doc, session, args.edit, now, images)?,
+        Some(Prepared::Material { preset, insertion, selection, layers }) => {
+            if selection.is_some_and(|index| session.stack.selected != index)
+                || !session.can_insert_material(preset, Some(insertion))
+            {
+                return Err("The material destination changed; call get_paint_state again".into());
+            }
+            session.insert_smart_material(layers, insertion);
+            doc.paint_pending = true;
+        }
+        None => perform(doc, session, args.edit, now, Vec::new())?,
+    }
     Ok(snapshot(index, doc, Some(session), &paint.tips))
 }
 
@@ -622,7 +964,7 @@ fn raster(
     Ok(snapshot(index, doc, Some(session), &paint.tips))
 }
 
-fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64) -> Result<(), String> {
+fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, images: FillImages) -> Result<(), String> {
     let before = session.stack.clone();
     match edit {
         Edit::SelectSet { index } => {
@@ -647,12 +989,16 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64) -> R
                 .ok_or("Unknown material preset; use list_paint_presets")?;
             apply_action(session, PaintAction::AddMaterial(index))?;
         }
+        Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. } => {
+            return Err("The material preset has not been prepared".into());
+        }
         Edit::UpdateLayer {
             index,
             name,
             visible,
             opacity_percent,
             blend,
+            fill,
         } => {
             check_layer(session, index)?;
             let name = name.as_deref().map(Session::valid_layer_name).transpose()?;
@@ -675,6 +1021,9 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64) -> R
             }
             if let Some(value) = blend {
                 updated.blend = value;
+            }
+            if let Some(fill) = fill {
+                fill.apply(&mut updated, session.texture_size, images)?;
             }
             if updated != *layer {
                 session.checkpoint();
@@ -865,6 +1214,14 @@ fn layer_rows(stack: &Stack) -> Vec<Value> {
             "layers_inside": (layer.kind == LayerKind::Folder).then(|| stack.block(index).len() - 1),
             "collapsed": layer.collapsed,
             "channels": channels,
+            "fill": (layer.kind == LayerKind::Fill).then(|| {
+                let settings = layer.texture_fill.as_ref().map(|fill| fill.settings).unwrap_or_default();
+                let textured_channels = layer.texture_fill.as_ref().map(|fill| {
+                    CHANNEL_KEYS.iter().zip(&fill.images)
+                        .filter_map(|(name, image)| image.as_ref().map(|_| *name)).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                json!({"settings": settings, "textured_channels": textured_channels})
+            }),
             "mask": mask,
             "selected": index == stack.selected,
         })
@@ -903,12 +1260,16 @@ pub(in crate::editor) fn catalog(paint: &PaintState) -> Value {
         "channels": CHANNEL_KEYS,
         "materials": MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "smart_materials": SMART_MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
+        "textures": tips::texture_names(),
         "local_presets": paint.library.entries().map(|(index, entry)| json!({"index": index, "name": entry.name})).collect::<Vec<_>>(),
         "generators": GeneratorKind::ALL.map(|kind| json!({"id": kind, "label": kind.label()})),
         "generator_inputs": GeneratorInput::ALL.map(|input| json!({"id": input as usize, "label": input.label()})),
         "blend_modes": Blend::ALL.map(|blend| json!({"id": blend, "label": blend.label()})),
         "brush_tips": paint.tips.names(),
         "fill_modes": FillMode::OPTIONS.map(|(label, mode)| json!({"id": mode, "label": label})),
+        "fill_projections": texture_fill::Projection::ALL,
+        "fill_opacity_sources": texture_fill::OpacitySource::ALL,
+        "paint_tone_maps": crate::ToneMap::ALL,
         "bake_qualities": crate::editor::model_bake_settings::Quality::ALL,
         "bake_maps": bake::BakeMap::ALL.map(|map| json!({"id": map, "label": map.label(), "requires_high_poly": map.requires_high_poly()})),
         "export_presets": export::Template::ALL.map(|preset| json!({"id": preset, "label": preset.label()})),
@@ -1017,6 +1378,58 @@ mod tests {
     }
 
     #[test]
+    fn fill_settings_and_solid_values_share_layer_undo() {
+        let (mut doc, mut session) = fixture();
+        session.texture_size = 4;
+        let layer = &mut session.stack.layers[0];
+        layer.kind = LayerKind::Fill;
+        let edit = |fill: Value| {
+            serde_json::from_value(json!({
+                "operation": "update_layer", "index": 0, "name": "Glazed",
+                "opacity_percent": 72.0, "fill": fill,
+            })).unwrap()
+        };
+        let initial = session.stack.clone();
+        assert!(perform(&mut doc, &mut session, edit(json!({"tiling": 0.0})), 0., Vec::new()).is_err());
+        assert_eq!(session.stack, initial);
+        assert!(session.undo.is_empty());
+        assert!(!doc.paint_pending);
+
+        let patch = json!({
+            "channels": {"base_color": [20, 40, 80], "roughness": 100},
+            "projection": "Triplanar", "tiling": 3.0, "offset": [0.25, 0.0],
+            "variation": {"height": 0.4, "scale": 8.0}
+        });
+        perform(&mut doc, &mut session, edit(patch.clone()), 0., Vec::new()).unwrap();
+        let layer = &session.stack.layers[0];
+        assert_eq!(layer.name, "Glazed");
+        assert_eq!(layer.opacity, 72.);
+        assert_eq!(&layer.channels[0].as_ref().unwrap()[..4], &[20, 40, 80, 255]);
+        assert_eq!(&layer.channels[3].as_ref().unwrap()[..4], &[128, 128, 128, 255]);
+        let settings = layer.texture_fill.as_ref().unwrap().settings;
+        assert_eq!(settings.projection, texture_fill::Projection::Triplanar);
+        assert_eq!(settings.variation.scale, 8.);
+        assert!(doc.paint_pending);
+        assert_eq!(session.undo.len(), 1);
+        perform(&mut doc, &mut session, edit(patch), 0., Vec::new()).unwrap();
+        assert_eq!(session.undo.len(), 1);
+        perform(&mut doc, &mut session, Edit::Undo, 0., Vec::new()).unwrap();
+        assert_eq!(session.stack, initial);
+
+        let layer = &mut session.stack.layers[0];
+        let bitmap = texture_fill::Bitmap::from_rgba(
+            "Fixture".into(), image::RgbaImage::from_pixel(2, 2, image::Rgba([90, 20, 40, 255])),
+        ).unwrap();
+        layer.edit_texture_fill(|fill| fill.images[0] = Some(Arc::new(bitmap)));
+        let textured = session.stack.clone();
+        assert!(perform(&mut doc, &mut session, edit(json!({
+            "channels": {"base_color": [0, 0, 0]}, "tiling": 2.0,
+        })), 0., Vec::new()).is_err());
+        assert_eq!(session.stack, textured);
+        assert!(session.undo.is_empty());
+    }
+
+    #[test]
     fn paint_edit_validates_workspace_and_keeps_atomic_shared_history() {
         let (document, mut session) = fixture();
         session.texture_size = 16;
@@ -1042,6 +1455,7 @@ mod tests {
             visible: Some(false),
             opacity_percent: Some(opacity),
             blend: Some(Blend::Multiply),
+            fill: None,
         };
         let invalid = request(edited("Ignored".into(), 120.));
         assert!(apply(&editor, &mut editing, &mut paint, invalid, 0.).is_err());

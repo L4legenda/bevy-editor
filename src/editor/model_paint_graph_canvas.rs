@@ -7,6 +7,7 @@ use bevy::{
 use material_graph::previews::{Previews, Uploads};
 use material_graph::{Batch, BatchKind, Edit, GraphInput, WireSource};
 use material_painter_graph::{Graph, Kind, Library};
+use bevy::tasks::IoTaskPool;
 use std::sync::Arc;
 
 #[path = "model_paint_graph_catalogue.rs"]
@@ -38,6 +39,7 @@ struct Card {
     preview: Option<Entity>,
     origin: Vec2,
     height: f32,
+    source: Option<String>,
 }
 
 struct Wire {
@@ -69,6 +71,9 @@ pub(super) struct Canvas {
     graph_pane: Entity,
     export_tools: [Entity; 5],
     delete: Entity,
+    edit_source: Entity,
+    copy_source: Entity,
+    source_copy: Option<SourceCopy>,
     library: Option<Arc<Library>>,
     secondary_pan: bool,
     typing: bool,
@@ -108,7 +113,25 @@ enum Target {
     Shader(usize, usize),
 }
 
+struct SourceCopy {
+    target: Target,
+    payload: Arc<serde_json::Value>,
+    node: u64,
+    state: SourceCopyState,
+}
+
+enum SourceCopyState {
+    Writing(Task<Result<(String, Arc<str>), String>>),
+    Applying { definition: String, code: Arc<str> },
+}
+
 impl Target {
+    fn model(self) -> usize {
+        match self {
+            Self::Texture(model, ..) | Self::Shader(model, _) => model,
+        }
+    }
+
     fn for_session(model: usize, session: &Session) -> Self {
         if let Some(shader) = session.preview_shader.filter(|_| session.editing_shader().is_some()) {
             Self::Shader(model, shader)
@@ -276,6 +299,34 @@ impl Canvas {
                 }
             },
         );
+        let edit_source = local_button(commands, controls, font, "Открыть исходник WGSL");
+        commands.entity(edit_source).observe(
+            |event: On<PointerClick>, ui: Res<PaintUi>, mut maker: ResMut<ShaderMaker>, mut messages: MessageWriter<Action>| {
+                if event.button == PointerButton::Primary
+                    && let Some(target) = ui.graph.target
+                    && let Some((node, def)) = ui.graph.selected_source()
+                    && def.starts_with("user/")
+                    && node_library::available(def)
+                    && let Some(definition) = node_library::library().find(def)
+                {
+                    maker.request_graph_source(target.model(), node, definition.id.clone(), Arc::from(definition.source.as_str()));
+                    action(&mut messages, PaintAction::Panel(Panel::Shader));
+                }
+            },
+        );
+        let copy_source = local_button(commands, controls, font, "Редактировать копию узла");
+        commands.entity(copy_source).observe(
+            |event: On<PointerClick>, mut ui: ResMut<PaintUi>, maker: Res<ShaderMaker>, mut editor: ResMut<Editor>| {
+                if event.button == PointerButton::Primary
+                    && let Err(error) = ui.graph.copy_source(&maker)
+                {
+                    editor.status = error;
+                }
+            },
+        );
+        for button in [edit_source, copy_source] {
+            commands.entity(button).entry::<Node>().and_modify(|mut node| node.display = Display::None);
+        }
         let title = text(commands, toolbar, font, "", 13., TEXT);
         commands
             .entity(title)
@@ -433,6 +484,9 @@ impl Canvas {
             graph_pane: root,
             export_tools: [export, package, outputs, save, submission],
             delete,
+            edit_source,
+            copy_source,
+            source_copy: None,
             library: None,
             secondary_pan: false,
             typing: false,
@@ -759,6 +813,8 @@ impl Canvas {
                     preview,
                     origin: Vec2::from_array(node_data.pos),
                     height,
+                    source: (managed.is_none() && !node_library::is_embedded(&def.id))
+                        .then(|| def.id.clone()),
                 },
             );
         }
@@ -849,6 +905,77 @@ impl Canvas {
         self.selected = self.selection.last().copied();
         self.dirty = true;
         action(messages, self.selected.map_or(PaintAction::GraphClearSelection, PaintAction::GraphSelectNode));
+    }
+
+    fn selected_source(&self) -> Option<(u64, &str)> {
+        let &[id] = self.selection.as_slice() else { return None };
+        Some((id, self.cards.get(&id)?.source.as_deref()?))
+    }
+
+    fn copy_source(&mut self, maker: &ShaderMaker) -> Result<(), String> {
+        if self.source_copy.is_some() { return Ok(()); }
+        let Some((node, original)) = self.selected_source()
+            .filter(|(_, id)| material_graph::replaceable_builtin(id))
+        else { return Ok(()) };
+        let (Some(target), Some(payload)) = (self.target, self.payload.clone()) else { return Ok(()) };
+        let directory = maker.directory().ok_or("Папка пользовательских узлов недоступна")?;
+        let original = original.to_owned();
+        let task = IoTaskPool::get().spawn(async move {
+            let (path, code) = node_library::copy_builtin(&directory, &original)?;
+            Ok((node_library::node_id(&path)?, code))
+        });
+        self.source_copy = Some(SourceCopy { target, payload, node, state: SourceCopyState::Writing(task) });
+        Ok(())
+    }
+
+    fn update_source_copy(
+        &mut self,
+        active: Option<(usize, &Session, &Arc<serde_json::Value>)>,
+        maker: &mut ShaderMaker,
+        messages: &mut MessageWriter<Action>,
+    ) -> Result<(), String> {
+        let Some(mut copy) = self.source_copy.take() else { return Ok(()) };
+        let active = active.filter(|(model, session, _)| copy.target == Target::for_session(*model, session));
+        match &mut copy.state {
+            SourceCopyState::Writing(task) => {
+                let Some(result) = block_on(poll_once(task)) else {
+                    self.source_copy = Some(copy);
+                    return Ok(());
+                };
+                let (definition, code) = result?;
+                let kind = BatchKind::ReplaceSource;
+                let Some((_, session, payload)) = active
+                    .filter(|(_, session, payload)| Arc::ptr_eq(&copy.payload, payload)
+                        && session.available(PaintAction::GraphEdit(Edit::Batch(0, kind))))
+                else { return Err("Копия сохранена в библиотеке · исходный граф изменился".into()) };
+                if session.graph_node != Some(copy.node) || self.batch.is_some() {
+                    return Err("Копия сохранена в библиотеке · выделение или граф изменились".into());
+                }
+                let batch = Batch::ReplaceSource { node: copy.node, definition: definition.clone() };
+                self.queue_batch(batch, kind, messages);
+                copy.state = SourceCopyState::Applying { definition, code };
+                copy.payload = payload.clone();
+                self.source_copy = Some(copy);
+            }
+            SourceCopyState::Applying { definition, code } => {
+                let Some((_, session, payload)) = active else { return Ok(()) };
+                if Arc::ptr_eq(&copy.payload, payload) && session.smart_loading {
+                    self.source_copy = Some(copy);
+                    return Ok(());
+                }
+                if !Arc::ptr_eq(&copy.payload, payload)
+                    && material_graph::read(payload)?.node(copy.node).is_some_and(|node| node.def == *definition)
+                {
+                    if session.graph_node == Some(copy.node) {
+                        maker.request_graph_source(copy.target.model(), copy.node, definition.clone(), code.clone());
+                        action(messages, PaintAction::Panel(Panel::Shader));
+                    }
+                } else {
+                    return Err("Копия сохранена в библиотеке · узел на холсте не заменён".into());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn queue_batch(&mut self, batch: Batch, kind: BatchKind, messages: &mut MessageWriter<Action>) {
@@ -1072,7 +1199,7 @@ fn place_wire(
 
 pub(in crate::editor::ui::model_viewer) fn refresh(
     mut commands: Commands,
-    editor: Res<Editor>,
+    mut editor: ResMut<Editor>,
     editing: Res<editing::State>,
     paint: Res<PaintState>,
     mut ui: ResMut<PaintUi>,
@@ -1088,9 +1215,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     baked: Res<bake::State>,
     workspace: (Res<shader_preview::Cache>, Res<sidebar::State>, Res<ButtonInput<KeyCode>>,
         Res<ButtonInput<MouseButton>>, ResMut<bevy::input_focus::InputFocus>, Query<&mut bevy::text::EditableText>,
-        Query<(Entity, &catalogue::PresetSwatch)>, MessageWriter<Action>),
+        Query<(Entity, &catalogue::PresetSwatch)>, MessageWriter<Action>, ResMut<ShaderMaker>),
 ) {
-    let (shaders, shelf, keys, mouse, mut focus, mut editable, swatches, mut messages) = workspace;
+    let (shaders, shelf, keys, mouse, mut focus, mut editable, swatches, mut messages, mut maker) = workspace;
     let canvas = &mut ui.graph;
     let context = editor
         .viewing_model
@@ -1113,6 +1240,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 .graph_data()
                 .map(|(payload, images)| (model, session, payload, images))
         });
+    if let Err(error) = canvas.update_source_copy(graph.map(|(model, session, payload, _)| (model, session, payload)), &mut maker, &mut messages) {
+        editor.status = error;
+    }
     let Ok(mut root) = nodes.get_mut(canvas.root) else {
         return;
     };
@@ -1371,6 +1501,17 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             current.into_iter().collect()
         };
         canvas.dirty = true;
+    }
+    let source = canvas.selected_source().map(|(_, id)| id);
+    let open = source.is_some_and(|id| id.starts_with("user/") && node_library::available(id));
+    let copy = source.is_some_and(material_graph::replaceable_builtin)
+        && canvas.source_copy.is_none()
+        && session.available(PaintAction::GraphEdit(Edit::Batch(0, BatchKind::ReplaceSource)));
+    for (entity, visible) in [(canvas.edit_source, open), (canvas.copy_source, copy)] {
+        if let Ok(mut button) = nodes.get_mut(entity) {
+            let display = if visible { Display::Flex } else { Display::None };
+            if button.display != display { button.display = display; }
+        }
     }
     if canvas.dirty {
         for (&id, card) in &canvas.cards {

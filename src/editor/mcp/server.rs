@@ -252,7 +252,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Set the live paint viewport's camera, layout, channel or baked-map preview, path tracing and exposure",
+        description = "Set the live paint viewport's camera, layout, channel or baked-map preview, path tracing, exposure and post-processing",
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn set_paint_view(

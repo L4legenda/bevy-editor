@@ -135,9 +135,51 @@ pub(super) fn source_path(directory: &Path, id: &str) -> Result<PathBuf, String>
 
 static FILE_EDIT: Mutex<()> = Mutex::new(());
 
+/// Discover new sources and refresh parse diagnostics without moving palette indices.
+pub(super) fn scan(directory: &Path) {
+    let _file = FILE_EDIT.lock().unwrap_or_else(|error| error.into_inner());
+    let mut scanned = Library { defs: Vec::new(), errors: Vec::new(), user_dir: None };
+    load_folder(&mut scanned, directory);
+    let mut catalog = current().write().unwrap_or_else(|error| error.into_inner());
+    let added: Vec<_> = scanned.defs.into_iter()
+        .filter(|def| catalog.library.find(&def.id).is_none() && !catalog.archived.contains(&def.id))
+        .collect();
+    let errors: Vec<_> = catalog.library.errors.iter()
+        .filter(|(path, _)| path.parent() != Some(directory))
+        .cloned()
+        .chain(scanned.errors)
+        .collect();
+    if added.is_empty() && catalog.library.errors == errors {
+        return;
+    }
+    let mut library = append(&catalog.library, added);
+    library.errors = errors;
+    catalog.library = Arc::new(library);
+    catalog.revision += 1;
+}
+
 pub(super) fn publish(directory: &Path, source: &str) -> Result<PathBuf, String> {
     let id = format!("user/{}", bevy::asset::uuid::Uuid::new_v4());
     publish_as(directory, &id, source)
+}
+
+pub(super) fn copy_builtin(directory: &Path, id: &str) -> Result<(PathBuf, Arc<str>), String> {
+    let library = library();
+    let definition = library.find(id).filter(|_| !custom(id))
+        .ok_or("Выберите встроенный узел для копирования")?;
+    let source = builtin_copy_source(definition);
+    let path = publish(directory, &source)?;
+    Ok((path, source.into()))
+}
+
+pub(super) fn builtin_copy_source(definition: &NodeDef) -> String {
+    definition.source
+        .replacen(
+            &format!("// @name {}", definition.name),
+            &format!("// @name {} (копия)", definition.name),
+            1,
+        )
+        .replacen(&format!("// @category {}", definition.category), "// @category Custom", 1)
 }
 
 pub(super) fn publish_named(directory: &Path, filename: &Path, source: &str) -> Result<PathBuf, String> {

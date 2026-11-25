@@ -17,6 +17,8 @@ pub(in crate::editor::ui::model_viewer) use shader_maker::Maker as ShaderMaker;
 pub(super) use graph_canvas::NodePreview;
 #[cfg(test)]
 pub(super) use graph_canvas::PresetSwatch;
+#[cfg(test)]
+pub(super) use shader_maker::Swatch as ShaderSwatch;
 pub(super) use graph_canvas::position_next_to_graph;
 pub(in crate::editor::ui::model_viewer) use graph_canvas::refresh as refresh_graph;
 use bevy::{

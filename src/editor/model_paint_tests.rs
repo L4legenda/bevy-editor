@@ -1275,6 +1275,15 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
         let [r, g, b, _] = image.get_pixel(point.x, point.y).0;
         r.abs_diff(g) < 3 && r.abs_diff(b) < 3
     };
+    #[cfg(feature = "mcp")]
+    let request = |app: &mut App, settings| {
+        use bevy::ecs::system::RunSystemOnce;
+        let args: mcp_state::PaintViewArgs = serde_json::from_value(settings).unwrap();
+        app.world_mut().run_system_once(move |mut input: mcp_state::McpPreview,
+            editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+            mcp_state::set_view(&mut input, &editor, &mut editing, &mut paint, args.clone())
+        }).unwrap()
+    };
     scroll_to_paint_control(&mut app, PaintAction::PostPanel);
     paint_click(&mut app, window, PaintAction::PostPanel);
     let saturation_slider = {
@@ -1293,6 +1302,16 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     assert_eq!(*app.world().resource::<environment::Settings>(), preferences);
     let doc = &app.world().resource::<editing::State>().documents[&0];
     assert_eq!(Field::Saturation.value(doc.paint_post.unwrap().effects), 0.0);
+    #[cfg(feature = "mcp")]
+    {
+        request(&mut app, serde_json::json!({"model_id": 0, "post": {"saturation": 1.0}})).unwrap();
+        capture_when(&mut app, &target, &output.join("viewport-mcp-color.png"), |image| !gray(image));
+        let response = request(&mut app, serde_json::json!({"model_id": 0, "post": {"saturation": 0.0}})).unwrap();
+        assert_eq!(response["post"]["effects"]["saturation"], 0.0);
+        capture_when(&mut app, &target, &output.join("viewport-mcp-graded.png"), gray);
+        assert_eq!(samples(app.world()), Some(before_grade));
+        assert_eq!(*app.world().resource::<environment::Settings>(), preferences);
+    }
     paint_message(&mut app, PaintAction::PreviewShader(None));
     assert_eq!(canvas_image(&mut app), raster);
     capture_when(&mut app, &target, &output.join("viewport-raster-graded.png"), gray);
@@ -1315,14 +1334,6 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     assert_eq!(*world.resource::<environment::Settings>(), preferences);
     #[cfg(feature = "mcp")]
     {
-        use bevy::ecs::system::RunSystemOnce;
-        let request = |app: &mut App, settings| {
-            let args: mcp_state::PaintViewArgs = serde_json::from_value(settings).unwrap();
-            app.world_mut().run_system_once(move |mut input: mcp_state::McpPreview,
-                editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
-                mcp_state::set_view(&mut input, &editor, &mut editing, &mut paint, args.clone())
-            }).unwrap()
-        };
         let previous = app.world().resource::<Viewer>().camera();
         assert!(request(&mut app, serde_json::json!({"model_id": 0, "yaw_degrees": 30, "fov_degrees": 0})).is_err());
         assert_eq!(app.world().resource::<Viewer>().camera(), previous);
@@ -4449,6 +4460,90 @@ fn gpu_model_paint_graph_presets_and_node_edit_survive_glb() {
     assert_ne!(fill(&app).images[3].as_ref().unwrap().bytes, original.images[3].as_ref().unwrap().bytes);
     paint_message(&mut app, PaintAction::Undo);
     assert_eq!(current_graph(&app).params[0].name, "Плотность кирпича");
+
+    let files = tempfile::tempdir().unwrap();
+    app.world_mut().resource_mut::<ShaderMaker>().node_directory = Some(files.path().join("nodes"));
+    let before = fill(&app);
+    let before_graph = current_graph(&app);
+    let undo_depth = app.world().resource::<PaintState>().sessions[&0].undo.len();
+    paint_message(&mut app, PaintAction::GraphSelectNode(tiles.id));
+    click_label(&mut app, "Редактировать копию узла");
+    let started = std::time::Instant::now();
+    let (copy_id, code) = loop {
+        frame(&mut app);
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        let graph = current_graph(&app);
+        let node = graph.node(tiles.id).unwrap();
+        if session.panel == Panel::Shader && node.def.starts_with("user/") {
+            let world = app.world_mut();
+            let mut inputs = world.query::<(&AccessibleLabel, &bevy::text::EditableText)>();
+            let code = inputs.iter(world).find(|(label, _)| label.0 == "Исходный код WGSL").unwrap().1.value().to_string();
+            if code.contains("@name Tiles (копия)") {
+                break (node.def.clone(), code);
+            }
+        }
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    };
+    let after = fill(&app);
+    let mut expected = before_graph.clone();
+    expected.node_mut(tiles.id).unwrap().def = copy_id.clone();
+    assert_eq!(current_graph(&app), expected);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].undo.len(), undo_depth + 1);
+    assert!(Arc::ptr_eq(&before.images[3].as_ref().unwrap(), &after.images[3].as_ref().unwrap()));
+    assert_eq!(after.graph.as_ref().unwrap()["bevy_wgsl_nodes"][&copy_id], code);
+    settle(&mut app);
+    let path = files.path().join("fork.glb");
+    {
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        std::fs::write(&path, doc.source.encode(&doc.objects, &doc.original).unwrap()).unwrap();
+    }
+    let loaded = Glb::load(&path).unwrap();
+    let saved = loaded.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .find_map(|primitive| loaded.paint_surface(primitive).unwrap()).unwrap();
+    let saved = saved.stack.layers.iter().find_map(|layer| layer.texture_fill.as_ref()).unwrap();
+    assert_eq!(saved.graph, after.graph);
+    click_label(&mut app, "Вернуться к графу");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Layers);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(current_graph(&app), before_graph);
+    paint_message(&mut app, PaintAction::Redo);
+    assert_eq!(current_graph(&app), expected);
+    paint_message(&mut app, PaintAction::GraphSelectNode(tiles.id));
+    click_label(&mut app, "Открыть исходник WGSL");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Shader);
+    let edited = code.replace("return vec4<f32>(h * lum);", "return vec4<f32>(0.12);");
+    assert_ne!(edited, code);
+    {
+        let world = app.world_mut();
+        let mut inputs = world.query::<(&AccessibleLabel, &mut bevy::text::EditableText)>();
+        let (_, mut source) = inputs.iter_mut(world).find(|(label, _)| label.0 == "Исходный код WGSL").unwrap();
+        assert_eq!(source.value(), code.as_str());
+        source.editor_mut().set_text(&edited);
+    }
+    click_label(&mut app, "Сохранить правки");
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        if labelled(&mut app, "Применить к графу").width() > 0. { break; }
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    click_label(&mut app, "Применить к графу");
+    settle(&mut app);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Layers);
+    let updated = fill(&app);
+    assert_eq!(updated.graph.as_ref().unwrap()["bevy_wgsl_nodes"][&copy_id], edited);
+    assert_eq!(current_graph(&app), expected);
+    assert_ne!(updated.images[3].as_ref().unwrap().bytes, after.images[3].as_ref().unwrap().bytes);
+    let pinned = material_graph::read(saved.graph.as_ref().unwrap()).unwrap();
+    let pinned_def = &pinned.node(tiles.id).unwrap().def;
+    assert!(node_library::is_embedded(pinned_def));
+    assert_eq!(material_graph::library().find(pinned_def).unwrap().source, code);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(fill(&app).graph, after.graph);
+    assert_eq!(fill(&app).images[3].as_ref().unwrap().bytes, after.images[3].as_ref().unwrap().bytes);
+    paint_message(&mut app, PaintAction::Redo);
+    assert_eq!(fill(&app).graph, updated.graph);
 }
 
 #[test]
@@ -4778,6 +4873,10 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     let directory = std::env::temp_dir().join(format!(
         "bevy-wgsl-library-{}", bevy::asset::uuid::Uuid::new_v4(),
     ));
+    std::fs::create_dir(&directory).unwrap();
+    let broken_node = directory.join("broken.wgsl");
+    let broken = "// @name Broken\n// @unknown\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.3); }\n";
+    std::fs::write(&broken_node, broken).unwrap();
     app.world_mut().resource_mut::<ShaderMaker>().node_directory = Some(directory.clone());
     app.world_mut().resource_mut::<Editor>().drawer = false;
     app.world_mut().write_message(Action::ViewModel(0));
@@ -4846,6 +4945,62 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
         fill_modifier(app, window, KeyCode::Enter, Key::Enter, ButtonState::Pressed);
         fill_modifier(app, window, KeyCode::Enter, Key::Enter, ButtonState::Released);
     };
+    let swatch = |app: &mut App, label: &str| {
+        let world = app.world_mut();
+        let children = world.query::<(&AccessibleLabel, &Children)>().iter(world)
+            .find_map(|(name, children)| (name.0 == label).then_some(children))?;
+        children.iter().find_map(|child| {
+            world.get::<ui::ShaderSwatch>(child)?;
+            let image = world.get::<ImageNode>(child)?.image.id();
+            let node = world.get::<ComputedNode>(child)?;
+            let transform = world.get::<UiGlobalTransform>(child)?;
+            let scale = node.inverse_scale_factor();
+            Some((image, Rect::from_center_size(transform.affine().translation * scale, node.size() * scale)))
+        })
+    };
+    let wait_swatch = |app: &mut App, label: &str, previous| {
+        let start = Instant::now();
+        loop {
+            frame(app);
+            if let Some((asset, rect)) = swatch(app, label)
+                && Some(asset) != previous
+            {
+                return (asset, rect);
+            }
+            assert!(start.elapsed().as_secs() < 45, "Не загрузилась миниатюра {label}");
+        }
+    };
+    assert!(labelled(&mut app, "Галерея узлов WGSL").width() > 200.0);
+    assert_eq!(labelled(&mut app, "Исходный код WGSL").width(), 0.0);
+    let (generator, rect) = wait_swatch(&mut app, "Открыть узел · Генератор", None);
+    assert!(swatch(&mut app, "Шум").is_some());
+    assert!(swatch(&mut app, "Шейдинг").is_none());
+    let files = tempfile::tempdir().unwrap();
+    capture_when(&mut app, &target, &files.path().join("shader-gallery.png"), |image| {
+        let sample = |u, v| {
+            let point = (rect.min + rect.size() * Vec2::new(u, v)).as_uvec2();
+            image.get_pixel(point.x, point.y)[0]
+        };
+        let reference = sample(0.25, 0.25);
+        [0.3, 0.5, 0.7].into_iter().any(|v| [0.2, 0.4, 0.6, 0.8].into_iter().any(|u| {
+            sample(u, v).abs_diff(reference) > 20
+        }))
+    });
+    paint_message(&mut app, PaintAction::Panel(Panel::Layers));
+    paint_message(&mut app, PaintAction::Panel(Panel::Shader));
+    assert_eq!(swatch(&mut app, "Открыть узел · Генератор").unwrap().0, generator);
+    wait(&mut app, "Исправить · broken.wgsl");
+    click_label(&mut app, "Исправить · broken.wgsl");
+    wait(&mut app, "unknown tag");
+    let repaired = "// @name Repaired node\n// @output gray\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.3); }\n";
+    set_source(&mut app, repaired);
+    wait(&mut app, "Текстурный узел собран");
+    click_label(&mut app, "Сохранить правки");
+    wait_swatch(&mut app, "Repaired node", None);
+    assert_eq!(std::fs::read_to_string(&broken_node).unwrap(), repaired);
+    assert!(material_graph::library().find("user/broken").is_some());
+    click_label(&mut app, "Стартовая страница WGSL");
+    click_label(&mut app, "Открыть узел · Фильтр");
     wait(&mut app, "Текстурный узел собран");
     assert!(labelled(&mut app, "Исходный код WGSL").width() > 200.0);
     {
@@ -4870,6 +5025,15 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     let test_source = "// @name Test values\n// @output color\n// @param gain: float(0, 1) = 0\nfn node(uv: vec2<f32>) -> vec4<f32> {\n return vec4<f32>(1.0 - params.gain, params.gain, 0.0, 1.0);\n}\n";
     set_source(&mut app, test_source);
     wait(&mut app, "Текстурный узел собран");
+    click_label(&mut app, "Стартовая страница WGSL");
+    assert_eq!(labelled(&mut app, "Исходный код WGSL").width(), 0.0);
+    click_label(&mut app, "Вернуться к исходнику");
+    {
+        let world = app.world_mut();
+        let mut fields = world.query::<(&AccessibleLabel, &bevy::text::EditableText)>();
+        let (_, code) = fields.iter(world).find(|(label, _)| label.0 == "Исходный код WGSL").unwrap();
+        assert_eq!(code.value(), test_source);
+    }
     let texture_pixel = |app: &mut App| {
         let handle = image(app);
         app.world().resource::<Assets<Image>>().get(&handle).unwrap()
@@ -4897,6 +5061,7 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     assert_eq!(&assets.get(&red).unwrap().data.as_ref().unwrap()[..4], &[255, 0, 0, 255]);
     click_label(&mut app, "Добавить в библиотеку");
     wait(&mut app, "Узел добавлен");
+    let (published_swatch, _) = wait_swatch(&mut app, "Test texture", None);
     let reopened = node_library::reopen(directory.clone());
     let texture_def = reopened.defs.iter().find(|def| def.id.starts_with("user/") && def.name == "Test texture").unwrap();
     let mut texture_graph = material_painter_graph::Graph::new("User texture");
@@ -4957,6 +5122,7 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     set_source(&mut app, &updated);
     ctrl(&mut app, KeyCode::KeyS, "s");
     wait(&mut app, "Правки узла сохранены");
+    wait_swatch(&mut app, "Test texture", Some(published_swatch));
     assert_eq!(material_graph::library().find(&texture_def.id).unwrap().source, updated);
     ctrl(&mut app, KeyCode::KeyA, "a");
     assert_eq!(
@@ -5161,6 +5327,41 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     warm(&mut app, 4);
     let pixel = model_pixel(&mut app);
     capture_when(&mut app, &target, &screenshot, |image| is_green(pixel(image)));
+
+    paint_message(&mut app, PaintAction::Panel(Panel::Shader));
+    click_label(&mut app, "Стартовая страница WGSL");
+    let noise_card = {
+        let world = app.world_mut();
+        world.query::<(Entity, &AccessibleLabel)>().iter(world)
+            .find(|(_, label)| label.0 == "Открыть узел · Noise").unwrap().0
+    };
+    scroll_to_paint_entity(&mut app, noise_card);
+    click_label(&mut app, "Открыть узел · Noise");
+    wait(&mut app, "Текстурный узел собран");
+    let builtin = material_graph::library().find("noise").unwrap().clone();
+    let mode = |app: &App| *app.world().get::<bevy::text::TextReadWriteMode>(source_field).unwrap();
+    assert_eq!(mode(&app), bevy::text::TextReadWriteMode::ReadOnly);
+    assert_eq!(source(&app), builtin.source);
+    ctrl(&mut app, KeyCode::KeyA, "a");
+    fill_modifier(&mut app, window, KeyCode::Backspace, Key::Backspace, ButtonState::Pressed);
+    fill_modifier(&mut app, window, KeyCode::Backspace, Key::Backspace, ButtonState::Released);
+    assert_eq!(source(&app), builtin.source);
+    click_label(&mut app, "Создать редактируемую копию");
+    wait(&mut app, "Копия узла создана");
+    assert_eq!(mode(&app), bevy::text::TextReadWriteMode::Editable);
+    let reopened = node_library::reopen(directory.clone());
+    let copy = reopened.defs.iter().find(|def| def.name == "Noise (копия)").unwrap();
+    assert!(copy.id.starts_with("user/"));
+    assert_eq!(copy.body, builtin.body);
+    assert_eq!(copy.category, "Custom");
+    assert_eq!(source(&app), copy.source);
+    let renamed = copy.source.replace("// @name Noise (копия)", "// @name My Noise");
+    set_source(&mut app, &renamed);
+    ctrl(&mut app, KeyCode::KeyS, "s");
+    wait(&mut app, "Правки узла сохранены");
+    let reopened = node_library::reopen(directory.clone());
+    assert_eq!(reopened.find(&copy.id).unwrap().source, renamed);
+    assert_eq!(material_graph::library().find("noise").unwrap().source, builtin.source);
     std::fs::remove_file(screenshot).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
 }

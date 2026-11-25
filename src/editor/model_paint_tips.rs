@@ -72,6 +72,19 @@ pub(super) fn texture_name(index: usize) -> &'static str {
     GRAIN_LABELS[index]
 }
 
+#[cfg(feature = "mcp")]
+pub(super) fn texture_names() -> &'static [&'static str] {
+    &GRAIN_LABELS
+}
+
+#[cfg(feature = "mcp")]
+pub(super) fn texture_index(name: &str) -> Option<usize> {
+    let name = name.to_lowercase();
+    GRAIN_LABELS.iter().zip(procedural::TEXTURES).position(|(label, texture)| {
+        label.to_lowercase() == name || texture.name.to_lowercase() == name
+    })
+}
+
 pub(super) fn texture_matches(index: usize, query: &str) -> bool {
     let source = &procedural::TEXTURES[index];
     texture_name(index).to_lowercase().contains(query)

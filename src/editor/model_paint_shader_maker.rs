@@ -7,7 +7,7 @@ use bevy::{
     picking::events::PointerClick,
     render::renderer::{RenderDevice, RenderQueue},
     tasks::IoTaskPool,
-    text::{FontCx, LayoutCx, TextEdit},
+    text::{FontCx, LayoutCx, TextEdit, TextReadWriteMode},
 };
 use bevy_scene_format::{Revision, atomic_write};
 use material_painter_graph::{Graph, Library, Runtime, def, shading};
@@ -18,6 +18,10 @@ use std::{
 };
 
 use node_library::SOURCE_LIMIT;
+#[path = "model_paint_shader_gallery.rs"]
+mod gallery;
+#[cfg(test)]
+pub(in crate::editor::ui::model_viewer::paint) use gallery::Swatch;
 #[path = "model_paint_shader_parameters.rs"]
 mod parameters;
 #[path = "model_paint_shader_watch.rs"]
@@ -173,8 +177,14 @@ fn node(c: Shade) -> vec4<f32> {
 #[derive(Clone)]
 enum Command {
     Source(Arc<str>, Option<String>),
+    CopyBuiltin,
+    Home,
+    Resume,
     Input(usize),
     Open,
+    OpenPath(PathBuf),
+    RevealLibrary,
+    ScanLibrary,
     Save,
     SaveCurrent,
     Revert,
@@ -182,6 +192,8 @@ enum Command {
     Insert(&'static str),
     Publish,
     AddToGraph,
+    BackToGraph,
+    ApplyToGraph,
     Update,
     Remove,
     CancelRemove,
@@ -193,6 +205,8 @@ enum Command {
 
 enum FileResult {
     Opened(String, PathBuf),
+    Copied(PathBuf, Arc<str>),
+    Scanned,
     Saved(PathBuf),
     SavedDraft(PathBuf, Arc<str>),
     SavedCurrent(PathBuf, Arc<str>),
@@ -230,13 +244,26 @@ enum ResultView {
 pub(in crate::editor::ui::model_viewer) struct Maker {
     root: Entity,
     source: Entity,
+    code: Entity,
+    home_gallery: Entity,
+    home_button: Entity,
+    home_tools: Entity,
+    edit_tools: Entity,
+    write_tools: [Entity; 3],
+    builtin_tools: Entity,
+    preview_content: Entity,
+    preview_empty: Entity,
+    home: bool,
+    scan_pending: bool,
     input_title: Entity,
-    texture_panel: Entity,
     library: Entity,
     library_revision: Option<usize>,
+    gallery: Option<gallery::Gallery>,
     font: Handle<Font>,
     remove_button: Entity,
     add_to_graph: Entity,
+    back_to_graph: Entity,
+    apply_to_graph: Entity,
     revert_button: Entity,
     snippets: Entity,
     snippets_visible: bool,
@@ -251,6 +278,8 @@ pub(in crate::editor::ui::model_viewer) struct Maker {
     file_status: Entity,
     watch_status: Entity,
     command: Option<Command>,
+    graph_source: Option<(usize, u64, String, Arc<str>)>,
+    graph_origin: Option<(usize, u64, Arc<str>)>,
     selected: Option<Installed>,
     node_id: Option<String>,
     opened: Option<PathBuf>,
@@ -273,16 +302,58 @@ pub(in crate::editor::ui::model_viewer) struct Maker {
 }
 
 impl Maker {
+    fn builtin_id(&self) -> Option<&str> {
+        self.node_id
+            .as_deref()
+            .filter(|id| !id.starts_with("user/"))
+    }
+
+    fn open_node(&mut self, source: &mut EditableText, code: Arc<str>, id: Option<String>) {
+        self.graph_origin = None;
+        self.home = false;
+        source.pending_edits.clear();
+        source.pending_paste = None;
+        source.editor_mut().set_text(&code);
+        self.baseline = code.clone();
+        self.selected = id
+            .as_ref()
+            .filter(|id| id.starts_with("user/"))
+            .cloned()
+            .map(|id| Installed { id, expected: code });
+        self.node_id = id;
+        self.opened = None;
+        self.pending_save = None;
+        self.selection_before_blur = None;
+        self.snippets_visible = false;
+        self.confirming_removal = false;
+        self.parameters.new_source();
+    }
+
+    pub(in crate::editor::ui::model_viewer::paint) fn directory(&self) -> Option<PathBuf> {
+        #[cfg(test)]
+        if self.node_directory.is_some() {
+            return self.node_directory.clone();
+        }
+        node_library::directory()
+    }
+
+    pub(in crate::editor::ui::model_viewer::paint) fn request_graph_source(
+        &mut self,
+        model: usize,
+        node: u64,
+        id: String,
+        code: Arc<str>,
+    ) {
+        self.graph_source = Some((model, node, id, code));
+    }
+
     fn watched_file(&self) -> Option<watch::SourceFile> {
         if let Some(path) = &self.opened {
             return Some(watch::SourceFile::Opened(path.clone()));
         }
         let id = self.selected.as_ref()?.id.clone();
-        let directory = node_library::directory();
-        #[cfg(test)]
-        let directory = self.node_directory.clone().or(directory);
         Some(watch::SourceFile::Library {
-            directory: directory?,
+            directory: self.directory()?,
             id,
         })
     }
@@ -301,15 +372,16 @@ impl Maker {
     ) -> Option<(u64, &shader_preview::ShadingSource)> {
         self.draft
             .as_ref()
+            .filter(|_| !self.home)
             .map(|(revision, draft)| (*revision, draft))
     }
 
     pub(in crate::editor::ui::model_viewer) fn shows_model(&self) -> bool {
-        self.draft.is_some()
+        !self.home && self.draft.is_some()
     }
 
     pub(super) fn preview_pane(&self) -> Entity {
-        self.texture_panel
+        self.preview_content
     }
 
     pub(super) fn error_line(&self) -> Option<usize> {
@@ -367,24 +439,36 @@ pub(super) fn setup(
         },
     );
     text(commands, title, font, "Редактор узлов WGSL", 14., TEXT);
-    control(commands, title, font, "Открыть .wgsl…", Command::Open);
-    let save = control(
+    let home_button = control(
         commands,
         title,
         font,
-        "Сохранить правки",
-        Command::SaveCurrent,
+        "Стартовая страница WGSL",
+        Command::Home,
     );
-    control_hints::attach(commands, save, "Ctrl+S");
-    control(commands, title, font, "Сохранить копию…", Command::Save);
-    let revert_button = control(commands, title, font, "Вернуть исходник", Command::Revert);
+    let home_tools = node(commands, title, row(5.));
     control(
         commands,
-        title,
+        home_tools,
         font,
-        "Вставить фрагмент",
-        Command::ToggleSnippets,
+        "Вернуться к исходнику",
+        Command::Resume,
     );
+    control(
+        commands,
+        home_tools,
+        font,
+        "Папка узлов",
+        Command::RevealLibrary,
+    );
+    control(
+        commands,
+        home_tools,
+        font,
+        "Обновить библиотеку",
+        Command::ScanLibrary,
+    );
+    control(commands, title, font, "Открыть .wgsl…", Command::Open);
     control(
         commands,
         title,
@@ -392,20 +476,106 @@ pub(super) fn setup(
         "Сбросить раскладку WGSL",
         Command::ResetLayout,
     );
-    control(
+    let edit_tools = node(
         commands,
         title,
+        Node {
+            flex_wrap: FlexWrap::Wrap,
+            ..row(5.)
+        },
+    );
+    let save = control(
+        commands,
+        edit_tools,
+        font,
+        "Сохранить правки",
+        Command::SaveCurrent,
+    );
+    control_hints::attach(commands, save, "Ctrl+S");
+    control(
+        commands,
+        edit_tools,
+        font,
+        "Сохранить копию…",
+        Command::Save,
+    );
+    let revert_button = control(
+        commands,
+        edit_tools,
+        font,
+        "Вернуть исходник",
+        Command::Revert,
+    );
+    let insert_snippet = control(
+        commands,
+        edit_tools,
+        font,
+        "Вставить фрагмент",
+        Command::ToggleSnippets,
+    );
+    let publish = control(
+        commands,
+        edit_tools,
         font,
         "Добавить в библиотеку",
         Command::Publish,
     );
-    let remove_button = control(commands, title, font, "Убрать из палитры…", Command::Remove);
+    let builtin_tools = node(
+        commands,
+        edit_tools,
+        Node {
+            align_items: AlignItems::Center,
+            flex_wrap: FlexWrap::Wrap,
+            ..row(5.)
+        },
+    );
+    text(
+        commands,
+        builtin_tools,
+        font,
+        "Встроенный · только чтение",
+        12.,
+        MUTED,
+    );
+    control(
+        commands,
+        builtin_tools,
+        font,
+        "Создать редактируемую копию",
+        Command::CopyBuiltin,
+    );
+    let remove_button = control(
+        commands,
+        edit_tools,
+        font,
+        "Убрать из палитры…",
+        Command::Remove,
+    );
     let add_to_graph = control(
         commands,
-        title,
+        edit_tools,
         font,
         "Добавить в граф",
         Command::AddToGraph,
+    );
+    let back_to_graph = control(
+        commands,
+        edit_tools,
+        font,
+        "Вернуться к графу",
+        Command::BackToGraph,
+    );
+    let apply_to_graph = control(
+        commands,
+        edit_tools,
+        font,
+        "Применить к графу",
+        Command::ApplyToGraph,
+    );
+    control_hints::attach(
+        commands,
+        apply_to_graph,
+        "Обновить выбранный узел сохранённым исходником WGSL",
     );
     control_hints::attach(
         commands,
@@ -510,7 +680,31 @@ pub(super) fn setup(
     let face = fonts.add(Font::from_bytes(
         include_bytes!("../../vendor/photocraft/assets/fonts/JetBrainsMono-Regular.ttf").to_vec(),
     ));
-    let source = shader_code::setup(commands, editor, TEMPLATES[0].1, face);
+    let code = node(
+        commands,
+        editor,
+        Node {
+            display: Display::None,
+            width: percent(100.),
+            height: percent(100.),
+            ..row(6.)
+        },
+    );
+    let home_gallery = node(
+        commands,
+        editor,
+        Node {
+            width: percent(100.),
+            height: percent(100.),
+            overflow: Overflow::scroll_y(),
+            padding: UiRect::all(px(8)),
+            ..column(8.)
+        },
+    );
+    commands
+        .entity(home_gallery)
+        .insert((Scroller, AccessibleLabel("Галерея узлов WGSL".into())));
+    let source = shader_code::setup(commands, code, TEMPLATES[0].1, face);
     commands.entity(source).observe(
         |event: On<FocusLost>, fields: Query<&EditableText>, mut maker: ResMut<Maker>| {
             maker.selection_before_blur = fields
@@ -551,11 +745,36 @@ pub(super) fn setup(
             ..column(6.)
         },
     );
-    let input_title = text(commands, right, font, "", 13., TEXT);
-    let tile_toggle = control(commands, right, font, "Плитка 2×2", Command::ToggleTiles);
+    let preview_empty = text(
+        commands,
+        right,
+        font,
+        "Выберите узел для предпросмотра",
+        13.,
+        MUTED,
+    );
+    let preview_content = node(
+        commands,
+        right,
+        Node {
+            display: Display::None,
+            width: percent(100.),
+            height: percent(100.),
+            min_height: px(0.),
+            ..column(6.)
+        },
+    );
+    let input_title = text(commands, preview_content, font, "", 13., TEXT);
+    let tile_toggle = control(
+        commands,
+        preview_content,
+        font,
+        "Плитка 2×2",
+        Command::ToggleTiles,
+    );
     let preview = commands
         .spawn((
-            ChildOf(right),
+            ChildOf(preview_content),
             Node {
                 display: Display::None,
                 width: percent(100),
@@ -588,7 +807,7 @@ pub(super) fn setup(
     });
     let parameter_panel = node(
         commands,
-        right,
+        preview_content,
         Node {
             display: Display::None,
             width: percent(100.),
@@ -611,13 +830,26 @@ pub(super) fn setup(
     commands.insert_resource(Maker {
         root,
         source,
+        code,
+        home_gallery,
+        home_button,
+        home_tools,
+        edit_tools,
+        write_tools: [save, insert_snippet, publish],
+        builtin_tools,
+        preview_content,
+        preview_empty,
+        home: true,
+        scan_pending: true,
         input_title,
-        texture_panel: right,
         library,
         library_revision: None,
+        gallery: None,
         font: font.clone(),
         remove_button,
         add_to_graph,
+        back_to_graph,
+        apply_to_graph,
         revert_button,
         snippets,
         snippets_visible: false,
@@ -632,6 +864,8 @@ pub(super) fn setup(
         file_status,
         watch_status,
         command: None,
+        graph_source: None,
+        graph_origin: None,
         selected: None,
         node_id: None,
         opened: None,
@@ -653,38 +887,6 @@ pub(super) fn setup(
         node_directory: None,
     });
     sidebar::setup_shader(commands, body, library, editor, right);
-}
-
-fn tools(commands: &mut Commands, parent: Entity, font: &Handle<Font>) {
-    text(commands, parent, font, "Шаблоны узлов", 12., TEXT);
-    for (label, source) in TEMPLATES {
-        control(
-            commands,
-            parent,
-            font,
-            label,
-            Command::Source(source.into(), None),
-        );
-    }
-    text(commands, parent, font, "Вход для предпросмотра", 12., TEXT);
-    for (index, (_, label)) in INPUTS.into_iter().enumerate() {
-        control(commands, parent, font, label, Command::Input(index));
-    }
-    text(commands, parent, font, "Исходники узлов", 12., TEXT);
-    let (library, archived) = node_library::palette();
-    for def in library
-        .defs
-        .iter()
-        .filter(|def| node_library::visible(&def.id, &archived))
-    {
-        control(
-            commands,
-            parent,
-            font,
-            &def.name,
-            Command::Source(def.source.as_str().into(), Some(def.id.clone())),
-        );
-    }
 }
 
 fn text_value(labels: &mut Query<&mut Text>, entity: Entity, value: &str) {
@@ -869,7 +1071,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     time: Res<Time<Real>>,
     device: Option<Res<RenderDevice>>,
     queue: Option<Res<RenderQueue>>,
-    mut fields: Query<&mut EditableText>,
+    mut fields: Query<(&mut EditableText, &mut TextReadWriteMode)>,
     mut labels: Query<&mut Text>,
     mut nodes: Query<&mut Node>,
     mut preview: Query<&mut ImageNode>,
@@ -881,10 +1083,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ResMut<FontCx>,
         ResMut<LayoutCx>,
         MessageWriter<Action>,
+        ResMut<material_graph::previews::Uploads>,
+        Query<(Entity, &gallery::Swatch)>,
     ),
     mut backgrounds: Query<&mut BackgroundColor>,
 ) {
-    let (shelf, mut dock, mut focus, mut fonts, mut layouts, mut actions) = workspace;
+    let (shelf, mut dock, mut focus, mut fonts, mut layouts, mut actions, mut uploads, swatches) =
+        workspace;
     let active = editor
         .viewing_model
         .filter(|_| {
@@ -914,13 +1119,44 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let Some((model, session, doc)) = active else {
         return;
     };
+    let maps = session
+        .binding
+        .and_then(|set| baked.maps(model, doc, set, session.texture_size));
     let revision = node_library::revision();
-    if maker.library_revision != Some(revision) {
+    let rebuild = maker.library_revision != Some(revision);
+    if rebuild {
         commands.entity(maker.library).despawn_related::<Children>();
-        tools(&mut commands, maker.library, &maker.font);
+        commands
+            .entity(maker.home_gallery)
+            .despawn_related::<Children>();
+        maker.gallery = Some(gallery::Gallery::new(
+            &mut commands,
+            maker.library,
+            maker.home_gallery,
+            &maker.font,
+            maker.directory().as_deref(),
+        ));
         maker.library_revision = Some(revision);
     }
-    let Ok(mut source) = fields.get_mut(maker.source) else {
+    if let Some(gallery) = &mut maker.gallery {
+        gallery.set_inputs(doc, session, maps, rebuild);
+        if gallery.previews.update(
+            &mut images,
+            &mut uploads,
+            device.as_deref().zip(queue.as_deref()),
+        ) {
+            for (entity, swatch) in &swatches {
+                if let Some(image) = gallery.previews.image(swatch.0) {
+                    commands
+                        .entity(entity)
+                        .insert(ImageNode::new(image.clone()));
+                } else {
+                    commands.entity(entity).remove::<ImageNode>();
+                }
+            }
+        }
+    }
+    let Ok((mut source, mut source_mode)) = fields.get_mut(maker.source) else {
         return;
     };
     if let Some(result) = maker
@@ -931,6 +1167,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         maker.file_task = None;
         let message = match result {
             Ok(Some(FileResult::Opened(code, path))) => {
+                maker.graph_origin = None;
+                maker.home = false;
                 maker.selected = None;
                 maker.node_id = None;
                 maker.baseline = Arc::from(code.as_str());
@@ -942,6 +1180,14 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 source.editor_mut().set_text(&code);
                 format!("Открыт · {}", path.display())
             }
+            Ok(Some(FileResult::Copied(path, code))) => match node_library::node_id(&path) {
+                Ok(id) => {
+                    maker.open_node(&mut source, code, Some(id));
+                    focus.set(maker.source, FocusCause::Auto);
+                    format!("Копия узла создана · {}", path.display())
+                }
+                Err(error) => error,
+            },
             Ok(Some(FileResult::Saved(path))) => format!("Сохранено · {}", path.display()),
             Ok(Some(FileResult::SavedDraft(path, code))) => {
                 if source.value() == code.as_ref() {
@@ -953,9 +1199,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             Ok(Some(FileResult::SavedCurrent(path, code))) => {
                 if maker.opened.as_ref() == Some(&path) {
                     maker.baseline = code;
+                    maker.scan_pending |= maker.directory().as_deref() == path.parent();
                 }
                 format!("Правки сохранены · {}", path.display())
             }
+            Ok(Some(FileResult::Scanned)) => "Библиотека WGSL обновлена".into(),
             Ok(Some(FileResult::PreviewImage {
                 source: requested,
                 name,
@@ -972,6 +1220,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             }
             Ok(Some(FileResult::Published(path, code))) => {
                 if source.value() == code.as_str() {
+                    maker.graph_origin = None;
                     maker.opened = None;
                     maker.baseline = Arc::from(code.as_str());
                     maker.pending_save = None;
@@ -1066,26 +1315,102 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         maker.pending_save = None;
         maker.command = Some(Command::Update);
     }
+    if maker.file_task.is_none()
+        && maker.command.is_none()
+        && let Some((_, node, id, code)) = maker
+            .graph_source
+            .take()
+            .filter(|(target, _, _, _)| *target == model && session.shader_graph_return.is_some())
+    {
+        maker.open_node(&mut source, code.clone(), Some(id));
+        maker.graph_origin = Some((model, node, code));
+        text_value(&mut labels, maker.file_status, "");
+    }
+    let graph_return = session
+        .shader_graph_return
+        .as_ref()
+        .and_then(|target| session.shader_graph_destination(target.panel == Panel::Preview));
+    let source_update = graph_return.and_then(|target| {
+        let (origin_model, node, original) = maker.graph_origin.as_ref()?;
+        let id = maker.node_id.as_deref()?;
+        let stored = target.payload[node_library::EMBEDDED_SOURCES][id]
+            .as_str()
+            .unwrap_or(original);
+        if *origin_model != model || stored == maker.baseline.as_ref() || maker.file_task.is_some()
+        {
+            return None;
+        }
+        let library_revision = node_library::revision();
+        let (definition, shading) =
+            maker.library_node(|current| current == maker.baseline.as_ref())?;
+        (shading == (target.panel == Panel::Preview)).then_some((
+            *node,
+            definition,
+            library_revision,
+        ))
+    });
     if let Some(command) = maker.command.take() {
         match command {
-            Command::Source(code, id) => {
-                source.editor_mut().set_text(&code);
-                maker.baseline = code.clone();
-                maker.node_id = id;
-                maker.selected = maker
-                    .node_id
-                    .as_ref()
-                    .filter(|id| id.starts_with("user/"))
-                    .cloned()
-                    .map(|id| Installed { id, expected: code });
-                maker.opened = None;
-                maker.pending_save = None;
-                maker.selection_before_blur = None;
-                maker.confirming_removal = false;
-                maker.parameters.new_source();
+            Command::Home => {
+                maker.home = true;
+                maker.scan_pending = true;
+                focus.clear();
+            }
+            Command::Resume => {
+                maker.home = false;
+                focus.set(maker.source, FocusCause::Auto);
+            }
+            Command::Source(code, id) if maker.file_task.is_none() => {
+                maker.open_node(&mut source, code, id);
                 text_value(&mut labels, maker.file_status, "");
             }
+            Command::CopyBuiltin if maker.file_task.is_none() => {
+                if let Some(id) = maker.builtin_id().map(str::to_owned)
+                    && let Some(directory) = maker.directory()
+                {
+                    maker.file_task = Some(IoTaskPool::get().spawn(async move {
+                        let (path, code) = node_library::copy_builtin(&directory, &id)?;
+                        Ok(Some(FileResult::Copied(path, code)))
+                    }));
+                }
+            }
+            Command::OpenPath(path) if maker.file_task.is_none() => {
+                maker.file_task =
+                    Some(IoTaskPool::get().spawn(async move {
+                        Ok(Some(FileResult::Opened(open_source(&path)?, path)))
+                    }));
+            }
+            Command::ScanLibrary => maker.scan_pending = true,
+            Command::RevealLibrary if maker.file_task.is_none() => {
+                if let Some(directory) = maker.directory() {
+                    maker.file_task = Some(IoTaskPool::get().spawn(async move {
+                        std::fs::create_dir_all(&directory)
+                            .and_then(|()| crate::project_manager::reveal_folder(&directory))
+                            .map_err(|error| format!("Не удалось открыть папку WGSL · {error}"))?;
+                        Ok(None)
+                    }));
+                }
+            }
             Command::Input(index) => maker.input = index,
+            Command::BackToGraph => {
+                if let Some(target) = graph_return {
+                    actions.write(Action::ModelView(ModelViewAction::Paint(
+                        PaintAction::Panel(target.panel),
+                    )));
+                }
+            }
+            Command::ApplyToGraph => {
+                if let Some((node, definition, library_revision)) = source_update {
+                    actions.write(Action::ModelView(ModelViewAction::Paint(
+                        PaintAction::ShaderUpdateGraph {
+                            model,
+                            node,
+                            definition,
+                            library_revision,
+                        },
+                    )));
+                }
+            }
             Command::AddToGraph if maker.file_task.is_none() => {
                 let library_revision = node_library::revision();
                 match maker.library_node(|original| source.value() == original) {
@@ -1136,6 +1461,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     Err(error) => text_value(&mut labels, maker.file_status, &error),
                 }
             }
+            Command::SaveCurrent if maker.builtin_id().is_some() => {
+                text_value(
+                    &mut labels,
+                    maker.file_status,
+                    "Создайте редактируемую копию узла",
+                );
+            }
             Command::SaveCurrent if maker.file_task.is_none() => {
                 if source.value() == maker.baseline.as_ref()
                     && (maker.selected.is_some() || maker.opened.is_some())
@@ -1171,8 +1503,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 text_value(&mut labels, maker.file_status, "Исходник восстановлен");
                 focus.set(maker.source, FocusCause::Auto);
             }
-            Command::ToggleSnippets => maker.snippets_visible = !maker.snippets_visible,
-            Command::Insert(snippet) => {
+            Command::ToggleSnippets if maker.builtin_id().is_none() => {
+                maker.snippets_visible = !maker.snippets_visible;
+            }
+            Command::Insert(snippet) if maker.builtin_id().is_none() => {
                 if let Some(range) = maker.selection_before_blur.take()
                     && focus.get() != Some(maker.source)
                 {
@@ -1192,12 +1526,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     Some(IoTaskPool::get().spawn(async move { file(command, root, code) }));
             }
             Command::Publish | Command::Update | Command::ConfirmRemove
-                if maker.file_task.is_none() =>
+                if maker.file_task.is_none() && maker.builtin_id().is_none() =>
             {
                 maker.confirming_removal = false;
-                let directory = node_library::directory();
-                #[cfg(test)]
-                let directory = maker.node_directory.clone().or(directory);
+                let directory = maker.directory();
                 if !matches!(command, Command::ConfirmRemove)
                     && !maker
                         .validated
@@ -1255,14 +1587,45 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             _ => {}
         }
     }
+    if maker.file_task.is_none()
+        && std::mem::take(&mut maker.scan_pending)
+        && let Some(directory) = maker.directory()
+    {
+        maker.file_task = Some(IoTaskPool::get().spawn(async move {
+            node_library::scan(&directory);
+            Ok(Some(FileResult::Scanned))
+        }));
+    }
+    let builtin = maker.builtin_id().is_some();
+    source_mode.set_if_neq(if builtin {
+        TextReadWriteMode::ReadOnly
+    } else {
+        TextReadWriteMode::Editable
+    });
     for (entity, visible) in [
+        (maker.home_gallery, maker.home),
+        (maker.home_tools, maker.home),
+        (maker.home_button, !maker.home),
+        (maker.preview_empty, maker.home),
+        (maker.code, !maker.home),
+        (maker.edit_tools, !maker.home),
+        (maker.builtin_tools, builtin),
+        (maker.back_to_graph, graph_return.is_some()),
+        (maker.apply_to_graph, source_update.is_some()),
+        (maker.preview_content, !maker.home),
         (maker.remove_button, maker.selected.is_some()),
         (
             maker.revert_button,
-            source.value() != maker.baseline.as_ref(),
+            !builtin && source.value() != maker.baseline.as_ref(),
         ),
-        (maker.snippets, maker.snippets_visible),
-    ] {
+        (
+            maker.snippets,
+            !maker.home && !builtin && maker.snippets_visible,
+        ),
+    ]
+    .into_iter()
+    .chain(maker.write_tools.map(|entity| (entity, !builtin)))
+    {
         if let Ok(mut node) = nodes.get_mut(entity) {
             node.display = if visible {
                 Display::Flex
@@ -1279,16 +1642,16 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         background.set_if_neq(BackgroundColor(if can_add { ACTIVE } else { CHROME }));
     }
     if let Ok(mut node) = nodes.get_mut(maker.remove_confirmation) {
-        node.display = if maker.confirming_removal {
+        node.display = if !maker.home && maker.confirming_removal {
             Display::Flex
         } else {
             Display::None
         };
     }
+    if maker.home && maker.request.is_none() {
+        return;
+    }
     let code = source.value();
-    let maps = session
-        .binding
-        .and_then(|set| baked.maps(model, doc, set, session.texture_size));
     let previous = maker.request.as_ref();
     let changed = previous.is_none_or(|request| code != request.source.as_str());
     let new_code = changed.then(|| code.to_string());

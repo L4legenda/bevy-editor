@@ -631,6 +631,7 @@ pub(in crate::editor) enum PaintAction {
     GraphResolutionMenu,
     GraphEdit(material_graph::Edit),
     ShaderToGraph { model: usize, definition: usize, library_revision: usize },
+    ShaderUpdateGraph { model: usize, node: u64, definition: usize, library_revision: usize },
     ImportShelfMaterial,
     SaveShelfMaterial,
     ExportShelfMaterial,
@@ -911,6 +912,7 @@ impl PaintAction {
             Self::GraphResolutionMenu => "Выбрать размер расчёта графа или привязать его к набору текстур.",
             Self::GraphEdit(_) => "Изменить схему материала.",
             Self::ShaderToGraph { .. } => "Добавить узел WGSL в открытый граф.",
+            Self::ShaderUpdateGraph { .. } => "Применить сохранённый исходник к узлу на холсте.",
             Self::ImportShelfMaterial => "Импортировать пресет Material Painter из .mpsmart или ZIP-пакета.",
             Self::ExportShelfMaterial => "Экспортировать заливку или группу в файл .mpsmart.",
             Self::ExportShelfPackage => "Экспортировать заливку или группу с узлами WGSL в ZIP-пакет.",
@@ -2600,7 +2602,7 @@ impl Session {
             PaintAction::AddSmartMaterial(_) | PaintAction::AddSmartGraph(_) | PaintAction::AddGraphMaterial(_) | PaintAction::AddGraphMask
             | PaintAction::ImportGraphFile | PaintAction::ImportShaderGraph | PaintAction::ExportGraphFile | PaintAction::ExportGraphPackage | PaintAction::ExportGraphOutputs
             | PaintAction::GraphAdjust(..) | PaintAction::GraphEdit(_) | PaintAction::GraphBitmapPick(_) | PaintAction::GraphRebake
-            | PaintAction::ShaderToGraph { .. } | PaintAction::OpenProjectGraph { .. }
+            | PaintAction::ShaderToGraph { .. } | PaintAction::ShaderUpdateGraph { .. } | PaintAction::OpenProjectGraph { .. }
             | PaintAction::AddShelfTexture(_)
             | PaintAction::DropMaterial(ShelfMaterial::Smart(_) | ShelfMaterial::User(_) | ShelfMaterial::Downloaded(_) | ShelfMaterial::Texture(_) | ShelfMaterial::Graph(_) | ShelfMaterial::CommunityGraph(_), _)
             | PaintAction::DropMaterialOnSet(..)
@@ -2831,7 +2833,9 @@ impl Session {
         self.refresh_folder_view();
         if !self.available(action) { return Ok(None); }
         let Some(view) = self.active_folder_view() else { return Ok(None) };
-        let mut graph = view.graph.clone();
+        let previous = matches!(action, PaintAction::GraphEdit(material_graph::Edit::UpdateSource(..)))
+            .then(|| material_graph::read(&view.payload)).transpose()?;
+        let mut graph = previous.as_ref().unwrap_or(&view.graph).clone();
         let mut next = self.stack.clone();
         let node = match action {
             PaintAction::GraphAdjust(id, parameter, component, direction) => {
@@ -2861,7 +2865,7 @@ impl Session {
             }
             _ => return Ok(None),
         };
-        Ok(self.finish_folder_graph(next, graph, node))
+        Ok(self.finish_folder_graph(next, graph, node, previous.as_ref()))
     }
 
     fn edit_folder_batch(
@@ -2879,7 +2883,7 @@ impl Session {
             );
         }
         let changed = graph != view.graph;
-        let pending = self.finish_folder_graph(next, graph, node);
+        let pending = self.finish_folder_graph(next, graph, node, None);
         if changed && pending.is_none() {
             self.select_graph_batch(kind, node);
         }
@@ -2888,10 +2892,12 @@ impl Session {
 
     fn finish_folder_graph(
         &mut self, mut next: Stack, graph: material_painter_graph::Graph, node: Option<u64>,
+        previous: Option<&material_painter_graph::Graph>,
     ) -> Option<(Stack, folder_graph::Masks)> {
         let view = self.active_folder_view()?;
-        if graph == view.graph { return None; }
-        let masks = folder_graph::changed_masks(&self.stack, &view.graph, &graph);
+        let previous = previous.unwrap_or(&view.graph);
+        if &graph == previous { return None; }
+        let masks = folder_graph::changed_masks(&self.stack, previous, &graph);
         folder_graph::store(&mut next.layers[next.selected], &graph);
         if masks.iter().all(|(_, graph)| graph.is_none()) {
             for (index, _) in masks {
@@ -2910,6 +2916,10 @@ impl Session {
         use material_graph::BatchKind;
         match kind {
             BatchKind::Move => {}
+            BatchKind::ReplaceSource => {
+                self.graph_node = last;
+                self.graph_pasted = None;
+            }
             BatchKind::Remove => {
                 self.graph_node = None;
                 self.graph_pasted = None;
@@ -3000,6 +3010,30 @@ impl Session {
             return Err("Этот узел недоступен в графе группы".into());
         }
         edit.apply_for(&mut graph, None, node.shading)?;
+        self.edit(PaintAction::Panel(target.panel));
+        Ok(PaintAction::GraphEdit(edit))
+    }
+
+    fn update_shader_node(&mut self, id: u64, definition: usize, library_revision: usize) -> Result<PaintAction, String> {
+        let library = material_graph::library();
+        let next = library.defs.get(definition)
+            .filter(|node| library_revision == node_library::revision() && node_library::available(&node.id))
+            .ok_or("Библиотека узлов изменилась · вернитесь к графу ещё раз")?;
+        let target = self.shader_graph_destination(next.shading)
+            .ok_or("Открытый граф изменился")?;
+        let source = target.payload["nodes"].as_array().into_iter().flatten()
+            .find(|node| node["id"].as_u64() == Some(id)).and_then(|node| node["def"].as_str());
+        if source != Some(next.id.as_str()) {
+            return Err("Исходный узел больше не использует этот файл WGSL".into());
+        }
+        let mut graph = material_graph::read(&target.payload)?;
+        let edit = material_graph::Edit::UpdateSource(id, definition);
+        if self.folder_view_for(target.panel).is_some()
+            && !folder_graph::can_edit(&self.stack, &graph, edit)
+        {
+            return Err("Исходник этого узла группы нельзя заменить".into());
+        }
+        edit.apply_for(&mut graph, None, next.shading)?;
         self.edit(PaintAction::Panel(target.panel));
         Ok(PaintAction::GraphEdit(edit))
     }
@@ -3648,7 +3682,8 @@ pub(super) fn actions(
                     Ok(layers) if job.folder_graph => {
                         let stack = Stack { layers, selected: session.stack.selected };
                         let node = match job.action {
-                            PaintAction::GraphBitmapPick(material_graph::ParameterTarget::Node(id, _)) => Some(id),
+                            PaintAction::GraphBitmapPick(material_graph::ParameterTarget::Node(id, _))
+                            | PaintAction::GraphEdit(material_graph::Edit::UpdateSource(id, _)) => Some(id),
                             _ => None,
                         };
                         session.commit_folder_view(stack, node);
@@ -3704,6 +3739,9 @@ pub(super) fn actions(
                             && session.graph_node == Some(id)
                         {
                             session.graph_node = None;
+                        }
+                        if let PaintAction::GraphEdit(material_graph::Edit::UpdateSource(id, _)) = job.action {
+                            session.graph_node = Some(id);
                         }
                         if let PaintAction::GraphEdit(material_graph::Edit::Add(..) | material_graph::Edit::AddConnected(..)) = job.action {
                             session.graph_node = session.graph()
@@ -3892,7 +3930,9 @@ pub(super) fn actions(
                 }
                 continue;
             }
-            if let PaintAction::ShaderToGraph { model, definition, library_revision } = action {
+            if let PaintAction::ShaderToGraph { model, definition, library_revision }
+                | PaintAction::ShaderUpdateGraph { model, definition, library_revision, .. } = action
+            {
                 if model != index || editor.browser_popup || editor.hdri_library_open {
                     continue;
                 }
@@ -3900,7 +3940,11 @@ pub(super) fn actions(
                     editor.status = "Дождитесь завершения операции с материалом".into();
                     continue;
                 }
-                match session.insert_shader_node(definition, library_revision) {
+                let result = match action {
+                    PaintAction::ShaderUpdateGraph { node, .. } => session.update_shader_node(node, definition, library_revision),
+                    _ => session.insert_shader_node(definition, library_revision),
+                };
+                match result {
                     Ok(edit) => action = edit,
                     Err(error) => {
                         editor.status = error;

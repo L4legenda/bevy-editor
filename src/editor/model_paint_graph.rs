@@ -75,6 +75,7 @@ impl ParameterTarget {
 pub(in crate::editor) enum Edit {
     Add(usize, IVec2),
     AddConnected(usize, IVec2, WireSource),
+    UpdateSource(u64, usize),
     Move(u64, IVec2),
     Remove(u64),
     Connect(u64, u64, usize),
@@ -111,11 +112,13 @@ pub(in crate::editor) enum BatchKind {
     Move,
     Remove,
     Paste(u64),
+    ReplaceSource,
 }
 
 pub(super) enum Batch {
     Move(Vec<u64>, Vec2),
     Remove(Vec<u64>),
+    ReplaceSource { node: u64, definition: String },
     Paste {
         nodes: Vec<material_painter_graph::Node>,
         offset: Vec2,
@@ -151,6 +154,20 @@ impl Batch {
                     }
                 }
                 Ok(None)
+            }
+            Self::ReplaceSource { node, definition } => {
+                if !can_replace_source(graph, node, folder) {
+                    return Err("Этот узел нельзя заменить копией".into());
+                }
+                let target = graph.node_mut(node).ok_or("Узел не найден")?;
+                let library = library();
+                let original = library.find(&target.def).ok_or("Исходный код недоступен")?;
+                let copy = library.find(&definition).filter(|copy| {
+                    copy.id.starts_with("user/") && node_library::available(&copy.id)
+                        && copy.shading == shading && copy.source == node_library::builtin_copy_source(original)
+                }).ok_or("Исходник копии уже изменился")?;
+                target.def = copy.id.clone();
+                Ok(Some(node))
             }
             Self::Paste { nodes, offset, keep_links, images: copied_images } => {
                 let library = library();
@@ -208,6 +225,16 @@ impl Batch {
     }
 }
 
+pub(super) fn replaceable_builtin(id: &str) -> bool {
+    !id.starts_with("user/") && !node_library::is_embedded(id)
+        && !matches!(id, material_painter_graph::OUTPUT_DEF | material_painter_graph::shading::OUTPUT)
+}
+
+fn can_replace_source(graph: &Graph, id: u64, folder: bool) -> bool {
+    graph.node(id).is_some_and(|node| replaceable_builtin(&node.def))
+        && (!folder || folder_graph::managed(graph, id).is_none())
+}
+
 impl Edit {
     pub(super) fn rebuilds(self) -> bool {
         match self {
@@ -217,7 +244,7 @@ impl Edit {
                 .get(index)
                 .is_some_and(|def| def.id == material_painter_graph::OUTPUT_DEF),
             Self::Move(..)
-            | Self::Batch(_, BatchKind::Move)
+            | Self::Batch(_, BatchKind::Move | BatchKind::ReplaceSource)
             | Self::Publish(..)
             | Self::Unbind(..)
             | Self::RemoveParameter(_)
@@ -263,6 +290,14 @@ impl Edit {
         };
         match self {
             Self::Batch(..) => Err("Пакет правок графа недоступен".into()),
+            Self::UpdateSource(id, definition) => {
+                let next = lib.defs.get(definition)
+                    .filter(|def| def.id.starts_with("user/") && def.shading == shading
+                        && node_library::available(&def.id))
+                    .ok_or("Сохранённый исходник узла недоступен")?;
+                update_source(graph, id, lib, next)?;
+                Ok(Some(id))
+            }
             Self::Resolution(size) => {
                 if shading || size.is_some_and(|size| !RESOLUTIONS.contains(&size)) {
                     return Err("Неподдерживаемое разрешение графа".into());
@@ -420,6 +455,36 @@ impl Edit {
             Self::RemoveParameter(_) => Err("Параметр графа не найден".into()),
         }
     }
+}
+
+fn update_source(
+    graph: &mut Graph, id: u64, library: &Library, next: &material_painter_graph::def::NodeDef,
+) -> Result<(), String> {
+    let node = graph.node(id).ok_or("Узел не найден")?;
+    let previous = library.find(&node.def).ok_or("Прежний исходник узла недоступен")?;
+    let connects_to_other_nodes = graph.nodes.iter().any(|node| node.links.values().any(|value| *value == id));
+    if (connects_to_other_nodes && previous.output != next.output)
+        || !node.links.keys().all(|name| {
+            previous.inputs.iter().find(|input| &input.name == name).is_some_and(|old| {
+                next.inputs.iter().any(|input| input.name == old.name && input.kind == old.kind)
+            })
+        })
+    {
+        return Err("Тип выхода или подключённого входа изменился · проверьте связи узла".into());
+    }
+    let parameter_compatible = |name: &str| {
+        previous.params.iter().find(|param| param.name == name).is_some_and(|old| {
+            next.params.iter().any(|param| param.name == name && compatible(&old.kind, &param.kind))
+        })
+    };
+    if !node.params.keys().all(|name| parameter_compatible(name))
+        || !graph.params.iter().flat_map(|param| &param.binds)
+            .all(|(node, name)| *node != id || parameter_compatible(name))
+    {
+        return Err("Тип или имя используемого параметра изменились · обновите параметры графа".into());
+    }
+    graph.node_mut(id).expect("узел проверен").def = next.id.clone();
+    Ok(())
 }
 
 fn node_parameter<'a>(
@@ -985,6 +1050,34 @@ mod tests {
         let Value::Image(Some(copied)) = &graph.node(id).unwrap().params["image"] else { panic!() };
         assert!(Arc::ptr_eq(&images[path], &red));
         assert!(Arc::ptr_eq(&images[copied.to_str().unwrap()], &blue));
+    }
+
+    #[test]
+    fn saved_source_keeps_connected_ports_and_published_parameters() {
+        use material_painter_graph::def::parse;
+
+        let old = "// @output gray\n// @input input: gray = 0\n// @param gain: float(0, 1) = 1\nfn node(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(in_input(uv).r * params.gain); }";
+        let mut library = Library::load(None);
+        library.defs.push(parse("graph/old", old).unwrap());
+        let mut graph = Graph::new("Source update");
+        let input = graph.add("noise", [0., 0.]);
+        let target = graph.add("graph/old", [240., 0.]);
+        let output = graph.add("output", [480., 0.]);
+        graph.connect(input, target, "input");
+        graph.connect(target, output, "input");
+        graph.expose(target, "gain", &library);
+        let before = graph.clone();
+
+        for source in [old.replace("@input input", "@input renamed"), old.replace("@param gain", "@param renamed")] {
+            let next = parse("user/next", &source).unwrap();
+            assert!(update_source(&mut graph, target, &library, &next).is_err());
+            assert_eq!(graph, before);
+        }
+        let next = parse("user/next", &old.replace("* params.gain", "+ params.gain")).unwrap();
+        update_source(&mut graph, target, &library, &next).unwrap();
+        let mut expected = before;
+        expected.node_mut(target).unwrap().def = next.id;
+        assert_eq!(graph, expected);
     }
 
     #[test]

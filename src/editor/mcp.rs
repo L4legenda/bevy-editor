@@ -81,6 +81,11 @@ struct Job {
     deadline: Instant,
 }
 
+struct PendingPaintEdit {
+    job: Job,
+    work: mcp_state::PaintEditJob,
+}
+
 #[derive(Clone)]
 struct Bridge {
     sender: mpsc::SyncSender<Job>,
@@ -183,15 +188,24 @@ fn process(
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
     mut focus: Option<ResMut<InputFocus>>,
-    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io): (Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>, Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>),
+    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint): (Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>, Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>, Local<Option<PendingPaintEdit>>),
 ) {
     let Some(inbox) = inbox else { return };
+    if pending_paint.as_ref().is_some_and(|pending| pending.job.reply.is_closed() || Instant::now() >= pending.job.deadline) {
+        *pending_paint = None;
+    }
+    let mut ready = None;
+    if let Some(result) = pending_paint.as_mut().and_then(|pending| pending.work.poll()) {
+        let PendingPaintEdit { job, work } = pending_paint.take().unwrap();
+        match result {
+            Ok(data) => ready = Some((job, Some(work.finish(data)))),
+            Err(error) => { let _ = job.reply.send(Err(error)); }
+        }
+    }
     for _ in 0..16 {
-        let Some(job) = inbox
-            .0
-            .lock()
-            .ok()
-            .and_then(|receiver| receiver.try_recv().ok())
+        let Some((job, prepared_edit)) = ready.take().or_else(|| {
+            inbox.0.lock().ok().and_then(|receiver| receiver.try_recv().ok()).map(|job| (job, None))
+        })
         else {
             break;
         };
@@ -218,6 +232,23 @@ fn process(
                 "Finish the active edit, drag, camera navigation or confirmation dialog first"
                     .into(),
             ));
+            continue;
+        }
+        if let Command::PaintEdit(args) = &job.command
+            && prepared_edit.is_none()
+            && args.needs_preparation()
+        {
+            let result = if pending_paint.is_some() {
+                Err("Wait for the current paint edit to finish preparing".into())
+            } else {
+                model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                    .ok_or_else(|| "This editor has no model paint workspace".into())
+                    .and_then(|(editing, paint)| mcp_state::prepare_edit(&editor, editing, paint, args))
+            };
+            match result {
+                Ok(work) => *pending_paint = Some(PendingPaintEdit { job, work }),
+                Err(error) => { let _ = job.reply.send(Err(error)); }
+            }
             continue;
         }
         if let Command::PaintReplaceMesh(args) = job.command {
@@ -318,7 +349,7 @@ fn process(
         } else if let Command::PaintEdit(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
-                .and_then(|(editing, paint)| mcp_state::apply(&editor, editing, paint, args, real_time.elapsed_secs_f64()))
+                .and_then(|(editing, paint)| mcp_state::apply_prepared(&editor, editing, paint, args, real_time.elapsed_secs_f64(), prepared_edit))
         } else if let Command::PaintStroke(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
