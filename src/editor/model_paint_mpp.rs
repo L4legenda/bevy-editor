@@ -1,6 +1,6 @@
 //! Import Material Painter's MPP manifest and compressed layer data into an editable GLB.
 use super::{
-    model_document::{MaterialSlot, Object, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
+    model_document::{MaterialSlot, ModelCamera, Object, PaintPreview, MODEL_CAMERA_EXTRA, PAINT_PREVIEW_EXTRA, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
     model_mesh::{Corner, Face, Geometry},
     model_paint_data::{Blend, CHANNEL_COUNT, Layer, LayerKind, MAX_LAYERS, Stack, Surface, solid},
     model_paint_spp::{ImportDetails, project_name, publish_project},
@@ -691,8 +691,54 @@ struct Imported {
     object: Object,
     bake: bake_metadata::Bake,
     preview: Option<Value>,
+    camera: Option<ModelCamera>,
+    paint_preview: PaintPreview,
     active_set: usize,
     report: ImportDetails,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct OrbitCamera {
+    target: [f32; 3],
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+    fov: f32,
+}
+
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        Self {
+            target: [0.; 3],
+            distance: 5.2,
+            yaw: 0.6,
+            pitch: 0.35,
+            fov: 38.0_f32.to_radians(),
+        }
+    }
+}
+
+fn import_camera(view: &Value, mesh: &Value, warnings: &mut Vec<String>) -> Option<ModelCamera> {
+    let saved = view.get("camera").filter(|camera| !camera.is_null())?;
+    let camera = serde_json::from_value::<OrbitCamera>(saved.clone()).ok().and_then(|camera| {
+        let center = Vec3::from_array(serde_json::from_value(mesh["center"].clone()).unwrap_or([0.; 3]));
+        let scale = mesh["scale"].as_f64().unwrap_or(1.) as f32;
+        // The GLB vertices have already been taken out of the MPP normalization.
+        let pose = ModelCamera {
+            center: (Vec3::from_array(camera.target) / scale + center).to_array(),
+            distance: camera.distance / scale,
+            yaw: camera.yaw,
+            pitch: camera.pitch,
+            fov: camera.fov,
+            orthographic: false,
+        };
+        pose.valid().then_some(pose)
+    });
+    if camera.is_none() {
+        warnings.push("Положение камеры MPP недоступно. Модель откроется с обычным кадрированием.".into());
+    }
+    camera
 }
 
 fn import(path: &Path, name: &str) -> Result<Imported> {
@@ -772,6 +818,11 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
         );
     }
     let preview_ref = &manifest["view"]["preview_shader"];
+    let camera = import_camera(&manifest["view"], mesh, &mut warnings);
+    let paint_preview = PaintPreview {
+        height_strength: Some(manifest["view"]["height_strength"].as_f64().unwrap_or(1.).clamp(0., 8.) as f32),
+        emission_strength: manifest["view"]["emission"].as_f64().unwrap_or(2.).clamp(0., 20.) as f32,
+    };
     let preview = if preview_ref.is_null() {
         None
     } else {
@@ -861,6 +912,8 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
         object,
         bake,
         preview,
+        camera,
+        paint_preview,
         active_set,
         report: ImportDetails {
             label,
@@ -876,6 +929,8 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
         object,
         bake,
         preview,
+        camera,
+        paint_preview,
         active_set,
         report,
     } = import(source, &name).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -888,6 +943,10 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
             if let Some(preview) = preview {
                 root["extras"][PREVIEW_SHADER_EXTRA] = preview;
             }
+            if let Some(camera) = camera {
+                root["extras"][MODEL_CAMERA_EXTRA] = json!(camera);
+            }
+            root["extras"][PAINT_PREVIEW_EXTRA] = json!(paint_preview);
             bake.write(root, &model)
         },
         Some(&bake.cage),
@@ -900,6 +959,15 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
 mod tests {
     use super::*;
     use crate::editor::browser_files;
+
+    #[test]
+    fn mpp_camera_falls_back_when_saved_pose_is_invalid() {
+        let mut warnings = Vec::new();
+        assert!(import_camera(&json!({}), &json!({}), &mut warnings).is_none());
+        assert!(warnings.is_empty());
+        assert!(import_camera(&json!({"camera": {"distance": -2}}), &json!({}), &mut warnings).is_none());
+        assert_eq!(warnings.len(), 1);
+    }
 
     fn native_file(manifest: Value, raw_blobs: &[Vec<u8>]) -> Vec<u8> {
         let text = serde_json::to_vec(&manifest).unwrap();
@@ -982,21 +1050,34 @@ mod tests {
         let preview = material_painter_graph::shading::starter("Project look");
         let preview = preview.to_json(&library);
         let texture = |blob, format| json!({"blob": blob, "format": format, "width": set_size, "height": set_size});
+        let bake_settings = json!({
+            "quality": "High", "high_poly": "high.obj", "cage": "missing.fbx",
+            "front": 0.2, "rear": 0.3, "maps": 6819,
+            "fill_misses": false, "match_by_name": false,
+            "ignore_backfaces": false, "average_normals": false,
+            "id_source": "VertexColors",
+            "ao_rays": 73, "ao_distance": 0.4, "cavity_distance": 0.125,
+            "thickness_rays": 0, "thickness_distance": 0.5,
+            "sky_rays": 27, "sky_cone_deg": 35.5,
+            "aa": 6, "curvature_radius": 4.5, "curvature_scale": 0.45,
+            "edge_threshold": 0.31, "edge_auto": true,
+            "edge_max_distance": 0.18, "hard_edge_angle": 42.5,
+            "cage_paint": [0.8, 1, 1, 1, 1, 1],
+            "custom": [{"id": 20, "name": "Wear", "kind": "Point", "distance": 0.75, "point": [0.3, 0.6, 0.0]}],
+        });
+        let view = json!({
+            "preview_shader": 5, "height_strength": 2.5, "emission": 4.25,
+            "camera": {
+                "target": [0.6, -0.4, 0.2], "distance": 8, "yaw": 1.2, "pitch": -0.4, "fov": 0.85
+            }
+        });
         let manifest = json!({
             "app": "Material Painter", "version": 3,
             "active_set": 1,
             "graphs": [{"id": 4, "graph": graph}, {"id": 5, "graph": preview}],
-            "view": {"preview_shader": 5},
+            "view": view,
             "mesh": {"name": "Panels", "vertices": 0, "indices": 1, "center": [1, 2, 3], "scale": 2, "tri_color": 7},
-            "bake": {
-                "quality": "High", "high_poly": "high.obj", "cage": "missing.fbx",
-                "front": 0.2, "rear": 0.3, "maps": 547,
-                "fill_misses": false, "match_by_name": false,
-                "ignore_backfaces": false, "average_normals": false,
-                "id_source": "VertexColors",
-                "cage_paint": [0.8, 1, 1, 1, 1, 1],
-                "custom": [{"id": 20, "name": "Wear", "kind": "Point", "distance": 0.75, "point": [0.3, 0.6, 0.0]}],
-            },
+            "bake": bake_settings,
             "texture_sets": [
                 {
                     "name": "Panel.1001", "tris": [0, 1], "udim": 1001, "resolution": set_size,
@@ -1088,10 +1169,30 @@ mod tests {
         );
         assert_eq!(
             (settings.front, settings.rear, settings.map_bits),
-            (6, 9, 49)
+            (6, 9, 6833)
         );
         assert!(!settings.fill_misses && !settings.match_names);
         assert!(!settings.prefer_front_faces && !settings.average_normals);
+        let rays = settings.rays;
+        assert_eq!(
+            [rays.occlusion_samples, rays.thickness_samples, rays.sky_samples],
+            [Some(73), Some(0), Some(27)],
+        );
+        let diagonal_in_mpp = 2. * f64::from(Vec3::new(1.5, 0.5, 0.).length());
+        let reach = |distance: f64| (distance * 10_000. / diagonal_in_mpp).round() as u32;
+        assert_eq!(
+            [rays.occlusion_reach, rays.cavity_reach, rays.thickness_reach],
+            [reach(0.4), reach(0.125), reach(0.5)],
+        );
+        assert_eq!(rays.sky_cone, 355);
+        let surface = settings.surface;
+        assert_eq!(surface.grid, Some(6));
+        assert_eq!(surface.radius, 45);
+        assert_eq!(surface.contrast, reach(0.45));
+        assert_eq!(surface.sharpness, 310);
+        assert_eq!(surface.edge_reach, reach(0.18));
+        assert!(surface.auto_edge_reach);
+        assert_eq!(surface.hard_angle, 425);
         assert_eq!(
             settings.id_source,
             super::super::model_bake_settings::IdSource::VertexColors
@@ -1241,12 +1342,27 @@ mod tests {
         let path = glb.path.clone();
         let mut doc = super::super::model_document::Document::new(glb, vec![object]);
         assert_eq!(doc.paint_set_index(), 1);
+        let camera = ModelCamera {
+            center: [1.3, 1.8, 3.1],
+            distance: 4.,
+            yaw: 1.2,
+            pitch: -0.4,
+            fov: 0.85,
+            orthographic: false,
+        };
+        assert_eq!(doc.model_camera, Some(camera));
+        let paint_preview = PaintPreview {
+            height_strength: Some(2.5), emission_strength: 4.25,
+        };
+        assert_eq!(doc.paint_preview, paint_preview);
         assert!(!doc.dirty());
         Arc::make_mut(doc.preview_shader.as_mut().unwrap())["name"] = json!("Updated look");
         assert!(doc.dirty());
         doc.save().unwrap();
         assert!(!doc.dirty());
         let reopened = Glb::load(&path).unwrap();
+        assert_eq!(reopened.json["extras"][MODEL_CAMERA_EXTRA], json!(camera));
+        assert_eq!(reopened.json["extras"][PAINT_PREVIEW_EXTRA], json!(paint_preview));
         assert_eq!(
             reopened.json["extras"][PREVIEW_SHADER_EXTRA]["name"],
             "Updated look"

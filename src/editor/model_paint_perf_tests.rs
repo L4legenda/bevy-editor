@@ -161,6 +161,7 @@ fn model_paint_benchmark_40k_triangles() {
     let result = batch(
         Work {
             surface,
+            preview: Default::default(),
             stroke: None,
         },
         vec![
@@ -232,7 +233,7 @@ fn model_paint_incremental_composite_matches_full_for_all_channels() {
     let mut dirty = Default::default();
     let dirty: &mut Dirty = &mut dirty;
     dirty[3] = Some(rect);
-    let updates = composite::prepare(surface, *dirty);
+    let updates = composite::prepare(surface, *dirty, 4.);
     let patch = updates.textures[2].as_ref().unwrap();
     let expected = (patch.rect.min.y..patch.rect.max.y)
         .flat_map(|y| {

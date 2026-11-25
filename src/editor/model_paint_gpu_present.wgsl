@@ -42,10 +42,14 @@ fn display(p:vec3<u32>){
     if(channel==2u){a=vec4<f32>(1.0,textureLoad(rm_map,at,0).g,v.r,1.0);}
     if(channel==3u||channel==6u){
         let normal=select(v,unpack4x8unorm(auxiliary[i]),channel==3u);
-        let dx=(h(at+vec2<i32>(1,0),channel==3u)-h(at-vec2<i32>(1,0),channel==3u))*4.0;
-        let dy=(h(at+vec2<i32>(0,1),channel==3u)-h(at-vec2<i32>(0,1),channel==3u))*4.0;
-        let n=normalize(vec3<f32>(normal.r*2.0-1.0-dx,normal.g*2.0-1.0+dy,max(normal.b*2.0-1.0,0.01)));
-        a=vec4<f32>(n*0.5+0.5,1.0);
+        if(u.forward.w==0.0){
+            a=vec4<f32>(normal.rgb,1.0);
+        }else{
+            let dx=(h(at+vec2<i32>(1,0),channel==3u)-h(at-vec2<i32>(1,0),channel==3u))*u.forward.w;
+            let dy=(h(at+vec2<i32>(0,1),channel==3u)-h(at-vec2<i32>(0,1),channel==3u))*u.forward.w;
+            let n=normalize(vec3<f32>(normal.r*2.0-1.0-dx,normal.g*2.0-1.0+dy,max(normal.b*2.0-1.0,0.01)));
+            a=vec4<f32>(n*0.5+0.5,1.0);
+        }
     }
     if(channel==4u){a=vec4<f32>(srgb(textureLoad(color_map,at,0).rgb),v.r);}
     if(channel==7u){b=vec4<f32>(v.rgb,sqrt(v.r*0.5));}

@@ -1,5 +1,5 @@
 //! Geometry-aware à-trous filtering of ray-traced maps before UV padding.
-use super::{Maps, Progress, RayDevice, rgb};
+use super::{Maps, Progress, RayDevice, relief::Curvature, rgb};
 use bevy::prelude::*;
 use bevy::render::render_resource::Buffer;
 use std::sync::atomic::Ordering;
@@ -28,6 +28,7 @@ impl Guide {
 }
 
 const KERNEL: [f32; 5] = [0.0625, 0.25, 0.375, 0.25, 0.0625];
+const CURVATURE_PASSES: u32 = 2;
 pub(super) const RASTER_END: u32 = 850;
 const DENOISE_END: u32 = 975;
 
@@ -39,6 +40,106 @@ struct Tap {
 
 fn decode_normal(bytes: &[u8]) -> Vec3 {
     Vec3::new(bytes[0] as f32, bytes[1] as f32, bytes[2] as f32) * (2.0 / 255.0) - 1.0
+}
+
+pub(super) fn filter_curvature(
+    maps: &mut Maps,
+    guides: &[Guide],
+    curvature: &[Curvature],
+    radius: f32,
+    progress: &Progress,
+    device: Option<&RayDevice>,
+) -> Result<(), String> {
+    progress.check()?;
+    if !curvature.iter().any(|sample| sample.value.abs() > 1e-6) {
+        for (texel, sample) in maps.values.iter_mut().zip(curvature) {
+            texel[18] = sample.packed(0.);
+        }
+        return Ok(());
+    }
+    if let Some(device) = device {
+        match gpu::filter_curvature(device, maps, guides, curvature, radius, progress) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                progress.check()?;
+                warn!("GPU curvature smoothing failed; retrying on the CPU: {error}");
+            }
+        }
+    }
+    filter_curvature_cpu(maps, guides, curvature, radius, progress)
+}
+
+fn filter_curvature_cpu(
+    maps: &mut Maps,
+    guides: &[Guide],
+    curvature: &[Curvature],
+    radius: f32,
+    progress: &Progress,
+) -> Result<(), String> {
+    let size = maps.size as usize;
+    let mut values: Vec<_> = curvature.iter().map(|sample| sample.value).collect();
+    let mut scratch = vec![0.; values.len()];
+    for pass in 0..CURVATURE_PASSES {
+        let taps = taps(1 << pass);
+        for (y, row) in scratch.chunks_exact_mut(size).enumerate() {
+            progress.check()?;
+            for (x, output) in row.iter_mut().enumerate() {
+                let index = y * size + x;
+                let guide = guides[index];
+                if guide.texel <= 0. {
+                    *output = values[index];
+                    continue;
+                }
+                let normal = decode_normal(&maps.values[index][9..12]).normalize_or_zero();
+                let point = IVec2::new(x as i32, y as i32);
+                let scale = guide.texel.powi(2);
+                let variance = 2. * radius.powi(2) * scale;
+                let mut sum = 0.;
+                let mut total = 0.;
+                for tap in &taps {
+                    let sample = point + tap.offset;
+                    if sample.min_element() < 0 || sample.max_element() >= size as i32 {
+                        continue;
+                    }
+                    let other_index = sample.y as usize * size + sample.x as usize;
+                    let other = guides[other_index];
+                    if other.texel <= 0. || other.part != guide.part || other.island != guide.island {
+                        continue;
+                    }
+                    let distance = other.position.distance_squared(guide.position);
+                    if distance > tap.radius * scale {
+                        continue;
+                    }
+                    let other_normal = decode_normal(&maps.values[other_index][9..12]).normalize_or_zero();
+                    let facing = ((normal.dot(other_normal) - 0.6) / 0.25).clamp(0., 1.);
+                    let weight = tap.weight * facing * facing * (3. - 2. * facing)
+                        * (-distance / variance).exp();
+                    sum += values[other_index] * weight;
+                    total += weight;
+                }
+                *output = if total > 0. { sum / total } else { values[index] };
+            }
+        }
+        std::mem::swap(&mut values, &mut scratch);
+    }
+    for ((output, sample), filtered) in maps.values.iter_mut().zip(curvature).zip(values) {
+        output[18] = sample.packed(filtered);
+    }
+    Ok(())
+}
+
+fn taps(step: i32) -> Vec<Tap> {
+    KERNEL.iter().enumerate().flat_map(|(y, &wy)| {
+        KERNEL.iter().enumerate().map(move |(x, &wx)| {
+            let offset = IVec2::new(x as i32 - 2, y as i32 - 2) * step;
+            Tap {
+                offset,
+                radius: (offset.as_vec2().length() * 2.0 + 2.0).powi(2),
+                weight: wx * wy,
+            }
+        })
+    }).collect()
 }
 
 pub(super) fn filter(
@@ -78,23 +179,11 @@ fn filter_cpu(
     progress: &Progress,
 ) -> Result<(), String> {
     let size = maps.size as usize;
+    let write_bent = maps.selection.contains(super::BakeMap::BentNormal);
     let mut scratch = vec![[0; 7]; guides.len()];
     for pass in 0..passes {
         let step = 1 << pass;
-        let taps: Vec<_> = KERNEL
-            .iter()
-            .enumerate()
-            .flat_map(|(y, &wy)| {
-                KERNEL.iter().enumerate().map(move |(x, &wx)| {
-                    let offset = IVec2::new(x as i32 - 2, y as i32 - 2) * step;
-                    Tap {
-                        offset,
-                        radius: (offset.as_vec2().length() * 2.0 + 2.0).powi(2),
-                        weight: wx * wy,
-                    }
-                })
-            })
-            .collect();
+        let taps = taps(step);
         for y in 0..size {
             progress.check()?;
             progress.rows.store(
@@ -181,7 +270,9 @@ fn filter_cpu(
             for ((value, filtered), guide) in output.iter_mut().zip(filtered).zip(guides) {
                 if guide.texel > 0.0 {
                     value[..4].copy_from_slice(&filtered[..4]);
-                    value[6..9].copy_from_slice(&filtered[4..]);
+                    if write_bent {
+                        value[6..9].copy_from_slice(&filtered[4..]);
+                    }
                 }
             }
         }
@@ -241,6 +332,46 @@ mod tests {
             }
         }
         (maps_with_values(size, values), guides)
+    }
+
+    fn curvature_fixture(size: usize) -> Vec<Curvature> {
+        (0..size * size).map(|i| {
+            let x = i % size;
+            let y = i / size;
+            let mut sample = Curvature::default();
+            sample.value = match x {
+                0..=3 => if (x + y) % 2 == 0 { 0.75 } else { -0.75 },
+                4..=7 => 0.5,
+                8..=11 => -0.5,
+                12..=15 => 0.25,
+                16..=19 => -0.25,
+                _ => 0.,
+            };
+            sample
+        }).collect()
+    }
+
+    #[test]
+    fn baked_curvature_smooths_within_surface_and_keeps_edge_distances() {
+        let size = 24;
+        let (mut narrow, guides) = fixture(size);
+        let (mut wide, _) = fixture(size);
+        let samples = curvature_fixture(size);
+        let progress = Progress::default();
+        filter_curvature(&mut narrow, &guides, &samples, 1., &progress, None).unwrap();
+        filter_curvature(&mut wide, &guides, &samples, 5., &progress, None).unwrap();
+        let error = |maps: &Maps| {
+            maps.values.iter().enumerate().filter(|(i, _)| i % size < 4)
+                .map(|(_, texel)| u32::from(texel[18].abs_diff(128))).sum::<u32>()
+        };
+        assert!(error(&wide) < error(&narrow));
+        for (i, texel) in wide.values.iter().enumerate() {
+            if i % size >= 4 {
+                let expected = samples[i].packed(samples[i].value);
+                assert!(texel[18].abs_diff(expected) <= 1);
+            }
+            assert_eq!(&texel[19..21], &[123; 2]);
+        }
     }
 
     #[test]
@@ -373,7 +504,12 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(resident.values, actual.values);
+        assert!(resident.values == actual.values, "resident and staged visibility should match");
+
+        let samples = curvature_fixture(size);
+        filter_curvature_cpu(&mut cpu, &guides, &samples, 3.5, &progress).unwrap();
+        assert!(gpu::filter_curvature(&device, &mut actual, &guides, &samples, 3.5, &progress).unwrap());
+        assert!(cpu.values.iter().zip(&actual.values).all(|(a, b)| a[18].abs_diff(b[18]) <= 1));
     }
 
     #[test]

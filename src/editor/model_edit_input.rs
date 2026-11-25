@@ -174,8 +174,8 @@ pub(in crate::editor) fn ray(viewer: &Viewer, rect: Rect, point: Vec2) -> (Vec3,
     }
     let direction = (camera.rotation
         * Vec3::new(
-            p.x * (FOV * 0.5).tan() * rect.width() / rect.height(),
-            -p.y * (FOV * 0.5).tan(),
+            p.x * (viewer.fov() * 0.5).tan() * rect.width() / rect.height(),
+            -p.y * (viewer.fov() * 0.5).tan(),
             -1.0,
         ))
     .normalize();
@@ -1080,7 +1080,7 @@ pub(in crate::editor) fn input(
 }
 
 fn world_per_pixel(viewer: &Viewer, rect: Rect) -> f32 {
-    viewer.distance * 2.0 * (FOV * 0.5).tan() / rect.height()
+    view_height(viewer, viewer.distance) / rect.height()
 }
 
 #[cfg(test)]

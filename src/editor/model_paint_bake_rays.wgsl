@@ -20,6 +20,7 @@ struct Config {
     counts: vec4<u32>, // samples per map, number of texels
     settings: vec4<f32>, // scale, low-poly part IDs, visibility maps, number of recipes
     geometry: vec4<u32>, // resolution as f32 bits, triangle stride in vectors, selected maps
+    visibility: vec4<f32>, // AO, cavity and thickness relative reach, cosine of the sky cone
     recipes: array<Recipe, 64>,
 }
 struct Recipe {
@@ -195,19 +196,24 @@ fn visibility_maps(texel: Texel) -> vec2<u32> {
     let bias = geo * (scale * 0.00002);
     let outside = texel.p.xyz + bias;
     let inside = texel.p.xyz - bias;
-    let cavity_reach = scale * 0.04;
+    let ao_reach = scale * config.visibility.x;
+    let cavity_reach = scale * config.visibility.y;
     let maps = config.geometry.z;
     let ao_enabled = (maps & 1u) != 0u;
+    let bent_enabled = (maps & (1u << 9u)) != 0u;
+    let broad_visibility = ao_enabled || bent_enabled;
     let cavity_enabled = (maps & 2u) != 0u;
-    let thickness_enabled = (maps & 4u) != 0u;
-    let sky_enabled = (maps & 8u) != 0u;
-    let ao_reach = select(cavity_reach, scale * 0.6, ao_enabled);
-    let ao_exit = select(ao_reach, cavity_reach, cavity_enabled);
-    let thickness_reach = scale * 0.5;
+    let thickness_enabled = (maps & 4u) != 0u && config.counts.y != 0u;
+    let sky_enabled = (maps & 8u) != 0u && config.counts.z != 0u;
+    let reach_ao = select(cavity_reach, ao_reach, broad_visibility);
+    let reach_cavity = select(ao_reach, cavity_reach, cavity_enabled);
+    let visibility_reach = max(reach_ao, reach_cavity);
+    let ao_exit = min(reach_ao, reach_cavity);
+    let thickness_reach = scale * config.visibility.z;
     var ao = 0u;
     var cavity = 0u;
     var bent = vec3<f32>(0.0);
-    let ao_count = select(0u, config.counts.x, ao_enabled || cavity_enabled);
+    let ao_count = select(0u, config.counts.x, broad_visibility || cavity_enabled);
     for (var i = 0u; i < ao_count; i++) {
         var direction = hemisphere(normal, i, config.counts.x, phase);
         let incidence = dot(direction, geo);
@@ -215,11 +221,11 @@ fn visibility_maps(texel: Texel) -> vec2<u32> {
             direction = normalize(direction - 2.0 * incidence * geo);
         }
         // A hit inside the smaller reach marks both visibility maps as blocked.
-        let hit = trace_hit(outside, direction, ao_reach, texel.ids, 0u, ao_exit).distance;
+        let hit = trace_hit(outside, direction, visibility_reach, texel.ids, 0u, ao_exit).distance;
         if (hit > cavity_reach) {
             cavity += 1u;
         }
-        if (ao_enabled && hit > ao_reach) {
+        if (broad_visibility && hit > ao_reach) {
             ao += 1u;
             bent += direction;
         }
@@ -236,7 +242,7 @@ fn visibility_maps(texel: Texel) -> vec2<u32> {
             trace(inside, direction, thickness_reach, texel.ids, select(0u, 1u, config.settings.y != 0.0)));
     }
     var sky = 0u;
-    let cone_cos = cos(40.0 * (3.14159265359 / 180.0));
+    let cone_cos = config.visibility.w;
     let sky_count = select(0u, config.counts.z, sky_enabled);
     for (var i = 0u; i < sky_count; i++) {
         let y = 1.0 - (1.0 - cone_cos) * ((f32(i) + 0.5) / f32(config.counts.z));
@@ -249,14 +255,14 @@ fn visibility_maps(texel: Texel) -> vec2<u32> {
         }
     }
     var bent_direction = normal;
-    if (dot(bent, bent) > 0.0) {
+    if (bent_enabled && dot(bent, bent) > 0.0) {
         bent_direction = normalize(bent);
     }
     let coded = bent_direction * 0.5 + 0.5;
     let visibility = select(255u, byte(f32(ao) / f32(config.counts.x)), ao_enabled)
         | (select(255u, byte(f32(cavity) / f32(config.counts.x)), cavity_enabled) << 8u)
-        | (select(255u, byte(thickness / (thickness_reach * f32(config.counts.y))), thickness_enabled) << 16u)
-        | (select(255u, byte(f32(sky) / f32(config.counts.z)), sky_enabled) << 24u);
+        | (select(255u, byte(thickness / (thickness_reach * f32(max(config.counts.y, 1u)))), thickness_enabled) << 16u)
+        | (select(255u, byte(f32(sky) / f32(max(config.counts.z, 1u))), sky_enabled) << 24u);
     let bent_normal = byte(coded.x) | (byte(coded.y) << 8u) | (byte(coded.z) << 16u);
     return vec2<u32>(visibility, bent_normal);
 }

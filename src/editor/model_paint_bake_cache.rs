@@ -153,6 +153,19 @@ fn key(
     hash.number(settings.quality as u8);
     hash.number(settings.maps.bits());
     hash.number(settings.id_source as u8);
+    let sampling = settings.sampling();
+    for count in [sampling.occlusion, sampling.thickness, sampling.sky] {
+        hash.number(count);
+    }
+    hash.floats(sampling.visibility);
+    hash.number(sampling.grid);
+    let surface = settings.surface;
+    hash.number(surface.radius);
+    hash.number(surface.contrast);
+    hash.number(surface.edge_reach);
+    hash.number(u8::from(surface.auto_edge_reach));
+    hash.number(surface.sharpness);
+    hash.number(surface.hard_angle);
     let mut recipes = settings.custom.as_ref().clone();
     for recipe in &mut recipes {
         recipe.name.clear();

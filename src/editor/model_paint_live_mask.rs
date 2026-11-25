@@ -10,6 +10,7 @@ struct Source {
     transform: Transform,
     offset: Vec2,
     template: Handle<StandardMaterial>,
+    preview: crate::editor::model_document::PaintPreview,
 }
 
 impl Source {
@@ -20,6 +21,7 @@ impl Source {
             && self.transform == other.transform
             && self.offset == other.offset
             && self.template == other.template
+            && self.preview == other.preview
     }
 
     fn current(&self, model: usize, doc: &Document, binding: (usize, usize)) -> bool {
@@ -160,7 +162,7 @@ fn compose_preview(
             Arc::make_mut(mask).bind(context.clone());
         }
     }
-    (reduced, compose_maps(&surface))
+    (reduced, compose_maps(&surface, source.preview))
 }
 
 pub(in crate::editor::ui::model_viewer) fn update(
@@ -215,6 +217,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 transform: object.transform,
                 offset: object.uv_offset(binding.1),
                 template: slot.material.clone(),
+                preview: doc.paint_preview,
             },
             plane,
         ))
@@ -258,6 +261,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             &mut gpu,
             updates,
             &source.template,
+            source.preview.emission_strength,
             &mut images,
             &mut materials,
             &mut uploads,

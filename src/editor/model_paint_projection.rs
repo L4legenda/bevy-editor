@@ -40,6 +40,7 @@ pub(super) struct CameraMap {
     pub rect: Rect,
     pub clip: Rect,
     pub ortho: bool,
+    pub fov: f32,
     pub height: f32,
     pub depth: f32,
     pub epsilon: f32,
@@ -53,7 +54,7 @@ impl CameraMap {
         let h = if self.ortho {
             self.height
         } else {
-            2. * -p.z * (FOV * 0.5).tan()
+            2. * -p.z * (self.fov * 0.5).tan()
         };
         Some(
             self.rect.center()
@@ -84,8 +85,8 @@ impl CameraMap {
                 self.pose.translation,
                 (self.pose.rotation
                     * Vec3::new(
-                        p.x * aspect * (FOV * 0.5).tan(),
-                        -p.y * (FOV * 0.5).tan(),
+                        p.x * aspect * (self.fov * 0.5).tan(),
+                        -p.y * (self.fov * 0.5).tan(),
                         -1.,
                     ))
                 .normalize(),
@@ -116,6 +117,7 @@ pub(super) fn camera_map(viewer: &Viewer, rect: Rect) -> CameraMap {
         rect,
         clip: rect,
         ortho: viewer.orthographic,
+        fov: viewer.fov(),
         height: view_height(viewer, viewer.distance),
         depth: orthographic_depth(viewer),
         epsilon: viewer.radius.max(0.001) * 0.0005,

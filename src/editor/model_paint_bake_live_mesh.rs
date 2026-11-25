@@ -72,7 +72,10 @@ impl Scene {
         let high_parts = geometry
             .projection
             .as_ref()
-            .map(|projector| projector.build_relief(geometry.scale, false, progress))
+            .map(|projector| {
+                let params = relief::Parameters::new(geometry.bounds, geometry.scale, settings.surface);
+                projector.build_relief(params, false, progress)
+            })
             .transpose()?;
         let offset = object.uv_offset(slot);
         let mut triangles = Vec::new();

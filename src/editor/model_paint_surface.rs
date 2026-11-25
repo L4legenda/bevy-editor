@@ -1,5 +1,5 @@
 //! Resolve screen positions to the visible triangle for projected brush stamps.
-use super::{CameraMap, FOV, FillMode, Stamp};
+use super::{CameraMap, FillMode, Stamp};
 use crate::editor::{
     model_document::Object,
     ui::model_viewer::editing::input::{Bvh, PickTriangle},
@@ -371,7 +371,7 @@ impl SurfaceTrace {
             camera.height
         } else {
             let depth = (center - camera.pose.translation).dot(*camera.pose.forward());
-            2. * depth.max(0.0001) * (FOV * 0.5).tan()
+            2. * depth.max(0.0001) * (camera.fov * 0.5).tan()
         };
         let radius = (brush.radius * stamp.radius).max(0.5) * height / camera.rect.height();
         let right = *camera.pose.right();

@@ -40,9 +40,11 @@ pub(in crate::editor) use crate::editor::model_paint_data::map_fixes::BakeMap;
 use crate::editor::model_paint_data::map_fixes::Fixes;
 use crate::editor::model_paint_data::mask::{BakedInputs, Generator, GeneratorInput};
 impl BakeMap {
-    pub(super) const OPTIONAL: [Self; 7] = [
+    pub(super) const OPTIONAL: [Self; 13] = [
         Self::Occlusion, Self::Cavity, Self::Thickness, Self::Sky,
-        Self::Curvature, Self::EdgeDistance, Self::CreaseDistance,
+        Self::Curvature, Self::EdgeDistance, Self::CreaseDistance, Self::BentNormal,
+        Self::PartRandom, Self::PartGradient, Self::PartId,
+        Self::ProjectedNormal, Self::ProjectedHeight,
     ];
     pub const ALL: [Self; 16] = [
         Self::Occlusion,
@@ -113,12 +115,13 @@ impl BakeMap {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct MapSelection(u8);
+pub(super) struct MapSelection(u16);
 
 impl MapSelection {
-    pub const ALL: Self = Self(0b111_1111);
+    pub const ALL: Self = Self(crate::editor::model_bake_settings::ALL_MAP_BITS);
+    pub(super) const BASIC: Self = Self(crate::editor::model_bake_settings::BASIC_MAP_BITS);
     pub const MINIMUM: Self = Self(0);
-    const GENERATOR_MAPS: [(BakeMap, GeneratorInput); 8] = {
+    const GENERATOR_MAPS: [(BakeMap, GeneratorInput); 11] = {
         use GeneratorInput as Input;
         [
             (BakeMap::Occlusion, Input::Occlusion),
@@ -129,18 +132,27 @@ impl MapSelection {
             (BakeMap::Curvature, Input::Concavity),
             (BakeMap::EdgeDistance, Input::Edges),
             (BakeMap::CreaseDistance, Input::Creases),
+            (BakeMap::PartGradient, Input::PartGradient),
+            (BakeMap::PartRandom, Input::PartRandom),
+            (BakeMap::PartId, Input::Id),
         ]
     };
 
-    fn bit(map: BakeMap) -> u8 {
+    const fn bit(map: BakeMap) -> u16 {
         match map {
-            BakeMap::Occlusion | BakeMap::BentNormal => 1 << 0,
+            BakeMap::Occlusion => 1 << 0,
             BakeMap::Cavity => 1 << 1,
             BakeMap::Thickness => 1 << 2,
             BakeMap::Sky => 1 << 3,
             BakeMap::Curvature => 1 << 4,
             BakeMap::EdgeDistance => 1 << 5,
             BakeMap::CreaseDistance => 1 << 6,
+            BakeMap::PartRandom => 1 << 7,
+            BakeMap::PartGradient => 1 << 8,
+            BakeMap::BentNormal => crate::editor::model_bake_settings::BENT_NORMAL_BIT,
+            BakeMap::ProjectedNormal => 1 << 10,
+            BakeMap::ProjectedHeight => 1 << 11,
+            BakeMap::PartId => 1 << 12,
             _ => 0,
         }
     }
@@ -155,14 +167,14 @@ impl MapSelection {
     }
 
     pub fn visibility(self) -> bool {
-        self.0 & 0b1111 != 0
+        self.0 & (0b1111 | Self::bit(BakeMap::BentNormal)) != 0
     }
 
     pub fn relief(self) -> bool {
         self.0 & 0b111_0000 != 0
     }
 
-    pub fn bits(self) -> u8 {
+    pub fn bits(self) -> u16 {
         self.0
     }
 
@@ -213,11 +225,118 @@ pub(in crate::editor) fn import_generator_inputs(
     Ok(maps.generator_inputs().clone())
 }
 
-pub(in crate::editor) fn import_bake_map_bits(maps: impl Iterator<Item = BakeMap>) -> u8 {
+pub(in crate::editor) fn import_bake_map_bits(maps: impl Iterator<Item = BakeMap>) -> u16 {
     maps.fold(0, |bits, map| bits | MapSelection::bit(map))
 }
 
-pub(in crate::editor) use crate::editor::model_bake_settings::{IdSource, Quality};
+pub(in crate::editor) use crate::editor::model_bake_settings::{IdSource, Quality, RayOptions, SurfaceOptions};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) enum BakeControl {
+    OcclusionSamples,
+    ThicknessSamples,
+    SkySamples,
+    OcclusionReach,
+    CavityReach,
+    ThicknessReach,
+    SkyCone,
+    Grid,
+    CurvatureRadius,
+    CurvatureContrast,
+    EdgeSharpness,
+    EdgeReach,
+    HardEdgeAngle,
+}
+
+impl BakeControl {
+    pub(super) const RAYS: [Self; 7] = [
+        Self::OcclusionSamples, Self::ThicknessSamples, Self::SkySamples,
+        Self::OcclusionReach, Self::CavityReach, Self::ThicknessReach, Self::SkyCone,
+    ];
+    pub(super) const SURFACE: [Self; 6] = [
+        Self::Grid, Self::CurvatureRadius, Self::CurvatureContrast,
+        Self::EdgeSharpness, Self::EdgeReach, Self::HardEdgeAngle,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::OcclusionSamples => "Лучи AO и впадин",
+            Self::ThicknessSamples => "Лучи толщины",
+            Self::SkySamples => "Лучи обзора неба",
+            Self::OcclusionReach => "Дальность AO, %",
+            Self::CavityReach => "Дальность впадин, %",
+            Self::ThicknessReach => "Дальность толщины, %",
+            Self::SkyCone => "Конус обзора неба, °",
+            Self::Grid => "Сетка проекции, проб по оси",
+            Self::CurvatureRadius => "Радиус кривизны, пикс.",
+            Self::CurvatureContrast => "Контраст кривизны, %",
+            Self::EdgeSharpness => "Порог остроты скруглений",
+            Self::EdgeReach => "Дальность поиска рёбер, %",
+            Self::HardEdgeAngle => "Угол жёсткого ребра, °",
+        }
+    }
+
+    pub(super) fn bounds(self) -> (f64, f64) {
+        match self {
+            Self::OcclusionSamples => (4., 512.),
+            Self::ThicknessSamples | Self::SkySamples => (0., 256.),
+            Self::SkyCone => (1., 89.),
+            Self::Grid => (1., 8.),
+            Self::CurvatureRadius => (1., 16.),
+            Self::EdgeSharpness => (0.05, 0.95),
+            Self::HardEdgeAngle => (5., 120.),
+            _ => (0.01, f64::from(RayOptions::MAX_REACH) / 100.),
+        }
+    }
+
+    pub(super) fn digits(self) -> usize {
+        match self {
+            Self::OcclusionSamples | Self::ThicknessSamples | Self::SkySamples | Self::Grid => 0,
+            Self::SkyCone | Self::CurvatureRadius | Self::HardEdgeAngle => 1,
+            Self::EdgeSharpness => 3,
+            _ => 2,
+        }
+    }
+
+    pub(super) fn value(self, projection: &ProjectionSettings) -> f32 {
+        let sampling = projection.sampling();
+        match self {
+            Self::OcclusionSamples => sampling.occlusion as f32,
+            Self::ThicknessSamples => sampling.thickness as f32,
+            Self::SkySamples => sampling.sky as f32,
+            Self::OcclusionReach => projection.rays.occlusion_reach as f32 / 100.,
+            Self::CavityReach => projection.rays.cavity_reach as f32 / 100.,
+            Self::ThicknessReach => projection.rays.thickness_reach as f32 / 100.,
+            Self::SkyCone => f32::from(projection.rays.sky_cone) / 10.,
+            Self::Grid => sampling.grid as f32,
+            Self::CurvatureRadius => f32::from(projection.surface.radius) / 10.,
+            Self::CurvatureContrast => projection.surface.contrast as f32 / 100.,
+            Self::EdgeSharpness => f32::from(projection.surface.sharpness) / 1000.,
+            Self::EdgeReach => projection.surface.edge_reach as f32 / 100.,
+            Self::HardEdgeAngle => f32::from(projection.surface.hard_angle) / 10.,
+        }
+    }
+
+    fn set(self, projection: &mut ProjectionSettings, value: f32) {
+        let options = &mut projection.rays;
+        let surface = &mut projection.surface;
+        match self {
+            Self::OcclusionSamples => options.occlusion_samples = Some(value.round() as u16),
+            Self::ThicknessSamples => options.thickness_samples = Some(value.round() as u16),
+            Self::SkySamples => options.sky_samples = Some(value.round() as u16),
+            Self::OcclusionReach => options.occlusion_reach = (value * 100.).round() as u32,
+            Self::CavityReach => options.cavity_reach = (value * 100.).round() as u32,
+            Self::ThicknessReach => options.thickness_reach = (value * 100.).round() as u32,
+            Self::SkyCone => options.sky_cone = (value * 10.).round() as u16,
+            Self::Grid => surface.grid = Some(value.round() as u8),
+            Self::CurvatureRadius => surface.radius = (value * 10.).round() as u16,
+            Self::CurvatureContrast => surface.contrast = (value * 100.).round() as u32,
+            Self::EdgeSharpness => surface.sharpness = (value * 1000.).round() as u16,
+            Self::EdgeReach => surface.edge_reach = (value * 100.).round() as u32,
+            Self::HardEdgeAngle => surface.hard_angle = (value * 10.).round() as u16,
+        }
+    }
+}
 
 fn material_id_color(index: u32) -> [u8; 3] {
     // Material Painter steps through hues by the golden ratio.
@@ -242,9 +361,23 @@ struct Sampling {
     occlusion: u32,
     thickness: u32,
     sky: u32,
+    visibility: [f32; 4],
 }
 
 impl Sampling {
+    fn with_ray_options(mut self, options: RayOptions) -> Self {
+        self.occlusion = options.occlusion_samples.map_or(self.occlusion, u32::from);
+        self.thickness = options.thickness_samples.map_or(self.thickness, u32::from);
+        self.sky = options.sky_samples.map_or(self.sky, u32::from);
+        self.visibility = [
+            options.occlusion_reach as f32 / 10_000.,
+            options.cavity_reach as f32 / 10_000.,
+            options.thickness_reach as f32 / 10_000.,
+            (f32::from(options.sky_cone) / 10.).to_radians().cos(),
+        ];
+        self
+    }
+
     fn denoise_passes(self) -> u32 {
         match self.occlusion {
             0..=32 => 4,
@@ -281,7 +414,8 @@ impl Quality {
             occlusion,
             thickness,
             sky,
-        }
+            visibility: [0.; 4],
+        }.with_ray_options(RayOptions::default())
     }
 }
 
@@ -301,6 +435,8 @@ pub(super) struct ProjectionSettings {
     pub(super) quality: Quality,
     pub(super) maps: MapSelection,
     pub(super) id_source: IdSource,
+    pub(super) rays: RayOptions,
+    pub(super) surface: SurfaceOptions,
     source_generation: u64,
 }
 
@@ -342,12 +478,20 @@ impl Default for ProjectionSettings {
             quality: Quality::default(),
             maps: MapSelection::ALL,
             id_source: IdSource::default(),
+            rays: RayOptions::default(),
+            surface: SurfaceOptions::default(),
             source_generation: 0,
         }
     }
 }
 
 impl ProjectionSettings {
+    fn sampling(&self) -> Sampling {
+        let mut sampling = self.quality.sampling().with_ray_options(self.rays);
+        sampling.grid = self.surface.grid.map_or(sampling.grid, u32::from);
+        sampling
+    }
+
     fn saved(&self) -> Settings {
         Settings {
             high_poly: self.path.clone(),
@@ -355,6 +499,8 @@ impl ProjectionSettings {
             quality: self.quality,
             map_bits: self.maps.bits(),
             id_source: self.id_source,
+            rays: self.rays,
+            surface: self.surface,
             front: self.front,
             rear: self.rear,
             match_names: self.match_names,
@@ -371,6 +517,8 @@ impl ProjectionSettings {
         self.quality = settings.quality;
         self.maps = MapSelection(settings.map_bits);
         self.id_source = settings.id_source;
+        self.rays = settings.rays;
+        self.surface = settings.surface;
         self.front = settings.front;
         self.rear = settings.rear;
         self.match_names = settings.match_names;
@@ -864,7 +1012,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 if maps.gpu_padding {
                     editor.status.push_str(" · UV-отступы на GPU");
                 }
-                if maps.has_map(BakeMap::ProjectedNormal) {
+                if maps.has_map(BakeMap::ProjectionCoverage) {
                     editor.status.push_str(&format!(
                         " · лучи high-poly попали в {:.0}% UV-текселей",
                         maps.hits as f32 * 100. / maps.filled as f32
@@ -983,6 +1131,12 @@ pub(in crate::editor::ui::model_viewer) fn update(
         Action::ModelView(ModelViewAction::Paint(action)) => Some(action),
         _ => None,
     });
+    // Apply a field edit before handling a bake button that took focus from that field.
+    if let Some((control, value)) = session.bake_option_edit.take() && state.running.is_none() {
+        control.set(&mut session.bake_projection, value);
+        state.cache.retain(|(key, _)| key.model != index);
+        session.revision += 1;
+    }
     for action in paint_actions.chain(name_key) {
         if let PaintAction::BakeFixValue(value) = action {
             if session.active_bake_fix().is_some_and(levels::supports) && !session.busy {
@@ -1161,13 +1315,32 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
+            PaintAction::BakeRayOptions(options)
+                if state.running.is_none() && session.bake_projection.rays != options.validated() =>
+            {
+                session.bake_projection.rays = options.validated();
+                state.cache.retain(|(key, _)| key.model != index);
+                session.revision += 1;
+            }
+            PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
+                if state.running.is_none() =>
+            {
+                let surface = &mut session.bake_projection.surface;
+                if action == PaintAction::BakeAutoEdgeReach {
+                    surface.auto_edge_reach = !surface.auto_edge_reach;
+                } else {
+                    *surface = SurfaceOptions::default();
+                }
+                state.cache.retain(|(key, _)| key.model != index);
+                session.revision += 1;
+            }
             PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
                 if state.running.is_none() =>
             {
                 let selection = match action {
                     PaintAction::BakeToggleMap(map) => session.bake_projection.maps.toggle(map),
                     PaintAction::BakeSelectAllMaps(true) => MapSelection::ALL,
-                    _ => MapSelection::MINIMUM,
+                    _ => MapSelection::BASIC,
                 };
                 if session.bake_projection.maps != selection {
                     session.bake_projection.maps = selection;
@@ -1331,12 +1504,12 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     let has_projection = projection.path.is_some();
                     state.begin(key, doc, projection, ray_device());
                     if !matches!(session.bake_view, Some(BakeMap::Custom(_))) {
-                        session.bake_view = Some(if has_projection {
-                            BakeMap::ProjectedNormal
-                        } else if session.bake_projection.maps.contains(BakeMap::Occlusion) {
-                            BakeMap::Occlusion
-                        } else {
-                            BakeMap::WorldNormal
+                        session.bake_view = [
+                            BakeMap::ProjectedNormal, BakeMap::ProjectedHeight,
+                            BakeMap::Occlusion, BakeMap::WorldNormal,
+                        ].into_iter().find(|&map| {
+                            (has_projection || !map.requires_high_poly())
+                                && session.bake_projection.maps.contains(map)
                         });
                     }
                     editor.status = "Запекание карт меша…".into();

@@ -1,7 +1,7 @@
 //! Convert MPP's normalized bake data into Bevy Editor's document settings.
 use super::{MPP_BAKE_MAPS, Result};
 use crate::editor::{
-    model_bake_settings::{self, IdSource, Quality, Settings},
+    model_bake_settings::{self, IdSource, Quality, RayOptions, Settings, SurfaceOptions},
     model_cage_data::{Edit, Edits, Scales},
     model_document::Object,
     model_paint_data::custom::{self, Kind, Recipe},
@@ -50,12 +50,12 @@ impl Bake {
         if rounded_distance {
             warnings.push("Дальности проекции ограничены диапазоном 1–100%".into());
         }
+        let rays = ray_options(bake, distance_factor, warnings);
         let mask = bake["maps"].as_u64().unwrap_or(u64::MAX);
         let map_bits = import_bake_map_bits(
             MPP_BAKE_MAPS
                 .iter()
                 .copied()
-                .take(7)
                 .enumerate()
                 .filter_map(|(i, map)| (mask & (1 << i) != 0).then_some(map)),
         );
@@ -69,6 +69,8 @@ impl Bake {
             high_poly: source_file(path, &bake["high_poly"], "high-poly", warnings),
             cage: source_file(path, &bake["cage"], "cage", warnings),
             map_bits,
+            rays,
+            surface: surface_options(bake, distance_factor, warnings),
             id_source: match bake["id_source"].as_str() {
                 Some("Materials") => IdSource::Materials,
                 Some("VertexColors") => IdSource::VertexColors,
@@ -112,6 +114,71 @@ impl Bake {
         model_bake_settings::write(root, model, &self.settings)?;
         custom::write_document(root, &self.recipes)
     }
+}
+
+fn ray_options(bake: &Value, distance_factor: f64, warnings: &mut Vec<String>) -> RayOptions {
+    let defaults = RayOptions::default();
+    let mut limited = false;
+    let mut quantize = |value: f64, min: f64, max: f64| {
+        let value = value.round();
+        limited |= !((min..=max).contains(&value));
+        value.clamp(min, max) as u32
+    };
+    let mut reach = |key, default| {
+        bake[key].as_f64().map_or(default, |distance| {
+            quantize(distance * distance_factor * 100., 1., f64::from(RayOptions::MAX_REACH))
+        })
+    };
+    let occlusion_reach = reach("ao_distance", defaults.occlusion_reach);
+    let cavity_reach = reach("cavity_distance", defaults.cavity_reach);
+    let thickness_reach = reach("thickness_distance", defaults.thickness_reach);
+    let sky_cone = bake["sky_cone_deg"].as_f64().map_or(defaults.sky_cone, |angle| {
+        quantize(angle * 10., 10., 890.) as u16
+    });
+    let mut samples = |key, min, max| {
+        bake[key].as_u64().map(|count| quantize(count as f64, min, max) as u16)
+    };
+    let options = RayOptions {
+        occlusion_samples: samples("ao_rays", 4., 512.),
+        thickness_samples: samples("thickness_rays", 0., 256.),
+        sky_samples: samples("sky_rays", 0., 256.),
+        occlusion_reach,
+        cavity_reach,
+        thickness_reach,
+        sky_cone,
+    };
+    if limited {
+        warnings.push("Параметры лучей запекания ограничены диапазонами редактора".into());
+    }
+    options
+}
+
+fn surface_options(bake: &Value, distance_factor: f64, warnings: &mut Vec<String>) -> SurfaceOptions {
+    let defaults = SurfaceOptions::default();
+    let mut invalid = false;
+    let mut number = |key: &str, default: u32, factor: f64, min: f64, max: f64| {
+        bake[key].as_f64().map_or(default, |value| {
+            let value = (value * factor).round();
+            invalid |= !(min..=max).contains(&value);
+            value.clamp(min, max) as u32
+        })
+    };
+    let percent = distance_factor * 100.;
+    let max = f64::from(RayOptions::MAX_REACH);
+    let surface = SurfaceOptions {
+        grid: bake.get("aa").and_then(Value::as_f64)
+            .map(|_| number("aa", 1, 1., 1., 8.) as u8),
+        radius: number("curvature_radius", u32::from(defaults.radius), 10., 10., 160.) as u16,
+        contrast: number("curvature_scale", defaults.contrast, percent, 1., max),
+        edge_reach: number("edge_max_distance", defaults.edge_reach, percent, 1., max),
+        auto_edge_reach: bake["edge_auto"].as_bool().unwrap_or(defaults.auto_edge_reach),
+        sharpness: number("edge_threshold", u32::from(defaults.sharpness), 1000., 50., 950.) as u16,
+        hard_angle: number("hard_edge_angle", u32::from(defaults.hard_angle), 10., 50., 1200.) as u16,
+    };
+    if invalid {
+        warnings.push("Параметры сглаживания и кривизны ограничены диапазонами редактора".into());
+    }
+    surface
 }
 
 fn source_file(

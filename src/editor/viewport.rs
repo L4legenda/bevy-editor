@@ -544,8 +544,12 @@ pub(super) fn projection(kind: LensKind, lens: f32) -> Projection {
 
 /// Match the perspective framing at the orbit pivot when changing projection.
 pub(super) fn free_projection(orthographic: bool, distance: f32) -> Projection {
+    free_projection_with_fov(orthographic, distance, EDITOR_FOV)
+}
+
+pub(super) fn free_projection_with_fov(orthographic: bool, distance: f32, fov: f32) -> Projection {
     if orthographic {
-        let height = 2.0 * distance.max(0.000001) * (EDITOR_FOV * 0.5).tan();
+        let height = 2.0 * distance.max(0.000001) * (fov * 0.5).tan();
         Projection::Orthographic(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
                 viewport_height: height,
@@ -555,7 +559,7 @@ pub(super) fn free_projection(orthographic: bool, distance: f32) -> Projection {
             ..OrthographicProjection::default_3d()
         })
     } else {
-        projection(LensKind::Perspective, EDITOR_FOV.to_degrees())
+        projection(LensKind::Perspective, fov.to_degrees())
     }
 }
 

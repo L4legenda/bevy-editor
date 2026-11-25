@@ -170,15 +170,17 @@ impl Controller {
         }
         self.id = queue.id();
         self.key = Some(key);
+        let work = work.unwrap();
         queue.commands.push(gpu::Command::Setup {
             id: self.id,
-            surface: Arc::new(work.unwrap().surface.clone()),
+            surface: Arc::new(work.surface.clone()),
             channel: brush.channel,
             channels: brush.channels(),
             images: std::array::from_fn(|i| images[i].id()),
             scene: self.scene.as_ref().unwrap().1.clone(),
             object: map.object as u32 + 1,
             slot: map.slot as u32,
+            relief_factor: work.preview.relief_factor(work.surface.size),
             fix: None,
         });
         true

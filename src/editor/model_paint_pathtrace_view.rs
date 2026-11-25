@@ -190,6 +190,7 @@ struct ViewStamp {
     pose: Transform,
     viewport: Vec2,
     orthographic: bool,
+    fov: f32,
 }
 
 #[derive(Default)]
@@ -323,6 +324,7 @@ fn capture(
                 pose,
                 viewport: rect,
                 orthographic: viewer.orthographic,
+                fov: viewer.fov(),
             },
             viewer.gesture.is_some(),
             clock.elapsed(),
@@ -407,7 +409,7 @@ fn capture(
             proj::orthographic(-y * aspect, y * aspect, -y, y, -far, far)
         } else {
             proj::perspective(
-                super::super::super::FOV,
+                viewer.fov(),
                 aspect,
                 (viewer.radius * 0.001).max(0.000001),
                 far,
@@ -433,7 +435,10 @@ fn capture(
                 curve,
                 effects: env.post,
             },
-            settings: session.trace_settings,
+            settings: super::Settings {
+                emission_strength: doc.paint_preview.emission_strength,
+                ..session.trace_settings
+            },
         }))
     })();
     let next = if let Some(request) = request {

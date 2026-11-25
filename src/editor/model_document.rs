@@ -206,6 +206,65 @@ pub(in crate::editor) enum Operation {
 
 pub(super) const PREVIEW_SHADER_EXTRA: &str = "bevy_editor_preview_shader";
 pub(super) const PAINT_SET_EXTRA: &str = "bevy_editor_active_paint_set";
+pub(super) const MODEL_CAMERA_EXTRA: &str = "bevy_editor_model_camera";
+pub(super) const PAINT_PREVIEW_EXTRA: &str = "bevy_editor_paint_preview";
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub(super) struct PaintPreview {
+    pub height_strength: Option<f32>,
+    pub emission_strength: f32,
+}
+
+impl Default for PaintPreview {
+    fn default() -> Self {
+        Self { height_strength: None, emission_strength: 1. }
+    }
+}
+
+impl PaintPreview {
+    pub fn relief_factor(self, size: u32) -> f32 {
+        self.height_strength.map_or(4., |strength| strength * size as f32 / 512.)
+    }
+
+    fn read(root: &serde_json::Value) -> Self {
+        let mut settings = root["extras"].get(PAINT_PREVIEW_EXTRA)
+            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            .unwrap_or_default();
+        settings.height_strength = settings.height_strength.filter(|value| value.is_finite())
+            .map(|value| value.clamp(0., 8.));
+        settings.emission_strength = settings.emission_strength.clamp(0., 20.);
+        settings
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(super) struct ModelCamera {
+    pub center: [f32; 3],
+    pub distance: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub fov: f32,
+    #[serde(default)]
+    pub orthographic: bool,
+}
+
+impl ModelCamera {
+    pub fn valid(self) -> bool {
+        let center = Vec3::from_array(self.center);
+        center.is_finite()
+            && self.distance > 0.
+            && (center.abs().max_element() + self.distance).is_finite()
+            && self.yaw.is_finite()
+            && self.pitch.abs() <= std::f32::consts::FRAC_PI_2
+            && (1.0_f32.to_radians()..=175.0_f32.to_radians()).contains(&self.fov)
+    }
+
+    fn read(root: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value::<Self>(root["extras"].get(MODEL_CAMERA_EXTRA)?.clone())
+            .ok().filter(|camera| camera.valid())
+    }
+}
 
 pub(super) struct Document {
     pub source: glb::Glb,
@@ -218,6 +277,8 @@ pub(super) struct Document {
     pub saved_bake_settings: super::model_bake_settings::Settings,
     pub preview_shader: Option<Arc<serde_json::Value>>,
     pub paint_set: Option<usize>,
+    pub model_camera: Option<ModelCamera>,
+    pub paint_preview: PaintPreview,
     pub cage_edits: Arc<super::model_cage_data::Edits>,
     pub saved_cage_edits: Arc<super::model_cage_data::Edits>,
     pub active: Option<usize>,
@@ -249,6 +310,8 @@ impl Document {
         let preview_shader = preview.is_object().then(|| Arc::new(preview.clone()));
         let paint_set = source.json["extras"][PAINT_SET_EXTRA].as_u64()
             .and_then(|index| usize::try_from(index).ok());
+        let model_camera = ModelCamera::read(&source.json);
+        let paint_preview = PaintPreview::read(&source.json);
         let cage_edits = Arc::new(objects.iter().filter_map(|object| {
             let node = source.json["nodes"].get(object.source_node?)?;
             super::model_cage_data::read(node, object).map(|edit| (object.id, edit))
@@ -262,6 +325,8 @@ impl Document {
             bake_settings,
             preview_shader,
             paint_set,
+            model_camera,
+            paint_preview,
             saved_cage_edits: cage_edits.clone(),
             cage_edits,
             custom_bakes,
@@ -319,6 +384,9 @@ impl Document {
         if let Some(set) = self.writable_paint_set() {
             source.json["extras"][PAINT_SET_EXTRA] = serde_json::json!(set);
         }
+        if let Some(camera) = self.model_camera.filter(|camera| camera.valid()) {
+            source.json["extras"][MODEL_CAMERA_EXTRA] = serde_json::json!(camera);
+        }
         source
     }
 
@@ -337,6 +405,10 @@ impl Document {
         self.writable_paint_set().is_some_and(|index| {
             self.source.json["extras"][PAINT_SET_EXTRA].as_u64().unwrap_or(0) != index as u64
         })
+    }
+
+    pub(super) fn model_camera_changed(&self) -> bool {
+        self.model_camera.is_some_and(|camera| ModelCamera::read(&self.source.json) != Some(camera))
     }
 
     pub(super) fn paint_target(&self, set: usize) -> Option<(&Object, usize)> {

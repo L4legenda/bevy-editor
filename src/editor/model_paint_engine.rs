@@ -62,6 +62,7 @@ impl LineAnchor {
             && (map.uv
                 || (self.camera.pose == map.camera.pose
                     && self.camera.ortho == map.camera.ortho
+                    && self.camera.fov == map.camera.fov
                     && (!map.camera.ortho || self.camera.height == map.camera.height)))
     }
 }
@@ -114,13 +115,15 @@ impl Live {
 }
 struct Work {
     surface: Surface,
+    preview: crate::editor::model_document::PaintPreview,
     #[cfg(test)]
     stroke: Option<Stroke>,
 }
 impl Work {
-    fn new(surface: Surface) -> Self {
+    fn new(surface: Surface, preview: crate::editor::model_document::PaintPreview) -> Self {
         Self {
             surface,
+            preview,
             #[cfg(test)]
             stroke: None,
         }
@@ -509,7 +512,7 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
     let maps = dirty
         .iter()
         .any(Option::is_some)
-        .then(|| composite::prepare(&work.surface, dirty));
+        .then(|| composite::prepare(&work.surface, dirty, work.preview.relief_factor(work.surface.size)));
     Batch {
         work,
         maps,
@@ -544,7 +547,7 @@ fn take_events(queue: &mut VecDeque<Event>) -> Vec<Event> {
     events
 }
 fn compose(work: Work) -> Batch {
-    let maps = compose_maps(&work.surface);
+    let maps = compose_maps(&work.surface, work.preview);
     Batch {
         work,
         maps: Some(maps),
@@ -552,12 +555,12 @@ fn compose(work: Work) -> Batch {
     }
 }
 
-fn compose_maps(surface: &Surface) -> Updates {
+fn compose_maps(surface: &Surface, preview: crate::editor::model_document::PaintPreview) -> Updates {
     let rect = URect {
         min: UVec2::ZERO,
         max: UVec2::splat(surface.size),
     };
-    let mut maps = composite::prepare(surface, [Some(rect); 8]);
+    let mut maps = composite::prepare(surface, [Some(rect); 8], preview.relief_factor(surface.size));
     let mask = surface.stack
         .layers
         .get(surface.stack.selected)
@@ -576,7 +579,7 @@ pub(in crate::editor::ui::model_viewer) struct SurfacePreview(Updates);
 
 impl SurfacePreview {
     pub fn prepare(surface: &Surface) -> Self {
-        Self(compose_maps(surface))
+        Self(compose_maps(surface, Default::default()))
     }
 
     pub fn upload(
@@ -587,7 +590,7 @@ impl SurfacePreview {
         uploads: &mut crate::editor::image_texture::TextureUploads,
     ) {
         let mut gpu = None;
-        upload_textures(&mut gpu, self.0, &slot.material, images, materials, uploads);
+        upload_textures(&mut gpu, self.0, &slot.material, 1., images, materials, uploads);
         slot.material = gpu.unwrap().material;
     }
 }
@@ -603,11 +606,12 @@ fn initial(
     let mesh = object.geometry.clone();
     let uv_offset = object.uv_offset(slot);
     let transform = object.transform;
+    let preview = doc.paint_preview;
     AsyncComputeTaskPool::get().spawn(async move {
         let mut surface = source.build();
         surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
         surface.bind_generators(&mesh, slot, uv_offset, transform);
-        compose(Work::new(surface))
+        compose(Work::new(surface, preview))
     })
 }
 
@@ -788,11 +792,12 @@ fn upload(
     live: &mut Live,
     updates: Updates,
     slot: &mut crate::editor::model_document::MaterialSlot,
+    emission_strength: f32,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     uploads: &mut crate::editor::image_texture::TextureUploads,
 ) {
-    upload_textures(&mut live.gpu, updates, &slot.material, images, materials, uploads);
+    upload_textures(&mut live.gpu, updates, &slot.material, emission_strength, images, materials, uploads);
     slot.material = live.gpu.as_ref().unwrap().material.clone();
 }
 
@@ -800,6 +805,7 @@ fn upload_textures(
     output: &mut Option<Gpu>,
     mut updates: Updates,
     template: &Handle<StandardMaterial>,
+    emission_strength: f32,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
     uploads: &mut crate::editor::image_texture::TextureUploads,
@@ -818,7 +824,7 @@ fn upload_textures(
                 i == 0 || i == 3 || i == composite::MASK_PREVIEW,
                 RenderAssetUsages::default(),
             );
-            if i < 2 || (cfg!(test) && i == composite::SPECULAR_MATERIAL) {
+            if i < 2 || (cfg!(test) && (i == 2 || i == composite::SPECULAR_MATERIAL)) {
                 image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
             }
             images.add(image)
@@ -853,7 +859,7 @@ fn upload_textures(
                 m.metallic_roughness_texture = Some(gpu.images[1].clone());
                 m.normal_map_texture = Some(gpu.images[2].clone());
                 m.flip_normal_map_y = false;
-                m.emissive = LinearRgba::WHITE;
+                m.emissive = LinearRgba::new(emission_strength, emission_strength, emission_strength, 1.);
                 m.emissive_texture = Some(gpu.images[3].clone());
                 m.reflectance = 2.;
                 m.specular_texture = Some(gpu.images[composite::SPECULAR_MATERIAL].clone());
@@ -1081,6 +1087,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         live,
                         updates,
                         material,
+                        result.work.preview.emission_strength,
                         &mut images,
                         &mut materials,
                         &mut uploads,
@@ -2153,6 +2160,7 @@ mod tests {
         (
             Work {
                 surface,
+                preview: Default::default(),
                 stroke: None,
             },
             map,

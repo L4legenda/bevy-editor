@@ -20,6 +20,7 @@ fn camera_motion_settles_after_gestures_wheel_and_projection_changes() {
         pose: Transform::from_xyz(0.0, 0.0, 6.0),
         viewport: Vec2::new(900.0, 480.0),
         orthographic: false,
+        fov: 58.0_f32.to_radians(),
     };
     let ms = Duration::from_millis;
     assert!(!motion.active(stamp, false, ms(0)));
@@ -37,14 +38,16 @@ fn camera_motion_settles_after_gestures_wheel_and_projection_changes() {
         ..zoom
     };
     assert!(motion.active(orthographic, false, ms(320)));
-    assert!(motion.active(orthographic, false, ms(419)));
+    let new_lens = ViewStamp { fov: 38.0_f32.to_radians(), ..orthographic };
+    assert!(motion.active(new_lens, false, ms(330)));
+    assert!(motion.active(new_lens, false, ms(429)));
     assert!(!motion.active(
         ViewStamp {
             model: 1,
-            ..orthographic
+            ..new_lens
         },
         false,
-        ms(419)
+        ms(429)
     ));
 }
 

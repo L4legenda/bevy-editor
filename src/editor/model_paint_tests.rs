@@ -2004,6 +2004,70 @@ fn gpu_paint_restores_saved_texture_set_and_its_selected_layer() {
 }
 
 #[test]
+#[ignore = "requires GPU; opens an imported camera, saves framing and restores it after reopening"]
+fn gpu_paint_imported_camera_uses_its_fov_and_reopens_after_a_camera_only_save() {
+    use crate::editor::model_document::{MODEL_CAMERA_EXTRA, ModelCamera, glb::Glb};
+    use bevy::camera::Projection;
+
+    let directory = std::env::temp_dir().join(format!("bevy-mpp-camera-{}", bevy::asset::uuid::Uuid::new_v4()));
+    let mut project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    copy_tree(&project.asset_root, &directory);
+    project.asset_root = directory.clone();
+    let path = directory.join("models/block.glb");
+    let imported = ModelCamera {
+        center: [0.2, 0.5, -0.1],
+        distance: 3.5,
+        yaw: 0.9,
+        pitch: -0.2,
+        fov: 0.73,
+        orthographic: false,
+    };
+    let mut source = Glb::load(&path).unwrap();
+    source.json["extras"][MODEL_CAMERA_EXTRA] = serde_json::json!(imported);
+    std::fs::write(&path, source.encode(&[], &[]).unwrap()).unwrap();
+
+    let (mut app, _, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    let wait = |app: &mut App, condition: &dyn Fn(&World) -> bool| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            if condition(app.world()) {
+                return;
+            }
+            assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+        }
+    };
+    app.world_mut().write_message(Action::ViewModel(0));
+    wait(&mut app, &|world| world.resource::<Viewer>().camera() == imported);
+    let mut projection = app.world_mut().query_filtered::<&Projection, With<ViewCamera>>();
+    let Projection::Perspective(lens) = projection.single(app.world()).unwrap() else {
+        panic!("MPP perspective camera");
+    };
+    assert!((lens.fov - imported.fov).abs() < 1e-6);
+    assert!(!app.world().resource::<editing::State>().documents[&0].dirty());
+
+    let reframed = ModelCamera { distance: 2.75, center: [0.1, 0.3, 0.2], ..imported };
+    app.world_mut().resource_mut::<Viewer>().restore_camera(reframed);
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)));
+    wait(&mut app, &|world| {
+        let doc = &world.resource::<editing::State>().documents[&0];
+        !doc.model_camera_changed() && doc.model_camera == Some(reframed)
+    });
+    let saved = Glb::load(&path).unwrap();
+    assert_eq!(saved.json["extras"][MODEL_CAMERA_EXTRA], serde_json::json!(reframed));
+
+    app.world_mut().write_message(Action::CloseModelTab(0));
+    wait(&mut app, &|world| !world.resource::<editing::State>().documents.contains_key(&0));
+    app.world_mut().write_message(Action::ViewModel(0));
+    wait(&mut app, &|world| world.resource::<Viewer>().camera() == reframed);
+    drop(app);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "requires GPU; saves bake settings through the editor and restores them after reopening"]
 fn gpu_paint_bake_settings_save_and_reopen() {
     use crate::editor::model_document::glb::Glb;
@@ -2035,6 +2099,41 @@ fn gpu_paint_bake_settings_save_and_reopen() {
     enter_paint(&mut app);
     paint_message(&mut app, PaintAction::BakeQuality(bake::Quality::Standard));
     paint_message(&mut app, PaintAction::BakeIdSource(bake::IdSource::Materials));
+    let rays = bake::RayOptions {
+        occlusion_samples: Some(113),
+        ..Default::default()
+    };
+    paint_message(&mut app, PaintAction::BakeRayOptions(rays));
+    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+    paint_message(&mut app, PaintAction::BakeMapOptions);
+    warm(&mut app, 4);
+    for (name, value) in [
+        ("Рисование: Конус обзора неба, °", "53,1"),
+        ("Рисование: Сетка проекции, проб по оси", "6"),
+        ("Рисование: Радиус кривизны, пикс.", "4,3"),
+    ] {
+        let field = {
+            let world = app.world_mut();
+            let mut inputs = world.query::<(Entity, &AccessibleLabel, &mut bevy::text::EditableText)>();
+            let (entity, _, mut input) = inputs.iter_mut(world)
+                .find(|(_, label, _)| label.0 == name).unwrap();
+            input.editor_mut().set_text(value);
+            entity
+        };
+        app.world_mut().resource_mut::<bevy::input_focus::InputFocus>()
+            .set(field, bevy::input_focus::FocusCause::Auto);
+        warm(&mut app, 3);
+        app.world_mut().resource_mut::<bevy::input_focus::InputFocus>().clear();
+        warm(&mut app, 4);
+    }
+    paint_message(&mut app, PaintAction::BakeAutoEdgeReach);
+    let rays = bake::RayOptions { sky_cone: 531, ..rays };
+    let surface = bake::SurfaceOptions {
+        grid: Some(6),
+        radius: 43,
+        auto_edge_reach: true,
+        ..Default::default()
+    };
     paint_message(&mut app, PaintAction::BakeSelectAllMaps(false));
     paint_message(&mut app, PaintAction::BakeRange { front: true, percent: 17 });
     paint_message(&mut app, PaintAction::BakePreferFrontFaces);
@@ -2042,7 +2141,9 @@ fn gpu_paint_bake_settings_save_and_reopen() {
     let doc = &app.world().resource::<editing::State>().documents[&0];
     assert_eq!(doc.bake_settings.quality, bake::Quality::Standard);
     assert_eq!(doc.bake_settings.id_source, bake::IdSource::Materials);
-    assert_eq!(doc.bake_settings.map_bits, 0);
+    assert_eq!(doc.bake_settings.rays, rays);
+    assert_eq!(doc.bake_settings.surface, surface);
+    assert_eq!(doc.bake_settings.map_bits, bake::MapSelection::BASIC.bits());
     assert_eq!(doc.bake_settings.front, 17);
     assert!(!doc.bake_settings.prefer_front_faces && !doc.bake_settings.average_normals);
     assert!(doc.dirty());
@@ -2069,7 +2170,9 @@ fn gpu_paint_bake_settings_save_and_reopen() {
     let projection = &world.resource::<PaintState>().sessions[&0].bake_projection;
     assert_eq!(projection.quality, bake::Quality::Standard);
     assert_eq!(projection.id_source, bake::IdSource::Materials);
-    assert_eq!(projection.maps.bits(), 0);
+    assert_eq!(projection.rays, rays);
+    assert_eq!(projection.surface, surface);
+    assert_eq!(projection.maps, bake::MapSelection::BASIC);
     assert_eq!(projection.front, 17);
     assert!(!projection.prefer_front_faces && !projection.average_normals);
     assert!(!world.resource::<editing::State>().documents[&0].dirty());
@@ -5661,6 +5764,11 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         doc.objects[0].geometry = mesh.into();
         doc.objects[0].transform = Transform::IDENTITY;
         doc.paint_default_size = 512;
+        doc.paint_preview = crate::editor::model_document::PaintPreview {
+            height_strength: Some(0.),
+            emission_strength: 3.25,
+            ..default()
+        };
         doc.mode = Mode::Paint;
         doc.revision += 1;
     }
@@ -5772,7 +5880,12 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         let id = &world.resource::<editing::State>().documents[&0].objects[0].materials[0].material;
         let material = world.resource::<Assets<StandardMaterial>>().get(id).unwrap();
         assert_eq!(material.alpha_mode, AlphaMode::Blend);
-        [material.base_color_texture.clone().unwrap(), material.metallic_roughness_texture.clone().unwrap()]
+        assert_eq!(material.emissive, LinearRgba::new(3.25, 3.25, 3.25, 1.));
+        [
+            material.base_color_texture.clone().unwrap(),
+            material.metallic_roughness_texture.clone().unwrap(),
+            material.normal_map_texture.clone().unwrap(),
+        ]
     };
     let read = |app: &mut App, image, offset: usize| {
         let (send, receive) = std::sync::mpsc::sync_channel(1);
@@ -5793,6 +5906,11 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
     };
     assert_eq!(read(&mut app, material_maps[0].clone(), center), [120, 50, 220, 89]);
     assert_eq!(read(&mut app, material_maps[1].clone(), center), [255, 102, 153, 255]);
+    let height = current(&app).unwrap().composite(3);
+    let edge = ((256 * 512 + 1)..(257 * 512 - 1))
+        .find(|&i| height[(i - 1) * 4] != height[(i + 1) * 4])
+        .expect("stroke must have a height slope");
+    assert_eq!(read(&mut app, material_maps[2].clone(), edge * 4), [128, 128, 255, 255]);
     paint_message(&mut app, PaintAction::Undo);
     assert!(current(&app).is_none_or(|surface| surface.stack.layers[0].channels.iter().all(Option::is_none)));
     paint_message(&mut app, PaintAction::Redo);
@@ -5810,7 +5928,8 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         viewer.distance = 4.;
         viewer.yaw = 0.;
         viewer.pitch = 0.;
-        viewer.orthographic = true;
+        viewer.field_of_view = Some(0.64);
+        viewer.orthographic = false;
     }
     warm(&mut app, 4);
     let rect = labelled(&mut app, "3D-вид модели");

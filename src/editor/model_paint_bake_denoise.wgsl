@@ -13,7 +13,57 @@ struct Settings {
     width: u32,
     rows: u32,
     step: i32,
-    _unused: u32,
+    radius: f32,
+}
+
+@compute @workgroup_size(8, 8)
+fn smooth_curvature(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= settings.width || id.y >= settings.rows) {
+        return;
+    }
+    let index = id.y * settings.width + id.x;
+    let center = guides[index];
+    let offset = index * 2u;
+    if (center.texel <= 0.0) {
+        after[offset] = before[offset];
+        return;
+    }
+    let position = vec3(center.x, center.y, center.z);
+    let normal = normal_or(decode_normal(center.normal), vec3(0.0));
+    let size = vec2<i32>(i32(settings.width), i32(settings.rows));
+    let scale = center.texel * center.texel;
+    let variance = 2.0 * settings.radius * settings.radius * scale;
+    var curvature = 0.0;
+    var total = 0.0;
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            let shift = vec2(x, y) * settings.step;
+            let sample = vec2<i32>(id.xy) + shift;
+            if (any(sample < vec2(0)) || any(sample >= size)) {
+                continue;
+            }
+            let neighbor = u32(sample.y) * settings.width + u32(sample.x);
+            let other = guides[neighbor];
+            if (other.texel <= 0.0 || other.part != center.part || other.island != center.island) {
+                continue;
+            }
+            let delta = vec3(other.x, other.y, other.z) - position;
+            let distance = dot(delta, delta);
+            let reach = length(vec2<f32>(shift)) * 2.0 + 2.0;
+            if (distance > reach * reach * scale) {
+                continue;
+            }
+            let facing = smoothstep(0.6, 0.85, dot(normal,
+                normal_or(decode_normal(other.normal), vec3(0.0))));
+            let weight = KERNEL[x + 2] * KERNEL[y + 2] * facing * exp(-distance / variance);
+            curvature += bitcast<f32>(before[neighbor * 2u]) * weight;
+            total += weight;
+        }
+    }
+    after[offset] = before[offset];
+    if (total > 0.0) {
+        after[offset] = bitcast<u32>(curvature / total);
+    }
 }
 
 @group(0) @binding(0) var<storage, read> guides: array<Guide>;

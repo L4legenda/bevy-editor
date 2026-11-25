@@ -288,6 +288,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     stamps: [Option<(usize, u64, u64, usize, usize)>; 5],
     stack_context: [Option<(usize, Option<sets::SetKey>)>; 5],
     texture_value: Option<TextureValue>,
+    bake_option_field: Option<(usize, Entity, bake::BakeControl)>,
     uv_stamp: Option<(usize, usize, usize, u64)>,
     uv_job: Option<Task<((usize, usize, usize, u64), image::RgbaImage, bool)>>,
     swatches: Vec<Handle<Image>>,
@@ -733,11 +734,18 @@ fn number(
         Number::decimal(min as f32, max as f32, 0.05, 2)
     } else if parameter == Parameter::CageStrength {
         Number::decimal(min as f32, max as f32, 0.1, 1)
+    } else if let Parameter::BakeOption(control) = parameter {
+        let digits = control.digits();
+        let speed = [1., 0.1, 0.1, 0.005][digits];
+        Number::decimal(min as f32, max as f32, speed, digits)
     } else {
         Number::decimal(min as f32, max as f32, 1., 0)
     }.finish();
     let field = number_line(commands, parent, font, parameter.label(), number, compact);
     commands.entity(field).insert(Value(parameter));
+    if matches!(parameter, Parameter::BakeOption(_)) {
+        commands.entity(field).entry::<Node>().and_modify(|mut node| node.width = px(72));
+    }
 }
 
 fn number_line(
@@ -2173,6 +2181,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         stamps: [None; 5],
         stack_context: [None; 5],
         texture_value: None,
+        bake_option_field: None,
         uv_stamp: None,
         uv_job: None,
         swatches,
@@ -2249,11 +2258,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         (Without<Value>, Without<HistoryPreference>),
     >,
     mut images: ResMut<Assets<Image>>,
-    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>),
+    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>),
     baked: Res<bake::State>,
     mut texture_nodes: Query<&mut ImageNode, With<engine::TextureCanvas>>,
 ) {
-    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences) = rendering;
+    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys) = rendering;
     let doc = editor
         .viewing_model
         .and_then(|index| editing.documents.get(&index));
@@ -2394,6 +2403,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ui.shelf_stamp = None;
         paint.shelf.menu = false;
         ui.texture_value = None;
+        ui.bake_option_field = None;
         return;
     }
     let index = editor.viewing_model.unwrap();
@@ -2473,11 +2483,36 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             }
         }
     }
+    if let Some((model, entity, control)) = ui.bake_option_field
+        && (model != index || focus.get() != Some(entity))
+    {
+        ui.bake_option_field = None;
+        if model == index && !session.bake_busy && !keys.just_pressed(KeyCode::Escape)
+            && let Ok((_, _, input, _)) = fields.p0().get_mut(entity)
+            && let Ok(value) = input.value().to_string().replace(',', ".").parse::<f32>()
+        {
+            let (min, max) = control.bounds();
+            if (min as f32..=max as f32).contains(&value)
+                && value != control.value(&session.bake_projection)
+            {
+                session.bake_option_edit = Some((control, value));
+            }
+        }
+    }
     let mut editing_texture_value = false;
+    let mut editing_bake_option = false;
     for (entity, parameter, mut input, mut border) in &mut fields.p0() {
         if focus.get() == Some(entity) {
             let texture = parameter.0.fill_parameter();
             editing_texture_value |= texture;
+            let ray = match parameter.0 {
+                Parameter::BakeOption(control) => Some(control),
+                _ => None,
+            };
+            editing_bake_option |= ray.is_some();
+            if let Some(control) = ray {
+                ui.bake_option_field = Some((index, entity, control));
+            }
             let parsed = input.value().to_string().replace(',', ".").parse::<f32>();
             let (min, max) = parameter.0.bounds();
             match parsed {
@@ -2487,7 +2522,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                             model: index, binding: session.binding, layer: session.stack.selected,
                             parameter: parameter.0, value,
                         });
-                    } else if session.value(parameter.0) != value {
+                    } else if ray.is_none() && session.value(parameter.0) != value {
                         session.set_value(parameter.0, value);
                     }
                     border.set_if_neq(BorderColor::all(FOCUS));
@@ -2500,7 +2535,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
             }
         } else {
-            let digits = if texture_decimal(parameter.0) { 2 } else { 0 };
+            let digits = match parameter.0 {
+                Parameter::BakeOption(control) => control.digits(),
+                parameter if texture_decimal(parameter) => 2,
+                _ => 0,
+            };
             let value = format!("{:.digits$}", session.value(parameter.0));
             if input.value().to_string() != value {
                 input.editor_mut().set_text(&value);
@@ -2640,7 +2679,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ui.graph_settings_stamp = None;
     }
     for (i, panel) in sidebar::PANELS.into_iter().enumerate() {
-        if !visible_panels[i] || ui.stamps[i] == Some(panel_stamps[i]) || editing_texture_value || editing_layer_name {
+        if !visible_panels[i] || ui.stamps[i] == Some(panel_stamps[i])
+            || editing_texture_value || editing_layer_name || editing_bake_option
+        {
             continue;
         }
         let stack = ui.stacks[i];
@@ -3441,6 +3482,19 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     }
                     button(&mut commands, options, font, "Все карты", PaintAction::BakeSelectAllMaps(true));
                     button(&mut commands, options, font, "Только основные", PaintAction::BakeSelectAllMaps(false));
+                    text(&mut commands, stack, font, "Лучи запекания", 11., MUTED);
+                    for control in bake::BakeControl::RAYS {
+                        number(&mut commands, stack, font, Parameter::BakeOption(control), false);
+                    }
+                    button(&mut commands, stack, font, "Сбросить параметры лучей", PaintAction::BakeRayOptions(bake::RayOptions::default()));
+                    text(&mut commands, stack, font, "Проекция, кривизна и рёбра", 11., MUTED);
+                    button(&mut commands, stack, font, "Автодальность поиска рёбер", PaintAction::BakeAutoEdgeReach);
+                    for control in bake::BakeControl::SURFACE {
+                        if control != bake::BakeControl::EdgeReach || !session.bake_projection.surface.auto_edge_reach {
+                            number(&mut commands, stack, font, Parameter::BakeOption(control), false);
+                        }
+                    }
+                    button(&mut commands, stack, font, "Сбросить настройки кривизны и проекции", PaintAction::BakeResetSurface);
                     text(&mut commands, stack, font, "Источник карты ID", 11., MUTED);
                     let sources = node(&mut commands, stack, Node {
                         flex_wrap: FlexWrap::Wrap,

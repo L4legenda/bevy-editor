@@ -91,7 +91,7 @@ impl Maps {
                         std::array::from_fn(|channel| remap(channel, pixel, values[channel]))
                     })
                     .collect(),
-                part_ids: Some(PartIds::new(
+                part_ids: self.selection.contains(BakeMap::PartId).then(|| PartIds::new(
                     self.values.iter().map(|v| [v[15], v[16], v[17]]).collect(),
                 )),
                 custom: self.custom.clone(),
@@ -122,6 +122,9 @@ impl Maps {
     pub(in crate::editor::ui::model_viewer::paint) fn projected_tangent_normals(
         &self,
     ) -> Option<impl Fn(usize) -> Option<[u8; 3]> + '_> {
+        if !self.selection.contains(BakeMap::ProjectedNormal) {
+            return None;
+        }
         let projection = self.projection.as_deref()?;
         Some(move |index: usize| {
             (self.covered[index] != 0).then(|| {
@@ -617,17 +620,23 @@ fn hemisphere(normal: Vec3, sample: u32, count: u32, phase: f32) -> Vec3 {
 }
 
 impl Rays<'_> {
-    fn metadata(surface: RaySurface) -> [u8; COMPONENTS] {
+    fn metadata(&self, surface: RaySurface) -> [u8; COMPONENTS] {
         let id = hash((surface.object as u32).wrapping_mul(0x9e3779b9) ^ surface.part as u32 ^ 1);
         let mut result = [0; COMPONENTS];
         result[..4].fill(255);
-        result[4] = id as u8;
-        result[5] = byte(surface.bounds.normalize(surface.point).y);
+        result[4] = if self.maps.contains(BakeMap::PartRandom) { id as u8 } else { 128 };
+        result[5] = if self.maps.contains(BakeMap::PartGradient) {
+            byte(surface.bounds.normalize(surface.point).y)
+        } else {
+            128
+        };
         result[9..12].copy_from_slice(&rgb(surface.normal * 0.5 + 0.5));
         let normal = [result[9], result[10], result[11]];
         result[6..9].copy_from_slice(&normal);
-        let [_, r, g, b] = id.to_le_bytes();
-        result[15..18].copy_from_slice(&[r, g, b].map(|value| 48 + value % 176));
+        if self.maps.contains(BakeMap::PartId) {
+            let [_, r, g, b] = id.to_le_bytes();
+            result[15..18].copy_from_slice(&[r, g, b].map(|value| 48 + value % 176));
+        }
         result[18..21].copy_from_slice(&[128, 255, 255]);
         result
     }
@@ -638,14 +647,16 @@ impl Rays<'_> {
         pixel: usize,
         thickness_accepts: impl Fn(&PickTriangle) -> bool,
     ) -> [u8; COMPONENTS] {
-        let mut result = Self::metadata(surface);
+        let mut result = self.metadata(surface);
         if !self.maps.visibility() {
             return result;
         }
         let ao_enabled = self.maps.contains(BakeMap::Occlusion);
+        let bent_enabled = self.maps.contains(BakeMap::BentNormal);
+        let broad_visibility = ao_enabled || bent_enabled;
         let cavity_enabled = self.maps.contains(BakeMap::Cavity);
-        let thickness_enabled = self.maps.contains(BakeMap::Thickness);
-        let sky_enabled = self.maps.contains(BakeMap::Sky);
+        let thickness_enabled = self.maps.contains(BakeMap::Thickness) && self.sampling.thickness != 0;
+        let sky_enabled = self.maps.contains(BakeMap::Sky) && self.sampling.sky != 0;
         let RaySurface {
             point: p,
             normal,
@@ -662,8 +673,15 @@ impl Rays<'_> {
         let mut ao = 0;
         let mut cavity = 0;
         let mut bent = Vec3::ZERO;
-        let visibility_count = if ao_enabled || cavity_enabled { self.sampling.occlusion } else { 0 };
-        let ao_reach = self.scale * if ao_enabled { 0.6 } else { 0.04 };
+        let visibility_count = if broad_visibility || cavity_enabled { self.sampling.occlusion } else { 0 };
+        let [ao_reach, cavity_reach, thickness_reach, cone_cos] = self.sampling.visibility;
+        let ao_reach = self.scale * ao_reach;
+        let cavity_reach = self.scale * cavity_reach;
+        let visibility_reach = match (broad_visibility, cavity_enabled) {
+            (true, true) => ao_reach.max(cavity_reach),
+            (true, false) => ao_reach,
+            _ => cavity_reach,
+        };
         for i in 0..visibility_count {
             let mut direction = hemisphere(normal, i, self.sampling.occlusion, phase);
             if direction.dot(geo) < 0. {
@@ -671,17 +689,17 @@ impl Rays<'_> {
             }
             let distance = self
                 .scene
-                .cast_triangle_up_to(outside, direction, ao_reach, other_face)
+                .cast_triangle_up_to(outside, direction, visibility_reach, other_face)
                 .map_or(f32::INFINITY, |(_, distance)| distance);
-            if distance > self.scale * 0.04 {
+            if distance > cavity_reach {
                 cavity += 1;
             }
-            if ao_enabled && distance > ao_reach {
+            if broad_visibility && distance > ao_reach {
                 ao += 1;
                 bent += direction;
             }
         }
-        let reach = self.scale * 0.5;
+        let reach = self.scale * thickness_reach;
         let mut thickness = 0.;
         let thickness_count = if thickness_enabled { self.sampling.thickness } else { 0 };
         for i in 0..thickness_count {
@@ -697,7 +715,6 @@ impl Rays<'_> {
                 .map_or(reach, |(_, distance)| distance);
         }
         let mut sky = 0;
-        let cone_cos = 40.0_f32.to_radians().cos();
         let sky_count = if sky_enabled { self.sampling.sky } else { 0 };
         for i in 0..sky_count {
             let y = 1. - (1. - cone_cos) * ((i as f32 + 0.5) / self.sampling.sky as f32);
@@ -716,6 +733,8 @@ impl Rays<'_> {
         }
         if ao_enabled {
             result[0] = byte(ao as f32 / self.sampling.occlusion as f32);
+        }
+        if bent_enabled {
             result[6..9].copy_from_slice(&rgb(bent.try_normalize().unwrap_or(normal) * 0.5 + 0.5));
         }
         if cavity_enabled {
@@ -731,13 +750,18 @@ impl Rays<'_> {
     }
 }
 
-fn set_relief(texel: &mut [u8; COMPONENTS], values: [f32; 3], selection: MapSelection) {
-    let maps = [BakeMap::Curvature, BakeMap::EdgeDistance, BakeMap::CreaseDistance];
-    for ((output, value), map) in texel[18..21].iter_mut().zip(values).zip(maps) {
+fn set_relief(texel: &mut [u8; COMPONENTS], sample: relief::Sample, selection: MapSelection) {
+    let maps = [BakeMap::EdgeDistance, BakeMap::CreaseDistance];
+    for ((output, value), map) in texel[19..21].iter_mut().zip(sample.distance).zip(maps) {
         if selection.contains(map) {
             *output = byte(value);
         }
     }
+}
+
+struct BakeGuides {
+    surface: Vec<denoise::Guide>,
+    curvature: Vec<relief::Curvature>,
 }
 
 fn neutral_texel(normal: Vec3) -> [u8; COMPONENTS] {
@@ -784,7 +808,7 @@ impl ProjectionPass<'_> {
         item: &ProjectionPixel,
         sample: Option<aa::Texel>,
         maps: &mut Maps,
-        guides: &mut [denoise::Guide],
+        guides: &mut BakeGuides,
         batch: &mut Option<rays_gpu::Batch>,
         progress: &Progress,
     ) -> Result<(), String> {
@@ -795,16 +819,18 @@ impl ProjectionPass<'_> {
             maps.hits += usize::from(hit.ray_hit);
             maps.filled_misses += usize::from(!hit.ray_hit);
             let surface = RaySurface::projected(self.rays.scene, self.relief, hit);
-            if maps.selection.visibility() {
-                guides[pixel] = denoise::Guide::new(hit.point, surface.part, item.island, item.width);
+            if let Some(guide) = guides.surface.get_mut(pixel) {
+                *guide = denoise::Guide::new(hit.point, surface.part, item.island, item.width);
             }
             texel = if let Some(batch) = batch.as_mut() {
                 batch.push(surface, pixel, item.width);
-                Rays::metadata(surface)
+                self.rays.metadata(surface)
             } else {
                 self.rays.sample(surface, pixel, |_| true)
             };
-            if let Some(color) = self.projector.id_color(hit.triangle) {
+            if maps.selection.contains(BakeMap::PartId)
+                && let Some(color) = self.projector.id_color(hit.triangle)
+            {
                 texel[15..18].copy_from_slice(&color);
             }
             if batch.is_none() {
@@ -816,10 +842,20 @@ impl ProjectionPass<'_> {
                 }
             }
             if maps.selection.relief() {
-                set_relief(&mut texel, self.relief.sample(&hit, item.width), maps.selection);
+                let sample = self.relief.sample(&hit, item.width);
+                set_relief(&mut texel, sample, maps.selection);
+                if let Some(curvature) = guides.curvature.get_mut(pixel) {
+                    *curvature = sample.curvature;
+                }
             }
-            let [r, g, b] = rgb(sample.normal * 0.5 + 0.5);
-            [r, g, b, byte(sample.height * 0.5 + 0.5), if hit.ray_hit { 255 } else { 0 }]
+            let mut packed = [128, 128, 255, 128, if hit.ray_hit { 255 } else { 0 }];
+            if maps.selection.contains(BakeMap::ProjectedNormal) {
+                packed[..3].copy_from_slice(&rgb(sample.normal * 0.5 + 0.5));
+            }
+            if maps.selection.contains(BakeMap::ProjectedHeight) {
+                packed[3] = byte(sample.height * 0.5 + 0.5);
+            }
+            packed
         } else {
             texel = neutral_texel(item.normal);
             [128, 128, 255, 128, 0]
@@ -835,7 +871,7 @@ impl ProjectionPass<'_> {
     }
 
     fn submit(
-        &mut self, maps: &mut Maps, guides: &mut [denoise::Guide],
+        &mut self, maps: &mut Maps, guides: &mut BakeGuides,
         batch: &mut Option<rays_gpu::Batch>, progress: &Progress,
     ) -> Result<(), String> {
         if self.work.probes.is_empty() {
@@ -860,7 +896,7 @@ impl ProjectionPass<'_> {
     }
 
     fn retire(
-        &mut self, maps: &mut Maps, guides: &mut [denoise::Guide],
+        &mut self, maps: &mut Maps, guides: &mut BakeGuides,
         batch: &mut Option<rays_gpu::Batch>, progress: &Progress,
     ) -> Result<(), String> {
         let (readback, mut work) = self.pending.pop_front().unwrap();
@@ -876,7 +912,7 @@ impl ProjectionPass<'_> {
     }
 
     fn finish(
-        &mut self, maps: &mut Maps, guides: &mut [denoise::Guide],
+        &mut self, maps: &mut Maps, guides: &mut BakeGuides,
         batch: &mut Option<rays_gpu::Batch>, progress: &Progress,
     ) -> Result<(), String> {
         self.submit(maps, guides, batch, progress)?;
@@ -1066,8 +1102,11 @@ pub(super) fn bake_on_device(
         bounds, scale, geometric, corner_normals, triangle_normals,
         low_scene, projection, parts, positions, projection_normals, cage, cage_fit,
     } = prepare_scene(&objects, object, settings, flow, progress)?;
-    let sampling = settings.quality.sampling();
-    let material_color = if projection.is_none() && settings.id_source == IdSource::Materials {
+    let sampling = settings.sampling();
+    let relief_params = relief::Parameters::new(bounds, scale, settings.surface);
+    let material_color = if settings.maps.contains(BakeMap::PartId)
+        && projection.is_none() && settings.id_source == IdSource::Materials
+    {
         low_material_color(&objects, target, slot)
     } else {
         None
@@ -1098,14 +1137,14 @@ pub(super) fn bake_on_device(
                 &corner_normals,
                 &geometric,
                 &parts.faces,
-                scale,
+                relief_params,
                 progress,
             )
         })
         .transpose()?;
     let source_relief = projection
         .as_ref()
-        .map(|projector| projector.build_relief(scale, settings.maps.relief(), progress))
+        .map(|projector| projector.build_relief(relief_params, settings.maps.relief(), progress))
         .transpose()?;
     let count = (size * size) as usize;
     let custom: Vec<_> = settings
@@ -1146,7 +1185,11 @@ pub(super) fn bake_on_device(
     if !trace_maps {
         batch = None;
     }
-    let mut guides = vec![denoise::Guide::default(); if visibility { count } else { 0 }];
+    let curve = settings.maps.contains(BakeMap::Curvature);
+    let mut guides = BakeGuides {
+        surface: vec![denoise::Guide::default(); if visibility || curve { count } else { 0 }],
+        curvature: vec![relief::Curvature::default(); if curve { count } else { 0 }],
+    };
     let mut maps = Maps {
         size,
         filled: 0,
@@ -1161,7 +1204,7 @@ pub(super) fn bake_on_device(
         gpu_denoise: false,
         gpu_padding: false,
         selection: settings.maps,
-        edge_reach: scale * 0.2,
+        edge_reach: relief_params.reach,
         inputs: OnceLock::new(),
         custom: settings
             .custom
@@ -1280,8 +1323,8 @@ pub(super) fn bake_on_device(
             let mut texel;
             if let (Some(rays), Some(parts)) = (&low_rays, &parts) {
                 let part = parts.faces[face];
-                if visibility {
-                    guides[pixel] = denoise::Guide::new(p, part, islands[face], width);
+                if let Some(guide) = guides.surface.get_mut(pixel) {
+                    *guide = denoise::Guide::new(p, part, islands[face], width);
                 }
                 let surface = RaySurface {
                     point: p,
@@ -1297,7 +1340,7 @@ pub(super) fn bake_on_device(
                 };
                 texel = if let Some(batch) = &mut batch {
                     batch.push(surface, pixel, width);
-                    Rays::metadata(surface)
+                    rays.metadata(surface)
                 } else {
                     rays.sample(surface, pixel, same_part)
                 };
@@ -1308,12 +1351,16 @@ pub(super) fn bake_on_device(
                     }
                 }
                 if let (Some(features), Some(curvature)) = (&features, curvature) {
-                    set_relief(&mut texel, features.sample(part, p, curvature.dot(w), width), settings.maps);
+                    let sample = features.sample(part, p, curvature.dot(w), width);
+                    set_relief(&mut texel, sample, settings.maps);
+                    if let Some(curvature) = guides.curvature.get_mut(pixel) {
+                        *curvature = sample.curvature;
+                    }
                 }
             } else {
                 texel = neutral_texel(normal);
             }
-            if let Some(color) = id_color {
+            if settings.maps.contains(BakeMap::PartId) && let Some(color) = id_color {
                 texel[15..18].copy_from_slice(&color);
             }
             texel[12..15].copy_from_slice(&rgb(bounds.normalize(p)));
@@ -1341,9 +1388,12 @@ pub(super) fn bake_on_device(
     #[cfg(test)]
     let denoise_start = std::time::Instant::now();
     if visibility {
-        denoise::filter(&mut maps, &guides, passes, progress, device, visibility_atlas.as_ref())?;
+        denoise::filter(&mut maps, &guides.surface, passes, progress, device, visibility_atlas.as_ref())?;
     }
     drop(visibility_atlas);
+    if curve {
+        denoise::filter_curvature(&mut maps, &guides.surface, &guides.curvature, relief_params.radius, progress, device)?;
+    }
     drop(guides);
     #[cfg(test)]
     let padding_start = std::time::Instant::now();
@@ -1550,6 +1600,10 @@ mod tests {
             path: Some(path.clone()),
             match_names: false,
             fill_misses: false,
+            surface: crate::editor::model_bake_settings::SurfaceOptions {
+                grid: Some(3),
+                ..default()
+            },
             ..Default::default()
         };
         let progress = Progress::default();
@@ -1569,6 +1623,15 @@ mod tests {
         assert!(floor.abs_diff(128) <= 1);
         let (_, lid) = compare(&ProjectionSettings { prefer_front_faces: false, ..settings.clone() });
         assert!(lid > floor + 20);
+        let maps = MapSelection::MINIMUM.toggle(BakeMap::ProjectedHeight);
+        let height_only = ProjectionSettings { maps, prefer_front_faces: false, ..settings.clone() };
+        assert_eq!(compare(&height_only).1, lid);
+        let output = bake_on_device(vec![low.clone()], 0, 0, 16, &height_only, &progress, Some(&device)).unwrap();
+        assert!(output.has_map(BakeMap::ProjectedHeight));
+        assert!(output.has_map(BakeMap::ProjectionCoverage));
+        assert!(!output.has_map(BakeMap::ProjectedNormal));
+        assert!(output.projected_tangent_normals().is_none());
+        assert_eq!(&output.projection.as_ref().unwrap()[8 * 16 + 8][..3], &[128, 128, 255]);
         let unaveraged = ProjectionSettings { average_normals: false, ..settings };
         assert_eq!(compare(&unaveraged).0, 0);
         let probe = probe::build(vec![low], 0, 0, &unaveraged, &progress).unwrap();
@@ -1622,6 +1685,78 @@ mod tests {
     }
 
     #[test]
+    fn bake_ray_options_use_independent_reaches_and_skip_zero_counts() {
+        check_bake_ray_options(None);
+    }
+
+    #[test]
+    fn disabled_part_maps_have_neutral_bytes_and_generator_inputs() {
+        use crate::editor::model_paint_data::mask::GeneratorInput;
+
+        let mut tilted = quad(0, 0.);
+        for point in &mut tilted.geometry.positions {
+            point.y = point.x;
+        }
+        let settings = ProjectionSettings {
+            maps: MapSelection::MINIMUM.toggle(BakeMap::PartGradient),
+            ..default()
+        };
+        let output = bake_with_projection(vec![tilted], 0, 0, 16, &settings, &Progress::default()).unwrap();
+        assert!(output.has_map(BakeMap::PartGradient));
+        assert!(!output.has_map(BakeMap::PartRandom));
+        assert!(!output.has_map(BakeMap::PartId));
+        assert!(!output.has_map(BakeMap::BentNormal));
+        assert!(output.graph_component(BakeMap::PartRandom, 0).is_none());
+        let baked = output.generator_inputs();
+        assert!(baked.part_ids.is_none());
+        assert_ne!(baked.disabled_inputs & (1 << GeneratorInput::Id as u32), 0);
+        assert_ne!(baked.disabled_inputs & (1 << GeneratorInput::PartRandom as u32), 0);
+        assert_eq!(baked.disabled_inputs & (1 << GeneratorInput::PartGradient as u32), 0);
+        for i in [8 * 16 + 3, 8 * 16 + 12] {
+            assert_eq!(output.values[i][4], 128);
+            assert_eq!(&output.values[i][15..18], &[0; 3]);
+        }
+        assert_ne!(output.values[8 * 16 + 3][5], output.values[8 * 16 + 12][5]);
+    }
+
+    fn check_bake_ray_options(device: Option<&RayDevice>) {
+        let objects = vec![quad(0, 0.), quad(1, 0.09)];
+        let mut settings = ProjectionSettings::default();
+        settings.rays.occlusion_samples = Some(23);
+        settings.rays.occlusion_reach = 100;
+        settings.rays.cavity_reach = 6000;
+        settings.rays.thickness_samples = Some(0);
+        settings.rays.sky_samples = Some(0);
+        let center = 16 * 8 + 8;
+        let bake = |settings: &ProjectionSettings| {
+            let progress = Progress::default();
+            let result = bake_on_device(objects.clone(), 0, 0, 16, settings, &progress, device).unwrap();
+            assert_eq!(result.gpu_rays, device.is_some());
+            result.values[center]
+        };
+        let short_ao = bake(&settings);
+        assert_eq!(short_ao[0], 255);
+        assert!(short_ao[1] < 70);
+        assert_eq!(short_ao[2..4], [255, 255]);
+        std::mem::swap(&mut settings.rays.occlusion_reach, &mut settings.rays.cavity_reach);
+        let short_cavity = bake(&settings);
+        assert!(short_cavity[0] < 70);
+        assert_eq!(short_cavity[1], 255);
+
+        settings.maps = MapSelection::MINIMUM.toggle(BakeMap::BentNormal);
+        let bent_only = bake(&settings);
+        assert_eq!(bent_only[0], 255);
+        settings.maps = settings.maps.toggle(BakeMap::Occlusion);
+        let ao_and_bent = bake(&settings);
+        assert_eq!(bent_only[6..9], ao_and_bent[6..9]);
+        assert!(ao_and_bent[0] < 70);
+        settings.maps = settings.maps.toggle(BakeMap::BentNormal);
+        let ao_only = bake(&settings);
+        assert_eq!(ao_only[0], ao_and_bent[0]);
+        assert_eq!(ao_only[6..9], ao_only[9..12]);
+    }
+
+    #[test]
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_baked_visibility_matches_cpu_on_connected_and_separate_parts() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
@@ -1629,6 +1764,7 @@ mod tests {
             device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
             queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
         };
+        check_bake_ray_options(Some(&device));
         let selected = ProjectionSettings {
             maps: MapSelection::MINIMUM.toggle(BakeMap::Cavity),
             ..Default::default()
@@ -2184,7 +2320,7 @@ mod tests {
             );
         }
 
-        let folded = |height| {
+        let folded = |height, surface| {
             let mut object = floor.clone();
             object
                 .geometry
@@ -2195,10 +2331,12 @@ mod tests {
                 material: 1,
                 smooth: false,
             });
-            bake(vec![object], 0, 0, 32, &progress).unwrap()
+            let settings = ProjectionSettings { surface, ..default() };
+            bake_with_projection(vec![object], 0, 0, 32, &settings, &progress).unwrap()
         };
-        let ridge = folded(-1.);
-        let crease = folded(1.);
+        let surface = crate::editor::model_bake_settings::SurfaceOptions::default();
+        let ridge = folded(-1., surface);
+        let crease = folded(1., surface);
         let near = |maps: &Maps, map| maps.rgba(map)[16 * 32 * 4];
         assert!(near(&ridge, BakeMap::Curvature) > 225);
         assert!(near(&ridge, BakeMap::EdgeDistance) < 20);
@@ -2206,6 +2344,50 @@ mod tests {
         assert!(near(&crease, BakeMap::Curvature) < 30);
         assert!(near(&crease, BakeMap::CreaseDistance) < 20);
         assert_eq!(near(&crease, BakeMap::EdgeDistance), 255);
+        let wide = folded(-1., crate::editor::model_bake_settings::SurfaceOptions {
+            radius: 80, ..surface
+        });
+        let row = 16 * 32 * 4;
+        assert!(wide.rgba(BakeMap::Curvature)[row + 4 * 3] > ridge.rgba(BakeMap::Curvature)[row + 4 * 3]);
+        let blunt = folded(-1., crate::editor::model_bake_settings::SurfaceOptions {
+            hard_angle: 1000, ..surface
+        });
+        assert_eq!(near(&blunt, BakeMap::EdgeDistance), 255);
+        assert_eq!(near(&blunt, BakeMap::Curvature), 128);
+        let auto = folded(-1., crate::editor::model_bake_settings::SurfaceOptions {
+            auto_edge_reach: true, ..surface
+        });
+        assert!((auto.edge_reach - 0.1).abs() < 1e-6);
+        assert!(auto.rgba(BakeMap::EdgeDistance)[row + 4 * 3] > ridge.rgba(BakeMap::EdgeDistance)[row + 4 * 3]);
+    }
+
+    #[test]
+    fn baked_low_poly_finds_smooth_ridges_and_creases_within_reach() {
+        let calculate = |sign: f32, edge_reach| {
+            let mut object = quad(0, 0.);
+            let face = &mut object.geometry.faces[0];
+            for (vertex, corner) in face.corners.iter_mut().enumerate() {
+                let side = if vertex == 0 || vertex == 3 { -1. } else { 1. };
+                corner.source_normal = Some(Vec3::new(side * sign, 0.5, 0.).normalize());
+            }
+            let settings = ProjectionSettings {
+                maps: MapSelection::MINIMUM.toggle(BakeMap::EdgeDistance).toggle(BakeMap::CreaseDistance),
+                surface: crate::editor::model_bake_settings::SurfaceOptions {
+                    edge_reach,
+                    hard_angle: 1200,
+                    ..default()
+                },
+                ..default()
+            };
+            bake_with_projection(vec![object], 0, 0, 16, &settings, &Progress::default()).unwrap()
+        };
+        let narrow = calculate(1., 2000);
+        let ridge = calculate(1., 10_000);
+        let crease = calculate(-1., 10_000);
+        let center = 8 * 16 + 8;
+        assert_eq!(&narrow.values[center][18..21], &[128, 255, 255]);
+        assert_eq!(&ridge.values[center][18..21], &[128, 0, 255]);
+        assert_eq!(&crease.values[center][18..21], &[128, 255, 0]);
     }
 
     #[test]
@@ -2222,14 +2404,14 @@ mod tests {
             fill_misses: false,
             ..default()
         };
-        let bake_source = |source| {
+        let bake_source = |source, settings: &ProjectionSettings| {
             std::fs::write(&path, Glb::new_asset(&[source]).unwrap()).unwrap();
-            bake_with_projection(vec![low.clone()], 0, 0, 32, &settings, &Progress::default())
+            bake_with_projection(vec![low.clone()], 0, 0, 32, settings, &Progress::default())
                 .unwrap()
         };
         let mut flat = quad(1, 0.05);
         flat.name = low.name.clone();
-        let raised = bake_source(flat.clone());
+        let raised = bake_source(flat.clone(), &settings);
         let fold = |height| {
             let mut high = flat.clone();
             high.geometry
@@ -2240,7 +2422,7 @@ mod tests {
                 material: 1,
                 smooth: false,
             });
-            bake_source(high)
+            bake_source(high, &settings)
         };
         let ridge = fold(-0.6);
         let crease = fold(0.7);
@@ -2248,7 +2430,14 @@ mod tests {
             let side = if vertex == 0 || vertex == 3 { -1. } else { 1. };
             corner.source_normal = Some(Vec3::new(side * 0.9, 0.45, 0.).normalize());
         }
-        let smooth = bake_source(flat);
+        let smooth = bake_source(flat.clone(), &settings);
+        let mut altered = settings.clone();
+        altered.surface.sharpness = 50;
+        let low_threshold = bake_with_projection(vec![low.clone()], 0, 0, 32, &altered, &Progress::default()).unwrap();
+        altered.surface.sharpness = 950;
+        let high_threshold = bake_with_projection(vec![low.clone()], 0, 0, 32, &altered, &Progress::default()).unwrap();
+        altered.surface.contrast = 100;
+        let low_contrast = bake_with_projection(vec![low], 0, 0, 32, &altered, &Progress::default()).unwrap();
         std::fs::remove_file(path).unwrap();
         let near = |maps: &Maps, map| maps.rgba(map)[16 * 32 * 4];
         let center = |maps: &Maps, map| maps.rgba(map)[(16 * 32 + 16) * 4];
@@ -2261,6 +2450,8 @@ mod tests {
         assert!(near(&crease, BakeMap::CreaseDistance) < 20);
         assert_eq!(near(&crease, BakeMap::EdgeDistance), 255);
         assert!(center(&smooth, BakeMap::Curvature) > 150);
+        assert!(center(&low_threshold, BakeMap::EdgeDistance) < center(&high_threshold, BakeMap::EdgeDistance));
+        assert!(center(&smooth, BakeMap::Curvature) > center(&low_contrast, BakeMap::Curvature));
     }
 
     #[test]
@@ -2335,7 +2526,7 @@ mod tests {
             bevy::asset::uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, Glb::new_asset(&[base, step]).unwrap()).unwrap();
-        let calculate = |quality| {
+        let calculate = |grid| {
             bake_with_projection(
                 vec![low.clone()],
                 0,
@@ -2344,14 +2535,17 @@ mod tests {
                 &ProjectionSettings {
                     path: Some(path.clone()),
                     match_names: false,
-                    quality,
+                    surface: crate::editor::model_bake_settings::SurfaceOptions {
+                        grid,
+                        ..default()
+                    },
                     ..default()
                 },
                 &Progress::default(),
             )
         };
-        let draft = calculate(super::super::Quality::Draft);
-        let standard = calculate(super::super::Quality::Standard);
+        let draft = calculate(None);
+        let standard = calculate(Some(2));
         std::fs::remove_file(path).unwrap();
         let draft = draft.unwrap();
         let standard = standard.unwrap();

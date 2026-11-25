@@ -411,7 +411,7 @@ impl State {
                 .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision),
             EditAction::Undo => !doc.undo.is_empty() && self.gesture.is_none(),
             EditAction::Redo => !doc.redo.is_empty() && self.gesture.is_none(),
-            EditAction::Save => doc.dirty() || doc.paint_busy || doc.paint_set_changed(),
+            EditAction::Save => doc.dirty() || doc.paint_busy || doc.paint_set_changed() || doc.model_camera_changed(),
             EditAction::Element(_) => doc.mode == Mode::Edit,
             EditAction::CreateMaterial | EditAction::AssignMaterial { .. } => {
                 doc.can_assign_material() && self.gesture.is_none() && !doc.paint_busy
@@ -1222,7 +1222,7 @@ pub(super) fn process_actions(
                             o.geometry.radius() * o.transform.scale.abs().max_element() * 0.5
                         });
                         viewer.center = center;
-                        viewer.distance = fit_distance(radius.max(0.001), 1.0);
+                        viewer.distance = fit_distance(radius.max(0.001), 1.0, viewer.fov());
                         viewer.fitted = true;
                     }
                 }

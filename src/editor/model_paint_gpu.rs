@@ -88,6 +88,7 @@ pub(super) enum Command {
         scene: Arc<Scene>,
         object: u32,
         slot: u32,
+        relief_factor: f32,
         fix: Option<(Vec<u8>, bool)>,
     },
     Begin {
@@ -702,6 +703,7 @@ struct Context {
     composition: Composition,
     additional: Vec<StrokeChannel>,
     auxiliary: Buffer,
+    relief_factor: f32,
     mask_compositions: Vec<Composition>,
     mask_filter: Option<MaskFilters>,
     mask_affine: bool,
@@ -1090,6 +1092,7 @@ fn params(
     brush: Brush,
     view: View,
     count: u32,
+    relief_factor: f32,
 ) -> Vec<u8> {
     let c = view.camera;
     let aspect = c.rect.width() / c.rect.height();
@@ -1104,7 +1107,7 @@ fn params(
         )
     } else {
         bevy::math::proj::perspective_infinite_reverse(
-            FOV,
+            c.fov,
             aspect,
             (c.height * 0.0001).max(c.epsilon * 0.01).max(0.000001),
         )
@@ -1125,7 +1128,7 @@ fn params(
             c.pose.forward().x,
             c.pose.forward().y,
             c.pose.forward().z,
-            0.,
+            relief_factor,
         ])
         .chain([c.rect.min.x, c.rect.min.y, c.rect.width(), c.rect.height()])
         .chain([brush.radius, brush.hardness, brush.flow, brush.opacity])
@@ -1232,6 +1235,7 @@ impl Context {
         scene: &Scene,
         object: u32,
         slot: u32,
+        relief_factor: f32,
         fix: Option<(Vec<u8>, bool)>,
     ) -> Self {
         let size = surface.size;
@@ -1419,6 +1423,7 @@ impl Context {
             composition,
             additional,
             auxiliary,
+            relief_factor,
             mask_compositions,
             mask_filter,
             fix_normal,
@@ -1524,6 +1529,7 @@ impl Context {
                 brush,
                 view,
                 0,
+                self.relief_factor,
             ),
             BufferUsages::UNIFORM,
         );
@@ -1738,6 +1744,7 @@ impl Context {
                 brush,
                 view,
                 (bytes.len() / STAMP_BYTES) as u32,
+                self.relief_factor,
             ),
             BufferUsages::UNIFORM,
         );
@@ -1874,7 +1881,7 @@ impl Context {
             let channel = target.channel | (usize::from(brush.grain.is_some()) << 28);
             let uniform = buffer(
                 device, "paint channel values",
-                &params(self.size, channel, self.object, self.slot, brush.for_channel(target.channel), view, 0),
+                &params(self.size, channel, self.object, self.slot, brush.for_channel(target.channel), view, 0, self.relief_factor),
                 BufferUsages::UNIFORM,
             );
             self.apply_coverage(device, pipelines, encoder, &uniform, &target.snapshot,
@@ -1928,7 +1935,7 @@ impl Context {
                 let uniform = buffer(
                     device,
                     "paint mask display",
-                    &params(self.size, channel, self.object, self.slot, brush, view, 0),
+                    &params(self.size, channel, self.object, self.slot, brush, view, 0, self.relief_factor),
                     BufferUsages::UNIFORM,
                 );
                 self.present_map(
@@ -2035,7 +2042,7 @@ impl Context {
             };
             let uniform = buffer(
                 device, "paint channel display",
-                &params(self.size, channel, self.object, self.slot, brush, view, 0),
+                &params(self.size, channel, self.object, self.slot, brush, view, 0, self.relief_factor),
                 BufferUsages::UNIFORM,
             );
             self.present_map(device, pipelines, encoder, images, &uniform, channel, pixels,
@@ -2057,7 +2064,7 @@ impl Context {
         let uniform = buffer(
             device,
             "bake fix display",
-            &params(self.size, channel, self.object, self.slot, brush, view, 0),
+            &params(self.size, channel, self.object, self.slot, brush, view, 0, self.relief_factor),
             BufferUsages::UNIFORM,
         );
         self.present_map(
@@ -2253,6 +2260,7 @@ fn execute(
                 scene,
                 object,
                 slot,
+                relief_factor,
                 fix,
             } => {
                 contexts.insert(
@@ -2268,6 +2276,7 @@ fn execute(
                         &scene,
                         object,
                         slot,
+                        relief_factor,
                         fix,
                     ),
                 );

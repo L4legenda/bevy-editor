@@ -1,5 +1,6 @@
 //! Signed surface curvature and exact distance to geometric feature segments.
-use super::Progress;
+use super::{Bounds, Progress};
+use crate::editor::model_bake_settings::SurfaceOptions;
 use crate::editor::model_mesh::Geometry;
 use bevy::prelude::*;
 use std::collections::HashMap;
@@ -116,16 +117,82 @@ impl SegmentTree {
 
 pub(super) struct Features {
     pub curvature: Vec<Vec<f32>>,
-    field: Field,
+    edges: Edges,
 }
 
-pub(super) struct Field {
+pub(super) type Segments = HashMap<usize, [Vec<Segment>; 2]>;
+
+pub(super) struct Edges {
+    folds: Field,
+    curves: Field,
+    threshold: f32,
+}
+
+struct Field {
     segments: HashMap<usize, [SegmentTree; 2]>,
-    scale: f32,
+    params: Parameters,
 }
 
-pub(super) fn hard_fold(a: Vec3, b: Vec3, between_centers: Vec3) -> Option<usize> {
-    let shallow = 35.0_f32.to_radians().cos();
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::editor::ui::model_viewer::paint::bake) struct Parameters {
+    pub scale: f32,
+    pub reach: f32,
+    pub contrast: f32,
+    pub sharpness: f32,
+    pub hard_cosine: f32,
+    pub radius: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Curvature {
+    pub value: f32,
+    lines: [u16; 2],
+}
+
+impl Curvature {
+    pub fn packed(self, value: f32) -> u8 {
+        let [ridge, fold] = self.lines.map(|weight| f32::from(weight) / 65535.);
+        let signed = value.max(ridge) - (-value).max(fold);
+        super::byte(0.5 + signed.clamp(-1., 1.) * 0.5)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Sample {
+    pub curvature: Curvature,
+    pub distance: [f32; 2],
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self { curvature: Curvature::default(), distance: [1.; 2] }
+    }
+}
+
+impl Parameters {
+    pub fn new(bounds: Bounds, scale: f32, options: SurfaceOptions) -> Self {
+        let extent = bounds.max - bounds.min;
+        let unit = bounds.custom_unit();
+        let mut contrast = scale * options.contrast as f32 / 10_000.;
+        let reach = if options.auto_edge_reach {
+            let reach = (extent.min_element() * 0.1).clamp(unit * 0.005, unit * 0.2);
+            contrast *= reach / (unit * 0.2);
+            reach
+        } else {
+            scale * options.edge_reach as f32 / 10_000.
+        };
+        Self {
+            scale,
+            reach,
+            contrast,
+            sharpness: f32::from(options.sharpness) / 1000.,
+            hard_cosine: (f32::from(options.hard_angle) / 10.).to_radians().cos(),
+            radius: f32::from(options.radius) / 10.,
+        }
+    }
+}
+
+pub(super) fn hard_fold(a: Vec3, b: Vec3, between_centers: Vec3, shallow: f32) -> Option<usize> {
     let folded_back = 170.0_f32.to_radians().cos();
     (a != Vec3::ZERO && b != Vec3::ZERO && (folded_back..=shallow).contains(&a.dot(b)))
         .then(|| usize::from(b.dot(between_centers) >= 0.))
@@ -138,7 +205,7 @@ impl Features {
         normals: &[Vec<Vec3>],
         geometric: &[Vec3],
         parts: &[usize],
-        scale: f32,
+        params: Parameters,
         progress: &Progress,
     ) -> Result<Self, String> {
         let mut groups_by_vertex = vec![Vec::<(Vec3, usize)>::new(); positions.len()];
@@ -182,7 +249,7 @@ impl Features {
                 }
             }
         }
-        let curvature = groups
+        let curvature: Vec<Vec<f32>> = groups
             .into_iter()
             .map(|face| {
                 face.into_iter()
@@ -194,7 +261,7 @@ impl Features {
             })
             .collect();
 
-        let mut features = HashMap::<usize, [Vec<Segment>; 2]>::new();
+        let mut folds = Segments::new();
         for (edge, adjacent) in mesh.edges() {
             progress.check()?;
             let [a, b] = adjacent.as_slice() else {
@@ -211,7 +278,7 @@ impl Features {
             } else {
                 geometric[*b]
             };
-            let Some(kind) = hard_fold(na, nb, centers[*a] - centers[*b]) else {
+            let Some(kind) = hard_fold(na, nb, centers[*a] - centers[*b], params.hard_cosine) else {
                 continue;
             };
             let normal_at = |face: usize, vertex| {
@@ -235,24 +302,92 @@ impl Features {
             if segment.a.distance_squared(segment.b) <= 1e-20 {
                 continue;
             }
-            features.entry(parts[*a]).or_default()[kind].push(segment);
+            folds.entry(parts[*a]).or_default()[kind].push(segment);
+        }
+        // A smooth bevel is a feature when its curvature corresponds to a
+        // radius within the search distance, regardless of the hard-edge angle.
+        let threshold = (1.25 * params.reach).recip();
+        let mut curves = Segments::new();
+        for (face, polygon) in mesh.faces.iter().enumerate() {
+            progress.check()?;
+            let values = &curvature[face];
+            if !values.iter().any(|value| value.abs() >= threshold) {
+                continue;
+            }
+            for triangle in mesh.triangles(polygon) {
+                let points = triangle.map(|i| positions[polygon.corners[i].vertex]);
+                add_contours(&mut curves, parts[face], points, triangle.map(|i| values[i]), threshold);
+            }
         }
         Ok(Self {
             curvature,
-            field: Field::build(features, scale, progress)?,
+            edges: Edges::build(folds, curves, threshold, params, progress)?,
         })
     }
 
-    pub fn sample(&self, part: usize, point: Vec3, curvature: f32, line_width: f32) -> [f32; 3] {
-        let folds = self.field.distances(part, point);
-        self.field.channels(curvature, line_width, folds, folds)
+    pub fn sample(&self, part: usize, point: Vec3, curvature: f32, line_width: f32) -> Sample {
+        self.edges.sample(part, point, curvature, line_width)
+    }
+}
+
+pub(super) fn add_contours(
+    curves: &mut Segments,
+    part: usize,
+    points: [Vec3; 3],
+    values: [f32; 3],
+    threshold: f32,
+) {
+    for (kind, sign) in [1., -1.].into_iter().enumerate() {
+        let values = values.map(|value| value * sign);
+        let mut crossings = (0..3).filter_map(|i| {
+            let j = (i + 1) % 3;
+            let a = values[i];
+            let b = values[j];
+            ((a < threshold) != (b < threshold))
+                .then(|| points[i].lerp(points[j], (threshold - a) / (b - a)))
+        });
+        if let (Some(a), Some(b)) = (crossings.next(), crossings.next())
+            && a.distance_squared(b) > 1e-20
+        {
+            curves.entry(part).or_default()[kind].push(Segment { a, b });
+        }
+    }
+}
+
+impl Edges {
+    pub fn build(
+        folds: Segments,
+        curves: Segments,
+        threshold: f32,
+        params: Parameters,
+        progress: &Progress,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            folds: Field::build(folds, params, progress)?,
+            curves: Field::build(curves, params, progress)?,
+            threshold,
+        })
+    }
+
+    pub fn sample(&self, part: usize, point: Vec3, curvature: f32, width: f32) -> Sample {
+        let folds = self.folds.distances(part, point);
+        let curves = self.curves.distances(part, point);
+        let distances = std::array::from_fn(|i| {
+            let sign = if i == 0 { 1. } else { -1. };
+            if curvature * sign >= self.threshold {
+                0.
+            } else {
+                folds[i].min(curves[i])
+            }
+        });
+        self.folds.channels(curvature, width, folds, distances)
     }
 }
 
 impl Field {
-    pub fn build(
-        features: HashMap<usize, [Vec<Segment>; 2]>,
-        scale: f32,
+    fn build(
+        features: Segments,
+        params: Parameters,
         progress: &Progress,
     ) -> Result<Self, String> {
         let mut segments = HashMap::with_capacity(features.len());
@@ -260,11 +395,11 @@ impl Field {
             progress.check()?;
             segments.insert(part, features.map(SegmentTree::build));
         }
-        Ok(Self { segments, scale })
+        Ok(Self { segments, params })
     }
 
-    pub fn distances(&self, part: usize, point: Vec3) -> [f32; 2] {
-        let reach = self.scale * 0.2;
+    fn distances(&self, part: usize, point: Vec3) -> [f32; 2] {
+        let reach = self.params.reach;
         self.segments.get(&part).map_or([reach; 2], |trees| {
             [
                 trees[0].distance(point, reach),
@@ -273,24 +408,25 @@ impl Field {
         })
     }
 
-    pub fn channels(
+    fn channels(
         &self,
         curvature: f32,
         line_width: f32,
         [ridge, fold]: [f32; 2],
         [edge, crease]: [f32; 2],
-    ) -> [f32; 3] {
-        let reach = self.scale * 0.2;
+    ) -> Sample {
+        let reach = self.params.reach;
+        let line_width = line_width * (self.params.radius * 0.5);
         let line = |distance: f32| {
-            let t = (distance / line_width.max(self.scale * 1e-7).min(reach)).clamp(0., 1.);
+            let t = (distance / line_width.max(self.params.scale * 1e-7).min(reach)).clamp(0., 1.);
             1. - t * t * (3. - 2. * t)
         };
-        let scaled = curvature * self.scale * 0.25;
-        let signed = scaled.max(line(ridge)).max(0.) - (-scaled).max(line(fold)).max(0.);
-        [
-            0.5 + signed.clamp(-1., 1.) * 0.5,
-            edge / reach,
-            crease / reach,
-        ]
+        Sample {
+            curvature: Curvature {
+                value: (curvature * self.params.contrast).clamp(-1., 1.),
+                lines: [ridge, fold].map(|distance| (line(distance) * 65535.).round() as u16),
+            },
+            distance: [edge / reach, crease / reach],
+        }
     }
 }

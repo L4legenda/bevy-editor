@@ -382,6 +382,7 @@ impl Target {
                 scene: ready.scene,
                 object: object as u32 + 1,
                 slot: slot as u32,
+                relief_factor: 4.,
                 fix: Some((ready.base, self.map == BakeMap::ProjectedNormal)),
             });
             self.gpu = Some(Live { id, trace: None });

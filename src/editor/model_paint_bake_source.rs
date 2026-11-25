@@ -192,18 +192,30 @@ mod tests {
         let second = Projection::load(&path, "PANEL-low.001", 1., &edited, &progress).unwrap();
         assert!(Arc::ptr_eq(&first.source, &second.source));
         assert_ne!(first.front, second.front);
-        let relief = first.build_relief(1., true, &progress).unwrap();
+        use super::super::super::{Bounds, relief::Parameters};
+        let bounds = Bounds { min: Vec3::ZERO, max: Vec3::ONE };
+        let params = Parameters::new(bounds, 1., settings.surface);
+        let smaller = Parameters::new(bounds, 0.5, settings.surface);
+        let sharper = Parameters::new(bounds, 1., crate::editor::model_bake_settings::SurfaceOptions {
+            hard_angle: 500,
+            ..settings.surface
+        });
+        let relief = first.build_relief(params, true, &progress).unwrap();
         assert!(Arc::ptr_eq(
             &relief,
-            &second.build_relief(1., true, &progress).unwrap()
+            &second.build_relief(params, true, &progress).unwrap()
         ));
         assert!(Arc::ptr_eq(
             &relief,
-            &second.build_relief(0.5, false, &progress).unwrap()
+            &second.build_relief(smaller, false, &progress).unwrap()
         ));
         assert!(!Arc::ptr_eq(
             &relief,
-            &second.build_relief(0.5, true, &progress).unwrap()
+            &second.build_relief(sharper, true, &progress).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &relief,
+            &second.build_relief(smaller, true, &progress).unwrap()
         ));
         assert!(Projection::load(&path, "Other_low", 1., &settings, &progress).is_err());
 

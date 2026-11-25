@@ -187,6 +187,7 @@ fn gpu_compare_complex_paint() {
             &scene,
             1,
             0,
+            4.,
             None,
         );
         let pose = Transform::from_xyz(0., 0., 4.);
@@ -198,6 +199,7 @@ fn gpu_compare_complex_paint() {
                 rect: Rect::from_corners(Vec2::ZERO, Vec2::new(1024., 768.)),
                 clip: Rect::from_corners(Vec2::ZERO, Vec2::new(1024., 768.)),
                 ortho: false,
+                fov: FOV,
                 height: 8. * (FOV * 0.5).tan(),
                 depth: 100.,
                 epsilon: 0.0005,

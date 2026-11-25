@@ -196,7 +196,7 @@ impl Maps {
 
     fn resolve_rgba(&self, map: BakeMap, correction: Correction<'_>) -> Vec<u8> {
         let mut pixels = self.raw.rgba(map);
-        if correction.active() {
+        if self.has_map(map) && correction.active() {
             for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
                 if map == BakeMap::ProjectedNormal {
                     let normal = correction.normal(index, [pixel[0], pixel[1], pixel[2]]);

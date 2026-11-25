@@ -1,5 +1,6 @@
 //! Isolated model documents. Their meshes, camera and lights never enter a scene.
 use super::*;
+use crate::editor::model_document::ModelCamera;
 use crate::editor::model_source::ModelSource;
 use bevy::{
     camera::{ClearColorConfig, RenderTarget, primitives::Aabb, visibility::RenderLayers},
@@ -51,15 +52,6 @@ struct ModelGrid;
 #[derive(Component)]
 struct ModelBackground;
 
-#[derive(Clone, Copy)]
-struct SavedView {
-    center: Vec3,
-    distance: f32,
-    yaw: f32,
-    pitch: f32,
-    orthographic: bool,
-}
-
 #[derive(Resource, Default)]
 struct Viewer {
     model: Option<usize>,
@@ -75,11 +67,39 @@ struct Viewer {
     distance: f32,
     yaw: f32,
     pitch: f32,
+    field_of_view: Option<f32>,
     orthographic: bool,
     gesture: Option<(navigation::Navigation, Vec2)>,
     return_focus: Option<Entity>,
-    poses: std::collections::HashMap<usize, SavedView>,
-    restore: Option<SavedView>,
+    poses: std::collections::HashMap<usize, ModelCamera>,
+    restore: Option<ModelCamera>,
+    pending_document_camera: bool,
+}
+
+impl Viewer {
+    fn fov(&self) -> f32 {
+        self.field_of_view.unwrap_or(FOV)
+    }
+
+    fn camera(&self) -> ModelCamera {
+        ModelCamera {
+            center: self.center.to_array(),
+            distance: self.distance,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            fov: self.fov(),
+            orthographic: self.orthographic,
+        }
+    }
+
+    fn restore_camera(&mut self, camera: ModelCamera) {
+        self.center = Vec3::from_array(camera.center);
+        self.distance = camera.distance;
+        self.yaw = camera.yaw;
+        self.pitch = camera.pitch;
+        self.field_of_view = Some(camera.fov);
+        self.orthographic = camera.orthographic;
+    }
 }
 
 #[derive(Resource)]
@@ -375,6 +395,15 @@ fn actions(
     ),
 ) {
     let incoming: Vec<_> = messages.read().copied().collect();
+    if viewer.fitted && !viewer.pending_document_camera && viewer.model == editor.viewing_model
+        && let Some(document) = viewer.model.and_then(|index| editing.documents.get_mut(&index))
+        && document.model_camera.is_some()
+    {
+        let camera = viewer.camera();
+        if camera.valid() {
+            document.model_camera = Some(camera);
+        }
+    }
     editing::process_actions(
         &incoming,
         &mut editor,
@@ -420,6 +449,7 @@ fn actions(
                     ModelViewAction::Fit => {
                         viewer.fitted = false;
                         viewer.restore = None;
+                        viewer.pending_document_camera = false;
                     }
                     ModelViewAction::Retry => {
                         let index = editor.viewing_model.unwrap();
@@ -474,13 +504,7 @@ fn actions(
         && viewer.fitted
         && !retry
     {
-        let pose = SavedView {
-            center: viewer.center,
-            distance: viewer.distance,
-            yaw: viewer.yaw,
-            pitch: viewer.pitch,
-            orthographic: viewer.orthographic,
-        };
+        let pose = viewer.camera();
         viewer.poses.insert(index, pose);
     }
     let poses = std::mem::take(&mut viewer.poses);
@@ -494,6 +518,7 @@ fn actions(
         return_focus,
         poses,
         restore,
+        pending_document_camera: restore.is_none(),
         yaw: 0.65,
         pitch: 0.35,
         ..default()
@@ -638,8 +663,8 @@ fn load(
     );
 }
 
-fn fit_distance(radius: f32, aspect: f32) -> f32 {
-    let half_angle = (FOV * 0.5).min(((FOV * 0.5).tan() * aspect.max(0.01)).atan());
+fn fit_distance(radius: f32, aspect: f32, fov: f32) -> f32 {
+    let half_angle = (fov * 0.5).min(((fov * 0.5).tan() * aspect.max(0.01)).atan());
     radius / half_angle.sin() * 1.15
 }
 
@@ -738,23 +763,27 @@ fn navigate(
         }
         viewer.center = (min + max) * 0.5;
         viewer.radius = ((max - min).length() * 0.5).max(0.0001);
-        viewer.distance = fit_distance(viewer.radius, size.x / size.y).max(viewer.radius * 7.0);
+        viewer.distance = fit_distance(viewer.radius, size.x / size.y, viewer.fov()).max(viewer.radius * 7.0);
         if let Some(pose) = viewer.restore.take() {
-            viewer.center = pose.center;
-            viewer.distance = pose.distance;
-            viewer.yaw = pose.yaw;
-            viewer.pitch = pose.pitch;
-            viewer.orthographic = pose.orthographic;
+            viewer.restore_camera(pose);
         }
         viewer.fitted = true;
         viewer.error = None;
+    }
+    if viewer.pending_document_camera
+        && let Some(document) = viewer.model.and_then(|index| editing.documents.get(&index))
+    {
+        viewer.pending_document_camera = false;
+        if let Some(camera) = document.model_camera {
+            viewer.restore_camera(camera);
+        }
     }
     let uv_mode = editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv;
     if uv_mode && !viewer.uv_mode {
         // Fit the actual silhouette into the final split pane, including its depth.
         let aspect = (size.x * 0.51 / size.y).max(0.1);
         let rotation = view_pose(&viewer).rotation.inverse();
-        let tangent = (FOV * 0.5).tan();
+        let tangent = (viewer.fov() * 0.5).tan();
         let mut distance = viewer.radius * 0.1;
         if let Some(doc) = editor.viewing_model.and_then(|i| editing.documents.get(&i)) {
             for object in doc.objects.iter().filter(|o| !o.hidden) {
@@ -843,7 +872,7 @@ fn navigate(
     }
     if let Ok((mut transform, mut projection)) = cameras.single_mut() {
         *transform = view_pose(&viewer);
-        let mut next = viewport::free_projection(viewer.orthographic, viewer.distance);
+        let mut next = viewport::free_projection_with_fov(viewer.orthographic, viewer.distance, viewer.fov());
         let near = (viewer.radius * 0.001).max(0.000001);
         let far = (viewer.distance + viewer.radius * 100.0).max(10000.0);
         match &mut next {
@@ -879,7 +908,7 @@ fn view_height(viewer: &Viewer, depth: f32) -> f32 {
     } else {
         depth
     };
-    2.0 * depth.max(0.000001) * (FOV * 0.5).tan()
+    2.0 * depth.max(0.000001) * (viewer.fov() * 0.5).tan()
 }
 
 // Orthographic magnification is independent of eye distance. Keep the depth

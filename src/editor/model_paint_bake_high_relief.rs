@@ -1,7 +1,7 @@
 //! High-poly curvature and feature distances evaluated at the projection hit.
 use super::super::{
     Bounds,
-    relief::{Field, Segment, hard_fold},
+    relief::{Edges, Parameters, Sample, Segment, Segments, add_contours, hard_fold},
     root,
 };
 use super::{Hit, Progress, Projection, SourceTriangle, SourceUse, fit::position_key};
@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const NO_GROUP: u32 = u32::MAX;
-const EDGE_THRESHOLD: f32 = 0.35;
 
 pub(in crate::editor::ui::model_viewer::paint::bake) struct HighRelief {
     parts: Vec<usize>,
@@ -20,23 +19,21 @@ pub(in crate::editor::ui::model_viewer::paint::bake) struct HighRelief {
 
 struct ReliefDetails {
     corners: Vec<[f32; 3]>,
-    folds: Field,
-    curved: Field,
-    threshold: f32,
+    edges: Edges,
 }
 
 #[derive(Default)]
 pub(super) struct Cache {
     parts: Option<Arc<HighRelief>>,
-    full: Option<(u32, Arc<HighRelief>)>,
+    full: Option<(Parameters, Arc<HighRelief>)>,
 }
 
 impl Cache {
-    fn get(&self, scale: u32, details: bool) -> Option<Arc<HighRelief>> {
+    fn get(&self, params: Parameters, details: bool) -> Option<Arc<HighRelief>> {
         if details {
             self.full
                 .as_ref()
-                .filter(|(size, _)| *size == scale)
+                .filter(|(stored, _)| *stored == params)
                 .map(|(_, relief)| relief.clone())
         } else {
             self.full
@@ -76,13 +73,12 @@ impl EdgeUse {
 impl Projection {
     pub(in crate::editor::ui::model_viewer::paint::bake) fn build_relief(
         &self,
-        scale: f32,
+        params: Parameters,
         include_details: bool,
         progress: &Progress,
     ) -> Result<Arc<HighRelief>, String> {
         progress.check()?;
-        let key = scale.to_bits();
-        if let Some(relief) = self.source.relief.lock().unwrap().get(key, include_details) {
+        if let Some(relief) = self.source.relief.lock().unwrap().get(params, include_details) {
             #[cfg(test)]
             progress
                 .high_relief_hit
@@ -91,18 +87,18 @@ impl Projection {
         }
         let relief = Arc::new(HighRelief::build(
             &self.source.triangles,
-            scale,
+            params,
             include_details,
             progress,
         )?);
         progress.check()?;
         let mut cache = self.source.relief.lock().unwrap();
-        if let Some(existing) = cache.get(key, include_details) {
+        if let Some(existing) = cache.get(params, include_details) {
             return Ok(existing);
         }
         if include_details {
             cache.parts = None;
-            cache.full = Some((key, relief.clone()));
+            cache.full = Some((params, relief.clone()));
         } else {
             cache.parts = Some(relief.clone());
         }
@@ -113,7 +109,7 @@ impl Projection {
 impl HighRelief {
     fn build(
         triangles: &[SourceTriangle],
-        scale: f32,
+        params: Parameters,
         include_details: bool,
         progress: &Progress,
     ) -> Result<Self, String> {
@@ -133,7 +129,7 @@ impl HighRelief {
                     * 3,
             );
         }
-        let minimum_length_squared = (scale * 1e-8).powi(2);
+        let minimum_length_squared = (params.scale * 1e-8).powi(2);
         for (face, triangle) in triangles.iter().enumerate() {
             if face % 4096 == 0 {
                 progress.check()?;
@@ -236,7 +232,7 @@ impl HighRelief {
             });
         }
         edges.sort_unstable_by_key(EdgeUse::key);
-        let mut folds = HashMap::<usize, [Vec<Segment>; 2]>::new();
+        let mut folds = Segments::new();
         let normal = |[a, b, c]: [Vec3; 3]| (b - a).cross(c - a).normalize_or_zero();
         for (index, neighbors) in edges.chunk_by(|a, b| a.key() == b.key()).enumerate() {
             if index % 4096 == 0 {
@@ -252,7 +248,7 @@ impl HighRelief {
                 normal(q)
             };
             let offset = (p[0] - q[0] + p[1] - q[1] + p[2] - q[2]) / 3.;
-            if let Some(kind) = hard_fold(normal(p), nb, offset) {
+            if let Some(kind) = hard_fold(normal(p), nb, offset, params.hard_cosine) {
                 folds.entry(parts[first]).or_default()[kind].push(Segment {
                     a: positions[a.from as usize],
                     b: positions[a.to as usize],
@@ -262,7 +258,7 @@ impl HighRelief {
         drop(edges);
         drop(positions);
 
-        let values = smooth(triangles, &corner_groups, &groups, scale, progress)?;
+        let values = smooth(triangles, &corner_groups, &groups, params, progress)?;
         drop(groups);
         let corners: Vec<_> = corner_groups
             .into_iter()
@@ -274,8 +270,8 @@ impl HighRelief {
                 }
             })
             .collect();
-        let threshold = EDGE_THRESHOLD / (0.25 * scale);
-        let mut curved = HashMap::<usize, [Vec<Segment>; 2]>::new();
+        let threshold = params.sharpness / params.contrast;
+        let mut curves = Segments::new();
         for (face, (triangle, values)) in triangles.iter().zip(&corners).enumerate() {
             if face % 4096 == 0 {
                 progress.check()?;
@@ -283,22 +279,14 @@ impl HighRelief {
             if triangle.usage != SourceUse::Project {
                 continue;
             }
-            for (kind, sign) in [1., -1.].into_iter().enumerate() {
-                if let Some(line) =
-                    contour(triangle.points, values.map(|value| value * sign), threshold)
-                {
-                    curved.entry(parts[face]).or_default()[kind].push(line);
-                }
-            }
+            add_contours(&mut curves, parts[face], triangle.points, *values, threshold);
         }
         Ok(Self {
             parts,
             bounds,
             details: Some(ReliefDetails {
                 corners,
-                folds: Field::build(folds, scale, progress)?,
-                curved: Field::build(curved, scale, progress)?,
-                threshold,
+                edges: Edges::build(folds, curves, threshold, params, progress)?,
             }),
         })
     }
@@ -312,27 +300,13 @@ impl HighRelief {
         (part, self.bounds[&part])
     }
 
-    pub fn sample(&self, hit: &Hit, width: f32) -> [f32; 3] {
+    pub(in crate::editor::ui::model_viewer::paint::bake::mesh) fn sample(&self, hit: &Hit, width: f32) -> Sample {
         let Some(details) = &self.details else {
-            return [0.5, 1., 1.];
+            return Sample::default();
         };
         let part = self.parts[hit.triangle];
         let curvature = Vec3::from_array(details.corners[hit.triangle]).dot(hit.weights);
-        let folds = details.folds.distances(part, hit.point);
-        let curves = details.curved.distances(part, hit.point);
-        let edge = if curvature >= details.threshold {
-            0.
-        } else {
-            folds[0].min(curves[0])
-        };
-        let crease = if curvature <= -details.threshold {
-            0.
-        } else {
-            folds[1].min(curves[1])
-        };
-        details
-            .folds
-            .channels(curvature, width, folds, [edge, crease])
+        details.edges.sample(part, hit.point, curvature, width)
     }
 }
 
@@ -340,10 +314,10 @@ fn smooth(
     triangles: &[SourceTriangle],
     corner_groups: &[[u32; 3]],
     groups: &[Group],
-    scale: f32,
+    params: Parameters,
     progress: &Progress,
 ) -> Result<Vec<f32>, String> {
-    let limit = 4. / scale;
+    let limit = params.contrast.recip();
     let mut values: Vec<_> = groups
         .iter()
         .map(|g| (g.curvature / g.count.max(1) as f32).clamp(-limit, limit))
@@ -352,7 +326,7 @@ fn smooth(
         .iter()
         .map(|g| {
             (g.lengths / g.count.max(1) as f32)
-                .max(scale * 1e-8)
+                .max(params.scale * 1e-8)
                 .recip()
         })
         .collect();
@@ -384,17 +358,4 @@ fn smooth(
         }
     }
     Ok(values)
-}
-
-fn contour(points: [Vec3; 3], values: [f32; 3], threshold: f32) -> Option<Segment> {
-    let mut crossings = (0..3).filter_map(|i| {
-        let j = (i + 1) % 3;
-        let a = values[i];
-        let b = values[j];
-        ((a < threshold) != (b < threshold))
-            .then(|| points[i].lerp(points[j], (threshold - a) / (b - a)))
-    });
-    let a = crossings.next()?;
-    let b = crossings.next()?;
-    (a.distance_squared(b) > 1e-20).then_some(Segment { a, b })
 }

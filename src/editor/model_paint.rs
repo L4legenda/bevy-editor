@@ -205,6 +205,7 @@ pub(in crate::editor) enum Parameter {
     ExportHeightStrength,
     CageRadius,
     CageStrength,
+    BakeOption(bake::BakeControl),
     TipAngle,
     Roughness,
     Metallic,
@@ -253,6 +254,7 @@ impl Parameter {
             Self::ExportHeightStrength => "Сила рельефа из высоты",
             Self::CageRadius => "Радиус оболочки, px",
             Self::CageStrength => "Сила кисти оболочки",
+            Self::BakeOption(control) => control.label(),
             Self::TipAngle => "Поворот наконечника, °",
             Self::Roughness => "Шероховатость, %",
             Self::Metallic => "Металличность, %",
@@ -287,6 +289,7 @@ impl Parameter {
             Self::ExportHeightStrength => (0., 8.),
             Self::CageRadius => (5., 300.),
             Self::CageStrength => (0.1, 4.),
+            Self::BakeOption(control) => control.bounds(),
             Self::FilterValue(_, kind, value) => {
                 let (_, _, min, max) = kind.controls()[value];
                 (min as f64, max as f64)
@@ -440,6 +443,9 @@ pub(in crate::editor) enum PaintAction {
     BakeAverageNormals,
     BakeRange { front: bool, percent: u8 },
     BakeQuality(bake::Quality),
+    BakeRayOptions(bake::RayOptions),
+    BakeAutoEdgeReach,
+    BakeResetSurface,
     BakeIdSource(bake::IdSource),
     BakeMapOptions,
     BakeAdjustLevels(bake::BakeMap, bake::levels::Field, i8),
@@ -632,6 +638,9 @@ impl PaintAction {
             Self::BakeAverageNormals => "Усреднять направления лучей на совпадающих вершинах и UV-швах.",
             Self::BakeRange { .. } => "Дальность лучей в процентах от диагонали видимой модели.",
             Self::BakeQuality(quality) => quality.hint(),
+            Self::BakeRayOptions(_) => "Вернуть число лучей из пресета качества и исходные дальности и конус.",
+            Self::BakeAutoEdgeReach => "Подбирать дальность поиска рёбер по наименьшему размеру модели.",
+            Self::BakeResetSurface => "Вернуть сетку проекции из пресета и исходные параметры кривизны и рёбер.",
             Self::BakeIdSource(_) => "Задать источник цветов карты ID.",
             Self::BakeMapOptions => "Выбрать дополнительные карты для следующего запекания.",
             Self::BakeToggleMap(_) => "Включить или пропустить карту при следующем запекании.",
@@ -840,6 +849,7 @@ struct Session {
     bake_ready: bool,
     bake_picking: bool,
     bake_projection: bake::ProjectionSettings,
+    bake_option_edit: Option<(bake::BakeControl, f32)>,
     bake_inspect_cage: bool,
     bake_paint_cage: bool,
     cage_radius: f32,
@@ -966,6 +976,7 @@ impl Default for Session {
             bake_ready: false,
             bake_picking: false,
             bake_projection: bake::ProjectionSettings::default(),
+            bake_option_edit: None,
             bake_inspect_cage: false,
             bake_paint_cage: false,
             cage_radius: 40.,
@@ -1212,7 +1223,8 @@ impl Session {
             PaintAction::BakeClearCage => return self.bake_projection.cage.is_some() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeAutoFitCage => return self.bake_projection.path.is_some() && self.bake_projection.cage.is_none() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeInspectCage => return self.bake_projection.path.is_some(),
-            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_)
+            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeRayOptions(_)
+            | PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
             | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_) => {
                 return !self.bake_busy;
             }
@@ -1238,7 +1250,8 @@ impl Session {
             }
             PaintAction::BakePreview(map) => return map.is_none_or(|map| {
                 (self.bake_live && matches!(map, bake::BakeMap::Custom(_)))
-                    || (self.bake_ready && (!map.requires_high_poly() || self.bake_projection.path.is_some()))
+                    || (self.bake_ready && self.bake_projection.maps.contains(map)
+                        && (!map.requires_high_poly() || self.bake_projection.path.is_some()))
             }),
             PaintAction::BakeLiveMasks => return self.bake_live_masks
                 || (self.bake_live && matches!(self.bake_view, Some(bake::BakeMap::Custom(_)))),
@@ -1645,6 +1658,7 @@ impl Session {
             Parameter::ExportHeightStrength => self.export_settings.file.normal.height_strength,
             Parameter::CageRadius => self.cage_radius,
             Parameter::CageStrength => self.cage_strength,
+            Parameter::BakeOption(control) => control.value(&self.bake_projection),
             Parameter::TipAngle => self.tip_angle,
             Parameter::Roughness => self.roughness,
             Parameter::Metallic => self.metallic,
@@ -1757,6 +1771,7 @@ impl Session {
             Parameter::ExportHeightStrength => self.export_settings.file.normal.height_strength = value.clamp(0., 8.),
             Parameter::CageRadius => self.cage_radius = value.clamp(5., 300.),
             Parameter::CageStrength => self.cage_strength = value.clamp(0.1, 4.),
+            Parameter::BakeOption(_) => unreachable!("bake settings are edited through bake actions"),
             Parameter::TipAngle => self.tip_angle = value,
             Parameter::Roughness => self.roughness = value,
             Parameter::Metallic => self.metallic = value,
@@ -2230,7 +2245,8 @@ impl Session {
             | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
             | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
             | PaintAction::BakeAverageNormals | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => {}
-            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions
+            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions | PaintAction::BakeRayOptions(_)
+            | PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
             | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
             | PaintAction::BakeAdjustLevels(..) | PaintAction::BakeResetLevels(_)
             | PaintAction::BakeFixTool(_) | PaintAction::BakeClearFix(_) | PaintAction::BakeFixValue(_) => {}
@@ -2770,6 +2786,7 @@ impl Session {
             PaintAction::BakeAverageNormals => self.bake_projection.average_normals,
             PaintAction::BakeAutoFitCage => self.bake_projection.auto_fit,
             PaintAction::BakeQuality(quality) => self.bake_projection.quality == quality,
+            PaintAction::BakeAutoEdgeReach => self.bake_projection.surface.auto_edge_reach,
             PaintAction::BakeIdSource(source) => self.bake_projection.id_source == source,
             PaintAction::BakeMapOptions => self.bake_map_options,
             PaintAction::BakeToggleMap(map) => self.bake_projection.maps.contains(map),
@@ -3890,7 +3907,8 @@ pub(super) fn actions(
                 | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
                 | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
                 | PaintAction::BakeAverageNormals | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => continue,
-                PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions
+                PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions | PaintAction::BakeRayOptions(_)
+                | PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
                 | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
                 | PaintAction::BakeAdjustLevels(..) | PaintAction::BakeResetLevels(_)
                 | PaintAction::BakeFixTool(_) | PaintAction::BakeClearFix(_) | PaintAction::BakeFixValue(_) => continue,

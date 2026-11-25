@@ -14,7 +14,7 @@ use std::{collections::VecDeque, sync::mpsc, time::Duration};
 
 const NODE_BYTES: usize = 48;
 const TEXEL_BYTES: usize = 64;
-const HEADER_BYTES: usize = 48;
+const HEADER_BYTES: usize = 64;
 const CONFIG_BYTES: usize = HEADER_BYTES + crate::editor::model_paint_data::custom::MAX_MAPS * 48;
 const BASE_WORDS: usize = 2;
 const MAX_IN_FLIGHT: usize = 3;
@@ -84,7 +84,8 @@ fn batch_limit(recipes: &[custom::Prepared], rays: &Rays, visibility: bool) -> u
     let maps = rays.maps;
     let visibility_cost = if visibility {
         sampling.occlusion
-            * u32::from(maps.contains(BakeMap::Occlusion) || maps.contains(BakeMap::Cavity))
+            * u32::from([BakeMap::Occlusion, BakeMap::BentNormal, BakeMap::Cavity]
+                .into_iter().any(|map| maps.contains(map)))
             + sampling.thickness * u32::from(maps.contains(BakeMap::Thickness))
             + sampling.sky * u32::from(maps.contains(BakeMap::Sky))
     } else {
@@ -272,6 +273,7 @@ impl Batch {
                 0,
             ],
         );
+        words(&mut self.config, sampling.visibility.map(f32::to_bits));
         for recipe in recipes {
             let custom::GpuRecipe {
                 kind,

@@ -78,6 +78,21 @@ fn imported_bake_defaults_are_clean_and_explicit_factory_settings_survive_profil
 }
 
 #[test]
+fn legacy_bake_selection_retains_previously_implied_maps() {
+    use crate::editor::model_bake_settings::{self as bake, BASIC_MAP_BITS, BENT_NORMAL_BIT};
+
+    let path = Path::new("legacy.glb");
+    let mut root = json!({"extras": {"bevy_editor_bake_settings": {"map_bits": 4}}});
+    assert_eq!(bake::read(&root, path).map_bits, BASIC_MAP_BITS | 4);
+    root["extras"]["bevy_editor_bake_settings"]["map_bits"] = json!(5);
+    assert_eq!(bake::read(&root, path).map_bits, BASIC_MAP_BITS | BENT_NORMAL_BIT | 5);
+
+    let explicit = bake::Settings { map_bits: 5, ..Default::default() };
+    bake::write(&mut root, path, &explicit).unwrap();
+    assert_eq!(bake::read(&root, path), explicit);
+}
+
+#[test]
 fn bake_settings_survive_glb_reopen_move_and_document_undo() {
     use crate::editor::model_bake_settings::{self as bake, IdSource, Quality, Settings};
 
@@ -94,6 +109,22 @@ fn bake_settings_survive_glb_reopen_move_and_document_undo() {
         quality: Quality::Ultra,
         map_bits: 9,
         id_source: IdSource::Materials,
+        rays: bake::RayOptions {
+            occlusion_samples: Some(91),
+            thickness_samples: Some(0),
+            cavity_reach: 1324,
+            sky_cone: 443,
+            ..Default::default()
+        },
+        surface: bake::SurfaceOptions {
+            grid: Some(6),
+            radius: 37,
+            contrast: 1724,
+            edge_reach: 511,
+            auto_edge_reach: true,
+            sharpness: 375,
+            hard_angle: 450,
+        },
         front: 12,
         rear: 37,
         match_names: false,

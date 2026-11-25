@@ -24,7 +24,7 @@ pub(super) fn union(a: Option<URect>, b: Option<URect>) -> Option<URect> {
         (a, None) => a,
     }
 }
-pub(super) fn prepare(surface: &Surface, dirty: Dirty) -> Updates {
+pub(super) fn prepare(surface: &Surface, dirty: Dirty, relief_factor: f32) -> Updates {
     let mut updates = Updates {
         textures: std::array::from_fn(|_| None),
         transparent: None,
@@ -68,7 +68,7 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty) -> Updates {
                 }
                 rm
             }
-            2 => normal_rect(surface, rect),
+            2 => normal_rect(surface, rect, relief_factor),
             3 => surface.composite_rect(5, rect),
             _ => surface.composite_rect([1, 2, 3, 4, 7][target - 4], rect),
         };
@@ -88,9 +88,9 @@ pub(super) fn prepare(surface: &Surface, dirty: Dirty) -> Updates {
     }
     updates
 }
-fn normal_rect(surface: &Surface, rect: URect) -> Vec<u8> {
+fn normal_rect(surface: &Surface, rect: URect, relief_factor: f32) -> Vec<u8> {
     let mut out = surface.composite_rect(6, rect);
-    if !surface.has_channel(3) {
+    if relief_factor == 0. || !surface.has_channel(3) {
         return out;
     }
     let padded = URect {
@@ -105,8 +105,8 @@ fn normal_rect(surface: &Surface, rect: URect) -> Vec<u8> {
                 height[((y - padded.min.y) * padded.width() + x - padded.min.x) as usize * 4] as f32
                     / 255.
             };
-            let dx = (h((x + 1).min(surface.size - 1), y) - h(x.saturating_sub(1), y)) * 4.;
-            let dy = (h(x, (y + 1).min(surface.size - 1)) - h(x, y.saturating_sub(1))) * 4.;
+            let dx = (h((x + 1).min(surface.size - 1), y) - h(x.saturating_sub(1), y)) * relief_factor;
+            let dy = (h(x, (y + 1).min(surface.size - 1)) - h(x, y.saturating_sub(1))) * relief_factor;
             let i = ((y - rect.min.y) as usize * width + (x - rect.min.x) as usize) * 4;
             let n = Vec3::new(
                 out[i] as f32 / 127.5 - 1. - dx,

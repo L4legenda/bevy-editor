@@ -437,6 +437,7 @@ mod tests {
                     rect,
                     clip: rect,
                     ortho: false,
+                    fov: crate::editor::viewport::EDITOR_FOV,
                     height: 4.,
                     depth: 10.,
                     epsilon: 0.001,

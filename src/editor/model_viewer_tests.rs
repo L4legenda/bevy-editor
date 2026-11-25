@@ -831,7 +831,7 @@ fn pen_pan_stays_in_the_view_where_it_started() {
 fn fitting_handles_tall_wide_and_tiny_models() {
     for radius in [0.0001, 1.0, 10000.0] {
         for aspect in [0.3, 1.0, 3.0] {
-            let distance = fit_distance(radius, aspect);
+            let distance = fit_distance(radius, aspect, FOV);
             let angle = (FOV * 0.5).min(((FOV * 0.5).tan() * aspect).atan());
             assert!(distance.is_finite());
             assert!(distance * angle.sin() > radius);

@@ -1,6 +1,6 @@
 //! GPU filtering in horizontal bands, with enough overlap for all passes.
 use super::super::RayDevice;
-use super::{DENOISE_END, Guide, Maps, Progress, RASTER_END};
+use super::{CURVATURE_PASSES, Curvature, DENOISE_END, Guide, Maps, Progress, RASTER_END};
 use bevy::render::render_resource::{
     BindGroupEntry, BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor,
     BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor, MapMode,
@@ -90,6 +90,39 @@ pub(super) fn filter_bands(
     bytes: usize,
     atlas: Option<&Buffer>,
 ) -> Result<bool, String> {
+    filter_pass(gpu, maps, guides, passes, progress, bytes, Filter::Visibility(atlas))
+}
+
+pub(super) fn filter_curvature(
+    gpu: &RayDevice,
+    maps: &mut Maps,
+    guides: &[Guide],
+    samples: &[Curvature],
+    radius: f32,
+    progress: &Progress,
+) -> Result<bool, String> {
+    filter_pass(gpu, maps, guides, CURVATURE_PASSES, progress, BAND_BYTES, Filter::Curvature(samples, radius))
+}
+
+#[derive(Clone, Copy)]
+enum Filter<'a> {
+    Visibility(Option<&'a Buffer>),
+    Curvature(&'a [Curvature], f32),
+}
+
+fn filter_pass(
+    gpu: &RayDevice,
+    maps: &mut Maps,
+    guides: &[Guide],
+    passes: u32,
+    progress: &Progress,
+    bytes: usize,
+    filter: Filter,
+) -> Result<bool, String> {
+    let atlas = match filter {
+        Filter::Visibility(atlas) => atlas,
+        Filter::Curvature(..) => None,
+    };
     if atlas.is_none() && !guides.iter().any(|guide| guide.texel > 0.0) {
         return Ok(false);
     }
@@ -172,7 +205,10 @@ pub(super) fn filter_bands(
         label: Some("Bake denoise"),
         layout: Some(&pipeline_layout),
         module: &shader,
-        entry_point: Some("denoise"),
+        entry_point: Some(match filter {
+            Filter::Visibility(_) => "denoise",
+            Filter::Curvature(..) => "smooth_curvature",
+        }),
         compilation_options: Default::default(),
         cache: None,
     });
@@ -199,9 +235,10 @@ pub(super) fn filter_bands(
         }
         shape_bytes.clear();
         channel_bytes.clear();
-        for (guide, value) in guides[source.clone()]
+        for (index, (guide, value)) in guides[source.clone()]
             .iter()
             .zip(&maps.values[source.clone()])
+            .enumerate()
         {
             for coordinate in guide.position.to_array().into_iter().chain([guide.texel]) {
                 shape_bytes.extend_from_slice(&coordinate.to_le_bytes());
@@ -209,9 +246,16 @@ pub(super) fn filter_bands(
             shape_bytes.extend_from_slice(&guide.part.to_le_bytes());
             shape_bytes.extend_from_slice(&guide.island.to_le_bytes());
             shape_bytes.extend_from_slice(&[value[9], value[10], value[11], 0]);
-            if atlas.is_none() {
-                channel_bytes.extend_from_slice(&value[..4]);
-                channel_bytes.extend_from_slice(&[value[6], value[7], value[8], 0]);
+            match filter {
+                Filter::Visibility(None) => {
+                    channel_bytes.extend_from_slice(&value[..4]);
+                    channel_bytes.extend_from_slice(&[value[6], value[7], value[8], 0]);
+                }
+                Filter::Curvature(samples, _) => {
+                    channel_bytes.extend_from_slice(&samples[source.start + index].value.to_le_bytes());
+                    channel_bytes.extend_from_slice(&[0; 4]);
+                }
+                Filter::Visibility(Some(_)) => {}
             }
         }
         gpu.queue.write_buffer(&shape, 0, &shape_bytes);
@@ -223,7 +267,11 @@ pub(super) fn filter_bands(
         let count = (destination.len() * CHANNEL_BYTES) as u64;
         for pass in 0..passes {
             progress.check()?;
-            let config = [maps.size, height, 1 << pass, 0].map(u32::to_le_bytes);
+            let radius = match filter {
+                Filter::Visibility(_) => 0.,
+                Filter::Curvature(_, radius) => radius,
+            };
+            let config = [maps.size, height, 1 << pass, radius.to_bits()].map(u32::to_le_bytes);
             gpu.queue.write_buffer(&uniform, 0, config.as_flattened());
             let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Bake denoise"),
@@ -285,16 +333,37 @@ pub(super) fn filter_bands(
             }
             staging.unmap();
         }
-        progress.rows.store(
-            RASTER_END + (DENOISE_END - RASTER_END) * end as u32 / maps.size,
-            Ordering::Relaxed,
-        );
+        if matches!(filter, Filter::Visibility(_)) {
+            progress.rows.store(
+                RASTER_END + (DENOISE_END - RASTER_END) * end as u32 / maps.size,
+                Ordering::Relaxed,
+            );
+        }
     }
     progress.check()?;
-    for ((value, texel), guide) in maps.values.iter_mut().zip(filtered).zip(guides) {
-        if guide.texel > 0.0 || texel[7] == 255 {
-            value[..4].copy_from_slice(&texel[..4]);
-            value[6..9].copy_from_slice(&texel[4..7]);
+    match filter {
+        Filter::Visibility(_) => {
+            let write_bent = maps.selection.contains(super::super::BakeMap::BentNormal);
+            for ((value, texel), guide) in maps.values.iter_mut().zip(filtered).zip(guides) {
+                if guide.texel > 0.0 || texel[7] == 255 {
+                    value[..4].copy_from_slice(&texel[..4]);
+                    if write_bent {
+                        value[6..9].copy_from_slice(&texel[4..7]);
+                    }
+                }
+            }
+        }
+        Filter::Curvature(samples, _) => {
+            for (((value, texel), sample), guide) in
+                maps.values.iter_mut().zip(filtered).zip(samples).zip(guides)
+            {
+                let curvature = if guide.texel > 0. {
+                    f32::from_le_bytes(texel[..4].try_into().unwrap())
+                } else {
+                    sample.value
+                };
+                value[18] = sample.packed(curvature);
+            }
         }
     }
     progress.rows.store(DENOISE_END, Ordering::Relaxed);
