@@ -67,6 +67,8 @@ pub(super) use model_viewer::{ModelViewAction, ModelViewerPlugin};
 #[path = "navigation_gizmo.rs"]
 pub(super) mod navigation_gizmo;
 pub(super) use navigation_gizmo::NavigationGizmoPlugin;
+#[path = "environment_library.rs"]
+pub(super) mod environment_library;
 #[path = "hdri_library.rs"]
 mod hdri_library;
 #[path = "lighting_ui.rs"]
@@ -101,9 +103,9 @@ pub(super) use camera_preview::{rect as camera_preview_rect, update as update_ca
 pub(super) use confirmation::update as update_confirmation;
 pub(super) use control_hints::update as update_control_hints;
 pub(super) use drawer::{
-    AssetDrag, DrawerMotion, DrawerSize, actions as browser_actions, animate as animate_drawer,
-    drag_assets, drag_visuals, refresh as refresh_browser, resize_drawer, search as search_browser,
-    update_files as update_browser_files,
+    AssetDrag, DrawerMotion, DrawerSize, GridWindow, PreviewCard, actions as browser_actions,
+    animate as animate_drawer, drag_assets, drag_visuals, refresh as refresh_browser,
+    resize_drawer, search as search_browser, update_files as update_browser_files, update_grid,
 };
 pub(super) use icons::SvgIconsPlugin;
 pub(super) use image_viewer::edit::color_drop::{ColorDropPlugin, input as color_drop_input};
@@ -144,6 +146,7 @@ pub(super) const IMAGE_TOP: f32 = 52.0;
 pub(super) const SIDE: f32 = 316.0;
 pub(super) const DRAWER: f32 = 350.0;
 pub(super) const FOOT: f32 = 34.0;
+const OUTLINE_DISCLOSURE_WIDTH: f32 = 18.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
@@ -171,6 +174,7 @@ pub(super) struct HorizontalScroller;
 #[derive(Resource)]
 pub(super) struct Interface {
     font: Handle<Font>,
+    root: Entity,
     tabs: Entity,
     toolbar: Entity,
     tool_bar: Entity,
@@ -202,27 +206,74 @@ pub(super) struct Interface {
 
 #[derive(Default)]
 pub(super) struct OutlineState {
-    room: Option<Room>,
-    model: Option<usize>,
-    imported: usize,
-    models: Vec<u32>,
-    hidden: Vec<bool>,
-    objects: Vec<(Selection, String, bool)>,
-    lights: Vec<(u32, String, bool, crate::lighting::LightKind)>,
-    hierarchy: Vec<(
-        u32,
-        Option<String>,
-        String,
-        bool,
-        bool,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        bool,
-    )>,
-    hierarchy_selection: Option<Selection>,
-    inspector_multiple: bool,
-    hierarchy_parenting: Option<(Room, u32)>,
+    graph: std::sync::Weak<crate::hierarchy::SceneHierarchy>,
+    graph_signature: u64,
+    tree: Option<u64>,
+    inspector: Option<(Option<Selection>, bool)>,
+}
+
+impl OutlineState {
+    fn tree_signature(&mut self, editor: &Editor, room: Option<Room>, scan: u64) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hash = DefaultHasher::new();
+        (room, editor.viewing_model).hash(&mut hash);
+        let Some(room) = room else {
+            return hash.finish();
+        };
+        (editor.hierarchy_parenting, scan).hash(&mut hash);
+        if let Some(graph) = &editor.edits.hierarchy {
+            if self.graph.as_ptr() != std::sync::Arc::as_ptr(graph) {
+                let mut structure = DefaultHasher::new();
+                for n in &graph.nodes {
+                    (
+                        n.key,
+                        &n.entity.id,
+                        &n.entity.name,
+                        &n.entity.parent,
+                        &n.entity.model,
+                        &n.camera,
+                        &n.instance,
+                        n.entity.components.contains_key("light"),
+                        graph.overridden(n.key),
+                    )
+                        .hash(&mut structure);
+                }
+                self.graph_signature = structure.finish();
+                self.graph = std::sync::Arc::downgrade(graph);
+            }
+            self.graph_signature.hash(&mut hash);
+        }
+        for object in &editor.imported {
+            object.name.hash(&mut hash);
+        }
+        for model in &editor.edits.models {
+            (model.id, &model.asset).hash(&mut hash);
+        }
+        for light in &editor.edits.lights {
+            (
+                light.id,
+                &light.name,
+                light.enabled,
+                std::mem::discriminant(&light.kind),
+            )
+                .hash(&mut hash);
+        }
+        for camera in &editor.definition().cameras {
+            (&camera.id, &camera.label).hash(&mut hash);
+        }
+        editor.edits.model_names.hash(&mut hash);
+        editor.edits.node_names.hash(&mut hash);
+        editor.edits.deleted_nodes.hash(&mut hash);
+        for key in &editor.hierarchy_collapsed {
+            key.hash(&mut hash);
+        }
+        if let Some(hidden) = editor.hidden_objects.get(&room) {
+            for key in hidden {
+                key.hash(&mut hash);
+            }
+        }
+        hash.finish()
+    }
 }
 
 pub(super) fn viewport_rect(window: &Window, sidebar: &SidebarLayout) -> Rect {
@@ -637,6 +688,7 @@ pub(super) fn setup(
         14.0,
         TEXT,
     );
+    scene_tree_drag::mark(&mut commands, tree_toggle, None);
     horizon(&mut commands, header);
     let outliner = node(
         &mut commands,
@@ -654,6 +706,7 @@ pub(super) fn setup(
         sidebar_resize::SceneTree,
         AccessibleLabel("Список объектов сцены".into()),
     ));
+    scene_tree_drag::setup(&mut commands, root, &font);
     sidebar_resize::height_grip(&mut commands, side);
 
     let inspector_shell = surface(
@@ -766,6 +819,7 @@ pub(super) fn setup(
     confirmation::setup(&mut commands, root, &font);
     commands.insert_resource(Interface {
         font,
+        root,
         tabs,
         toolbar,
         tool_bar,
@@ -805,6 +859,7 @@ fn outline_entry(
     kind: Option<crate::lighting::LightKind>,
     enabled: bool,
     node_icon: icons::Glyph,
+    draggable: bool,
 ) -> Entity {
     let entry = button(
         commands,
@@ -837,6 +892,9 @@ fn outline_entry(
         TEXT
     };
     let icon = icons::spawn(commands, entry, glyph, 14.0, tint);
+    if draggable {
+        scene_tree_drag::mark(commands, entry, Some((selection, glyph)));
+    }
     commands
         .entity(icon)
         .entry::<Node>()
@@ -863,7 +921,7 @@ fn object_outline_entry(
         Node {
             width: percent(100),
             height: px(28),
-            padding: UiRect::left(px(18)),
+            padding: UiRect::left(px(OUTLINE_DISCLOSURE_WIDTH)),
             flex_shrink: 0.0,
             ..row(0.0)
         },
@@ -883,6 +941,12 @@ fn object_outline_entry(
         Selection::Light(id) => editor.light(id),
         _ => None,
     };
+    let draggable = editor.has_scene()
+        && editor.definition().is_native()
+        && matches!(
+            target,
+            Selection::Model(_) | Selection::Light(_) | Selection::Camera(_)
+        );
     let item = outline_entry(
         commands,
         name,
@@ -892,17 +956,9 @@ fn object_outline_entry(
         light.map(|light| light.kind),
         !hidden && light.is_none_or(|light| light.enabled),
         icons::Glyph::Folder,
+        draggable,
     );
     commands.entity(item).observe(scene_objects::pointer_menu);
-    if editor.has_scene()
-        && editor.definition().is_native()
-        && matches!(
-            target,
-            Selection::Model(_) | Selection::Light(_) | Selection::Camera(_)
-        )
-    {
-        scene_tree_drag::mark(commands, item, Some(target));
-    }
     let eye = control(
         commands,
         container,
@@ -1096,7 +1152,10 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
             editor.has_scene() && editor.ready && editor.can_toggle_visibility(target)
         }
         Action::LocalSpace | Action::Snap => editor.has_scene() && editor.ready,
-        Action::Lighting(_) | Action::LightMenu => editor.has_scene() && editor.ready,
+        Action::EnvironmentLibrary(action) => environment_library::available(editor, action),
+        Action::Lighting(_) | Action::SceneAddMenu | Action::LightMenu => {
+            editor.has_scene() && editor.ready
+        }
         Action::BrowseBack => browser.can_go_back(),
         Action::BrowseForward => browser.can_go_forward(),
         Action::BrowseUp => browser.current != 0,
@@ -1293,7 +1352,9 @@ fn activate_control<E: EntityEvent, const EXPLICIT: bool>(
         }
         if let Action::ModelView(ModelViewAction::Paint(action)) = control.action
             && !matches!(action, model_viewer::paint::PaintAction::Panel(_))
-            && let Some(panel) = paint_panes.0.iter_ancestors(entity)
+            && let Some(panel) = paint_panes
+                .0
+                .iter_ancestors(entity)
                 .find_map(|parent| paint_panes.1.get(parent).ok())
         {
             messages.write(Action::ModelView(ModelViewAction::Paint(
@@ -1412,9 +1473,9 @@ pub(super) fn shortcuts(
             &keys,
             model_edit.as_deref(),
             editor.viewing_model,
-            model_paint.as_deref().filter(|_| {
-                !mouse.any_pressed([MouseButton::Left, MouseButton::Middle])
-            }),
+            model_paint
+                .as_deref()
+                .filter(|_| !mouse.any_pressed([MouseButton::Left, MouseButton::Middle])),
             &mut actions,
         ) {
             return;
@@ -1692,6 +1753,8 @@ pub(super) fn scroll(
             Has<HorizontalScroller>,
             Has<image_viewer::edit::ColorPickerScroll>,
             Has<image_viewer::edit::layers::ui::LayerScroll>,
+            Has<environment_library::Options>,
+            Option<&bevy::ui::CalculatedClip>,
         ),
         With<Scroller>,
     >,
@@ -1731,24 +1794,34 @@ pub(super) fn scroll(
     } else {
         areas
             .iter()
-            .filter(|(computed, transform, _, _, _, _, layer)| {
-                *layer
+            .filter(|(computed, transform, _, _, _, _, layer, options, clip)| {
+                (*layer || *options)
+                    && clip.is_none_or(|clip| clip.contains_point(cursor))
                     && computed.size().min_element() > 0.0
                     && !(cursor - transform.affine().translation)
                         .abs()
                         .cmpgt(computed.size() * 0.5)
                         .any()
             })
-            .map(|(computed, _, _, _, _, _, _)| computed.size().x * computed.size().y)
+            .map(|(computed, _, _, _, _, _, _, _, _)| computed.size().x * computed.size().y)
             .min_by(f32::total_cmp)
     };
-    for (computed, transform, mut offset, drawer_scroll, horizontal, picker_scroll, layer_scroll) in
-        &mut areas
+    for (
+        computed,
+        transform,
+        mut offset,
+        drawer_scroll,
+        horizontal,
+        picker_scroll,
+        layer_scroll,
+        options,
+        clip,
+    ) in &mut areas
     {
         if !color_picker
-            && (layer_area
-                .is_some_and(|area| !layer_scroll || computed.size().x * computed.size().y != area)
-                || layer_popup && !layer_scroll)
+            && (layer_area.is_some_and(|area| {
+                !(layer_scroll || options) || computed.size().x * computed.size().y != area
+            }) || layer_popup && !layer_scroll)
         {
             continue;
         }
@@ -1757,6 +1830,7 @@ pub(super) fn scroll(
         }
         let center = transform.affine().translation;
         if computed.size().min_element() <= 0.0
+            || clip.is_some_and(|clip| !clip.contains_point(cursor))
             || (cursor - center).abs().cmpgt(computed.size() * 0.5).any()
         {
             continue;
@@ -1797,7 +1871,7 @@ pub(super) fn refresh(
     (focus, focus_visible): (Res<InputFocus>, Res<bevy::input_focus::InputFocusVisible>),
     (browser_ui, browser_context): (Res<drawer::BrowserUi>, Res<BrowserContext>),
     numeric: Res<NumericInput>,
-    lighting: Res<LightingUi>,
+    (lighting, environments): (Res<LightingUi>, Res<environment_library::Library>),
     (mut outline, mut tabs, mut inspector_selection): (
         Local<OutlineState>,
         Local<scene_tabs::Tabs>,
@@ -1874,79 +1948,10 @@ pub(super) fn refresh(
         }
         *inspector_selection = Some(selected_document);
     }
-    let models: Vec<_> = editor.edits.models.iter().map(|model| model.id).collect();
-    let objects: Vec<_> = (0..editor.imported.len())
-        .map(Selection::Imported)
-        .chain(models.iter().copied().map(Selection::Model))
-        .map(|target| (target, editor.label(target), editor.object_deleted(target)))
-        .collect();
-    let hidden: Vec<_> = (0..editor.imported.len())
-        .map(Selection::Imported)
-        .chain(models.iter().copied().map(Selection::Model))
-        .chain(
-            editor
-                .edits
-                .lights
-                .iter()
-                .map(|light| Selection::Light(light.id)),
-        )
-        .chain(viewport::shots(&editor).map(Selection::Camera))
-        .map(|target| editor.object_hidden(target))
-        .collect();
-    let lights: Vec<_> = editor
-        .edits
-        .lights
-        .iter()
-        .map(|light| (light.id, light.name.clone(), light.enabled, light.kind))
-        .collect();
-    let hierarchy = editor
-        .edits
-        .hierarchy
-        .as_ref()
-        .map(|h| {
-            h.nodes
-                .iter()
-                .map(|n| {
-                    (
-                        n.key,
-                        n.entity.parent.clone(),
-                        editor.label(editor.hierarchy_selection(n.key)),
-                        editor.hierarchy_collapsed.contains(&(editor.room, n.key)),
-                        h.overridden(n.key),
-                        n.entity.model.clone(),
-                        n.camera.clone(),
-                        n.instance.clone(),
-                        editor.object_hidden(editor.hierarchy_selection(n.key)),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if outline.room != room
-        || outline.model != editor.viewing_model
-        || outline.imported != editor.imported.len()
-        || outline.models != models
-        || outline.hidden != hidden
-        || outline.objects != objects
-        || outline.lights != lights
-        || outline.hierarchy != hierarchy
-        || outline.hierarchy_selection != editor.selection
-        || outline.inspector_multiple != editor.multiple_selected()
-        || outline.hierarchy_parenting != editor.hierarchy_parenting
-    {
-        *outline = OutlineState {
-            room,
-            model: editor.viewing_model,
-            imported: editor.imported.len(),
-            models,
-            hidden,
-            objects,
-            lights,
-            hierarchy,
-            hierarchy_selection: editor.selection,
-            inspector_multiple: editor.multiple_selected(),
-            hierarchy_parenting: editor.hierarchy_parenting,
-        };
+    let signature = outline.tree_signature(&editor, room, browser.scan_revision);
+    let tree_changed = outline.tree != Some(signature);
+    if tree_changed {
+        outline.tree = Some(signature);
         commands
             .entity(interface.outliner)
             .despawn_related::<Children>();
@@ -1970,6 +1975,10 @@ pub(super) fn refresh(
         } else {
             heading(&mut commands, "НЕТ ОТКРЫТОЙ СЦЕНЫ");
         }
+    }
+    let inspector = (editor.selection, editor.multiple_selected());
+    if tree_changed || outline.inspector != Some(inspector) {
+        outline.inspector = Some(inspector);
         scene_hierarchy_ui::inspector(
             &mut commands,
             &interface.hierarchy_info,
@@ -1997,7 +2006,10 @@ pub(super) fn refresh(
             } else {
                 "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
             }
-        } else if let Some(model) = editor.viewing_model.and_then(|i| editor.project.catalog.get(i)) {
+        } else if let Some(model) = editor
+            .viewing_model
+            .and_then(|i| editor.project.catalog.get(i))
+        {
             use crate::data::ModelFormat;
             match ModelFormat::from_path(&model.asset) {
                 Some(ModelFormat::Fbx) => "Просмотр FBX · ПКМ + WASD — полёт · Alt+ЛКМ — орбита",
@@ -2119,7 +2131,7 @@ pub(super) fn refresh(
             Selection::Imported(_) => "Импортированный объект",
             Selection::Model(_) => "3D-модель",
             Selection::Light(_) => "Источник света",
-            Selection::Environment => "Окружение сцены",
+            Selection::Environment => "",
         };
         let kind = if selected.len() > 1 {
             "Общие координаты · тире при различиях"
@@ -2307,6 +2319,7 @@ pub(super) fn refresh(
                 model_edit.is_some_and(|state| state.available(action, editor.viewing_model))
             })
             && match control.action {
+                Action::EnvironmentLibrary(action) => environments.enabled(&editor, action),
                 Action::ImageEdit(action) => image_viewer
                     .as_ref()
                     .is_some_and(|viewer| viewer.edit.available(action, editor.viewing_image)),

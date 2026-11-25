@@ -13,11 +13,10 @@ pub(in crate::editor) enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::editor) enum ShadingAction {
     Set(Mode),
-    PreviewLighting,
 }
 
 #[derive(Resource, Default)]
-pub(super) struct Shading {
+pub(in crate::editor) struct Shading {
     pub mode: Mode,
     pub preview_lighting: bool,
 }
@@ -34,7 +33,6 @@ impl Shading {
     pub fn apply(&mut self, action: ShadingAction) {
         match action {
             ShadingAction::Set(mode) => self.mode = mode,
-            ShadingAction::PreviewLighting => self.preview_lighting = !self.preview_lighting,
         }
     }
 }

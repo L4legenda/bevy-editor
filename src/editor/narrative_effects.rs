@@ -361,6 +361,7 @@ mod tests {
     fn answer_renumbering_preserves_surviving_wire_identity() {
         let mut d = Dialogue::new("Тест".into());
         let from = d.add(NodeKind::Line, 0);
+        d.node_mut(from).unwrap().add_answer();
         let target = d.add(NodeKind::Line, from);
         d.node_mut(from).unwrap().choices.push(Choice {
             text: "Второй".into(),

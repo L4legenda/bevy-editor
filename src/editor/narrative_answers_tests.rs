@@ -93,6 +93,8 @@ fn gpu_narrative_answer_transitions() {
     action(&mut app, NarrativeAction::Add(NodeKind::Line));
     action(&mut app, NarrativeAction::Add(NodeKind::Line));
     action(&mut app, NarrativeAction::Select(1));
+    let _ = control_point(&mut app, "Связать выход ноды #1");
+    action(&mut app, NarrativeAction::AddChoice);
     {
         let mut editor = app.world_mut().resource_mut::<Editor>();
         let doc = editor.narrative.current_mut().unwrap();
@@ -200,10 +202,24 @@ fn gpu_narrative_answer_transitions() {
     assert_eq!(choices(&app).len(), 2);
     action(&mut app, NarrativeAction::RemoveChoice(1));
     action(&mut app, NarrativeAction::RemoveChoice(0));
-    assert!(choices(&app).is_empty());
+    let continuation = choices(&app);
+    assert_eq!(continuation.len(), 1);
+    assert!(continuation[0].text.is_empty());
+    assert_eq!(continuation[0].target, Some(2));
+    let outlet = control_point(&mut app, "Связать выход ноды #1");
+    let add = control_point(&mut app, "+ Вариант ответа");
+    assert!((outlet.y - add.y).abs() < 1.1);
+    let world = app.world_mut();
+    let mut fields = world.query::<(&DraftField, &nodes::Owner)>();
+    assert!(
+        !fields
+            .iter(world)
+            .any(|(field, owner)| owner.0 == 1 && matches!(field, DraftField::Choice(_)))
+    );
     action(&mut app, NarrativeAction::AddChoice);
     warm(&mut app, 25);
     assert_eq!(choices(&app).len(), 1);
+    assert_eq!(choices(&app)[0].target, Some(2));
     socket_aligned(&mut app, 0);
     action(&mut app, NarrativeAction::Create(false));
     assert!(!app.world().resource::<effects::State>().answers.active());

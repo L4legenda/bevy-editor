@@ -580,6 +580,44 @@ pub(super) fn composite(doc: &Document) -> Rgba8Image {
     composite_region(doc, Rect::from_size(doc.size))
 }
 
+pub(super) fn render_preview(
+    document: &Document,
+    view: Option<photocraft_engine::commands::mask_view_cmds::LayerMaskView>,
+    rect: Rect,
+) -> Rgba8Image {
+    use photocraft_engine::commands::mask_view_cmds::{MaskViewMode, viewed_mask};
+    let rect = rect.intersect(&Rect::from_size(document.size));
+    let Some(view) = view else {
+        return composite_region(document, rect);
+    };
+    let Some(mask) = document
+        .layer(view.layer)
+        .and_then(|l| viewed_mask(l, view.filter))
+    else {
+        return composite_region(document, rect);
+    };
+    let mut image = if view.mode == MaskViewMode::Gray {
+        Rgba8Image::new(rect.width(), rect.height())
+    } else {
+        composite_region(document, rect)
+    };
+    for (index, pixel) in image.pixels.chunks_exact_mut(4).enumerate() {
+        let x = rect.x0 + (index % rect.width() as usize) as i32;
+        let y = rect.y0 + (index / rect.width() as usize) as i32;
+        let value = mask.surface.sample_channel(x, y, 0).clamp(0.0, 1.0);
+        if view.mode == MaskViewMode::Gray {
+            let gray = (value * 255.0).round() as u8;
+            pixel.copy_from_slice(&[gray, gray, gray, 255]);
+        } else {
+            let alpha = (1.0 - value) * 0.5;
+            pixel[0] = (pixel[0] as f32 * (1.0 - alpha) + 255.0 * alpha).round() as u8;
+            pixel[1] = (pixel[1] as f32 * (1.0 - alpha)).round() as u8;
+            pixel[2] = (pixel[2] as f32 * (1.0 - alpha)).round() as u8;
+        }
+    }
+    image
+}
+
 pub(super) fn composite_region(doc: &Document, rect: Rect) -> Rgba8Image {
     let rect = rect.intersect(&Rect::from_size(doc.size));
     if rect.is_empty() {

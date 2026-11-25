@@ -394,7 +394,6 @@ pub(super) fn update(
     mut state: ResMut<State>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut thumbnails: ResMut<crate::editor::thumbnails::Thumbnails>,
-    mut images: ResMut<Assets<Image>>,
 ) {
     if editor.generation.active && !state.checked && state.probe.is_none() {
         let mut roots = vec![editor.root.clone()];
@@ -575,7 +574,7 @@ pub(super) fn update(
         match result {
             Ok(path) => {
                 browser.refresh(&mut editor.project);
-                thumbnails.extend(&mut images, editor.project.catalog.len());
+                thumbnails.extend(editor.project.catalog.len());
                 let asset = path.to_string_lossy().replace('\\', "/");
                 if let Some(index) = editor
                     .project

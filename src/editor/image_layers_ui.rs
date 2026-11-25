@@ -752,7 +752,9 @@ pub(in crate::editor) fn refresh(
         }
         ui.signature = signature;
     }
+    let opacity_drag = viewer.edit.dragging_layer_opacity(editor.viewing_image);
     if !rebuild
+        && !opacity_drag
         && thumbnail_revision != ui.thumbnail_revision
         && editing
         && let Some(doc) = doc
@@ -771,7 +773,9 @@ pub(in crate::editor) fn refresh(
             }
         }
     }
-    ui.thumbnail_revision = thumbnail_revision;
+    if !opacity_drag {
+        ui.thumbnail_revision = thumbnail_revision;
+    }
     let popup_signature = format!(
         "{}:{}:{}:{:?}",
         editing, state.ui_revision, state.menu, viewer.edit.error

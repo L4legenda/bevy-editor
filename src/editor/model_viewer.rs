@@ -22,7 +22,7 @@ mod space_mouse;
 #[path = "model_paint.rs"]
 pub(in crate::editor) mod paint;
 #[path = "model_shading.rs"]
-mod shading;
+pub(in crate::editor) mod shading;
 
 #[path = "model_edit.rs"]
 pub(in crate::editor) mod editing;

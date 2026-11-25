@@ -91,8 +91,11 @@ fn fixture(files: &Files) -> (App, usize) {
         .unwrap();
     let mut editor = Editor::new(project, crate::LevelEdits::default());
     editor.drawer = true;
+    let window =
+        crate::editor::ui::GridWindow::for_entries(browser.entries(&editor.project.catalog));
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
+        .insert_resource(window)
         .insert_resource(editor)
         .insert_resource(browser)
         .init_resource::<Assets<Image>>()

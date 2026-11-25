@@ -35,8 +35,11 @@ game = [
     "bevy/x11",
 ]
 editor = [
+    "dep:tempfile",
     "dep:notify",
     "dep:hidapi",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
     "dep:subcraft-spp",
     "dep:material-painter-graph",
     "dep:blake3",
@@ -85,6 +88,10 @@ required-features = ["mcp"]
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_Pointer", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2.2", optional = true, features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.2.2", optional = true, features = ["NSData", "NSThread"] }
+
 [dependencies]
 hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native", "linux-native-basic-udev", "macos-shared-device"] }
 subcraft-spp = { path = "vendor/subcraft-spp", optional = true }
@@ -119,6 +126,7 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 uuid = { version = "1", optional = true, features = ["v4"] }
 base64 = { version = "0.22", optional = true }
 spade = "2.15.1"
+tempfile = { version = "3", optional = true }
 notify = { version = "8.2", default-features = false, features = ["macos_fsevent"], optional = true }
 
 [build-dependencies]

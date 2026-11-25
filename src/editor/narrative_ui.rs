@@ -596,11 +596,15 @@ fn edit_fields(
     mut editor: ResMut<Editor>,
     mut ui: ResMut<NarrativeUi>,
     focus: Res<InputFocus>,
-    fields: Query<
-        (Entity, &DraftField, &EditableText, Option<&nodes::Owner>),
-        Changed<EditableText>,
-    >,
+    keys: Res<ButtonInput<KeyCode>>,
+    fields: Query<(
+        Entity,
+        &DraftField,
+        Ref<EditableText>,
+        Option<&nodes::Owner>,
+    )>,
     owners: Query<&nodes::Owner>,
+    mut empty_answer: Local<Option<Entity>>,
 ) {
     if editor.narrative.active.is_none() || editor.pending.is_some() {
         return;
@@ -613,7 +617,20 @@ fn edit_fields(
             doc.selected = owner.0;
         }
     }
+    let finishing_edit = keys.any_just_pressed([KeyCode::Enter, KeyCode::NumpadEnter])
+        || (keys.any_just_pressed([KeyCode::KeyS, KeyCode::KeyW])
+            && keys.any_pressed([
+                KeyCode::ControlLeft,
+                KeyCode::ControlRight,
+                KeyCode::SuperLeft,
+                KeyCode::SuperRight,
+            ]));
+    let finishing_empty =
+        empty_answer.take_if(|entity| finishing_edit || focus.get() != Some(*entity));
     for (entity, kind, text, owner) in &fields {
+        if !text.is_changed() && finishing_empty != Some(entity) {
+            continue;
+        }
         let value = text.value().to_string();
         if let DraftField::Condition(field) = *kind {
             if focus.get() == Some(entity) {
@@ -645,11 +662,23 @@ fn edit_fields(
                 }
             }
             (Content::Dialogue(d), DraftField::Choice(i)) => {
-                if let Some(c) = d
-                    .node_mut(owner.map_or(doc.selected, |o| o.0))
-                    .and_then(|n| n.choices.get_mut(*i))
+                if let Some(n) = d.node_mut(owner.map_or(doc.selected, |o| o.0))
+                    && let Some(choice) = n.answers().get(*i)
                 {
-                    c.text = value;
+                    let becomes_direct = n.kind == NodeKind::Line
+                        && n.choices.len() == 1
+                        && choice.condition.is_empty()
+                        && value.is_empty();
+                    if becomes_direct && !finishing_edit && focus.get() == Some(entity) {
+                        // A cleared input must stay editable while the user replaces its text.
+                        *empty_answer = Some(entity);
+                        continue;
+                    }
+                    empty_answer.take_if(|pending| *pending == entity);
+                    n.choices[*i].text = value;
+                    if becomes_direct {
+                        ui.generation += 1;
+                    }
                 }
             }
             (Content::Character(c), DraftField::Title) => c.name = value,
@@ -1188,21 +1217,7 @@ fn actions(
                         if let Content::Dialogue(d) = &mut doc.content {
                             let source = ui.linking.take();
                             let from = source.map_or(doc.selected, |(from, _)| from);
-                            let targets = source
-                                .and_then(|(from, _)| d.node(from))
-                                .map(|n| n.choices.iter().map(|c| c.target).collect::<Vec<_>>());
-                            let id = d.add(kind, from);
-                            if let Some((from, choice)) = source {
-                                if let Some(n) = d.node_mut(from) {
-                                    // d.add connects the first free output. An explicit output takes priority.
-                                    for (c, target) in
-                                        n.choices.iter_mut().zip(targets.into_iter().flatten())
-                                    {
-                                        c.target = target;
-                                    }
-                                    n.set_output(choice, Some(id));
-                                }
-                            }
+                            let id = d.add_from(kind, from, source.map(|(_, output)| output));
                             nodes::place(d, id, from);
                             doc.selected = id;
                         }
@@ -1238,39 +1253,37 @@ fn actions(
                     NarrativeAction::AddChoice
                     | NarrativeAction::RemoveChoice(_)
                     | NarrativeAction::Disconnect(_) => {
-                        if matches!(
-                            action,
-                            NarrativeAction::RemoveChoice(_) | NarrativeAction::Disconnect(_)
-                        ) {
-                            ui.linking = None;
+                        let Content::Dialogue(d) = &doc.content else {
+                            continue;
+                        };
+                        let Some(n) = d.node(doc.selected) else {
+                            continue;
+                        };
+                        if !match action {
+                            NarrativeAction::AddChoice => n.kind == NodeKind::Line,
+                            NarrativeAction::RemoveChoice(i) => i < n.answers().len(),
+                            NarrativeAction::Disconnect(i) => n.output_connected(i),
+                            _ => false,
+                        } {
+                            continue;
                         }
-                        if let NarrativeAction::Disconnect(i) = action {
-                            if !matches!(&doc.content, Content::Dialogue(d) if d.node(doc.selected).is_some_and(|n| n.output_connected(i)))
-                            {
-                                continue;
-                            }
-                        }
+                        ui.linking = None;
                         doc.checkpoint();
                         if let Content::Dialogue(d) = &mut doc.content {
                             if let Some(n) = d.node_mut(doc.selected) {
                                 match action {
-                                    NarrativeAction::AddChoice if n.kind == NodeKind::Line => {
-                                        n.choices.push(Choice {
-                                            text: format!("Ответ {}", n.choices.len() + 1),
-                                            target: None,
-                                            condition: Default::default(),
-                                            dialogue: None,
-                                        });
+                                    NarrativeAction::AddChoice => {
+                                        n.add_answer();
                                         effects.answers.add(doc.id, n, time.elapsed_secs_f64());
                                     }
-                                    NarrativeAction::RemoveChoice(i) if i < n.choices.len() => {
+                                    NarrativeAction::RemoveChoice(i) => {
                                         effects.answers.remove(
                                             doc.id,
                                             n,
                                             i,
                                             time.elapsed_secs_f64(),
                                         );
-                                        n.choices.remove(i);
+                                        n.remove_answer(i);
                                     }
                                     NarrativeAction::Disconnect(i) => {
                                         n.set_output(i, None);
@@ -1428,7 +1441,7 @@ fn play(editor: &Editor, doc: &Document, ui: &mut NarrativeUi, action: Narrative
         let automatic = node.kind == NodeKind::Line
             && node.speaker.is_none()
             && node.text.is_empty()
-            && matches!(node.choices.as_slice(), [choice] if choice.text.is_empty() && choice.condition.is_empty());
+            && node.has_direct_output();
         if !hidden && !automatic && !matches!(node.kind, NodeKind::Start | NodeKind::Jump) {
             break;
         }
@@ -1991,6 +2004,17 @@ fn modal(
             );
         }
         let mut visible = 0;
+        let direct = n.has_direct_output();
+        if direct && n.choices.is_empty() {
+            wrapped(
+                commands,
+                parent,
+                handle,
+                "Подключите выход к следующей ноде",
+                12.0,
+                AMBER,
+            );
+        }
         for (i, c) in n.choices.iter().enumerate() {
             if !c.condition.allows(&ui.preview_values) {
                 continue;
@@ -2023,15 +2047,26 @@ fn modal(
                         ..row(10.0)
                     },
                 );
-                commands.entity(b).insert(AccessibleLabel(c.text.clone()));
-                text(commands, b, handle, format!("{:02}", i + 1), 11.0, FOCUS);
-                wrapped(commands, b, handle, &c.text, 14.0, TEXT);
+                let label = if direct {
+                    "Продолжить"
+                } else {
+                    &c.text
+                };
+                commands.entity(b).insert(AccessibleLabel(label.into()));
+                if !direct {
+                    text(commands, b, handle, format!("{:02}", i + 1), 11.0, FOCUS);
+                }
+                wrapped(commands, b, handle, label, 14.0, TEXT);
             } else {
                 wrapped(
                     commands,
                     parent,
                     handle,
-                    format!("{} · переход не задан", c.text),
+                    if direct {
+                        "Подключите выход к следующей ноде".into()
+                    } else {
+                        format!("{} · переход не задан", c.text)
+                    },
                     12.0,
                     AMBER,
                 );

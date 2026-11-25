@@ -228,6 +228,7 @@ pub(super) fn texture_image(decoded: DecodedImage) -> Image {
 pub(super) fn update(
     editor: Res<Editor>,
     browser: Res<Browser>,
+    window: Res<super::ui::GridWindow>,
     mut previews: ResMut<ImagePreviews>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -240,10 +241,11 @@ pub(super) fn update(
         // finish before starting another job, then reject its obsolete index.
     }
 
-    if previews.browser_revision != Some(browser.revision) {
-        previews.visible_files = browser
-            .entries(&editor.project.catalog)
-            .into_iter()
+    if previews.browser_revision != Some(window.revision) {
+        previews.visible_files = window
+            .visible()
+            .iter()
+            .copied()
             .filter_map(|entry| match entry {
                 Entry::Image(file) => Some(file),
                 Entry::File(file)
@@ -259,7 +261,7 @@ pub(super) fn update(
         let visible = previews.visible_files.clone();
         previews.completed.retain(|file, _| visible.contains(file));
         previews.sources.retain(|file, _| visible.contains(file));
-        previews.browser_revision = Some(browser.revision);
+        previews.browser_revision = Some(window.revision);
     }
 
     // Open character documents include unsaved portrait changes and undo.

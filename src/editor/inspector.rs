@@ -6,12 +6,14 @@ use bevy::ui_widgets::SelectAllOnFocus;
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum InspectorAction {
     Fold(Entity),
+    ToggleSearch,
     ClearSearch,
 }
 
 #[derive(Resource)]
 pub(in crate::editor) struct Panel {
     bar: Entity,
+    search_toggle: Entity,
     search: Entity,
     clear: Entity,
     placeholder: Entity,
@@ -68,11 +70,21 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font_handle: &Handl
     let name = text(commands, titles, font_handle, "Выберите объект", 15.0, TEXT);
     let kind = text(commands, titles, font_handle, "", 11.0, MUTED);
 
+    let search_toggle = node(commands, identity, row(0.0));
+    icon_button(
+        commands,
+        search_toggle,
+        Glyph::Search,
+        "Найти свойство",
+        Action::Inspector(InspectorAction::ToggleSearch),
+    );
+
     let bar = surface(
         commands,
         top,
         Node {
             height: px(28),
+            display: Display::None,
             min_width: px(0),
             padding: UiRect::horizontal(px(7)),
             border: UiRect::all(px(1)),
@@ -156,6 +168,7 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font_handle: &Handl
     });
     commands.insert_resource(Panel {
         bar,
+        search_toggle,
         search,
         clear,
         placeholder,
@@ -407,12 +420,15 @@ pub(in crate::editor) fn refresh(
     mut previous_model: Local<bool>,
     mut previous_icon: Local<Option<Glyph>>,
     mut was_search_focused: Local<bool>,
+    mut search_open: Local<bool>,
 ) {
     let model = editor.viewing_model.is_some();
     let active_scene =
         editor.has_scene() && !editor.asset_viewer_open() && editor.selection.is_some();
     let search_available =
         model && editor.viewing_image.is_none() && !editor.hdri_library_open || active_scene;
+    let environment = active_scene && editor.selection == Some(Selection::Environment);
+    let can_search = search_available && !environment;
     let glyph = if model {
         Glyph::Box
     } else {
@@ -433,7 +449,11 @@ pub(in crate::editor) fn refresh(
         return;
     };
     let mut changed_fold = false;
-    let mut clear = *previous_model != model;
+    let mut clear =
+        *previous_model != model || environment && !input.value().to_string().is_empty();
+    if !can_search || *previous_model != model {
+        *search_open = false;
+    }
     for action in actions.read() {
         match *action {
             Action::Inspector(InspectorAction::Fold(entity))
@@ -449,13 +469,27 @@ pub(in crate::editor) fn refresh(
                 }
             }
             Action::Inspector(InspectorAction::ClearSearch) => clear = true,
+            Action::Inspector(InspectorAction::ToggleSearch)
+                if can_search && editor.pending.is_none() =>
+            {
+                *search_open = !*search_open;
+                if *search_open {
+                    focus.set(panel.search, bevy::input_focus::FocusCause::Auto);
+                } else {
+                    clear = true;
+                }
+            }
             _ => {}
         }
     }
     *previous_model = model;
     let search_focused = focus.get() == Some(panel.search);
     let escape = (search_focused || *was_search_focused) && keys.just_pressed(KeyCode::Escape);
-    if search_focused && (!search_available || editor.pending.is_some() || escape) {
+    if escape {
+        *search_open = false;
+    }
+    let search_visible = can_search && *search_open;
+    if search_focused && (!search_visible || editor.pending.is_some()) {
         focus.clear();
     }
     *was_search_focused = focus.get() == Some(panel.search);
@@ -465,7 +499,8 @@ pub(in crate::editor) fn refresh(
     }
     let value = input.value().to_string();
     let query = normalize(value.trim());
-    show(&mut nodes, panel.bar, search_available);
+    show(&mut nodes, panel.search_toggle, can_search);
+    show(&mut nodes, panel.bar, search_visible);
     show(&mut nodes, panel.placeholder, value.is_empty());
     show(&mut nodes, panel.clear, !value.is_empty());
     if let Ok(mut border) = borders.get_mut(panel.bar) {

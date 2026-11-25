@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -86,7 +85,8 @@ pub(super) struct Thumbnails {
     changed: Vec<Instant>,
     scan_revision: Option<u64>,
     browser_revision: Option<u64>,
-    visible: Arc<[Entry]>,
+    placeholder: Handle<Image>,
+    recent: std::collections::VecDeque<Target>,
     pending_snapshots: HashMap<usize, scene::SnapshotRead>,
     warmup: Option<Target>,
     warmed_up: bool,
@@ -136,16 +136,18 @@ impl Job {
 
 impl Thumbnails {
     pub(super) fn new(images: &mut Assets<Image>, models: usize, scenes: usize) -> Self {
-        let mut previews = Self {
-            images: Vec::with_capacity(models),
-            scene_images: Vec::with_capacity(scenes),
+        let placeholder = images.add(Image::transparent());
+        Self {
+            images: vec![placeholder.clone(); models],
+            scene_images: vec![placeholder.clone(); scenes],
             completed: HashSet::new(),
             failed: HashSet::new(),
             snapshots: vec![None; scenes],
             changed: vec![Instant::now(); scenes],
             scan_revision: None,
             browser_revision: None,
-            visible: Arc::from([]),
+            placeholder,
+            recent: Default::default(),
             pending_snapshots: HashMap::new(),
             warmup: None,
             warmed_up: false,
@@ -155,16 +157,41 @@ impl Thumbnails {
             changed_assets: HashSet::new(),
             asset_versions: HashMap::new(),
             job: None,
-        };
-        previews.extend(images, models);
-        previews
-            .scene_images
-            .resize_with(scenes, || target_texture(images));
-        previews
+        }
     }
 
-    pub(super) fn extend(&mut self, images: &mut Assets<Image>, count: usize) {
-        self.images.resize_with(count, || target_texture(images));
+    pub(super) fn extend(&mut self, count: usize) {
+        self.images.resize(count, self.placeholder.clone());
+    }
+
+    fn allocate(&mut self, target: Target, visible: &[Entry], images: &mut Assets<Image>) {
+        const CAPACITY: usize = 64;
+        if self.image(target) == self.placeholder {
+            let texture = target_texture(images);
+            match target {
+                Target::Model(i) => self.images[i] = texture,
+                Target::Scene(i) => self.scene_images[i] = texture,
+            }
+        }
+        self.recent.retain(|&t| t != target);
+        self.recent.push_back(target);
+        while self.recent.len() > CAPACITY {
+            let Some(index) = self.recent.iter().position(|&t| {
+                t != target && !visible.iter().any(|&e| Target::from_entry(e) == Some(t))
+            }) else {
+                break;
+            };
+            let evicted = self.recent.remove(index).unwrap();
+            match evicted {
+                Target::Model(i) => self.images[i] = self.placeholder.clone(),
+                Target::Scene(i) => {
+                    self.scene_images[i] = self.placeholder.clone();
+                    self.snapshots[i] = None;
+                }
+            }
+            self.completed.remove(&evicted);
+            self.failed.remove(&evicted);
+        }
     }
 
     pub(super) fn invalidate_asset(&mut self, path: &str) {
@@ -436,6 +463,8 @@ pub(super) fn update(
     mut commands: Commands,
     editor: Res<Editor>,
     browser: Res<Browser>,
+    window: Res<super::ui::GridWindow>,
+    mut cards: Query<(&super::ui::PreviewCard, &mut ImageNode)>,
     mut previews: ResMut<Thumbnails>,
     assets: Res<AssetServer>,
     gltfs: Res<Assets<Gltf>>,
@@ -456,9 +485,8 @@ pub(super) fn update(
     };
     previews.refresh_models(&editor, &model_environment, &mut commands);
     let scene_count = editor.project.scenes.len();
-    previews
-        .scene_images
-        .resize_with(scene_count, || target_texture(&mut images));
+    let placeholder = previews.placeholder.clone();
+    previews.scene_images.resize(scene_count, placeholder);
     previews.snapshots.resize_with(scene_count, || None);
     previews.changed.resize_with(scene_count, Instant::now);
     if previews.scan_revision != Some(browser.scan_revision) {
@@ -494,6 +522,10 @@ pub(super) fn update(
             }
         }
         previews.cancel(&mut commands);
+        let placeholder = previews.placeholder.clone();
+        previews.images.fill(placeholder.clone());
+        previews.scene_images.fill(placeholder);
+        previews.recent.clear();
         previews.completed.clear();
         previews.failed.clear();
         previews.snapshots.fill(None);
@@ -501,13 +533,33 @@ pub(super) fn update(
         previews.browser_revision = None;
         previews.scan_revision = Some(browser.scan_revision);
     }
-    let changed_folder = editor.drawer && previews.browser_revision != Some(browser.revision);
+    let changed_folder = previews.browser_revision != Some(window.revision);
+    let visible = if editor.drawer { window.visible() } else { &[] };
     if changed_folder {
-        previews.visible = browser.entries(&editor.project.catalog).into();
-        previews.browser_revision = Some(browser.revision);
+        previews.browser_revision = Some(window.revision);
+        // Protect recently viewed thumbnails even when they were already cached.
+        for entry in visible {
+            if let Some(target) = Target::from_entry(*entry)
+                && let Some(i) = previews.recent.iter().position(|&t| t == target)
+            {
+                previews.recent.remove(i);
+                previews.recent.push_back(target);
+            }
+        }
     }
-    let entries = Arc::clone(&previews.visible);
-    let visible = if editor.drawer { entries.as_ref() } else { &[] };
+    for (card, mut image) in &mut cards {
+        if let Some(target) = Target::from_entry(card.0) {
+            let handle = match target {
+                Target::Model(i) => previews.images.get(i),
+                Target::Scene(i) => previews.scene_images.get(i),
+            };
+            if let Some(handle) = handle
+                && image.image != *handle
+            {
+                image.image = handle.clone();
+            }
+        }
+    }
     // Warm the same calibrated environment used by the active scene.
     let start_warmup = !previews.warmed_up && previews.warmup.is_none() && editor.has_scene();
     if start_warmup {
@@ -537,6 +589,7 @@ pub(super) fn update(
                 .filter(|target| !previews.completed.contains(target) && ready(*target))
         });
         if let Some(target) = next {
+            previews.allocate(target, visible, &mut images);
             let path = match target {
                 Target::Model(index) => &editor.project.catalog[index].asset,
                 Target::Scene(room) => &editor.project.scenes[room].asset,

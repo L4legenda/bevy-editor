@@ -58,7 +58,7 @@ pub(super) struct DialogueNode {
     pub otherwise: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct Choice {
     pub text: String,
     #[serde(default, skip_serializing_if = "Condition::is_empty")]
@@ -69,6 +69,46 @@ pub(super) struct Choice {
 }
 
 impl DialogueNode {
+    pub fn has_direct_output(&self) -> bool {
+        self.kind == NodeKind::Line
+            && match self.choices.as_slice() {
+                [] => true,
+                // .dialog stores a connected continuation as a lone unlabeled choice.
+                [choice] => choice.text.is_empty() && choice.condition.is_empty(),
+                _ => false,
+            }
+    }
+
+    pub fn answers(&self) -> &[Choice] {
+        if self.has_direct_output() {
+            &[]
+        } else {
+            &self.choices
+        }
+    }
+
+    pub fn add_answer(&mut self) {
+        let text = format!("Ответ {}", self.answers().len() + 1);
+        if self.has_direct_output()
+            && let Some(output) = self.choices.first_mut()
+        {
+            output.text = text;
+        } else {
+            self.choices.push(Choice { text, ..default() });
+        }
+    }
+
+    pub fn remove_answer(&mut self, index: usize) {
+        let answer = self.choices.remove(index);
+        if self.choices.is_empty() && answer.condition.is_empty() && answer.connected() {
+            self.choices.push(Choice {
+                target: answer.target,
+                dialogue: answer.dialogue,
+                ..default()
+            });
+        }
+    }
+
     pub fn has_otherwise(&self) -> bool {
         self.kind == NodeKind::Jump || self.kind == NodeKind::Line && !self.condition.is_empty()
     }
@@ -77,7 +117,7 @@ impl DialogueNode {
         if index == OTHERWISE {
             self.has_otherwise()
         } else {
-            self.choices.get(index).is_some()
+            self.choices.get(index).is_some() || (index == 0 && self.has_direct_output())
         }
     }
 
@@ -108,6 +148,11 @@ impl DialogueNode {
         } else if let Some(choice) = self.choices.get_mut(index) {
             choice.target = target;
             choice.dialogue = None;
+        } else if index == 0 && self.has_direct_output() && target.is_some() {
+            self.choices.push(Choice {
+                target,
+                ..default()
+            });
         }
     }
 }
@@ -152,6 +197,10 @@ impl Dialogue {
         self.nodes.iter_mut().find(|n| n.id == id)
     }
     pub fn add(&mut self, kind: NodeKind, from: u32) -> u32 {
+        self.add_from(kind, from, None)
+    }
+
+    pub fn add_from(&mut self, kind: NodeKind, from: u32, output: Option<usize>) -> u32 {
         let id = self
             .nodes
             .iter()
@@ -173,12 +222,18 @@ impl Dialogue {
         }) {
             position[1] += 230.0;
         }
-        if kind != NodeKind::Jump
-            && let Some(source) = self.node_mut(from)
+        if let Some(source) = self.node_mut(from)
+            && let Some(index) = output.or_else(|| {
+                if kind == NodeKind::Jump {
+                    return None;
+                }
+                if source.has_direct_output() {
+                    return (!source.output_connected(0)).then_some(0);
+                }
+                source.choices.iter().position(|choice| !choice.connected())
+            })
         {
-            if let Some(choice) = source.choices.iter_mut().find(|c| !c.connected()) {
-                choice.target = Some(id);
-            }
+            source.set_output(index, Some(id));
         }
         self.nodes.push(DialogueNode {
             id,
@@ -197,16 +252,7 @@ impl Dialogue {
             text_spans: Vec::new(),
             condition: Condition::default(),
             otherwise: None,
-            choices: if kind == NodeKind::Line {
-                vec![Choice {
-                    text: "Продолжить".into(),
-                    target: None,
-                    condition: Default::default(),
-                    dialogue: None,
-                }]
-            } else {
-                vec![]
-            },
+            choices: Vec::new(),
         });
         id
     }
@@ -271,7 +317,10 @@ impl Dialogue {
             if n.kind == NodeKind::Jump && n.dialogue.is_none() {
                 result.push(format!("Переход #{}: выберите диалог", n.id));
             }
-            if matches!(n.kind, NodeKind::Start | NodeKind::Line) && n.choices.is_empty() {
+            if n.has_direct_output() && !n.output_connected(0) {
+                result.push(format!("Реплика #{}: подключите выход", n.id));
+            }
+            if n.kind == NodeKind::Start && n.choices.is_empty() {
                 result.push(format!("Узел #{}: добавьте переход или завершение", n.id));
             }
             if n.kind == NodeKind::Line
@@ -286,7 +335,7 @@ impl Dialogue {
             if n.kind == NodeKind::Line && n.has_otherwise() && n.otherwise.is_none() {
                 result.push(format!("Реплика #{}: подключите выход «Иначе»", n.id));
             }
-            for (i, c) in n.choices.iter().enumerate() {
+            for (i, c) in n.answers().iter().enumerate() {
                 if !c.connected() {
                     result.push(format!("Узел #{} · ответ {}: нет перехода", n.id, i + 1));
                 }

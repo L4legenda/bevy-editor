@@ -480,3 +480,58 @@ fn closing_the_workspace_despawns_custom_lights_without_removing_source_lights()
     assert!(!app.world().entities().contains(custom[0]));
     assert!(app.world().entities().contains(source));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn preview_budgets_only_point_maps_and_restores_full_quality_without_a_scene_edit() {
+    let mut app = app();
+    let lights: Vec<_> = (1..=5)
+        .map(|id| {
+            let mut light = if id == 5 {
+                LightPreset::Spot
+            } else {
+                LightPreset::Bulb
+            }
+            .create(id);
+            light.shadows = id != 4;
+            light.contact_shadows = true;
+            light.pose.position = [id as f32 * 4.0, 0.0, 0.0];
+            light
+        })
+        .collect();
+    {
+        let mut editor = app.world_mut().resource_mut::<Editor>();
+        editor.view.translation = Vec3::ZERO;
+        editor.edits.lights.clone_from(&lights);
+    }
+    app.update();
+    let maps = |app: &mut App| {
+        let w = app.world_mut();
+        let mut ids: Vec<_> = w
+            .query::<(&LightEntity, &PointLight)>()
+            .iter(w)
+            .filter_map(|(id, light)| {
+                assert!(light.contact_shadows_enabled);
+                light.shadow_maps_enabled.then_some(id.0)
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(maps(&mut app), vec![1, 2]);
+    app.world_mut().resource_mut::<Editor>().view.translation.x = 16.0;
+    app.update();
+    assert_eq!(maps(&mut app), vec![2, 3]);
+    action(&mut app, LightingAction::ToggleFullPreviewShadows);
+    assert_eq!(maps(&mut app), vec![1, 2, 3]);
+    let editor = app.world().resource::<Editor>();
+    assert_eq!(editor.edits.lights, lights);
+    assert!(editor.undo.is_empty());
+    let w = app.world_mut();
+    assert!(
+        w.query::<&SpotLight>()
+            .single(w)
+            .unwrap()
+            .shadow_maps_enabled
+    );
+}

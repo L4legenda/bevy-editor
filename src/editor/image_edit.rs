@@ -102,9 +102,90 @@ pub(in crate::editor) enum EditAction {
 struct Session {
     pub doc: PhotoDocument,
     pub editing: bool,
+    opacity_preview: Option<OpacityPreview>,
     rendered: Option<(u64, u64)>,
     prepared: Option<(u64, u64, photocraft_raster::Rgba8Image)>,
 }
+/// The main thread keeps the document authoritative. A gesture owns one worker and
+/// one reduced document; queued slider positions collapse into the newest revision.
+struct OpacityPreview {
+    layer: photocraft_doc::LayerId,
+    revision: u64,
+    view: u64,
+    proxy: Option<photocraft_doc::Document>,
+    task: Option<Task<OpacityFrame>>,
+    displayed: Option<u64>,
+}
+
+struct OpacityFrame {
+    revision: u64,
+    exact: bool,
+    proxy: Option<photocraft_doc::Document>,
+    image: photocraft_raster::Rgba8Image,
+}
+
+impl OpacityPreview {
+    fn poll(&mut self, doc: &PhotoDocument, dragging: bool) -> Option<OpacityFrame> {
+        let mut frame = self
+            .task
+            .as_mut()
+            .and_then(|task| block_on(poll_once(task)));
+        if let Some(result) = &mut frame {
+            self.task = None;
+            self.proxy = result.proxy.take();
+            if !dragging && (!result.exact || result.revision != self.revision) {
+                frame = None;
+            } else {
+                self.displayed = Some(result.revision);
+            }
+        }
+        let complete = frame
+            .as_ref()
+            .is_some_and(|f| f.exact && f.revision == self.revision);
+        if self.task.is_none() && !complete && (!dragging || self.displayed != Some(self.revision))
+        {
+            let revision = self.revision;
+            let layer = self.layer;
+            let opacity = doc.document.layer(layer)?.opacity;
+            let mask_view = doc.mask_view;
+            let cached = dragging.then(|| self.proxy.take()).flatten();
+            let document = cached.is_none().then(|| doc.document.clone());
+            self.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                let (mut source, reduced) = if let Some(proxy) = cached {
+                    (proxy, true)
+                } else {
+                    let source = document.unwrap();
+                    let factor = source.size.width.max(source.size.height).div_ceil(768);
+                    if dragging && factor > 1 && photocraft_compose::proxy::proxy_faithful(&source)
+                    {
+                        (
+                            photocraft_compose::proxy::proxy_document(&source, factor),
+                            true,
+                        )
+                    } else {
+                        (source, false)
+                    }
+                };
+                if let Some(layer) = source.layer_mut(layer) {
+                    layer.opacity = opacity;
+                }
+                let image = photo_document::render_preview(
+                    &source,
+                    mask_view,
+                    photocraft_geom::Rect::from_size(source.size),
+                );
+                OpacityFrame {
+                    revision,
+                    exact: !reduced,
+                    image,
+                    proxy: reduced.then_some(source),
+                }
+            }));
+        }
+        frame
+    }
+}
+
 struct Opening {
     id: usize,
     path: PathBuf,
@@ -300,6 +381,9 @@ impl State {
     }
     pub(in crate::editor) fn gradient_dragging(&self) -> bool {
         matches!(self.gesture, Some((_, Gesture::Gradient(_))))
+    }
+    pub(super) fn dragging_layer_opacity(&self, id: Option<usize>) -> bool {
+        self.opacity_drag.is_some_and(|(tab, _)| Some(tab) == id)
     }
     pub fn document(&self, id: Option<usize>) -> Option<&PhotoDocument> {
         Some(&self.sessions.get(&id?)?.doc)
@@ -671,6 +755,7 @@ pub(super) fn update(
                     state.sessions.insert(
                         id,
                         Session {
+                            opacity_preview: None,
                             doc,
                             editing: true,
                             rendered: None,
@@ -753,6 +838,11 @@ pub(super) fn update(
                 | Action::ViewModel(_)
                 | Action::CloseImageTab(_)
         ) {
+            if let Some(old) = viewer.tab.and_then(|id| state.sessions.get_mut(&id))
+                && old.opacity_preview.take().is_some()
+            {
+                old.rendered = None;
+            }
             layers::finish_preview(state, false);
             state.menu = false;
             state.color_picker = None;
@@ -1093,14 +1183,31 @@ pub(super) fn update(
                         {
                             continue;
                         }
-                        if state.opacity_drag != Some((id, layer)) {
-                            session.doc.checkpoint();
-                            state.opacity_drag = Some((id, layer));
+                        let opacity = value.clamp(0.0, 1.0);
+                        if !opacity.is_finite() {
+                            continue;
                         }
-                        if let Some(layer) = session.doc.document.layer_mut(layer) {
-                            layer.opacity = value.clamp(0.0, 1.0);
+                        if session.doc.document.layer(layer).unwrap().opacity != opacity {
+                            if state.opacity_drag != Some((id, layer)) {
+                                session.doc.checkpoint();
+                                state.opacity_drag = Some((id, layer));
+                                if session.doc.size().area() >= 512 * 512 {
+                                    session.opacity_preview = Some(OpacityPreview {
+                                        layer,
+                                        revision: session.doc.revision,
+                                        view: session.doc.view_revision,
+                                        proxy: None,
+                                        task: None,
+                                        displayed: None,
+                                    });
+                                }
+                            }
+                            session.doc.document.layer_mut(layer).unwrap().opacity = opacity;
+                            session.doc.changed();
+                            if let Some(preview) = &mut session.opacity_preview {
+                                preview.revision = session.doc.revision;
+                            }
                         }
-                        session.doc.changed();
                         if final_value {
                             state.opacity_drag = None;
                         }
@@ -1145,7 +1252,27 @@ pub(super) fn sync(
     if let Some(id) = editor.viewing_image
         && let Some(session) = state.sessions.get_mut(&id)
     {
-        if session.rendered != Some((session.doc.revision, session.doc.view_revision))
+        let mut opacity_frame = None;
+        if let Some(preview) = &mut session.opacity_preview {
+            let dragging = state.opacity_drag == Some((id, preview.layer));
+            if preview.revision != session.doc.revision
+                || preview.view != session.doc.view_revision
+                || (!dragging && session.rendered == Some((preview.revision, preview.view)))
+            {
+                session.opacity_preview = None;
+            } else {
+                let Some(frame) = preview.poll(&session.doc, dragging) else {
+                    return;
+                };
+                let settled = frame.exact && frame.revision == session.doc.revision;
+                if settled && !dragging {
+                    session.opacity_preview = None;
+                }
+                opacity_frame = Some((frame.image, settled));
+            }
+        }
+        if opacity_frame.is_some()
+            || session.rendered != Some((session.doc.revision, session.doc.view_revision))
             || viewer.tab != Some(id)
             || viewer.image.is_none()
         {
@@ -1154,6 +1281,7 @@ pub(super) fn sync(
             let initialized = session.rendered.is_some() && viewer.tab == Some(id);
             let damage = session.doc.take_damage();
             if initialized
+                && opacity_frame.is_none()
                 && size.max_element() <= MAX_TEXTURE
                 && let (Some(rect), Some(handle), Some(uploads)) =
                     (damage, viewer.image.as_ref(), uploads.as_deref_mut())
@@ -1181,13 +1309,18 @@ pub(super) fn sync(
                 session.rendered = Some((session.doc.revision, session.doc.view_revision));
                 return;
             }
-            let composite = session
-                .prepared
-                .take()
-                .filter(|(revision, view, _)| {
-                    (*revision, *view) == (session.doc.revision, session.doc.view_revision)
+            let exact = opacity_frame.as_ref().is_none_or(|(_, exact)| *exact);
+            let composite = opacity_frame
+                .map(|(image, _)| image)
+                .or_else(|| {
+                    session
+                        .prepared
+                        .take()
+                        .filter(|(revision, view, _)| {
+                            (*revision, *view) == (session.doc.revision, session.doc.view_revision)
+                        })
+                        .map(|(_, _, image)| image)
                 })
-                .map(|(_, _, image)| image)
                 .unwrap_or_else(|| session.doc.preview());
             let size = UVec2::new(composite.width, composite.height);
             let decoded = if size.max_element() > MAX_TEXTURE {
@@ -1223,10 +1356,10 @@ pub(super) fn sync(
             if let (Some(uploads), Some(handle)) = (uploads, viewer.image.as_ref()) {
                 uploads.reset(handle.id());
             }
-            viewer.dimensions = Some(size);
+            viewer.dimensions = Some(UVec2::new(source_size.width, source_size.height));
             viewer.decoded_size = Some(decoded_size);
             viewer.error = None;
-            session.rendered = Some((session.doc.revision, session.doc.view_revision));
+            session.rendered = exact.then_some((session.doc.revision, session.doc.view_revision));
         }
     }
 }
@@ -1883,5 +2016,47 @@ mod tests {
         state.select_eraser_mode(EraserMode::Brush);
         assert_eq!(state.size, 16.0);
         assert_eq!(state.snap_point(Vec2::new(2.1, 6.8)), Vec2::new(2.1, 6.8));
+    }
+}
+
+#[cfg(test)]
+mod opacity_preview_tests {
+    use super::*;
+
+    #[test]
+    fn release_during_a_proxy_render_publishes_the_latest_exact_pixels() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opacity.png");
+        ::image::RgbaImage::from_pixel(1536, 64, ::image::Rgba([63u8, 107, 203, 211]))
+            .save(&path)
+            .unwrap();
+        let mut doc = PhotoDocument::load(&path).unwrap();
+        let layer = doc.active_id().unwrap();
+        let mut work = OpacityPreview {
+            layer,
+            revision: doc.revision,
+            view: doc.view_revision,
+            task: None,
+            proxy: None,
+            displayed: None,
+        };
+        assert!(work.poll(&doc, true).is_none());
+        doc.document.layer_mut(layer).unwrap().opacity = 0.35;
+        doc.changed();
+        work.revision = doc.revision;
+        let timeout = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let frame = loop {
+            if let Some(frame) = work.poll(&doc, false) {
+                break frame;
+            }
+            assert!(std::time::Instant::now() < timeout);
+            std::thread::yield_now();
+        };
+        assert!(frame.exact);
+        assert_eq!(frame.revision, doc.revision);
+        assert_eq!(frame.image.width, 1536);
+        assert_eq!(frame.image.pixels, doc.preview().pixels);
     }
 }

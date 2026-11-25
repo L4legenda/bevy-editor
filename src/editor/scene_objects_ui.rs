@@ -1,5 +1,6 @@
 //! Commands on scene instances, independent of their shared source assets.
 use super::*;
+use crate::editor::scene_hierarchy::{self, HierarchyAction};
 use bevy::input_focus::FocusCause;
 
 #[cfg(test)]
@@ -11,6 +12,7 @@ pub(in crate::editor) enum ObjectAction {
     Menu(Selection),
     Rename(Selection),
     EditName,
+    Hierarchy(HierarchyAction),
     Remove,
     Confirm,
     Cancel,
@@ -26,6 +28,7 @@ struct Bound {
 struct ObjectUi {
     root: Entity,
     menu: Entity,
+    hierarchy_menu: Entity,
     dialog: Entity,
     field: Entity,
     error: Entity,
@@ -54,6 +57,11 @@ pub(super) fn available(editor: &Editor, action: ObjectAction) -> bool {
             ObjectAction::Menu(target) | ObjectAction::Rename(target) => {
                 editor.object_editable(target)
             }
+            ObjectAction::Hierarchy(action) => {
+                editor.scene_object_popup
+                    && !editor.multiple_selected()
+                    && scene_hierarchy::available(editor, action)
+            }
             _ => editor.scene_object_popup,
         }
 }
@@ -77,6 +85,49 @@ pub(super) fn pointer_menu(
         actions.write(Action::SceneObject(ObjectAction::Menu(*target)));
     }
 }
+
+fn menu_button(
+    commands: &mut Commands,
+    menu: Entity,
+    font: &Handle<Font>,
+    label: &str,
+    glyph: icons::Glyph,
+    action: ObjectAction,
+) {
+    let item = button(
+        commands,
+        menu,
+        font,
+        label,
+        Action::SceneObject(action),
+        Look::Regular,
+    );
+    commands
+        .entity(item)
+        .entry::<Node>()
+        .and_modify(|mut node| node.width = percent(100));
+    let icon = icons::themed(commands, item, glyph, 15.0);
+    commands.entity(item).insert_children(0, &[icon]);
+}
+
+const HIERARCHY_ACTIONS: [(&str, icons::Glyph, HierarchyAction); 4] = [
+    (
+        "Сменить родителя",
+        icons::Glyph::FolderOpen,
+        HierarchyAction::PickParent,
+    ),
+    ("В корень", icons::Glyph::ArrowUp, HierarchyAction::ToRoot),
+    (
+        "Переместить выше",
+        icons::Glyph::ChevronUp,
+        HierarchyAction::SiblingEarlier,
+    ),
+    (
+        "Переместить ниже",
+        icons::Glyph::ChevronDown,
+        HierarchyAction::SiblingLater,
+    ),
+];
 
 fn setup(mut commands: Commands, interface: Res<Interface>) {
     let root = node(
@@ -124,20 +175,31 @@ fn setup(mut commands: Commands, interface: Res<Interface>) {
             ObjectAction::Remove,
         ),
     ] {
-        let item = button(
+        menu_button(&mut commands, menu, &interface.font, label, glyph, action);
+    }
+    let hierarchy_menu = surface(
+        &mut commands,
+        menu,
+        Node {
+            display: Display::None,
+            padding: UiRect::top(px(3)),
+            border: UiRect::top(px(1)),
+            ..column(3.0)
+        },
+        Color::NONE,
+    );
+    commands
+        .entity(hierarchy_menu)
+        .insert(BorderColor::all(EDGE));
+    for (label, glyph, action) in HIERARCHY_ACTIONS {
+        menu_button(
             &mut commands,
-            menu,
+            hierarchy_menu,
             &interface.font,
             label,
-            Action::SceneObject(action),
-            Look::Regular,
+            glyph,
+            ObjectAction::Hierarchy(action),
         );
-        commands
-            .entity(item)
-            .entry::<Node>()
-            .and_modify(|mut node| node.width = percent(100));
-        let icon = icons::themed(&mut commands, item, glyph, 15.0);
-        commands.entity(item).insert_children(0, &[icon]);
     }
     let dialog = surface(
         &mut commands,
@@ -216,6 +278,7 @@ fn setup(mut commands: Commands, interface: Res<Interface>) {
     commands.insert_resource(ObjectUi {
         root,
         menu,
+        hierarchy_menu,
         dialog,
         field,
         error,
@@ -267,11 +330,18 @@ fn input(
                 let cursor = window
                     .cursor_position()
                     .unwrap_or(Vec2::new(window.width() - 230.0, TOP + 20.0));
+                let hierarchy_height =
+                    if !editor.multiple_selected() && editor.hierarchy_key(target).is_some() {
+                        32.0 * HIERARCHY_ACTIONS.len() as f32 + 4.0
+                    } else {
+                        0.0
+                    };
                 if let Ok(mut menu) = nodes.get_mut(ui.menu) {
                     menu.left = px(cursor.x.clamp(4.0, (window.width() - 224.0).max(4.0)));
-                    menu.top =
-                        px((cursor.y - TOP)
-                            .clamp(4.0, (window.height() - TOP - FOOT - 82.0).max(4.0)));
+                    menu.top = px((cursor.y - TOP).clamp(
+                        4.0,
+                        (window.height() - TOP - FOOT - 82.0 - hierarchy_height).max(4.0),
+                    ));
                 }
             }
             Action::SceneObject(ObjectAction::Rename(target))
@@ -281,6 +351,18 @@ fn input(
             }
             Action::SceneObject(ObjectAction::EditName) => {
                 rename = ui.bound.map(|bound| bound.target);
+            }
+            Action::SceneObject(ObjectAction::Hierarchy(command))
+                if !ui.rename && available(&editor, ObjectAction::Hierarchy(command)) =>
+            {
+                if ui.bound.is_some_and(|bound| {
+                    bound.room == editor.room && editor.selection == Some(bound.target)
+                }) {
+                    editor.hierarchy_action(command);
+                    ui.bound = None;
+                    ui.suppress_click = true;
+                    focus.clear();
+                }
             }
             Action::SceneObject(ObjectAction::Confirm) => {
                 ui.confirm = ui.rename;
@@ -388,9 +470,15 @@ fn input(
     }
     editor.scene_object_popup = ui.bound.is_some() || ui.suppress_click;
     let visible = ui.bound.is_some();
+    let hierarchy_visible = !ui.rename
+        && !editor.multiple_selected()
+        && ui
+            .bound
+            .is_some_and(|bound| editor.hierarchy_key(bound.target).is_some());
     for (entity, shown) in [
         (ui.root, visible),
         (ui.menu, visible && !ui.rename),
+        (ui.hierarchy_menu, hierarchy_visible),
         (ui.dialog, visible && ui.rename),
         (ui.error, !ui.message.is_empty()),
     ] {

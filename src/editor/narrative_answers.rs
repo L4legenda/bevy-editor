@@ -78,21 +78,22 @@ impl State {
         self.nodes
             .retain(|id, _| d.node(*id).is_some_and(|n| n.kind == NodeKind::Line));
         for n in d.nodes.iter().filter(|n| n.kind == NodeKind::Line) {
+            let answers = n.answers();
             let Some(mut slots) = self.nodes.remove(&n.id) else {
-                let slots = n.choices.iter().map(|c| self.slot(c, false)).collect();
+                let slots = answers.iter().map(|c| self.slot(c, false)).collect();
                 self.nodes.insert(n.id, slots);
                 continue;
             };
-            if slots.iter().filter(|s| !s.removing).count() == n.choices.len()
+            if slots.iter().filter(|s| !s.removing).count() == answers.len()
                 && slots
                     .iter()
                     .filter(|s| !s.removing)
-                    .zip(&n.choices)
+                    .zip(answers)
                     .any(|(slot, choice)| slot.choice != *choice)
             {
                 let mut available: Vec<_> = slots.iter().filter(|s| !s.removing).collect();
                 let mut order = Vec::new();
-                for choice in &n.choices {
+                for choice in answers {
                     let Some(at) = available.iter().position(|s| s.choice == *choice) else {
                         break;
                     };
@@ -103,12 +104,12 @@ impl State {
                     .filter(|s| !s.removing)
                     .map(|s| s.token)
                     .collect();
-                if order.len() == n.choices.len() && order != old {
+                if order.len() == answers.len() && order != old {
                     self.order_slots(n.id, &mut slots, &order, now);
                 }
             }
             // Undo/redo uses the same transitions, including reviving an unfinished removal.
-            while slots.iter().filter(|s| !s.removing).count() > n.choices.len() {
+            while slots.iter().filter(|s| !s.removing).count() > answers.len() {
                 let live: Vec<_> = slots
                     .iter()
                     .enumerate()
@@ -116,13 +117,13 @@ impl State {
                     .collect();
                 let i = live
                     .iter()
-                    .zip(&n.choices)
+                    .zip(answers)
                     .take_while(|((_, s), c)| s.choice == **c)
                     .count();
                 let at = live[i.min(live.len() - 1)].0;
                 slots[at].retarget(true, now);
             }
-            while slots.iter().filter(|s| !s.removing).count() < n.choices.len() {
+            while slots.iter().filter(|s| !s.removing).count() < answers.len() {
                 let live: Vec<_> = slots
                     .iter()
                     .enumerate()
@@ -130,25 +131,25 @@ impl State {
                     .collect();
                 let i = live
                     .iter()
-                    .zip(&n.choices)
+                    .zip(answers)
                     .take_while(|((_, s), c)| s.choice == **c)
                     .count();
                 let at = live.get(i).map_or(slots.len(), |(at, _)| *at);
                 let restored = slots
                     .iter()
-                    .position(|s| s.removing && s.choice == n.choices[i]);
+                    .position(|s| s.removing && s.choice == answers[i]);
                 if let Some(old) = restored {
                     let mut slot = slots.remove(old);
                     slot.retarget(false, now);
                     slots.insert(at - usize::from(old < at), slot);
                 } else {
-                    slots.insert(at, self.slot(&n.choices[i], true));
+                    slots.insert(at, self.slot(&answers[i], true));
                 }
             }
             for (i, (slot, choice)) in slots
                 .iter_mut()
                 .filter(|s| !s.removing)
-                .zip(&n.choices)
+                .zip(answers)
                 .enumerate()
             {
                 slot.choice.clone_from(choice);
@@ -168,7 +169,7 @@ impl State {
     pub fn add(&mut self, document: usize, n: &DialogueNode, now: f64) {
         if self.document == Some(document) && self.nodes.contains_key(&n.id) {
             self.now = now;
-            if let Some(c) = n.choices.last() {
+            if let Some(c) = n.answers().last() {
                 let slot = self.slot(c, true);
                 self.nodes.get_mut(&n.id).unwrap().push(slot);
             }
@@ -183,7 +184,7 @@ impl State {
             .get_mut(&n.id)
             .and_then(|slots| slots.iter_mut().filter(|s| !s.removing).nth(index))
         {
-            slot.choice = n.choices[index].clone();
+            slot.choice = n.answers()[index].clone();
             slot.retarget(true, now);
         }
     }
@@ -200,7 +201,7 @@ impl State {
             return nodes::height(n);
         };
         nodes::height(n)
-            + (slots.iter().map(|s| s.amount(self.now)).sum::<f32>() - n.choices.len() as f32)
+            + (slots.iter().map(|s| s.amount(self.now)).sum::<f32>() - n.answers().len() as f32)
                 * OUTPUT_HEIGHT
     }
     pub fn key(&self, id: u32, index: usize) -> usize {
@@ -217,6 +218,11 @@ impl State {
     }
     pub fn output_position(&self, n: &DialogueNode, index: usize) -> Vec2 {
         let mut p = nodes::output_position(n, index);
+        if index == 0 && n.has_direct_output() {
+            // The footer follows any answer rows that are still collapsing.
+            p.y += self.height(n) - nodes::height(n);
+            return p;
+        }
         if let Some(slots) = self.nodes.get(&n.id) {
             let mut y = 0.;
             let mut live = 0;
@@ -337,7 +343,7 @@ pub(super) fn spawn(
         return;
     };
     let mut index = 0;
-    let mut y = nodes::output_position(n, 0).y - OUTPUT_HEIGHT * 0.5;
+    let mut y = nodes::answer_rows_top(n) + 1.;
     for slot in slots {
         let amount = slot.amount(state.now);
         let wrapper = surface(
@@ -615,6 +621,7 @@ mod tests {
     fn answer_expansion_and_collapse_keep_geometry_continuous() {
         let mut d = Dialogue::new("Тест".into());
         let id = d.add(NodeKind::Line, 0);
+        d.node_mut(id).unwrap().add_answer();
         let mut state = State::default();
         state.observe(Some((1, &d)), 0.);
         let original = state.height(d.node(id).unwrap());
@@ -646,6 +653,7 @@ mod tests {
     fn answer_undo_revives_same_row_and_ports_follow_shifted_indices() {
         let mut d = Dialogue::new("Тест".into());
         let id = d.add(NodeKind::Line, 0);
+        d.node_mut(id).unwrap().add_answer();
         d.node_mut(id).unwrap().choices.extend([
             Choice {
                 text: "Второй".into(),

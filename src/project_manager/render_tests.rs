@@ -159,6 +159,9 @@ fn assert_controls_fit(app: &mut App, width: f32, height: f32) {
     for (entity, control, label, computed, transform, clip) in query.iter(world) {
         if modal != control.modal
             || (modal && !["Отмена", "×", "Создать", "Открыть"].contains(&label.0.as_str()))
+            || world
+                .get::<Node>(entity)
+                .is_some_and(|node| node.display == Display::None)
         {
             continue;
         }
@@ -184,7 +187,8 @@ fn assert_controls_fit(app: &mut App, width: f32, height: f32) {
         );
         assert!(
             clip.is_none_or(|clip| clip.contains_point(center)),
-            "A manager control is clipped"
+            "Manager control {:?} is clipped at {center:?}",
+            label.0
         );
     }
 }
@@ -232,13 +236,18 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     })
     .init_resource::<CapturedImage>()
     .add_systems(Startup, retarget.after(ui::setup));
-    // The test harness rejects --project and exits without opening an OS window.
-    // We only need to verify that a child was launched, then reap it below.
+    // Use a short-lived child and deliver its launch acknowledgement in the test.
     let manager = Manager::load(
         scratch.0.join("history.json"),
         std::env::current_exe().unwrap(),
     );
     install(&mut app, manager);
+    app.add_systems(
+        Update,
+        super::reply_from_test_editor
+            .after(actions)
+            .before(poll_editors),
+    );
     let window = app
         .world_mut()
         .spawn((
@@ -294,9 +303,6 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     assert_eq!(app.world().resource::<Manager>().recent.projects.len(), 1);
     {
         let mut manager = app.world_mut().resource_mut::<Manager>();
-        for (_, mut child) in manager.running.drain(..) {
-            child.wait().unwrap();
-        }
         manager.status.clear();
     }
     screenshot(&mut app, &target, &output.join("03-recent.png"));
@@ -378,7 +384,7 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     mouse_click(&mut app, window, point, MouseButton::Right);
     assert!(app.world().resource::<Manager>().context.is_some());
     assert!(
-        app.world().resource::<Manager>().running.is_empty(),
+        app.world().resource::<Manager>().launch.is_none(),
         "A context click must not open the project"
     );
     assert_controls_fit(&mut app, 880.0, 620.0);
@@ -410,9 +416,6 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
         selected,
         "The context action must open its target project"
     );
-    for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
-        child.wait().unwrap();
-    }
     click_control(&mut app, window, "Моя первая сцена");
     assert_eq!(
         app.world().resource::<Manager>().selected.as_ref(),
@@ -435,7 +438,10 @@ fn gpu_project_manager_creation_search_open_errors_and_minimum_size() {
     );
 
     let world = app.world_mut();
-    assert!(world.query::<&Text>().iter(world).any(|text| {
-        text.0 == concat!("Версия ", env!("CARGO_PKG_VERSION"))
-    }));
+    assert!(
+        world
+            .query::<&Text>()
+            .iter(world)
+            .any(|text| { text.0 == concat!("Версия ", env!("CARGO_PKG_VERSION")) })
+    );
 }

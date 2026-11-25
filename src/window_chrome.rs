@@ -23,16 +23,16 @@ impl Plugin for WindowChromePlugin {
         app.add_plugins(crate::app_icon::AppIconPlugin)
             .init_resource::<ChromeState>()
             .add_systems(PostUpdate, refresh.after(UiSystems::Layout));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
         app.add_systems(Update, configure_native_windows);
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
 #[derive(Component)]
 struct NativeAppearanceApplied;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
 fn configure_native_windows(
     _main_thread: NonSendMarker,
     windows: Query<Entity, (With<Window>, Without<NativeAppearanceApplied>)>,

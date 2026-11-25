@@ -18,9 +18,9 @@ mod lighting;
 mod lighting_gizmos;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub mod mcp;
-mod model_document;
 mod model_bake_settings;
 mod model_cage_data;
+mod model_document;
 mod model_import_mesh;
 mod model_mesh;
 mod model_paint_data;
@@ -147,8 +147,10 @@ enum Action {
     ToggleVisibility(Selection),
     SceneObject(ui::SceneObjectAction),
     Lighting(lighting::LightingAction),
+    EnvironmentLibrary(ui::environment_library::Command),
     HdriLibrary(ui::HdriAction),
     UseDownloadedHdri(usize),
+    SceneAddMenu,
     LightMenu,
     Inspector(ui::InspectorAction),
     RevertProperty(ui::TransformProperty),
@@ -280,6 +282,7 @@ struct Editor {
     hierarchy_collapsed: std::collections::HashSet<(Room, u32)>,
     hierarchy_parenting: Option<(Room, u32)>,
     folder_arrival: Option<(Room, u32, std::time::Instant)>,
+    tree_drop_arrival: Option<(Room, Selection, Selection, std::time::Instant)>,
     tool: Tool,
     local_space: bool,
     snap: bool,
@@ -311,6 +314,8 @@ struct Editor {
     pivot: Vec3,
     view_orthographic: bool,
     lighting_defaults: crate::lighting::SceneLighting,
+    #[cfg(target_os = "macos")]
+    full_preview_shadows: bool,
     show_lights: bool,
     hidden_objects: HashMap<Room, std::collections::HashSet<object_visibility::ObjectKey>>,
 }
@@ -344,6 +349,7 @@ impl Editor {
             hierarchy_collapsed: default(),
             hierarchy_parenting: None,
             folder_arrival: None,
+            tree_drop_arrival: None,
             tool: Tool::default(),
             local_space: false,
             snap: false,
@@ -374,6 +380,8 @@ impl Editor {
             pivot: Vec3::ZERO,
             view_orthographic: false,
             lighting_defaults: crate::lighting::SceneLighting::editor_default(),
+            #[cfg(target_os = "macos")]
+            full_preview_shadows: false,
             show_lights: true,
             hidden_objects,
         }
@@ -401,6 +409,7 @@ impl Editor {
                 | Action::ViewModel(_)
                 | Action::CloseModelTab(_)
                 | Action::ModelView(_)
+                | Action::EnvironmentLibrary(_)
                 | Action::ToggleSceneTree
                 | Action::Inspector(_)
                 | Action::Drawer
@@ -631,7 +640,7 @@ impl Editor {
             Selection::Light(id) => self
                 .light(id)
                 .map_or_else(String::new, |light| light.name.clone()),
-            Selection::Environment => "Освещение сцены".into(),
+            Selection::Environment => "Окружение".into(),
             Selection::Model(id) => self.model(id).map_or_else(String::new, |model| {
                 let file = model.asset.rsplit('/').next().unwrap_or_default();
                 let label = self
@@ -686,7 +695,7 @@ impl Editor {
             return;
         }
         if let Some(key) = self.hierarchy_key(target) {
-            self.edit_hierarchy(|h| h.set_world(key, pose));
+            self.edit_poses(|h| h.set_world(key, pose));
             return;
         }
         match target {
@@ -806,7 +815,7 @@ impl Editor {
                 Reset::Rotation => pose.rotation = Quat::IDENTITY,
                 Reset::Scale => pose.scale = Vec3::ONE,
             }
-            self.edit_hierarchy(|h| h.set_local(key, pose.into()));
+            self.edit_poses(|h| h.set_local(key, pose.into()));
             return;
         }
         let Some(mut pose) = self.pose(target) else {
@@ -1063,14 +1072,26 @@ impl EditorPlugin {
     pub fn new(mut project: EditorProject) -> std::io::Result<Self> {
         project.asset_root = project.asset_root.canonicalize()?;
         crate::asset_paths::apply_project_paths(&mut project)?;
-        project.validate()?;
+        project.validate_manifest(true)?;
+        Self::open_first(project)
+    }
+
+    fn open_first(mut project: EditorProject) -> std::io::Result<Self> {
         let edits = project.read_scene(0)?;
+        if project.scenes[0].is_native()
+            && project.scenes[0].cameras.is_empty()
+            && let Some(metadata) = &edits.scene
+        {
+            project.scenes[0].label.clone_from(&metadata.label);
+            project.scenes[0].cameras.clone_from(&metadata.cameras);
+        }
         Ok(Self { project, edits })
     }
 }
 
 impl Plugin for EditorPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<ui::GridWindow>();
         area_selection::register(app);
         app.add_systems(Update, asset_monitor::update);
         app.add_plugins(ui::LayerDragFxPlugin);
@@ -1112,6 +1133,18 @@ impl Plugin for EditorPlugin {
         .insert_resource(PointLightShadowMap { size: 512 })
         .insert_resource(Editor::new(self.project.clone(), self.edits.clone()))
         .init_resource::<Scene>()
+        .init_resource::<ui::environment_library::Library>()
+        .add_systems(Startup, ui::environment_library::load)
+        .add_systems(
+            Update,
+            (
+                ui::environment_library::actions,
+                ui::environment_library::refresh,
+            )
+                .chain()
+                .after(handle_actions)
+                .before(ui::refresh),
+        )
         .init_resource::<viewport::PointerState>()
         .init_resource::<ui::NumericInput>()
         .init_resource::<ui::NumberScrub>()
@@ -1141,7 +1174,7 @@ impl Plugin for EditorPlugin {
                     ui::resize_sidebar,
                     ui::scrub_numbers,
                     ui::drag_assets,
-                    ui::scene_tree_drag::update,
+                    ui::scene_tree_drag::update.before(handle_actions),
                     ui::drag_photo_layers,
                 )
                     .chain(),
@@ -1183,7 +1216,12 @@ impl Plugin for EditorPlugin {
                 lighting::sync,
                 scene_hierarchy::sync,
                 object_visibility::sync,
-                (thumbnails::watch_assets, thumbnails::update).chain(),
+                (
+                    ui::update_grid,
+                    thumbnails::watch_assets,
+                    thumbnails::update,
+                )
+                    .chain(),
                 image_previews::update,
                 (
                     viewport::draw,
@@ -1240,6 +1278,7 @@ impl Plugin for EditorPlugin {
             ui::refresh_inspector.after(ui::refresh_lighting_controls),
         );
         app.add_systems(Update, ui::lock_numeric_text.after(ui::refresh));
+        app.add_systems(Update, ui::scene_tree_drag::animate.after(ui::refresh));
         app.add_systems(
             PostUpdate,
             asset_placement::measure
@@ -1255,7 +1294,19 @@ impl Plugin for EditorPlugin {
 
 /// Create an editor app with the default renderer and a project-aware window.
 pub fn create_app(project: EditorProject) -> Result<App, Box<dyn std::error::Error>> {
-    let plugin = EditorPlugin::new(project)?;
+    build_app(EditorPlugin::new(project)?)
+}
+
+/// Open the standalone editor with a single manifest load and the active document.
+pub fn create_app_from_path(
+    path: &std::path::Path,
+) -> Result<(String, App), Box<dyn std::error::Error>> {
+    let project = EditorProject::load_for_editor(path)?;
+    let title = project.title.clone();
+    Ok((title, build_app(EditorPlugin::open_first(project)?)?))
+}
+
+fn build_app(plugin: EditorPlugin) -> Result<App, Box<dyn std::error::Error>> {
     let mut app = App::new();
     let render_worker = render_worker::enabled();
     if render_worker {
@@ -1347,9 +1398,10 @@ fn begin_room(
     camera: Query<Entity, With<viewport::EditorCamera>>,
     surface: Res<viewport::Surface>,
 ) {
-    if !std::mem::take(&mut editor.reload) {
+    if !editor.reload {
         return;
     }
+    editor.reload = false;
     if let Some(root) = scene.root.take() {
         commands.entity(root).despawn();
     }
@@ -1645,7 +1697,10 @@ fn save_editor(
         Ok(()) => {
             editor.edits = saved.clone();
             editor.saved = saved;
-            editor.status = format!("Сохранено · {}", editor.definition().label);
+            editor.status = match ui::environment_library::save_scene(editor) {
+                Ok(()) => format!("Сохранено · {}", editor.definition().label),
+                Err(error) => format!("Сцена сохранена · окружение не записано: {error}"),
+            };
             true
         }
         Err(error) => {
@@ -1800,7 +1855,9 @@ fn handle_actions(
                 | Action::ModelView(_)
                 | Action::ImageView(_)
                 | Action::ImageEdit(_)
+                | Action::SceneAddMenu
                 | Action::LightMenu
+                | Action::EnvironmentLibrary(_)
                 | Action::Inspector(_)
         ) {
             continue;

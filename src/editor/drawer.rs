@@ -80,6 +80,7 @@ pub(crate) struct BrowserUi {
     tree: Entity,
     breadcrumbs: Entity,
     pub(super) grid: Entity,
+    canvas: Entity,
     count: Entity,
     detail: Entity,
     placeholder: Entity,
@@ -403,15 +404,20 @@ pub(super) fn setup(
             min_width: px(0),
             padding: UiRect::axes(px(12), px(2)),
             overflow: Overflow::scroll_y(),
-            flex_wrap: FlexWrap::Wrap,
-            align_content: AlignContent::Start,
-            align_items: AlignItems::Start,
-            row_gap: px(10),
-            column_gap: px(10),
+            flex_direction: FlexDirection::Column,
             ..default()
         },
     );
     commands.entity(grid).insert((Scroller, DrawerScroll));
+    let canvas = node(
+        commands,
+        grid,
+        Node {
+            width: percent(100),
+            flex_shrink: 0.0,
+            ..default()
+        },
+    );
     let status = surface(
         commands,
         panel,
@@ -451,6 +457,7 @@ pub(super) fn setup(
         tree,
         breadcrumbs,
         grid,
+        canvas,
         count,
         detail,
         placeholder,
@@ -498,7 +505,6 @@ pub(crate) fn actions(
     mut editor: ResMut<Editor>,
     pointer: Res<viewport::PointerState>,
     mut previews: ResMut<Thumbnails>,
-    mut images: ResMut<Assets<Image>>,
     mut interface: ResMut<BrowserUi>,
     redirects: Option<Res<crate::asset_paths::AssetRedirects>>,
     numeric: Option<Res<NumericInput>>,
@@ -554,7 +560,7 @@ pub(crate) fn actions(
             Action::BrowseRefresh => {
                 interface.select(None);
                 browser.refresh(&mut editor.project);
-                previews.extend(&mut images, editor.project.catalog.len());
+                previews.extend(editor.project.catalog.len());
             }
             Action::BrowseToggle(folder) => {
                 browser.toggle_folder(folder);
@@ -594,7 +600,7 @@ pub(crate) fn actions(
                             continue;
                         }
                         interface.select(None);
-                        previews.extend(&mut images, editor.project.catalog.len());
+                        previews.extend(editor.project.catalog.len());
                         if scene_asset.is_some_and(|asset| asset != editor.definition().asset) {
                             editor.restore_selection = match editor.selection {
                                 Some(Selection::Imported(index)) => {
@@ -916,12 +922,116 @@ pub(super) fn file_size(bytes: u64) -> String {
     }
 }
 
+const CARD_GAP: f32 = 10.0;
+const ROW_HEIGHT: f32 = CARD_HEIGHT + CARD_GAP;
+
+/// One list drives layout, thumbnail requests and scroll-to-file focus.
+#[derive(Resource, Default)]
+pub(crate) struct GridWindow {
+    entries: Vec<Entry>,
+    range: std::ops::Range<usize>,
+    columns: usize,
+    folders: usize,
+    listing: Option<u64>,
+    last_folder_revision: Option<u64>,
+    pub(crate) revision: u64,
+}
+
+impl GridWindow {
+    #[cfg(test)]
+    pub(crate) fn for_entries(entries: Vec<Entry>) -> Self {
+        Self {
+            range: 0..entries.len(),
+            entries,
+            ..default()
+        }
+    }
+    pub(crate) fn visible(&self) -> &[Entry] {
+        &self.entries[self.range.clone()]
+    }
+}
+
+pub(crate) fn update_grid(
+    editor: Res<Editor>,
+    browser: Res<Browser>,
+    interface: Res<BrowserUi>,
+    motion: Res<DrawerMotion>,
+    context: Res<BrowserContext>,
+    mut grid: ResMut<GridWindow>,
+    mut scrolls: Query<(&ComputedNode, &mut ScrollPosition)>,
+) {
+    let Ok((node, mut scroll)) = scrolls.get_mut(interface.grid) else {
+        return;
+    };
+    let open = editor.drawer || motion.visible_height > 0.0;
+    if !open {
+        if grid.listing.take().is_some() {
+            grid.entries.clear();
+            grid.range = 0..0;
+            grid.revision += 1;
+        }
+        return;
+    }
+    let listing_changed = grid.listing != Some(browser.revision);
+    if grid.last_folder_revision != Some(browser.revision) {
+        scroll.y = 0.0;
+        grid.last_folder_revision = Some(browser.revision);
+    }
+    if listing_changed {
+        grid.entries = browser.entries(&editor.project.catalog);
+        grid.folders = grid
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Folder(_)))
+            .count();
+        grid.listing = Some(browser.revision);
+    }
+    let size = node.content_box().size() * node.inverse_scale_factor();
+    let columns = ((size.x + CARD_GAP) / (CARD + CARD_GAP)).floor().max(1.0) as usize;
+    let rows = grid.entries.len().div_ceil(columns);
+    let mut y = scroll
+        .y
+        .min((rows as f32 * ROW_HEIGHT - size.y).max(0.0))
+        .max(0.0);
+    if let Some(path) = context.focus_after.as_ref()
+        && let Some(index) = grid.entries.iter().position(|&e| {
+            crate::editor::file_moves::entry_path(&editor, &browser, e).is_ok_and(|p| p == *path)
+        })
+    {
+        let top = (index / columns) as f32 * ROW_HEIGHT;
+        let target = y.min(top).max(top + CARD_HEIGHT - size.y).max(0.0);
+        if (target - y).abs() > 0.5 && size.y > 0.0 {
+            y = target;
+            scroll.y = target;
+        }
+    }
+    let first = ((y / ROW_HEIGHT) as usize).saturating_sub(1);
+    let end = (((y + size.y) / ROW_HEIGHT).ceil() as usize + 1).min(rows);
+    let range = if size.x > 0.0 && size.y > 0.0 {
+        (first * columns).min(grid.entries.len())..(end * columns).min(grid.entries.len())
+    } else {
+        0..0
+    };
+    if listing_changed || grid.columns != columns || grid.range != range {
+        grid.columns = columns;
+        grid.range = range;
+        grid.revision += 1;
+    }
+}
+
+#[derive(Component)]
+pub(crate) struct PreviewCard(pub(crate) Entry);
+
 pub(crate) fn refresh(
     mut commands: Commands,
     browser: Res<Browser>,
     editor: Res<Editor>,
     previews: Res<Thumbnails>,
     interface: Res<BrowserUi>,
+    grid: Res<GridWindow>,
+    mut window_revision: Local<Option<u64>>,
+    mut cards: Local<std::collections::HashMap<usize, Entity>>,
+    mut empty_state: Local<Option<Entity>>,
     mut revision: Local<Option<u64>>,
     mut tree_revision: Local<Option<(u64, u64)>>,
     mut labels: Query<&mut Text>,
@@ -934,47 +1044,72 @@ pub(crate) fn refresh(
         commands.entity(interface.tree).despawn_children();
         tree_folder(&mut commands, &interface, &browser, 0, 0);
     }
-    if *revision == Some(browser.revision) {
-        return;
-    }
-    *revision = Some(browser.revision);
-    for entity in [interface.breadcrumbs, interface.grid] {
-        commands.entity(entity).despawn_children();
-    }
-    commands.entity(interface.grid).insert((
-        ScrollPosition::default(),
-        DropFolder(browser.current, browser.scan_revision),
-    ));
-    for (step, folder) in browser.breadcrumbs().into_iter().enumerate() {
-        if step > 0 {
-            icons::spawn(
+    let listing_changed = *revision != Some(browser.revision);
+    if listing_changed {
+        *revision = Some(browser.revision);
+        commands.entity(interface.breadcrumbs).despawn_children();
+        commands
+            .entity(interface.grid)
+            .insert(DropFolder(browser.current, browser.scan_revision));
+        for (step, folder) in browser.breadcrumbs().into_iter().enumerate() {
+            if step > 0 {
+                icons::spawn(
+                    &mut commands,
+                    interface.breadcrumbs,
+                    icons::Glyph::ChevronRight,
+                    14.0,
+                    MUTED,
+                );
+            }
+            let breadcrumb = button(
                 &mut commands,
                 interface.breadcrumbs,
-                icons::Glyph::ChevronRight,
-                14.0,
-                MUTED,
+                &interface.font,
+                &browser.folders[folder].label,
+                Action::Browse(folder),
+                Look::Regular,
             );
+            commands
+                .entity(breadcrumb)
+                .insert(DropFolder(folder, browser.scan_revision));
         }
-        let breadcrumb = button(
-            &mut commands,
-            interface.breadcrumbs,
-            &interface.font,
-            &browser.folders[folder].label,
-            Action::Browse(folder),
-            Look::Regular,
-        );
-        commands
-            .entity(breadcrumb)
-            .insert(DropFolder(folder, browser.scan_revision));
     }
-    let entries = browser.entries(&editor.project.catalog);
-    let mut folders = 0;
-    for &entry in &entries {
-        match entry {
+    if !listing_changed && *window_revision == Some(grid.revision) {
+        return;
+    }
+    *window_revision = Some(grid.revision);
+    cards.retain(|index, entity| {
+        let keep = !listing_changed && grid.range.contains(index);
+        if !keep {
+            commands.entity(*entity).despawn();
+        }
+        keep
+    });
+    let cols = grid.columns.max(1);
+    let height = (grid.entries.len().div_ceil(cols) as f32 * ROW_HEIGHT - CARD_GAP).max(0.0);
+    commands
+        .entity(interface.canvas)
+        .entry::<Node>()
+        .and_modify(move |mut n| {
+            n.height = px(height);
+        });
+    for index in grid.range.clone() {
+        let x = (index % cols) as f32 * (CARD + CARD_GAP);
+        let y = (index / cols) as f32 * ROW_HEIGHT;
+        let position = move |mut n: Mut<Node>| {
+            n.position_type = PositionType::Absolute;
+            n.left = px(x);
+            n.top = px(y);
+        };
+        if let Some(&entity) = cards.get(&index) {
+            commands.entity(entity).entry::<Node>().and_modify(position);
+            continue;
+        }
+        let entry = grid.entries[index];
+        let card = match entry {
             Entry::Folder(index) => {
-                folders += 1;
                 let folder = &browser.folders[index];
-                let card = asset_card(&mut commands, interface.grid, Action::Browse(index));
+                let card = asset_card(&mut commands, interface.canvas, Action::Browse(index));
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
                     DropFolder(index, browser.scan_revision),
@@ -990,12 +1125,13 @@ pub(crate) fn refresh(
                     "Папка",
                     MUTED,
                 );
+                card
             }
             Entry::Model(index) => {
                 let item = &editor.project.catalog[index];
                 let format = ModelFormat::from_path(&item.asset).map_or("3D", ModelFormat::label);
                 let filename = item.asset.rsplit('/').next().unwrap_or(&item.asset);
-                let card = asset_card(&mut commands, interface.grid, Action::ViewModel(index));
+                let card = asset_card(&mut commands, interface.canvas, Action::ViewModel(index));
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
                     AccessibleLabel(format!("Открыть модель {filename} · {}", item.label)),
@@ -1009,6 +1145,7 @@ pub(crate) fn refresh(
                     &interface.font,
                 );
                 commands.spawn((
+                    PreviewCard(entry),
                     ImageNode::new(previews.images[index].clone()),
                     Pickable::IGNORE,
                     Node {
@@ -1028,11 +1165,12 @@ pub(crate) fn refresh(
                     &format!("{format} · {}", item.label),
                     BLUE,
                 );
+                card
             }
             Entry::Scene { file, room } => {
                 let file = &browser.files[file];
                 let scene = &editor.project.scenes[room];
-                let card = asset_card(&mut commands, interface.grid, Action::Open(room));
+                let card = asset_card(&mut commands, interface.canvas, Action::Open(room));
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
                     AccessibleLabel(format!(
@@ -1050,6 +1188,7 @@ pub(crate) fn refresh(
                     &interface.font,
                 );
                 commands.spawn((
+                    PreviewCard(entry),
                     ImageNode::new(previews.scene_images[room].clone()),
                     Pickable::IGNORE,
                     Node {
@@ -1069,6 +1208,7 @@ pub(crate) fn refresh(
                     &format!("Сцена · {}", scene.label),
                     AMBER,
                 );
+                card
             }
             Entry::Image(index) | Entry::File(index) => {
                 let file = &browser.files[index];
@@ -1082,7 +1222,7 @@ pub(crate) fn refresh(
                 } else {
                     Action::BrowseFile(index)
                 };
-                let card = asset_card(&mut commands, interface.grid, action);
+                let card = asset_card(&mut commands, interface.canvas, action);
                 commands.entity(card).insert((
                     FileCard(entry, browser.scan_revision),
                     AccessibleLabel(format!(
@@ -1200,13 +1340,22 @@ pub(crate) fn refresh(
                         .entity(info)
                         .insert(ImageInfo(index, browser.scan_revision));
                 }
+                card
             }
-        }
+        };
+        commands.entity(card).entry::<Node>().and_modify(position);
+        cards.insert(index, card);
     }
-    if entries.is_empty() {
+    let empty_folder = grid.listing.is_some() && grid.entries.is_empty();
+    if (!empty_folder || listing_changed)
+        && let Some(entity) = empty_state.take()
+    {
+        commands.entity(entity).despawn();
+    }
+    if empty_folder && empty_state.is_none() {
         let empty = node(
             &mut commands,
-            interface.grid,
+            interface.canvas,
             Node {
                 width: percent(100),
                 padding: UiRect::vertical(px(34)),
@@ -1214,6 +1363,7 @@ pub(crate) fn refresh(
                 ..column(8.0)
             },
         );
+        *empty_state = Some(empty);
         text(
             &mut commands,
             empty,
@@ -1241,7 +1391,11 @@ pub(crate) fn refresh(
     }
     if let Ok(mut label) = labels.get_mut(interface.count) {
         label.0 = browser.error.clone().unwrap_or_else(|| {
-            format!("Папок: {folders}   ·   Файлов: {}", entries.len() - folders)
+            format!(
+                "Папок: {}   ·   Файлов: {}",
+                grid.folders,
+                grid.entries.len().saturating_sub(grid.folders)
+            )
         });
     }
 }
@@ -1381,6 +1535,65 @@ pub(crate) fn update_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "requires a GPU adapter for the real drawer layout and scrolling"]
+    fn large_folder_recycles_cards_on_scroll_and_unmounts_them_on_close() {
+        use crate::editor::{
+            scene_hierarchy::tests::fixture, selection_outline::render_tests::frame,
+            tests::lighting_ui_render::fixture_project,
+        };
+        let f = fixture();
+        let dir = f.root.join("many");
+        std::fs::create_dir(&dir).unwrap();
+        for n in 0..300 {
+            std::fs::write(dir.join(format!("{n:03}.txt")), []).unwrap();
+        }
+        let (mut app, _, _) = fixture_project(f.project.clone());
+        let folder = app
+            .world()
+            .resource::<Browser>()
+            .folders
+            .iter()
+            .position(|f| f.path == std::path::Path::new("many"))
+            .unwrap();
+        app.world_mut().resource_mut::<Browser>().navigate(folder);
+        app.world_mut().resource_mut::<Editor>().drawer = true;
+        for _ in 0..20 {
+            frame(&mut app);
+        }
+        let viewport = app.world().resource::<BrowserUi>().grid;
+        let canvas = app.world().resource::<BrowserUi>().canvas;
+        let cards = |app: &mut App| {
+            let w = app.world_mut();
+            w.query::<(&FileCard, &ChildOf)>()
+                .iter(w)
+                .filter(|(_, parent)| parent.parent() == canvas)
+                .map(|(card, _)| card.0)
+                .collect::<Vec<_>>()
+        };
+        let first = cards(&mut app);
+        assert!(!first.is_empty() && first.len() < 60);
+        app.world_mut()
+            .get_mut::<ScrollPosition>(viewport)
+            .unwrap()
+            .y = 10_000.;
+        for _ in 0..4 {
+            frame(&mut app);
+        }
+        let last = cards(&mut app);
+        assert!(!last.is_empty() && last.len() < 60);
+        assert!(last.iter().all(|c| !first.contains(c)));
+        let visible = app.world().resource::<GridWindow>().visible();
+        assert_eq!(visible.len(), last.len());
+        assert!(visible.iter().all(|entry| last.contains(entry)));
+        app.world_mut().resource_mut::<Editor>().drawer = false;
+        for _ in 0..30 {
+            frame(&mut app);
+        }
+        assert!(cards(&mut app).is_empty());
+    }
 
     #[test]
     fn drawer_slides_reversibly_and_stops_at_both_ends() {

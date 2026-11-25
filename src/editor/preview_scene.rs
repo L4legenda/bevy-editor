@@ -82,7 +82,6 @@ impl SceneSnapshot {
             editor.project.scenes.get(room).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "Unknown preview scene")
             })?;
-        Self::check_camera(definition)?;
         let open_edits = editor.preview_edits(room);
         let edits = match open_edits {
             Some(edits) => edits.clone(),
@@ -96,7 +95,6 @@ impl SceneSnapshot {
             editor.project.scenes.get(room).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "Unknown preview scene")
             })?;
-        Self::check_camera(definition)?;
         if let Some(edits) = editor.preview_edits(room) {
             return Ok(SnapshotRead {
                 state: SnapshotReadState::Ready(Self::from_edits(
@@ -121,10 +119,18 @@ impl SceneSnapshot {
         })
     }
 
-    fn check_camera(definition: &SceneDefinition) -> io::Result<&crate::CameraDefinition> {
-        definition.cameras.first().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Scene has no preview camera")
-        })
+    fn camera<'a>(
+        definition: &'a SceneDefinition,
+        edits: &'a RoomEdits,
+        open: bool,
+    ) -> Option<&'a crate::CameraDefinition> {
+        if !open && definition.is_native() {
+            return edits.scene.as_ref()?.cameras.first();
+        }
+        definition
+            .cameras
+            .first()
+            .or_else(|| edits.scene.as_ref()?.cameras.first())
     }
 
     fn from_edits(
@@ -133,7 +139,11 @@ impl SceneSnapshot {
         edits: RoomEdits,
         open_document: bool,
     ) -> io::Result<Self> {
-        let camera = Self::check_camera(definition)?;
+        let camera = Self::camera(definition, &edits, open_document)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Scene has no preview camera")
+            })?;
         Ok(Self {
             room,
             asset: definition.asset.clone(),
@@ -158,7 +168,11 @@ impl SceneSnapshot {
         let Some(definition) = editor.project.scenes.get(self.room) else {
             return false;
         };
-        let Some(camera) = definition.cameras.first() else {
+        let Some(camera) = Self::camera(
+            definition,
+            &self.edits,
+            editor.preview_edits(self.room).is_some(),
+        ) else {
             return false;
         };
         self.asset == definition.asset

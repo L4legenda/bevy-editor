@@ -250,12 +250,12 @@ fn choose_file(root: &Path) -> io::Result<Option<String>> {
     ))
 }
 
-pub(super) fn choose_file_path(root: &Path) -> io::Result<Option<PathBuf>> {
+pub(super) fn choose_file_path(_root: &Path) -> io::Result<Option<PathBuf>> {
     use std::process::Command;
     #[cfg(windows)]
     let output = {
         use std::os::windows::process::CommandExt;
-        Command::new("powershell.exe").creation_flags(0x08000000).current_dir(root).args(["-NoProfile","-STA","-Command","[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $d=New-Object Windows.Forms.OpenFileDialog; $d.InitialDirectory=(Get-Location).Path; if($d.ShowDialog() -eq 'OK'){[Console]::Write($d.FileName)}; $d.Dispose()"]).output()?
+        Command::new("powershell.exe").creation_flags(0x08000000).current_dir(_root).args(["-NoProfile","-STA","-Command","[Console]::OutputEncoding=[Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $d=New-Object Windows.Forms.OpenFileDialog; $d.InitialDirectory=(Get-Location).Path; if($d.ShowDialog() -eq 'OK'){[Console]::Write($d.FileName)}; $d.Dispose()"]).output()?
     };
     #[cfg(target_os = "macos")]
     let output = Command::new("osascript")
@@ -266,13 +266,13 @@ pub(super) fn choose_file_path(root: &Path) -> io::Result<Option<PathBuf>> {
         .output()?;
     #[cfg(not(any(windows, target_os = "macos")))]
     let output = Command::new("zenity")
-        .current_dir(root)
+        .current_dir(_root)
         .arg("--file-selection")
         .output()
         .or_else(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 Command::new("kdialog")
-                    .current_dir(root)
+                    .current_dir(_root)
                     .args(["--getopenfilename", "."])
                     .output()
             } else {
@@ -308,7 +308,6 @@ pub(super) fn update(
     buttons: Query<&RepairButton, Added<bevy::ui::Pressed>>,
     assets: Option<Res<AssetServer>>,
     mut thumbs: Option<ResMut<super::thumbnails::Thumbnails>>,
-    mut images: Option<ResMut<Assets<Image>>>,
 ) {
     let received: Vec<_> = monitor.rx.lock().unwrap().try_iter().collect();
     let mut rebuild = false;
@@ -393,8 +392,8 @@ pub(super) fn update(
                 .scenes
                 .extend(snapshot.project.scenes.into_iter().skip(snapshot.scene_len));
             browser.adopt(snapshot.browser);
-            if let (Some(thumbs), Some(images)) = (thumbs.as_mut(), images.as_mut()) {
-                thumbs.extend(images, editor.project.catalog.len());
+            if let Some(thumbs) = thumbs.as_mut() {
+                thumbs.extend(editor.project.catalog.len());
             }
         } else {
             monitor.refresh_needed = true;

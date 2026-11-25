@@ -273,7 +273,7 @@ pub(in crate::editor) struct BrowserContext {
     previous_focus: Option<Entity>,
     menu_entry: Option<MenuEntry>,
     rename_target: Option<rename::Target>,
-    focus_after: Option<PathBuf>,
+    pub(super) focus_after: Option<PathBuf>,
     suppress_release: bool,
     hovered: HashSet<PathBuf>,
     target: Option<(usize, Rect)>,
@@ -1212,7 +1212,6 @@ pub(in crate::editor) fn update(
     mut browser: ResMut<Browser>,
     mut browser_ui: ResMut<drawer::BrowserUi>,
     mut previews: ResMut<Thumbnails>,
-    mut images: ResMut<Assets<Image>>,
     mut focus: ResMut<InputFocus>,
     mut inputs: Query<&mut EditableText>,
     mut last_name: Local<String>,
@@ -1665,7 +1664,7 @@ pub(in crate::editor) fn update(
                 match browser_files::create_folder(&editor.root, &context.parent, &name) {
                     Ok(path) => {
                         browser.refresh(&mut editor.project);
-                        previews.extend(&mut images, editor.project.catalog.len());
+                        previews.extend(editor.project.catalog.len());
                         if let Some(parent) = browser
                             .folders
                             .iter()
@@ -1709,7 +1708,7 @@ pub(in crate::editor) fn update(
             && browser.folders[browser.current].path == completed.parent;
         if !completed.report.imported.is_empty() {
             browser.refresh(&mut editor.project);
-            previews.extend(&mut images, editor.project.catalog.len());
+            previews.extend(editor.project.catalog.len());
             if reveal && let Some(path) = completed.report.imported.last() {
                 browser_ui.selected = browser.files.iter().position(|file| file.path == *path);
                 browser_ui.selected_model = editor

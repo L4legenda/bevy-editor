@@ -77,6 +77,8 @@ pub(super) enum LightingAction {
     ToggleHdriBackground,
     ToggleFog,
     ToggleGlobalShadows,
+    #[cfg(target_os = "macos")]
+    ToggleFullPreviewShadows,
     SetShadowResolution(u32),
     CycleToneMapping,
     ResetEnvironment,
@@ -318,6 +320,11 @@ impl Editor {
 /// Root action dispatch owns the history snapshot, so each complete preset or
 /// toggle produces one undo entry. Gizmo visibility is a UI preference only.
 pub(super) fn handle(editor: &mut Editor, action: LightingAction) -> bool {
+    #[cfg(target_os = "macos")]
+    if action == LightingAction::ToggleFullPreviewShadows {
+        editor.full_preview_shadows = !editor.full_preview_shadows;
+        return false;
+    }
     if matches!(action, LightingAction::ToggleGizmos) {
         editor.show_lights = !editor.show_lights;
         return false;
@@ -698,6 +705,64 @@ fn clear_room(world: &mut World, runtime: &mut Runtime) {
     runtime.contact = false;
 }
 
+/// A point-light shadow needs six views. Keep the two nearest shadow casters in
+/// the interactive Metal preview, using the authored values again in full quality.
+#[cfg(target_os = "macos")]
+fn preview_point_shadows(
+    world: &mut World,
+    runtime: &Runtime,
+    environment: Option<&SceneLighting>,
+) {
+    const BUDGET: usize = 2;
+    let editor = world.resource::<Editor>();
+    let eye = editor.view.translation;
+    let full = editor.full_preview_shadows;
+    let global = environment.is_none_or(|s| s.shadows);
+    let imported = global && environment.is_none_or(|s| s.scene_lights);
+    let mut points: Vec<_> = runtime
+        .custom
+        .values()
+        .filter_map(|(entity, light)| {
+            (light.kind == LightKind::Point).then(|| {
+                (
+                    *entity,
+                    global && light.shadows,
+                    light.enabled,
+                    eye.distance_squared(light.pose.position.into()),
+                )
+            })
+        })
+        .chain(runtime.imported.iter().filter_map(|(&entity, source)| {
+            let SourceLight::Point(light) = source else {
+                return None;
+            };
+            let distance = world
+                .get::<GlobalTransform>(entity)
+                .map_or(f32::INFINITY, |t| eye.distance_squared(t.translation()));
+            Some((
+                entity,
+                imported && light.shadow_maps_enabled,
+                light.intensity > 0.0,
+                distance,
+            ))
+        }))
+        .collect();
+    points.sort_unstable_by(|a, b| {
+        (b.1 && b.2)
+            .cmp(&(a.1 && a.2))
+            .then_with(|| a.3.total_cmp(&b.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    for (index, (entity, requested, visible, _)) in points.into_iter().enumerate() {
+        let enabled = requested && (full || (visible && index < BUDGET));
+        if let Some(mut light) = world.get_mut::<PointLight>(entity)
+            && light.shadow_maps_enabled != enabled
+        {
+            light.shadow_maps_enabled = enabled;
+        }
+    }
+}
+
 /// Runs in Update after camera creation and before transform propagation.
 /// It never changes source meshes, thumbnail lights, mask views or saved DTOs.
 pub(super) fn sync(world: &mut World) {
@@ -783,15 +848,15 @@ pub(super) fn sync(world: &mut World) {
             Without<LightEntity>,
         )>()
         .iter(world)
-        .filter(|entity| belongs_to(world, *entity, &roots))
+        .filter(|entity| {
+            !runtime.imported.contains_key(entity) && belongs_to(world, *entity, &roots)
+        })
         .collect();
     runtime
         .imported
         .retain(|entity, _| world.entities().contains(*entity));
     for entity in sources {
-        if let Some(original) = SourceLight::capture(world, entity)
-            && !runtime.imported.contains_key(&entity)
-        {
+        if let Some(original) = SourceLight::capture(world, entity) {
             if environment.is_some() {
                 original.apply(world, entity, environment.as_ref());
             }
@@ -856,6 +921,8 @@ pub(super) fn sync(world: &mut World) {
         }
     }
     queue.apply(world);
+    #[cfg(target_os = "macos")]
+    preview_point_shadows(world, &runtime, environment.as_ref());
     let contact = environment
         .as_ref()
         .is_none_or(|environment| environment.shadows)

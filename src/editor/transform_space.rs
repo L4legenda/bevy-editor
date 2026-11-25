@@ -91,8 +91,8 @@ impl Editor {
                 Some((target, Self::with_transform_field(pose, field, value)))
             })
             .collect();
-        if let Some(graph) = self.edits.hierarchy.as_deref()
-            && let Some(mut by_key) = poses
+        if self.edits.hierarchy.is_some()
+            && let Some(by_key) = poses
                 .iter()
                 .map(|(t, p)| {
                     self.hierarchy_key(*t)
@@ -101,25 +101,12 @@ impl Editor {
                 .collect::<Option<Vec<_>>>()
         {
             let local = self.local_space;
-            if !local {
-                by_key.sort_by_cached_key(|(key, _)| {
-                    let mut depth = 0;
-                    let mut node = graph.parent(*key);
-                    while let Some(parent) = node {
-                        depth += 1;
-                        node = graph.parent(parent.key);
-                    }
-                    depth
-                });
-            }
-            self.edit_hierarchy(|graph| {
+            self.edit_poses(|graph| {
                 if local {
-                    return graph.set_locals(&by_key);
+                    graph.set_locals(&by_key)
+                } else {
+                    graph.set_worlds(&by_key)
                 }
-                for (key, pose) in by_key {
-                    graph.set_world(key, pose)?;
-                }
-                Ok(())
             });
         } else {
             for (target, pose) in poses {
@@ -132,7 +119,7 @@ impl Editor {
         if self.local_space
             && let Some(key) = self.hierarchy_key(target)
         {
-            self.edit_hierarchy(|h| h.set_local(key, pose.into()));
+            self.edit_poses(|h| h.set_local(key, pose.into()));
             return;
         }
         let mut world = pose;

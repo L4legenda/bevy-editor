@@ -1,6 +1,7 @@
 //! Model workspace lighting starts with the same defaults as a new scene.
-use super::*;
 use super::paint::post::{DocumentPost, Effects, Field as PostField};
+use super::*;
+use crate::editor::ui::environment_library::{self, Library, List};
 use bevy::{
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     ui_widgets::{
@@ -237,7 +238,7 @@ pub(super) struct Panel;
 pub(super) struct PanelUi {
     section: Entity,
     overrides: Entity,
-    source: Entity,
+    picker: Entity,
     uv_open: bool,
     model_open: bool,
 }
@@ -254,7 +255,6 @@ pub(super) struct ControlValue {
 }
 #[derive(Component)]
 pub(super) enum Caption {
-    Source,
     Background,
     Key,
     ToneMap,
@@ -299,17 +299,8 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
         },
         AccessibleLabel("Окружение просмотра модели".into()),
     ));
-    let source = button(
-        &mut commands,
-        section.body,
-        font,
-        "Свет и окружение сцены",
-        Action::ModelView(ModelViewAction::Shading(
-            shading::ShadingAction::PreviewLighting,
-        )),
-        Look::Regular,
-    );
-    commands.entity(source).insert(Caption::Source);
+    let picker = node(&mut commands, section.body, column(0.0));
+    environment_library::picker(&mut commands, picker, interface.root, font, List::Model);
     let overrides = node(
         &mut commands,
         section.body,
@@ -321,7 +312,7 @@ pub(super) fn setup(mut commands: Commands, interface: Res<Interface>, editor: R
     commands.insert_resource(PanelUi {
         section: section.root,
         overrides,
-        source,
+        picker,
         uv_open: false,
         model_open: true,
     });
@@ -719,6 +710,7 @@ pub(super) fn actions(
 
 pub(super) fn synchronize(
     settings: Res<Settings>,
+    library: Res<Library>,
     editor: Res<Editor>,
     shading: Res<shading::Shading>,
     editing: Res<editing::State>,
@@ -739,8 +731,15 @@ pub(super) fn synchronize(
 ) {
     use shading::Mode;
     let (mode, preview_lighting) = shading.viewport(editing.mode(editor.viewing_model));
+    let saved = if preview_lighting
+        && editing.mode(editor.viewing_model) != crate::editor::model_document::Mode::Paint
+    {
+        library.model_lighting()
+    } else {
+        None
+    };
     let lighting = match mode {
-        Mode::Rendered if preview_lighting => settings.lighting.clone(),
+        Mode::Rendered if preview_lighting => saved.unwrap_or(&settings.lighting).clone(),
         Mode::Rendered => editor.environment().clone(),
         Mode::Solid => crate::SceneLighting {
             ambient_brightness: 420.0,
@@ -755,7 +754,7 @@ pub(super) fn synchronize(
             ..default()
         },
     };
-    let backdrop = if preview_lighting {
+    let backdrop = if preview_lighting && saved.is_none() {
         crate::hdri::EnvironmentBackdrop {
             brightness: settings.background_brightness,
             blur: settings.blur,
@@ -829,7 +828,7 @@ pub(super) fn synchronize(
     }
     for (entity, mut light, mut pose, cascades) in &mut lights {
         let (illuminance, color, shadows, azimuth, elevation) = match mode {
-            Mode::Rendered if preview_lighting => (
+            Mode::Rendered if preview_lighting && saved.is_none() => (
                 if settings.key_enabled {
                     settings.key_intensity * LIGHT_SCALE
                 } else {
@@ -888,6 +887,7 @@ pub(super) struct PreviewSceneLight;
 pub(super) fn refresh(
     editor: Res<Editor>,
     settings: Res<Settings>,
+    library: Res<Library>,
     ui: Res<PanelUi>,
     mut sections: Query<&mut inspector::Section>,
     shading: Res<shading::Shading>,
@@ -903,28 +903,30 @@ pub(super) fn refresh(
     use crate::editor::model_document::Mode;
     let editing_mode = editing.mode(editor.viewing_model);
     let (mode, preview_lighting) = shading.viewport(editing_mode);
-    let shown = editor.viewing_model.is_some()
-        && editor.viewing_image.is_none()
-        && mode == shading::Mode::Rendered;
+    let shown = editor.viewing_model.is_some() && editor.viewing_image.is_none();
     let open = ui.open(editing_mode == Mode::Uv);
     if let Ok(mut section) = sections.get_mut(ui.section)
         && section.open() != open
     {
         section.set_open(open);
     }
-    if let Ok(mut source) = nodes.get_mut(ui.source) {
-        source.display = if editing_mode == Mode::Paint { Display::None } else { Display::Flex };
-    }
-    if let Ok(mut overrides) = nodes.get_mut(ui.overrides) {
-        overrides.display = if preview_lighting {
-            Display::Flex
-        } else {
+    if let Ok(mut picker) = nodes.get_mut(ui.picker) {
+        picker.display = if editing_mode == Mode::Paint {
             Display::None
+        } else {
+            Display::Flex
         };
     }
-    let preview_enabled = shown && preview_lighting && editor.pending.is_none()
-        && editor.viewing_image.is_none() && !editor.hdri_library_open;
-    let paint_doc = editor.viewing_model.and_then(|index| editing.documents.get(&index))
+    let manual = mode == shading::Mode::Rendered
+        && preview_lighting
+        && (editing_mode == Mode::Paint || library.model_lighting().is_none());
+    if let Ok(mut overrides) = nodes.get_mut(ui.overrides) {
+        overrides.display = if manual { Display::Flex } else { Display::None };
+    }
+    let preview_enabled = shown && manual && editor.pending.is_none() && !editor.hdri_library_open;
+    let paint_doc = editor
+        .viewing_model
+        .and_then(|index| editing.documents.get(&index))
         .filter(|doc| doc.mode == Mode::Paint);
     let post = settings.paint_post(paint_doc);
     for mut panel in &mut panels {
@@ -960,13 +962,6 @@ pub(super) fn refresh(
     }
     for (caption, children) in &captions {
         let value = match caption {
-            Caption::Source => {
-                if preview_lighting {
-                    "Свет и окружение просмотра".into()
-                } else {
-                    "Свет и окружение сцены".into()
-                }
-            }
             Caption::Background => {
                 if settings.lighting.hdri_background {
                     "Фон: окружение".into()

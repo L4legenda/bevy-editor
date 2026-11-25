@@ -77,6 +77,7 @@ fn saves_replace_documents_and_preserve_typed_runtime_camera_keys() {
         },
     );
     edits.models.push(PlacedModel {
+        selector: None,
         uid: None,
         id: 1,
         asset: "models/block.glb".into(),
@@ -108,6 +109,7 @@ fn invalid_documents_do_not_replace_the_last_saved_level() {
         "models/block.glb#Scene0",
     ] {
         edits.models = vec![PlacedModel {
+            selector: None,
             uid: None,
             id: 1,
             asset: path.into(),
@@ -167,6 +169,7 @@ fn native_document() -> LevelEdits {
         }],
     });
     edits.models.push(PlacedModel {
+        selector: None,
         uid: None,
         id: 7,
         asset: "models/block.glb".into(),

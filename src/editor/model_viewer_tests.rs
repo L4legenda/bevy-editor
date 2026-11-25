@@ -1072,9 +1072,9 @@ fn gpu_model_viewer_opens_renders_navigates_and_releases_its_scene() {
     app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
         shading::ShadingAction::Set(shading::Mode::Rendered),
     )));
-    app.world_mut().write_message(Action::ModelView(ModelViewAction::Shading(
-        shading::ShadingAction::PreviewLighting,
-    )));
+    app.world_mut().write_message(Action::EnvironmentLibrary(
+        crate::editor::ui::environment_library::Command::UsePreview,
+    ));
     frame(&mut app);
     let baseline = capture_when(&mut app, &target, &output.join("model.png"), |image| {
         let mut colored = 0;

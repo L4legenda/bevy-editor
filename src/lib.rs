@@ -44,7 +44,7 @@ mod window_chrome;
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub use editor::mcp;
 #[cfg(feature = "editor")]
-pub use editor::{EditorPlugin, create_app};
+pub use editor::{EditorPlugin, create_app, create_app_from_path};
 #[cfg(feature = "editor")]
 pub use project::{
     CameraDefinition, CatalogItem, EditorProject, LensKind, NodePolicy, PlayCommand,

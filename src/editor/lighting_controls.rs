@@ -345,7 +345,7 @@ fn slider(
             TabIndex(0),
             Hovered::default(),
             AccessibleLabel(label.into()),
-            Help("Перетащите ползунок или используйте стрелки ←/→. Esc отменяет текущее перетаскивание."),
+            Help("Перетащите ползунок или используйте стрелки ←/→. Esc отменяет текущее перетаскивание.".into()),
             BorderColor::all(Color::NONE),
             Node {
                 width: percent(100),
@@ -501,7 +501,7 @@ pub(super) fn color_editor(
             TabIndex(0),
             Hovered::default(),
             AccessibleLabel(format!("{label}: насыщенность и яркость")),
-            Help("Слева цвет спокойнее, справа — насыщеннее; сверху светлее, снизу темнее. Полоса под палитрой меняет оттенок."),
+            Help("Слева цвет спокойнее, справа — насыщеннее; сверху светлее, снизу темнее. Полоса под палитрой меняет оттенок.".into()),
             Node {
                 width: percent(100),
                 height: px(112),
@@ -644,7 +644,7 @@ pub(crate) fn input(
 ) {
     let force = actions.read().last().is_some() || closing.read().last().is_some();
     let context = editor.selection.map(|selection| (editor.room, selection));
-    let menu_open = ui.menu_open;
+    let menu_open = ui.is_menu_open();
     let state = &mut ui.controls;
     if state
         .drag
@@ -823,7 +823,7 @@ pub(crate) fn refresh(
     mut labels: Query<&mut Text>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let enabled = editor.has_scene() && editor.ready && editor.pending.is_none() && !ui.menu_open;
+    let enabled = editor.has_scene() && editor.ready && editor.pending.is_none() && !ui.is_menu_open();
     for (entity, mut picker) in &mut pickers {
         picker.sync(&editor);
         if picker.drawn_hue != picker.hsv.hue

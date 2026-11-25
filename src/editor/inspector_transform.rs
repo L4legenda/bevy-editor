@@ -167,11 +167,11 @@ impl TransformProperty {
             .map(|(target, pose)| Some((editor.hierarchy_key(*target)?, (*pose).into())))
             .collect::<Option<Vec<_>>>()
         {
-            editor.edit_hierarchy(|graph| graph.set_locals(&locals));
+            editor.edit_poses(|graph| graph.set_locals(&locals));
         } else {
             for (target, pose) in poses {
                 if let Some(key) = editor.hierarchy_key(target) {
-                    editor.edit_hierarchy(|graph| graph.set_local(key, pose.into()));
+                    editor.edit_poses(|graph| graph.set_local(key, pose.into()));
                 } else {
                     editor.set_pose(target, pose);
                 }

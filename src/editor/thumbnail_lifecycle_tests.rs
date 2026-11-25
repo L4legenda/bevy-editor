@@ -224,3 +224,22 @@ fn opening_a_hidden_scene_cancels_its_pending_disk_read_and_uses_the_live_draft(
     assert!(editor.preview_edits(1).is_none());
     assert!(!snapshot.matches_editor(&editor));
 }
+
+#[test]
+fn unopened_catalog_shares_one_pixel_and_scrolling_recycles_inactive_targets() {
+    let mut images = Assets::<Image>::default();
+    let mut cache = Thumbnails::new(&mut images, 750, 34);
+    assert_eq!(images.len(), 1);
+    assert_eq!(images.get(&cache.placeholder).unwrap().width(), 1);
+    let visible = [Entry::Model(0)];
+    for index in 0..75 {
+        let target = Target::Model(index);
+        cache.allocate(target, &visible, &mut images);
+        cache.complete(target);
+    }
+    assert_eq!(cache.recent.len(), 64);
+    assert_ne!(cache.images[0], cache.placeholder);
+    assert_eq!(cache.images[1], cache.placeholder);
+    assert!(!cache.completed.contains(&Target::Model(1)));
+    assert_eq!(cache.scene_images[0], cache.placeholder);
+}

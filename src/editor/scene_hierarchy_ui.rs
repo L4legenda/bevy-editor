@@ -14,39 +14,28 @@ fn action(commands: &mut Commands, parent: Entity, font: &Handle<Font>, label: &
         Look::Regular,
     );
 }
-fn toolbar(commands: &mut Commands, parent: Entity, font: &Handle<Font>) {
-    let line = node(
+pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>, editor: &Editor) {
+    let environment = node(
         commands,
         parent,
         Node {
-            flex_wrap: FlexWrap::Wrap,
-            ..row(3.0)
+            width: percent(100),
+            height: px(28),
+            padding: UiRect::left(px(OUTLINE_DISCLOSURE_WIDTH)),
+            flex_shrink: 0.0,
+            ..row(0.0)
         },
     );
-    action(commands, line, font, "+ Папка", H::AddFolder);
-    icons::button(
-        commands,
-        line,
-        icons::Glyph::Refresh,
-        "Обновить вложенные сцены с диска",
-        Action::Hierarchy(H::Refresh),
-        Look::Regular,
-    );
-}
-pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>, editor: &Editor) {
-    if editor.definition().is_native() {
-        toolbar(commands, parent, font);
-        scene_tree_drag::root_row(commands, parent, font);
-    }
     outline_entry(
         commands,
-        parent,
+        environment,
         font,
-        "Освещение сцены",
+        "Окружение",
         Selection::Environment,
         None,
         true,
         icons::Glyph::Folder,
+        false,
     );
     if editor.hierarchy_parenting.is_some() {
         text(
@@ -144,7 +133,7 @@ pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>,
             Action::Hierarchy(H::Fold(key)),
             Look::Regular,
             Node {
-                width: px(18),
+                width: px(OUTLINE_DISCLOSURE_WIDTH),
                 height: px(28),
                 flex_shrink: 0.0,
                 align_items: AlignItems::Center,
@@ -207,9 +196,9 @@ pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>,
             } else {
                 icons::Glyph::Folder
             },
+            true,
         );
         commands.entity(item).observe(scene_objects::pointer_menu);
-        scene_tree_drag::mark(commands, item, Some(target));
         if entry.instance.is_some() {
             control_hints::attach(
                 commands,
@@ -274,14 +263,6 @@ pub(super) fn tree(commands: &mut Commands, parent: Entity, font: &Handle<Font>,
             pending.extend(children.iter().rev().map(|n| (*n, depth + 1)));
         }
     }
-    text(
-        commands,
-        parent,
-        font,
-        "Перетащите файл сцены в 3D-вид, чтобы добавить экземпляр",
-        10.0,
-        MUTED,
-    );
 }
 #[derive(Component)]
 pub(in crate::editor) struct FolderArrival(Instant);
@@ -332,7 +313,7 @@ fn component(
         parent,
         Node {
             width: percent(100),
-            padding: UiRect::left(px((depth.min(24) * 14 + 18) as f32)),
+            padding: UiRect::left(px((depth.min(24) * 14) as f32 + OUTLINE_DISCLOSURE_WIDTH)),
             ..default()
         },
     );
@@ -350,13 +331,12 @@ fn component(
         light.map(|l| l.kind),
         true,
         icons::Glyph::Folder,
+        false,
     );
 }
 pub(super) struct Inspector {
-    relations: Entity,
-    instance: Entity,
-    relations_scope: Entity,
-    instance_scope: Entity,
+    body: Entity,
+    scope: Entity,
 }
 
 pub(super) fn setup_inspector(
@@ -364,15 +344,7 @@ pub(super) fn setup_inspector(
     parent: Entity,
     font: &Handle<Font>,
 ) -> Inspector {
-    let relations = node(
-        commands,
-        parent,
-        Node {
-            display: Display::None,
-            ..column(0.0)
-        },
-    );
-    let instance = node(
+    let scope = node(
         commands,
         parent,
         Node {
@@ -381,20 +353,10 @@ pub(super) fn setup_inspector(
         },
     );
     Inspector {
-        relations_scope: relations,
-        instance_scope: instance,
-        relations: inspector::section(
+        scope,
+        body: inspector::section(
             commands,
-            relations,
-            font,
-            "Узел сцены",
-            "node object hierarchy иерархия",
-            false,
-        )
-        .body,
-        instance: inspector::section(
-            commands,
-            instance,
+            scope,
             font,
             "Экземпляр сцены",
             "instance prefab исходная вложенная overrides",
@@ -413,80 +375,24 @@ pub(super) fn inspector(
     let target = (editor.has_scene() && !editor.asset_viewer_open() && !editor.multiple_selected())
         .then_some(editor.selection)
         .flatten();
-    let hierarchy = target.and_then(|target| {
+    let instance = target.and_then(|target| {
         let graph = editor.edits.hierarchy.as_deref()?;
         let key = editor.hierarchy_key(target)?;
-        Some((graph, key))
+        Some((graph, key, graph.source_path(key)?))
     });
-    let source = hierarchy.and_then(|(graph, key)| graph.source_path(key));
-    let rename = target
-        .filter(|&target| editor.object_editable(target) && !matches!(target, Selection::Light(_)));
-    for (scope, body, show) in [
-        (
-            ui.relations_scope,
-            ui.relations,
-            hierarchy.is_some() || rename.is_some(),
-        ),
-        (ui.instance_scope, ui.instance, source.is_some()),
-    ] {
-        commands.entity(body).despawn_related::<Children>();
-        commands
-            .entity(scope)
-            .entry::<Node>()
-            .and_modify(move |mut node| {
-                node.display = if show { Display::Flex } else { Display::None };
-            });
-    }
-    let relation_actions = node(
-        commands,
-        ui.relations,
-        Node {
-            flex_wrap: FlexWrap::Wrap,
-            row_gap: px(3),
-            ..row(3.0)
-        },
-    );
-    if let Some(target) = rename {
-        let item = node(commands, relation_actions, row(0.0));
-        inspector::searchable(commands, item, "переименовать имя rename name");
-        button(
-            commands,
-            item,
-            font,
-            "Переименовать",
-            Action::SceneObject(SceneObjectAction::Rename(target)),
-            Look::Regular,
-        );
-    }
-    let Some((graph, key)) = hierarchy else {
-        return;
+    commands.entity(ui.body).despawn_related::<Children>();
+    let display = if instance.is_some() {
+        Display::Flex
+    } else {
+        Display::None
     };
-    let parent = graph.parent(key).map(|n| editor.hierarchy_selection(n.key));
-    let label = parent.map_or_else(|| "Корень сцены".into(), |target| editor.label(target));
-    let label = text(
-        commands,
-        ui.relations,
-        font,
-        format!("Родитель · {label}"),
-        11.0,
-        MUTED,
-    );
-    inspector::searchable(commands, label, "родитель parent корень");
-    commands.entity(label).insert(TextLayout::default());
-    for (label, command, terms) in [
-        ("Сменить родителя", H::PickParent, "родитель reparent"),
-        ("В корень", H::ToRoot, "родитель корень root"),
-        ("Выше", H::SiblingEarlier, "порядок выше order"),
-        ("Ниже", H::SiblingLater, "порядок ниже order"),
-    ] {
-        if matches!(command, H::ToRoot) && parent.is_none() {
-            continue;
-        }
-        let item = node(commands, relation_actions, row(0.0));
-        inspector::searchable(commands, item, terms);
-        action(commands, item, font, label, command);
-    }
-    if let Some(source) = source {
+    commands
+        .entity(ui.scope)
+        .entry::<Node>()
+        .and_modify(move |mut node| {
+            node.display = display;
+        });
+    if let Some((graph, key, source)) = instance {
         let overridden = graph.overridden(key);
         let hint = if overridden {
             "Есть переопределения"
@@ -495,19 +401,19 @@ pub(super) fn inspector(
         };
         let status = text(
             commands,
-            ui.instance,
+            ui.body,
             font,
             hint,
             11.0,
             if overridden { FOCUS } else { MUTED },
         );
         inspector::searchable(commands, status, "переопределения overrides");
-        let path = text(commands, ui.instance, font, source, 11.0, MUTED);
+        let path = text(commands, ui.body, font, source, 11.0, MUTED);
         commands.entity(path).insert(TextLayout::default());
         inspector::searchable(commands, path, &format!("источник source {source}"));
         let actions = node(
             commands,
-            ui.instance,
+            ui.body,
             Node {
                 flex_wrap: FlexWrap::Wrap,
                 row_gap: px(3),
@@ -601,9 +507,7 @@ mod tests {
         let light_name = editor.edits.lights[0].name.clone();
         let common = [
             light_name.as_str(),
-            "+ Папка",
-            "Корень сцены",
-            "Освещение сцены",
+            "Окружение",
             "Главная камера",
             "Тестовый объект",
         ];
@@ -640,8 +544,15 @@ mod tests {
                 .all(|label| after.iter().any(|text| text == label))
         );
         assert!(after.iter().any(|text| text == "Папка"));
-        for label in ["ОСВЕЩЕНИЕ", "КАМЕРЫ", "ОБЪЕКТЫ СЦЕНЫ", "Сгруппировать"]
-        {
+        for label in [
+            "ОСВЕЩЕНИЕ",
+            "КАМЕРЫ",
+            "ОБЪЕКТЫ СЦЕНЫ",
+            "Сгруппировать",
+            "+ Папка",
+            "Корень сцены",
+            "Перетащите файл сцены в 3D-вид, чтобы добавить экземпляр",
+        ] {
             assert!(!before.iter().chain(&after).any(|text| text == label));
         }
     }

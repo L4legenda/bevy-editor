@@ -660,8 +660,13 @@ fn gpu_uv_workspace_unwraps_previews_edits_and_saves_without_scene_changes() {
                 ))
             )
         });
+        use crate::editor::ui::environment_library::{Command, List};
         click(&mut app, window, |a| {
-            matches!(a, Action::ModelView(ModelViewAction::Shading(ShadingAction::PreviewLighting)))
+            matches!(a, Action::EnvironmentLibrary(Command::Toggle(List::Model)))
+        });
+        warm(&mut app, 3);
+        click(&mut app, window, |a| {
+            matches!(a, Action::EnvironmentLibrary(Command::UsePreview))
         });
         warm(&mut app, 5);
         assert!(

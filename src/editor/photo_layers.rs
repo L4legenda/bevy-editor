@@ -553,38 +553,7 @@ impl PhotoDocument {
         self.preview_region(Rect::from_size(self.size()))
     }
     pub fn preview_region(&self, rect: Rect) -> Rgba8Image {
-        use photocraft_engine::commands::mask_view_cmds::{MaskViewMode, viewed_mask};
-        let rect = rect.intersect(&Rect::from_size(self.size()));
-        let Some(view) = self.mask_view else {
-            return self.composite_region(rect);
-        };
-        let Some(mask) = self
-            .document
-            .layer(view.layer)
-            .and_then(|l| viewed_mask(l, view.filter))
-        else {
-            return self.composite_region(rect);
-        };
-        let mut image = if view.mode == MaskViewMode::Gray {
-            Rgba8Image::new(rect.width(), rect.height())
-        } else {
-            self.composite_region(rect)
-        };
-        for (index, pixel) in image.pixels.chunks_exact_mut(4).enumerate() {
-            let x = rect.x0 + (index % rect.width() as usize) as i32;
-            let y = rect.y0 + (index / rect.width() as usize) as i32;
-            let value = mask.surface.sample_channel(x, y, 0).clamp(0.0, 1.0);
-            if view.mode == MaskViewMode::Gray {
-                let gray = (value * 255.0).round() as u8;
-                pixel.copy_from_slice(&[gray, gray, gray, 255]);
-            } else {
-                let alpha = (1.0 - value) * 0.5;
-                pixel[0] = (pixel[0] as f32 * (1.0 - alpha) + 255.0 * alpha).round() as u8;
-                pixel[1] = (pixel[1] as f32 * (1.0 - alpha)).round() as u8;
-                pixel[2] = (pixel[2] as f32 * (1.0 - alpha)).round() as u8;
-            }
-        }
-        image
+        super::render_preview(&self.document, self.mask_view, rect)
     }
     pub fn editing_smart(&self) -> bool {
         !self.parents.is_empty()

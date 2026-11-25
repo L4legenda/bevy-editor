@@ -109,7 +109,7 @@ pub(super) fn read(device: &RenderDevice, queue: &RenderQueue, target: &Target) 
     });
     let mut encoder = device.create_command_encoder(&default());
     encoder.copy_texture_to_buffer(
-        target.output.as_image_copy(),
+        target.view.texture().as_image_copy(),
         TexelCopyBufferInfo {
             buffer: &buffer,
             layout: TexelCopyBufferLayout {

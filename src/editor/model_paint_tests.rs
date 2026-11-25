@@ -778,8 +778,15 @@ fn gpu_paint_save_copy_opens_a_separate_editable_tab() {
     let original = std::fs::read(&source).unwrap();
     let destination = source.with_file_name("paint-copy-test.glb");
     app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Paint))));
-    warm(&mut app, 8);
-    paint_message(&mut app, PaintAction::Add(LayerKind::Fill));
+    let add_fill = PaintAction::Add(LayerKind::Fill);
+    let started = std::time::Instant::now();
+    while !app.world().resource::<PaintState>().sessions.get(&0)
+        .is_some_and(|session| session.binding.is_some() && session.available(add_fill))
+    {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 20, "The paint surface did not become editable");
+    }
+    paint_message(&mut app, add_fill);
     let original_stack = app.world().resource::<PaintState>().sessions[&0].stack.clone();
     assert!(app.world().resource::<editing::State>().documents[&0].dirty());
     #[cfg(feature = "mcp")]

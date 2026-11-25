@@ -380,9 +380,7 @@ fn rescan(
 ) {
     browser.refresh(&mut editor.project);
     ui.select(None);
-    assets
-        .previews
-        .extend(&mut assets.images, editor.project.catalog.len());
+    assets.previews.extend(editor.project.catalog.len());
 }
 
 fn effect_layout(geometry: &Geometry, panel_entity: Entity, rect: Rect) -> Option<Node> {

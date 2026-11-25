@@ -180,6 +180,25 @@ fn recents_round_trip_deduplicate_preserve_favorites_and_back_up_corrupt_history
     assert_eq!(fs::read(backup.path()).unwrap(), b"corrupt history");
 }
 
+// Stand in for the second executable without opening an OS window in the UI tests.
+fn reply_from_test_editor(mut manager: ResMut<Manager>) {
+    let Some(launch) = &mut manager.launch else {
+        return;
+    };
+    launch.child.wait().unwrap();
+    let result = EditorProject::load_for_editor(&launch.file)
+        .and_then(|project| {
+            let title = project.title.clone();
+            crate::EditorPlugin::new(project).map(|_| title)
+        })
+        .map_err(|e| e.to_string());
+    fs::write(
+        launch.reply.path().join("ready"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+}
+
 fn controller(scratch: &Scratch) -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
@@ -191,7 +210,10 @@ fn controller(scratch: &Scratch) -> App {
         .init_resource::<native::Picker>()
         .init_resource::<update::Updates>()
         .add_message::<Action>()
-        .add_systems(Update, (actions, poll_editors).chain());
+        .add_systems(
+            Update,
+            (actions, reply_from_test_editor, poll_editors).chain(),
+        );
     app
 }
 fn action(app: &mut App, action: Action) {
@@ -325,14 +347,11 @@ fn create_and_open_remembers_project_and_launch_failure_keeps_created_files() {
     {
         let manager = app.world().resource::<Manager>();
         assert!(manager.form.is_none());
-        assert_eq!(manager.running.len(), 1);
+        assert!(manager.launch.is_none());
         assert_eq!(
             RecentProjects::read(&manager.registry).unwrap().projects[0].file,
             file
         );
-    }
-    for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
-        child.wait().unwrap();
     }
     app.world_mut().resource_mut::<Manager>().executable = scratch.0.join("missing-executable");
     action(&mut app, Action::New);
@@ -429,11 +448,41 @@ fn enter_in_search_opens_the_matching_project_and_resets_the_filter() {
     assert!(matches!(app.should_exit(), Some(AppExit::Success)));
     {
         let manager = app.world().resource::<Manager>();
-        assert_eq!(manager.running[0].0, beta);
+        assert_eq!(manager.selected.as_ref(), Some(&beta));
         assert!(manager.filter.is_empty());
         assert!(manager.status.is_empty());
     }
-    for (_, mut child) in app.world_mut().resource_mut::<Manager>().running.drain(..) {
-        child.wait().unwrap();
-    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deferred_open_rejects_a_broken_active_scene_and_ignores_a_broken_closed_scene() {
+    let scratch = Scratch::new();
+    let file =
+        projects::create_project(&scratch.0.join("deferred"), "Deferred", Template::Empty).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let editor = EditorProject::load(&file).unwrap();
+    fs::write(editor.asset_root.join("unusable.scene"), b"{broken").unwrap();
+    manifest["scenes"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"file": "unusable.scene"}));
+    fs::write(&file, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let lazy = EditorProject::load_for_editor(&file).unwrap();
+    assert!(lazy.scenes[1].cameras.is_empty());
+    assert!(lazy.read_scene(1).is_err());
+    let mut app = controller(&scratch);
+    action(&mut app, Action::Open(file.clone()));
+    assert!(matches!(app.should_exit(), Some(AppExit::Success)));
+    app.world_mut().resource_mut::<Messages<AppExit>>().clear();
+    fs::write(editor.asset_root.join(&editor.scenes[0].file), b"{broken").unwrap();
+    action(&mut app, Action::Open(file));
+    assert!(app.should_exit().is_none());
+    assert!(
+        app.world()
+            .resource::<Manager>()
+            .status
+            .contains("Не удалось открыть")
+    );
 }

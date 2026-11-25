@@ -60,6 +60,7 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
     n.speaker = Some(c.to_string_lossy().into_owned());
     n.portrait = 1;
     n.text = "Сигнал принят?".into();
+    n.add_answer();
     let end = d.add(NodeKind::End, first);
     d.node_mut(first).unwrap().choices.push(Choice {
         text: "Повторить".into(),
@@ -77,6 +78,33 @@ fn branching_roundtrip_preserves_speakers_portraits_and_cycles() {
     assert!(d.node(first).unwrap().choices[0].target.is_none());
     d.delete(0);
     assert!(d.node(0).is_some());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_line_reuses_its_continuation_when_the_first_answer_is_added_and_removed() {
+    let mut d = Dialogue::new("Тест".into());
+    let line = d.add(NodeKind::Line, 0);
+    let n = d.node(line).unwrap();
+    assert!(n.choices.is_empty() && n.output_exists(0));
+    assert!(!n.output_exists(1));
+
+    let end = d.add(NodeKind::End, line);
+    let n = d.node_mut(line).unwrap();
+    assert!(n.answers().is_empty());
+    assert_eq!(n.output_target(0), Some(end));
+    n.add_answer();
+    assert!(!n.has_direct_output());
+    assert_eq!(n.answers().len(), 1);
+    assert_eq!(n.output_target(0), Some(end));
+    n.remove_answer(0);
+    assert!(n.answers().is_empty());
+    assert_eq!(n.output_target(0), Some(end));
+
+    let root = lab();
+    let path = Path::new("continuation.dialog");
+    Content::Dialogue(d.clone()).save(&root, path).unwrap();
+    assert_eq!(Content::read(&root, path).unwrap(), Content::Dialogue(d));
     fs::remove_dir_all(root).unwrap();
 }
 

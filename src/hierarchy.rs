@@ -184,6 +184,9 @@ impl SceneHierarchy {
                 .and_then(|e| e.instance.as_ref())
                 .is_some_and(|i| i.overrides.contains_key(child));
         }
+        if node.instance.is_none() {
+            return false;
+        }
         self.source
             .entities
             .iter()
@@ -726,73 +729,84 @@ impl SceneHierarchy {
                 }
             });
         }
-        self.nodes
-            .iter_mut()
-            .find(|n| n.key == key)
-            .unwrap()
-            .entity
-            .transform = crate::scene_io::transform(pose);
-        self.nodes[*self.by_key.get(&key).unwrap()]
-            .entity
-            .components
-            .extend(components);
+        let node = &mut self.nodes[self.by_key[&key]];
+        node.entity.transform = crate::scene_io::transform(pose);
+        node.entity.components.extend(components);
         Ok(())
     }
 
     fn update_world_transforms(&mut self) -> io::Result<()> {
-        // Recompute just matrices: transform drags never reload or expand dependencies.
-        let mut worlds: HashMap<String, Affine3A> = HashMap::new();
-        for node in &self.nodes {
-            let mut ancestors = vec![];
-            let mut cursor = Some(node);
-            while let Some(next) = cursor {
-                if worlds.contains_key(&next.entity.id) {
+        self.apply_world_batch(&HashMap::new())
+    }
+
+    pub fn set_world(&mut self, key: u32, pose: Pose) -> io::Result<()> {
+        self.set_worlds(&[(key, pose)])
+    }
+
+    /// Apply absolute targets against their final parents, independent of selection order.
+    pub(crate) fn set_worlds(&mut self, poses: &[(u32, Pose)]) -> io::Result<()> {
+        let mut targets = HashMap::with_capacity(poses.len());
+        for &(key, pose) in poses {
+            if !pose.valid() || !self.by_key.contains_key(&key) {
+                return Err(invalid("Invalid world transform or missing object"));
+            }
+            targets.insert(key, pose);
+        }
+        self.apply_world_batch(&targets)
+    }
+
+    fn apply_world_batch(&mut self, targets: &HashMap<u32, Pose>) -> io::Result<()> {
+        let mut done = vec![false; self.nodes.len()];
+        let mut ancestors = Vec::new();
+        for index in 0..self.nodes.len() {
+            let mut cursor = Some(index);
+            while let Some(i) = cursor {
+                if done[i] {
                     break;
                 }
-                ancestors.push(next);
-                cursor = next.entity.parent.as_deref().and_then(|id| self.by_id(id));
-            }
-            for next in ancestors.into_iter().rev() {
-                let parent = next
+                ancestors.push(i);
+                cursor = self.nodes[i]
                     .entity
                     .parent
                     .as_ref()
-                    .map_or(Affine3A::IDENTITY, |id| worlds[id]);
-                let world = parent * next.local().transform().compute_affine();
+                    .map(|id| self.by_id[id]);
+            }
+            while let Some(i) = ancestors.pop() {
+                let n = &self.nodes[i];
+                let parent = self
+                    .parent(n.key)
+                    .map_or(Affine3A::IDENTITY, SceneNode::affine);
+                let mut local = n.local();
+                if let Some(pose) = targets.get(&n.key) {
+                    let current = Transform::from_matrix(Mat4::from(
+                        parent * local.transform().compute_affine(),
+                    ));
+                    // A translation under a non-uniformly scaled parent must preserve local shear/axes.
+                    let rotation = current.rotation.normalize();
+                    let target_rotation = pose.transform().rotation;
+                    if (rotation.abs_diff_eq(target_rotation, 1e-5)
+                        || rotation.abs_diff_eq(-target_rotation, 1e-5))
+                        && current.scale.abs_diff_eq(pose.scale.into(), 1e-5)
+                    {
+                        local.position = parent
+                            .inverse()
+                            .transform_point3(pose.position.into())
+                            .to_array();
+                    } else {
+                        local = affine_pose(parent.inverse() * pose.transform().compute_affine())?;
+                    }
+                    self.patch_local(n.key, local)?;
+                    local = self.nodes[i].local();
+                }
+                let world = parent * local.transform().compute_affine();
                 if !world.is_finite() {
                     return Err(invalid("Hierarchy transform overflow"));
                 }
-                worlds.insert(next.entity.id.clone(), world);
+                self.nodes[i].world = world.to_cols_array();
+                done[i] = true;
             }
-        }
-        for node in &mut self.nodes {
-            node.world = worlds[&node.entity.id].to_cols_array();
         }
         Ok(())
-    }
-    pub fn set_world(&mut self, key: u32, pose: Pose) -> io::Result<()> {
-        let node = self
-            .node(key)
-            .ok_or_else(|| invalid("Object no longer exists"))?;
-        let parent = self.parent(key).map_or(Affine3A::IDENTITY, |n| n.affine());
-        let current = node.pose();
-        let local = if current
-            .transform()
-            .rotation
-            .abs_diff_eq(pose.transform().rotation, 1e-5)
-            && Vec3::from(current.scale).abs_diff_eq(pose.scale.into(), 1e-5)
-        {
-            Pose {
-                position: parent
-                    .inverse()
-                    .transform_point3(pose.position.into())
-                    .to_array(),
-                ..node.local()
-            }
-        } else {
-            affine_pose(parent.inverse() * pose.transform().compute_affine())?
-        };
-        self.set_local(key, local)
     }
     pub fn set_camera(&mut self, key: u32, placement: CameraPlacement) -> io::Result<()> {
         self.camera_placement(key, placement, false)
@@ -1004,22 +1018,34 @@ impl SceneHierarchy {
     }
 
     #[cfg(feature = "editor")]
-    pub(crate) fn drop_node(&mut self, key: u32, destination: TreeDrop<u32>) -> io::Result<bool> {
-        let Some(node) = self.node(key) else {
-            return Err(invalid("Объект больше не существует"));
-        };
-        let (parent, anchor) = match destination {
+    fn drop_parent(&self, destination: TreeDrop<u32>) -> io::Result<(Option<u32>, Option<u32>)> {
+        Ok(match destination {
             TreeDrop::Root => (None, None),
             TreeDrop::Inside(parent) => (Some(parent), None),
             TreeDrop::Before(target) | TreeDrop::After(target) => {
-                if target == key {
-                    return Ok(false);
-                }
                 self.node(target)
                     .ok_or_else(|| invalid("Целевой объект больше не существует"))?;
                 (self.parent(target).map(|n| n.key), Some(target))
             }
+        })
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn can_drop_node(&self, key: u32, destination: TreeDrop<u32>) -> bool {
+        self.drop_parent(destination).is_ok_and(|(parent, anchor)| {
+            anchor != Some(key) && self.parent_patch(key, parent).is_ok()
+        })
+    }
+
+    #[cfg(feature = "editor")]
+    pub(crate) fn drop_node(&mut self, key: u32, destination: TreeDrop<u32>) -> io::Result<bool> {
+        let Some(node) = self.node(key) else {
+            return Err(invalid("Объект больше не существует"));
         };
+        let (parent, anchor) = self.drop_parent(destination)?;
+        if anchor == Some(key) {
+            return Ok(false);
+        }
         let parent_patch = self.parent_patch(key, parent)?;
         let parent_id = parent
             .and_then(|key| self.node(key))

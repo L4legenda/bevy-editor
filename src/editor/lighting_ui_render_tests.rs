@@ -722,7 +722,7 @@ fn gpu_scene_tree_header_collapses_the_list_and_restores_the_split() {
     assert!(expanded_inspector.height() > inspector.height() + 100.0);
     assert!((expanded_inspector.min.y - header.max.y).abs() < 2.0);
     assert!((expanded_inspector.max.y - inspector.max.y).abs() < 2.0);
-    labeled_rect(&mut app, "+ Свет");
+    labeled_rect(&mut app, "Добавить в сцену");
     let output =
         std::env::temp_dir().join(format!("bevy-editor-tree-collapse-{}", std::process::id()));
     std::fs::create_dir_all(&output).unwrap();
@@ -870,6 +870,7 @@ fn gpu_scene_inspector_filters_and_reverts_properties() {
     send(&mut app, Action::Select(Selection::Model(mesh)));
     click(&mut app, "Пространство координат инспектора");
     assert!(app.world().resource::<Editor>().local_space);
+    click(&mut app, "Найти свойство");
     let search_rect = labeled_rect(&mut app, "Поиск свойств");
     assert!(visible_field(&mut app, Field::Position(0)));
 
@@ -1231,6 +1232,7 @@ fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
     app.world_mut()
         .write_message(Action::Select(Selection::Environment));
     warm(&mut app, 8);
+    click_inspector(&mut app, window, "Панорама HDRI");
     for preset in crate::EnvironmentPreset::ALL {
         let rect = labeled_rect(&mut app, &format!("HDRI: {}", preset.label()));
         assert!(
@@ -1257,7 +1259,7 @@ fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
     drag_control(
         &mut app,
         window,
-        "Поворот HDRI",
+        "Поворот",
         Vec2::new(0.5, 0.5),
         Vec2::new(0.8, 0.5),
     );
@@ -1271,7 +1273,7 @@ fn gpu_hdri_environment_picker_and_sliders_work_in_the_editor() {
     drag_control(
         &mut app,
         window,
-        "Яркость HDRI",
+        "Яркость",
         Vec2::new(0.6, 0.5),
         Vec2::new(0.7, 0.5),
     );
@@ -1569,8 +1571,17 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
     println!("Lighting UI GPU artifacts: {}", output.display());
     let (mut app, window, target) = fixture();
 
-    app.world_mut().write_message(Action::LightMenu);
-    warm(&mut app, 8);
+    click_inspector(&mut app, window, "Добавить в сцену");
+    let choices = labeled_rect(&mut app, "Добавление в сцену");
+    let add = labeled_rect(&mut app, "Добавить в сцену");
+    assert!(choices.min.y >= add.max.y + 4.0);
+    capture_when(
+        &mut app,
+        &target,
+        &output.join("00-add-menu.png"),
+        ui_pixels,
+    );
+    click_inspector(&mut app, window, "Свет");
     assert!(app.world().resource::<ui::LightingUi>().is_menu_open());
     capture_when(
         &mut app,
@@ -1579,7 +1590,6 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
         ui_pixels,
     );
     let menu = labeled_rect(&mut app, "Добавление света и схемы освещения");
-    let add = labeled_rect(&mut app, "+ Свет");
     assert!(add.min.x >= WIDTH as f32 - ui::SIDE && add.min.y >= ui::TOP);
     assert!(
         menu.min.y >= add.max.y + 4.0,
@@ -1621,6 +1631,7 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
         &output.join("02-spot-inspector.png"),
         ui_pixels,
     );
+    click_inspector(&mut app, window, "Цвет");
     let color = labeled_rect(&mut app, "Цвет источника: насыщенность и яркость");
     assert!(color.min.x >= WIDTH as f32 - ui::SIDE && color.max.x <= WIDTH as f32);
     assert!(visible_field(&mut app, Field::Light(LightField::Intensity)));
@@ -1680,6 +1691,7 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
         &output.join("02-color-picker-edited.png"),
         ui_pixels,
     );
+    click_inspector(&mut app, window, "Форма и тени");
     scroll_to_field(&mut app, Field::Light(LightField::OuterAngle));
     assert!(visible_field(
         &mut app,
@@ -1699,6 +1711,7 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
     app.world_mut()
         .write_message(Action::Select(Selection::Environment));
     warm(&mut app, 8);
+    click_inspector(&mut app, window, "Экспозиция и тонмаппинг");
     scroll_to_field(&mut app, Field::Environment(EnvironmentField::Exposure));
     assert!(visible_field(
         &mut app,
@@ -1708,6 +1721,8 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
         &mut app,
         Field::Light(LightField::OuterAngle)
     ));
+    click_inspector(&mut app, window, "Фоновый свет");
+    scroll_to_label(&mut app, "Цвет фонового света: насыщенность и яркость");
     let environment_image = capture_when(
         &mut app,
         &target,
@@ -1733,6 +1748,7 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
     app.world_mut()
         .write_message(Action::Lighting(LightingAction::ToggleFog));
     warm(&mut app, 3);
+    click_inspector(&mut app, window, "Свет сцены и туман");
     let ambient = app.world().resource::<Editor>().environment().ambient_color;
     drag_control(
         &mut app,
@@ -2072,4 +2088,138 @@ fn gpu_dragged_model_preview_tracks_cursor_and_release_matches_the_preview() {
     app.world_mut().write_message(Action::Redo);
     warm(&mut app, 4);
     assert_eq!(app.world().resource::<Editor>().edits.models, placed);
+}
+
+fn click_inspector(app: &mut App, window: Entity, label: &str) {
+    scroll_to_label(app, label);
+    let position = labeled_rect(app, label).center();
+    move_pointer(app, window, position);
+    mouse(app, window, ButtonState::Pressed);
+    mouse(app, window, ButtonState::Released);
+    warm(app, 4);
+}
+
+#[test]
+#[ignore = "requires a GPU adapter; verifies scene presets and captures test-only UI"]
+fn gpu_environment_presets_scene_and_model() {
+    use crate::editor::ui::environment_library::Library;
+    let temporary_output = std::env::temp_dir().join(format!(
+        "bevy-environment-captures-{}",
+        bevy::asset::uuid::Uuid::new_v4()
+    ));
+    let out = std::env::var_os("BEVY_ENVIRONMENT_SCREENSHOTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary_output.clone());
+    std::fs::create_dir_all(&out).unwrap();
+    let files = std::env::temp_dir().join(format!(
+        "bevy-environment-fixture-{}",
+        bevy::asset::uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&files).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy");
+    for directory in ["scenes", "models", "levels"] {
+        let target = files.join("assets").join(directory);
+        std::fs::create_dir_all(&target).unwrap();
+        for file in std::fs::read_dir(fixture.join("assets").join(directory)).unwrap() {
+            let file = file.unwrap();
+            std::fs::copy(file.path(), target.join(file.file_name())).unwrap();
+        }
+    }
+    std::fs::copy(fixture.join("project.json"), files.join("project.json")).unwrap();
+    let project = EditorProject::load(files.join("project.json")).unwrap();
+    let (mut app, window, target) = fixture_project(project);
+    let send = |app: &mut App, action: Action| {
+        app.world_mut().write_message(action);
+        warm(app, 8);
+    };
+    let night = LightingAction::SetEnvironment(Some(crate::EnvironmentPreset::Night));
+    send(&mut app, Action::Select(Selection::Environment));
+    send(&mut app, Action::ToggleSceneTree);
+    send(&mut app, Action::Lighting(night));
+    click_inspector(&mut app, window, "Сохранить окружение");
+    capture_when(&mut app, &target, &out.join("scene.png"), ui_pixels);
+
+    send(&mut app, Action::Open(1));
+    capture_when(&mut app, &target, &out.join("second-scene.png"), |_| true);
+    for _ in 0..120 {
+        if app.world().resource::<Editor>().ready {
+            break;
+        }
+        frame(&mut app);
+    }
+    send(&mut app, Action::Select(Selection::Environment));
+    send(
+        &mut app,
+        Action::Lighting(LightingAction::SetEnvironment(Some(
+            crate::EnvironmentPreset::SmallStudio,
+        ))),
+    );
+    send(&mut app, Action::Save);
+    assert_eq!(
+        std::fs::read_dir(files.join("assets/environments"))
+            .unwrap()
+            .flatten()
+            .filter(|f| f.file_name().to_string_lossy().ends_with(".env.json"))
+            .count(),
+        2
+    );
+
+    click_inspector(&mut app, window, "Окружения проекта");
+    capture_when(&mut app, &target, &out.join("scene-menu.png"), ui_pixels);
+    click_inspector(&mut app, window, "Окружение: Мастерская");
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(crate::EnvironmentPreset::Night)
+    );
+    send(&mut app, Action::Undo);
+    assert_eq!(
+        app.world().resource::<Editor>().environment().hdri,
+        Some(crate::EnvironmentPreset::SmallStudio)
+    );
+    let before = app.world().resource::<Editor>().edits.clone();
+
+    send(&mut app, Action::ViewModel(0));
+    capture_when(&mut app, &target, &out.join("model.png"), ui_pixels);
+    click_inspector(&mut app, window, "Выбрать окружение модели");
+    capture_when(&mut app, &target, &out.join("model-menu.png"), ui_pixels);
+    click_inspector(&mut app, window, "Окружение: Мастерская");
+    assert_eq!(
+        app.world()
+            .resource::<Library>()
+            .model_lighting()
+            .unwrap()
+            .hdri,
+        Some(crate::EnvironmentPreset::Night)
+    );
+    click_inspector(&mut app, window, "Выбрать окружение модели");
+    click_inspector(&mut app, window, "Окружение: Малая сцена");
+    assert_eq!(
+        app.world()
+            .resource::<Library>()
+            .model_lighting()
+            .unwrap()
+            .hdri,
+        Some(crate::EnvironmentPreset::SmallStudio)
+    );
+    let studio = capture_when(&mut app, &target, &out.join("model-studio.png"), ui_pixels);
+    click_inspector(&mut app, window, "Переключить два последних окружения");
+    assert_eq!(
+        app.world()
+            .resource::<Library>()
+            .model_lighting()
+            .unwrap()
+            .hdri,
+        Some(crate::EnvironmentPreset::Night)
+    );
+    let night = capture_when(&mut app, &target, &out.join("model-night.png"), ui_pixels);
+    assert_ne!(
+        studio.get_pixel(WIDTH / 3, HEIGHT / 3),
+        night.get_pixel(WIDTH / 3, HEIGHT / 3),
+        "The two environments must render a different viewport"
+    );
+    assert_eq!(app.world().resource::<Editor>().edits, before);
+    std::fs::remove_dir_all(&files).unwrap();
+    if out == temporary_output {
+        std::fs::remove_dir_all(out).unwrap();
+    }
 }

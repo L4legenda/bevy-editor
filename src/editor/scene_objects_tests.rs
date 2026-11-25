@@ -361,6 +361,83 @@ mod gpu {
     }
 
     #[test]
+    #[ignore = "requires GPU; moves a nested instance through the outliner context menu"]
+    fn gpu_scene_objects_hierarchy_commands_live_in_tree_menu() {
+        let files = crate::editor::scene_hierarchy::tests::fixture();
+        let (mut app, window, _) = lighting_ui_render::fixture_project(files.project.clone());
+        let key = {
+            let editor = app.world().resource::<Editor>();
+            editor
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .by_id("a")
+                .unwrap()
+                .key
+        };
+        let target = Selection::Node(key);
+        let point = control_point(
+            &mut app,
+            |action| matches!(action, Action::Select(selection) if selection == target),
+        );
+        click(&mut app, window, point, MouseButton::Right);
+        let world = app.world_mut();
+        assert!(
+            !world
+                .query::<(&Control, &AccessibleLabel)>()
+                .iter(world)
+                .any(
+                    |(control, label)| matches!(control.action, Action::Inspector(_))
+                        && label.0 == "Узел сцены"
+                )
+        );
+        control_point(&mut app, |action| {
+            matches!(action, Action::Hierarchy(HierarchyAction::OpenSource))
+        });
+        let point = control_point(&mut app, |action| {
+            matches!(
+                action,
+                Action::SceneObject(ObjectAction::Hierarchy(HierarchyAction::ToRoot))
+            )
+        });
+        click(&mut app, window, point, MouseButton::Left);
+        let editor = app.world().resource::<Editor>();
+        assert!(
+            editor
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .parent(key)
+                .is_none()
+        );
+        assert!(!editor.scene_object_popup);
+        app.world_mut().write_message(Action::Undo);
+        warm(&mut app, 4);
+        let editor = app.world().resource::<Editor>();
+        assert!(
+            editor
+                .edits
+                .hierarchy
+                .as_ref()
+                .unwrap()
+                .parent(key)
+                .is_some()
+        );
+
+        let point = control_point(&mut app, |action| matches!(action, Action::SceneAddMenu));
+        click(&mut app, window, point, MouseButton::Left);
+        let point = control_point(&mut app, |action| {
+            matches!(action, Action::Hierarchy(HierarchyAction::AddFolder))
+        });
+        click(&mut app, window, point, MouseButton::Left);
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.label(editor.selection.unwrap()), "Папка");
+        assert!(!app.world().resource::<LightingUi>().is_menu_open());
+    }
+
+    #[test]
     #[ignore = "requires GPU; renames and removes a real outliner object using its context menu, F2 and undo"]
     fn gpu_scene_objects_context_rename_delete_and_undo() {
         let project = EditorProject::load(

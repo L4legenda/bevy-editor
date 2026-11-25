@@ -228,7 +228,6 @@ pub(in crate::editor::ui::model_viewer) fn update(
     runtime: Res<engine::Runtime>,
     mut browser: ResMut<Browser>,
     mut previews: ResMut<Thumbnails>,
-    mut images: ResMut<Assets<Image>>,
 ) {
     let requested = messages
         .read()
@@ -310,7 +309,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             match result {
                 Ok(path) if editor.project.asset_root == job.root => {
                     browser.refresh(&mut editor.project);
-                    previews.extend(&mut images, editor.project.catalog.len());
+                    previews.extend(editor.project.catalog.len());
                     if active == Some(job.model)
                         && let Some(copy) = editor
                             .project

@@ -19,7 +19,6 @@ pub(super) enum HierarchyAction {
     OpenSource,
     ResetOverrides,
     Unpack,
-    Refresh,
     Insert(Room),
     Drop(Room, Selection, TreeDrop<Selection>),
 }
@@ -34,17 +33,13 @@ pub(super) fn available(editor: &Editor, action: HierarchyAction) -> bool {
         .and_then(|k| editor.edits.hierarchy.as_ref()?.node(k));
     match action {
         HierarchyAction::AddFolder => true,
-        HierarchyAction::Refresh => editor
-            .edits
-            .hierarchy
-            .as_ref()
-            .is_some_and(|h| h.nodes.iter().any(|n| n.instance.is_some())),
         HierarchyAction::Fold(key) => editor
             .edits
             .hierarchy
             .as_ref()
             .is_some_and(|h| h.node(key).is_some()),
-        HierarchyAction::PickParent | HierarchyAction::ToRoot => node.is_some(),
+        HierarchyAction::PickParent => node.is_some(),
+        HierarchyAction::ToRoot => node.is_some_and(|n| n.entity.parent.is_some()),
         HierarchyAction::SiblingEarlier | HierarchyAction::SiblingLater => node.is_some_and(|n| {
             editor
                 .edits
@@ -164,12 +159,7 @@ impl Editor {
                 })
                 .collect();
             if let Some(poses) = poses {
-                self.edit_hierarchy(|h| {
-                    for (key, pose) in poses {
-                        h.set_world(key, pose)?;
-                    }
-                    Ok(())
-                });
+                self.edit_poses(|h| h.set_worlds(&poses));
                 return;
             }
         }
@@ -242,6 +232,62 @@ impl Editor {
             self.selection_group = None;
         }
     }
+    /// A transform edit preserves IDs, order and asset references. Only publish the
+    /// new snapshot after every affected world transform has passed validation.
+    pub(super) fn edit_poses(
+        &mut self,
+        change: impl FnOnce(&mut SceneHierarchy) -> io::Result<()>,
+    ) {
+        let Some(previous) = self.edits.hierarchy.clone() else {
+            return;
+        };
+        let mut graph = (*previous).clone();
+        let result = change(&mut graph).and_then(|()| {
+            let mut changed = HashMap::new();
+            let mut cameras_changed = false;
+            for (node, old) in graph.nodes.iter().zip(&previous.nodes) {
+                let moved = node.world != old.world;
+                if moved {
+                    let pose = node.pose();
+                    if !pose.valid() {
+                        return Err(io::Error::other("Недопустимая мировая трансформация"));
+                    }
+                    changed.insert(node.key, pose);
+                }
+                if node.camera.is_some()
+                    && (moved
+                        || node.entity.components != old.entity.components
+                        || graph.parent(node.key).map(|n| n.world)
+                            != previous.parent(old.key).map(|n| n.world))
+                {
+                    cameras_changed = true;
+                }
+            }
+            if cameras_changed {
+                // Camera reset placements are relative to their parent; use the canonical bridge.
+                let next = graph.project()?;
+                self.edits = next;
+                self.sync_hierarchy_metadata();
+            } else {
+                for model in &mut self.edits.models {
+                    if let Some(&pose) = changed.get(&model.id) {
+                        model.pose = pose;
+                    }
+                }
+                for light in &mut self.edits.lights {
+                    if let Some(&pose) = changed.get(&light.id) {
+                        light.pose = pose;
+                    }
+                }
+                self.edits.hierarchy = Some(std::sync::Arc::new(graph));
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.status = format!("Изменение не применено · {error}");
+        }
+    }
+
     pub(super) fn edit_hierarchy<R>(
         &mut self,
         edit: impl FnOnce(&mut SceneHierarchy) -> io::Result<R>,
@@ -309,6 +355,19 @@ impl Editor {
         self.selection_group = None;
         Ok(())
     }
+    pub(super) fn can_drop_in_tree(
+        &self,
+        source: Selection,
+        destination: TreeDrop<Selection>,
+    ) -> bool {
+        let Some(graph) = &self.edits.hierarchy else {
+            return true;
+        };
+        self.hierarchy_key(source)
+            .zip(destination.try_map(|target| self.hierarchy_key(target)))
+            .is_some_and(|(key, target)| graph.can_drop_node(key, target))
+    }
+
     fn drop_in_tree(&mut self, source: Selection, destination: TreeDrop<Selection>) {
         let before = self.edits.clone();
         let result = (|| -> io::Result<_> {
@@ -323,12 +382,12 @@ impl Editor {
                 // Preserve the order displayed by the flat outliner on first use.
                 scene.entities.sort_by(|a, b| {
                     let section = |entity: &crate::scene_format::Entity| {
-                        if entity.components.contains_key("light") {
+                        if entity.components.contains_key("camera") {
                             0
-                        } else if entity.components.contains_key("camera") {
-                            1
-                        } else {
+                        } else if entity.components.contains_key("light") {
                             2
+                        } else {
+                            1
                         }
                     };
                     section(a)
@@ -386,7 +445,10 @@ impl Editor {
                     if let Some(parent) = parent {
                         self.hierarchy_collapsed.remove(&(self.room, parent));
                     }
-                    self.select(Some(self.hierarchy_selection(key)));
+                    let result = self.hierarchy_selection(key);
+                    self.select(Some(result));
+                    self.tree_drop_arrival =
+                        Some((self.room, source, result, std::time::Instant::now()));
                 }
             }
             Ok(None) => {}
@@ -530,7 +592,7 @@ impl Editor {
         let success = match action {
             HierarchyAction::AddFolder => {
                 if let Some(key) = self.edit_hierarchy(|h| {
-                    // Place the new folder beside the toolbar so its entrance is visible.
+                    // Put the new folder at the top of the tree where its entrance is visible.
                     let first = h
                         .nodes
                         .iter()
@@ -577,7 +639,6 @@ impl Editor {
             HierarchyAction::Unpack => {
                 key.is_some_and(|key| self.edit_hierarchy(|h| h.unpack(key)).is_some())
             }
-            HierarchyAction::Refresh => self.edit_hierarchy(|h| h.refresh(&root)).is_some(),
             HierarchyAction::Insert(room) => {
                 if let Some(scene) = self.project.scenes.get(room).cloned() {
                     let pose = Transform::from_translation(self.pivot).into();
@@ -606,19 +667,17 @@ impl Editor {
 
 /// Reparent render roots under canonical local TRS nodes, preserving affine shear.
 pub(super) fn sync(world: &mut World) {
-    let (room, graph, models) = {
-        let editor = world.resource::<Editor>();
-        let scene = world.resource::<Scene>();
-        (
-            editor.has_scene().then_some(editor.room),
-            editor
-                .edits
-                .hierarchy
-                .clone()
-                .filter(|_| editor.has_scene()),
-            scene.models.clone(),
-        )
-    };
+    let editor = world.resource::<Editor>();
+    let room = editor.has_scene().then_some(editor.room);
+    let graph = room.and(editor.edits.hierarchy.clone());
+    let scene = world.resource::<Scene>();
+    if graph.is_none()
+        && scene.spatial.is_empty()
+        && scene.spatial_graph.is_none()
+        && scene.spatial_room == room
+    {
+        return;
+    }
     let mut spatial = std::mem::take(&mut world.resource_mut::<Scene>().spatial);
     let changed_room = world.resource::<Scene>().spatial_room != room;
     let changed_graph = changed_room
@@ -633,7 +692,19 @@ pub(super) fn sync(world: &mut World) {
         scene.spatial_room = room;
         return;
     }
-    if changed_graph {
+    let topology_changed = changed_room
+        || (changed_graph
+            && match (&graph, &world.resource::<Scene>().spatial_graph) {
+                (Some(new), Some(old)) => {
+                    new.nodes.len() != old.nodes.len()
+                        || new.nodes.iter().any(|n| {
+                            old.node(n.key)
+                                .is_none_or(|previous| previous.entity.parent != n.entity.parent)
+                        })
+                }
+                _ => true,
+            });
+    if topology_changed {
         let old_ids: std::collections::HashSet<_> = spatial.values().copied().collect();
         // Detach first, then reconcile. Deleting a parent must not despawn surviving children.
         let detach: Vec<_> = world
@@ -674,6 +745,8 @@ pub(super) fn sync(world: &mut World) {
                     .unwrap()
                     .set_if_neq(node.local().transform());
             }
+        }
+        if topology_changed {
             for node in &graph.nodes {
                 if let Some(parent) = graph.parent(node.key) {
                     world
@@ -682,7 +755,13 @@ pub(super) fn sync(world: &mut World) {
                 }
             }
         }
-        for (key, (entity, _)) in models {
+        let models: Vec<_> = world
+            .resource::<Scene>()
+            .models
+            .iter()
+            .map(|(&key, &(entity, _))| (key, entity))
+            .collect();
+        for (key, entity) in models {
             if let Some(parent) = spatial.get(&key)
                 && world.get_entity(entity).is_ok()
             {

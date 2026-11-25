@@ -131,12 +131,13 @@ impl Editor {
         self.object_key(target).is_some() && !self.visibility_inherited(target)
     }
     pub(super) fn object_hidden(&self, target: Selection) -> bool {
-        self.visibility_inherited(target)
-            || self.object_deleted(target)
-            || self.object_key(target).is_some_and(|key| {
-                self.hidden_objects
-                    .get(&self.room)
-                    .is_some_and(|hidden| hidden.contains(&key))
+        self.object_deleted(target)
+            || self.hidden_objects.get(&self.room).is_some_and(|hidden| {
+                !hidden.is_empty()
+                    && (self.visibility_inherited(target)
+                        || self
+                            .object_key(target)
+                            .is_some_and(|key| hidden.contains(&key)))
             })
     }
 

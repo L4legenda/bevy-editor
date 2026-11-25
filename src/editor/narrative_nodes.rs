@@ -40,6 +40,9 @@ fn body_height(n: &DialogueNode) -> f32 {
         NodeKind::Jump => 112.0,
     }
 }
+pub(super) fn answer_rows_top(n: &DialogueNode) -> f32 {
+    EDGE_WIDTH + HEADER + body_height(n)
+}
 pub(super) fn height(n: &DialogueNode) -> f32 {
     if n.kind == NodeKind::Start {
         return EDGE_WIDTH * 2.0
@@ -50,7 +53,7 @@ pub(super) fn height(n: &DialogueNode) -> f32 {
     EDGE_WIDTH * 2.0
         + HEADER
         + body_height(n)
-        + n.choices.len() as f32 * OUTPUT_HEIGHT
+        + n.answers().len() as f32 * OUTPUT_HEIGHT
         + if n.kind == NodeKind::Line {
             FOOTER
         } else {
@@ -64,12 +67,15 @@ fn output_y(n: &DialogueNode, choice: usize) -> f32 {
     if n.kind == NodeKind::Start && choice == 0 {
         return EDGE_WIDTH + HEADER + 12.0 + START_LABEL_HEIGHT + 8.0 + 18.0;
     }
+    if n.has_direct_output() {
+        return height(n) - EDGE_WIDTH - FOOTER * 0.5;
+    }
     let row = if n.kind == NodeKind::Start {
         choice - 1
     } else {
         choice
     };
-    EDGE_WIDTH + HEADER + body_height(n) + row as f32 * OUTPUT_HEIGHT + 29.0
+    answer_rows_top(n) + (row as f32 + 0.5) * OUTPUT_HEIGHT + 1.0
 }
 pub(super) fn input_position() -> Vec2 {
     Vec2::new(EDGE_WIDTH * 0.5, EDGE_WIDTH + HEADER * 0.5)
@@ -718,6 +724,7 @@ pub(super) fn spawn(
                     height: px(FOOTER),
                     width: percent(100),
                     padding: UiRect::all(px(10)),
+                    flex_shrink: 0.0,
                     ..row(0.0)
                 },
             );
@@ -730,6 +737,18 @@ pub(super) fn spawn(
                 false,
             );
             full_button(commands, add);
+            if n.has_direct_output() {
+                let socket = links::socket(
+                    commands,
+                    footer,
+                    n.id,
+                    0,
+                    Vec2::new(NODE_WIDTH - EDGE_WIDTH * 1.5, FOOTER * 0.5),
+                );
+                commands
+                    .entity(socket)
+                    .insert(AccessibleLabel(format!("Связать выход ноды #{}", n.id)));
+            }
         }
     }
 }

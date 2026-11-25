@@ -67,9 +67,22 @@ pub struct EditorProject {
 impl EditorProject {
     /// Resolve the asset root against the project file, independent of the CWD.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::load_manifest(path.as_ref(), true)
+    }
+
+    /// Unopened native documents obtain their cameras and authored title on first use.
+    #[cfg(feature = "editor")]
+    pub(crate) fn load_for_editor(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::load_manifest(path.as_ref(), false)
+    }
+
+    fn manifest(file: &Path) -> io::Result<Self> {
+        serde_json::from_slice(&std::fs::read(file)?).map_err(io::Error::other)
+    }
+
+    fn load_manifest(path: &Path, read_documents: bool) -> io::Result<Self> {
         let path = resolve_project_file(path)?;
-        let mut project: Self =
-            serde_json::from_slice(&std::fs::read(&path)?).map_err(io::Error::other)?;
+        let mut project = Self::manifest(&path)?;
         let directory = path.parent().unwrap_or(Path::new("."));
         project.asset_root = directory.join(&project.asset_root).canonicalize()?;
         let index = crate::asset_registry::reopen(&project.asset_root)?;
@@ -97,6 +110,14 @@ impl EditorProject {
         crate::asset_paths::apply_project_paths(&mut project)?;
         for scene in &mut project.scenes {
             if scene.is_native() {
+                if !read_documents {
+                    scene.cameras.clear();
+                    if scene.label.is_empty() {
+                        scene.label =
+                            SceneDefinition::native_label(&project.asset_root, &scene.file);
+                    }
+                    continue;
+                }
                 let content = LevelEdits::<String>::read(&project.asset_root, &scene.file)?;
                 let settings = content.scene.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "Missing scene metadata")
@@ -105,11 +126,15 @@ impl EditorProject {
                 scene.cameras = settings.cameras;
             }
         }
-        project.validate()?;
+        project.validate_manifest(!read_documents)?;
         Ok(project)
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        self.validate_manifest(false)
+    }
+
+    pub(crate) fn validate_manifest(&self, deferred_native: bool) -> io::Result<()> {
         let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
         if self.scenes.is_empty() || !self.asset_root.is_dir() {
             return Err(invalid(
@@ -124,7 +149,7 @@ impl EditorProject {
                 || !crate::data::document_path(&scene.file)
                 || (relative_path(&scene.file, "scene") && !scene.asset.is_empty())
                 || !files.insert(&scene.file)
-                || scene.cameras.is_empty()
+                || (scene.cameras.is_empty() && !(deferred_native && scene.is_native()))
             {
                 return Err(invalid("Invalid scene asset, document path or camera list"));
             }
@@ -187,6 +212,60 @@ pub struct SceneDefinition {
 }
 
 impl SceneDefinition {
+    /// Native files store the title before their resources and entities. Stop at the
+    /// title and leave document validation and dependency loading to the editor tab.
+    pub(crate) fn native_label(root: &Path, file: &str) -> String {
+        use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+        use std::io::BufRead;
+        #[derive(Deserialize)]
+        struct Legacy {
+            label: String,
+        }
+        struct Title<'a>(&'a mut Option<String>);
+        impl<'de> Visitor<'de> for Title<'_> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a scene header")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<(), A::Error> {
+                while let Some(key) = fields.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => *self.0 = Some(fields.next_value()?),
+                        "scene" => *self.0 = Some(fields.next_value::<Legacy>()?.label),
+                        _ => {
+                            fields.next_value::<IgnoredAny>()?;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                Ok(())
+            }
+        }
+        let mut label = None;
+        if relative_path(file, "scene")
+            && let Ok(source) = std::fs::File::open(root.join(file))
+        {
+            let mut reader = io::BufReader::new(source);
+            if reader
+                .fill_buf()
+                .is_ok_and(|bytes| bytes.starts_with(&[0xef, 0xbb, 0xbf]))
+            {
+                reader.consume(3);
+            }
+            // Returning from the visitor early intentionally leaves the rest of the map unread.
+            let _ =
+                serde_json::Deserializer::from_reader(reader).deserialize_map(Title(&mut label));
+        }
+        label.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
+            Path::new(file)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
     pub(crate) fn is_native(&self) -> bool {
         self.asset.is_empty() && relative_path(&self.file, "scene")
     }

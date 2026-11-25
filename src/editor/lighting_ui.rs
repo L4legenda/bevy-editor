@@ -1,7 +1,10 @@
 //! Lighting controls keep view preferences separate from undoable scene data.
 use super::*;
 use crate::{
-    editor::lighting::{EnvironmentField, LightField, LightingAction},
+    editor::{
+        lighting::{EnvironmentField, LightField, LightingAction},
+        scene_hierarchy::HierarchyAction,
+    },
     lighting::{EnvironmentPreset, LightKind, LightPreset, LightingPreset},
 };
 use bevy::{input_focus::FocusCause, window::WindowCloseRequested};
@@ -12,6 +15,13 @@ use controls::{color_editor, scalar};
 pub(crate) use controls::{input as edit_controls, refresh as refresh_controls};
 
 const MENU_WIDTH: f32 = 450.0;
+const ADD_MENU_WIDTH: f32 = 172.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddMenu {
+    Objects,
+    Lights,
+}
 
 struct NameDraft {
     room: Room,
@@ -41,13 +51,16 @@ impl NameDraft {
 #[derive(Resource)]
 pub(crate) struct LightingUi {
     add: Entity,
+    choices: Entity,
+    folder_choice: Entity,
+    light_choice: Entity,
     menu: Entity,
     menu_first: Entity,
     inspector: Entity,
     name: Entity,
     tooltip: Entity,
     tooltip_label: Entity,
-    menu_open: bool,
+    open_menu: Option<AddMenu>,
     pointer_consumed: bool,
     controls: controls::State,
     name_draft: Option<NameDraft>,
@@ -56,12 +69,19 @@ pub(crate) struct LightingUi {
 }
 
 impl LightingUi {
+    fn menu_entity(&self, menu: AddMenu) -> Entity {
+        match menu {
+            AddMenu::Objects => self.choices,
+            AddMenu::Lights => self.menu,
+        }
+    }
+
     pub fn is_menu_open(&self) -> bool {
-        self.menu_open
+        self.open_menu.is_some()
     }
 
     pub fn blocks_scene_input(&self) -> bool {
-        self.menu_open || self.pointer_consumed || self.controls.active()
+        self.is_menu_open() || self.pointer_consumed || self.controls.active()
     }
 
     pub fn is_control_active(&self) -> bool {
@@ -79,7 +99,7 @@ impl LightingUi {
 pub(crate) struct NameInput;
 
 #[derive(Component)]
-pub(crate) struct Help(&'static str);
+pub(crate) struct Help(pub(super) std::borrow::Cow<'static, str>);
 
 #[derive(Clone, Copy, Component)]
 pub(crate) enum VisibleWhen {
@@ -107,6 +127,8 @@ pub(crate) enum Choice {
     ContactShadows,
     Imported,
     GlobalShadows,
+    #[cfg(target_os = "macos")]
+    FullPreviewShadows,
     Fog,
     Resolution(u32),
     Menu,
@@ -122,6 +144,8 @@ pub(crate) enum DynamicLabel {
     ContactShadows,
     Imported,
     GlobalShadows,
+    #[cfg(target_os = "macos")]
+    FullPreviewShadows,
     Fog,
     ToneMap,
     Intensity,
@@ -136,7 +160,7 @@ pub(crate) enum Swatch {
 }
 
 fn help(commands: &mut Commands, button: Entity, label: &'static str) {
-    commands.entity(button).insert(Help(label));
+    commands.entity(button).insert(Help(label.into()));
 }
 
 fn light_button(
@@ -187,7 +211,7 @@ fn dynamic_button(
     );
     commands
         .entity(button)
-        .insert((choice, Help(hint), AccessibleLabel(hint.into())));
+        .insert((choice, Help(hint.into()), AccessibleLabel(hint.into())));
     let label = text(commands, button, font_handle, label, 12.0, TEXT);
     commands.entity(label).insert(dynamic);
 }
@@ -267,7 +291,7 @@ fn palette(commands: &mut Commands, parent: Entity) {
         );
         commands.entity(button).insert((
             AccessibleLabel(format!("Цвет света: {name}")),
-            Help("Выбрать готовый цвет. Оттенок, насыщенность и яркость можно изменить в палитре выше."),
+            Help("Выбрать готовый цвет. Оттенок, насыщенность и яркость можно изменить в палитре выше.".into()),
         ));
         let chip = surface(
             commands,
@@ -315,21 +339,58 @@ pub(crate) fn setup(
     font_handle: &Handle<Font>,
     images: &mut Assets<Image>,
 ) {
-    let add = button(
+    let add = control(
         commands,
         tree_header,
-        font_handle,
-        "Свет",
-        Action::LightMenu,
+        Action::SceneAddMenu,
         Look::Regular,
+        Node {
+            height: px(29),
+            padding: UiRect::horizontal(px(8)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(5)),
+            flex_shrink: 0.0,
+            ..row(4.0)
+        },
     );
-    let plus = icons::themed(commands, add, icons::Glyph::Plus, 14.0);
-    commands.entity(add).insert_children(0, &[plus]);
-    commands.entity(add).insert((
-        AccessibleLabel("+ Свет".into()),
-        Choice::Menu,
-        Help("Добавить источник света или применить готовую схему освещения сцены."),
+    icons::themed(commands, add, icons::Glyph::Plus, 15.0);
+    icons::themed(commands, add, icons::Glyph::ChevronDown, 11.0);
+    commands
+        .entity(add)
+        .insert((AccessibleLabel("Добавить в сцену".into()), Choice::Menu));
+    let choices = surface(
+        commands,
+        root,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            width: px(ADD_MENU_WIDTH),
+            padding: UiRect::all(px(5)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(7)),
+            overflow: Overflow::scroll_y(),
+            ..column(2.0)
+        },
+        PANEL,
+    );
+    commands.entity(choices).insert((
+        ZIndex(70),
+        TabGroup::modal(),
+        BorderColor::all(EDGE),
+        AccessibleLabel("Добавление в сцену".into()),
     ));
+    let mut choice = |label, glyph, action| {
+        let item = button(commands, choices, font_handle, label, action, Look::Outline);
+        let icon = icons::themed(commands, item, glyph, 15.0);
+        commands.entity(item).insert_children(0, &[icon]);
+        item
+    };
+    let folder_choice = choice(
+        "Папка",
+        icons::Glyph::Folder,
+        Action::Hierarchy(HierarchyAction::AddFolder),
+    );
+    let light_choice = choice("Свет", icons::Glyph::Lightbulb, Action::LightMenu);
     let menu = surface(
         commands,
         root,
@@ -404,9 +465,10 @@ pub(crate) fn setup(
                 ..column(7.0)
             },
         );
-        commands
-            .entity(card)
-            .insert((AccessibleLabel(format!("Добавить: {label}")), Help(hint)));
+        commands.entity(card).insert((
+            AccessibleLabel(format!("Добавить: {label}")),
+            Help(hint.into()),
+        ));
         if kind == LightKind::Point {
             menu_first = card;
         }
@@ -571,7 +633,7 @@ pub(crate) fn setup(
         font_handle,
         "Цвет",
         "color rgb kelvin",
-        true,
+        false,
     )
     .body;
     color_editor(commands, light, font_handle, Swatch::Light, images);
@@ -613,7 +675,7 @@ pub(crate) fn setup(
         font_handle,
         "Форма и тени",
         "shape shadows",
-        true,
+        false,
     )
     .body;
     let radius = pane(commands, light, VisibleWhen::Radius);
@@ -699,33 +761,31 @@ pub(crate) fn setup(
     );
 
     let environment_scope = pane(commands, panel, VisibleWhen::Environment);
+    super::environment_library::picker(
+        commands,
+        environment_scope,
+        root,
+        font_handle,
+        super::environment_library::List::Scene,
+    );
     let environment = inspector::section(
         commands,
         environment_scope,
         font_handle,
-        "HDRI",
-        "окружение panorama панорама",
+        "Свет окружения",
+        "HDRI panorama панорама",
         true,
     )
     .body;
-    let library = node(commands, environment, column(0.0));
-    inspector::searchable(commands, library, "скачать загрузить каталог download hdri");
-    button(
+    let environments = super::environment_library::picker(
         commands,
-        library,
+        environment,
+        root,
         font_handle,
-        "Скачать HDRI…",
-        Action::HdriLibrary(super::HdriAction::Open),
-        Look::Regular,
-    );
-    let environments = wrap(commands, environment, 4.0);
-    inspector::searchable(
-        commands,
-        environments,
-        "панорама предустановки пресеты presets",
+        super::environment_library::List::Hdri,
     );
     for preset in std::iter::once(None).chain(EnvironmentPreset::ALL.into_iter().map(Some)) {
-        let label = preset.map_or("Выкл.", EnvironmentPreset::label);
+        let label = preset.map_or("Без панорамы", EnvironmentPreset::label);
         let choice = light_button(
             commands,
             environments,
@@ -734,6 +794,10 @@ pub(crate) fn setup(
             LightingAction::SetEnvironment(preset),
             "Выбрать панораму для фона, освещения и отражений на материалах.",
         );
+        commands
+            .entity(choice)
+            .entry::<Node>()
+            .and_modify(|mut node| node.width = percent(100));
         commands.entity(choice).insert((
             Choice::Environment(preset),
             AccessibleLabel(format!("HDRI: {label}")),
@@ -741,7 +805,7 @@ pub(crate) fn setup(
     }
     let downloaded = node(
         commands,
-        environment,
+        environments,
         Node {
             width: percent(100),
             ..column(4.0)
@@ -751,6 +815,14 @@ pub(crate) fn setup(
     commands
         .entity(downloaded)
         .insert(super::hdri_library::DownloadedList);
+    button(
+        commands,
+        environments,
+        font_handle,
+        "Скачать HDRI…",
+        Action::HdriLibrary(super::HdriAction::Open),
+        Look::Regular,
+    );
     let hdri = pane(commands, environment, VisibleWhen::Hdri);
     dynamic_button(
         commands,
@@ -766,7 +838,7 @@ pub(crate) fn setup(
         commands,
         hdri,
         font_handle,
-        "Яркость HDRI",
+        "Яркость",
         Field::Environment(EnvironmentField::HdriBrightness),
         "кд/м²",
     );
@@ -774,7 +846,7 @@ pub(crate) fn setup(
         commands,
         hdri,
         font_handle,
-        "Поворот HDRI",
+        "Поворот",
         Field::Environment(EnvironmentField::HdriRotation),
         "°",
     );
@@ -784,7 +856,7 @@ pub(crate) fn setup(
         font_handle,
         "Фоновый свет",
         "ambient фон",
-        true,
+        false,
     )
     .body;
     color_editor(commands, environment, font_handle, Swatch::Ambient, images);
@@ -803,7 +875,7 @@ pub(crate) fn setup(
         font_handle,
         "Экспозиция и тонмаппинг",
         "camera камера exposure color",
-        true,
+        false,
     )
     .body;
     scalar(
@@ -869,7 +941,7 @@ pub(crate) fn setup(
         font_handle,
         "Свет сцены и туман",
         "scene fog shadows",
-        true,
+        false,
     )
     .body;
     dynamic_button(
@@ -891,6 +963,17 @@ pub(crate) fn setup(
         Choice::GlobalShadows,
         DynamicLabel::GlobalShadows,
         "Глобально включить или выключить все тени сцены.",
+    );
+    #[cfg(target_os = "macos")]
+    dynamic_button(
+        commands,
+        environment,
+        font_handle,
+        "Тени в редакторе · Быстрые",
+        LightingAction::ToggleFullPreviewShadows,
+        Choice::FullPreviewShadows,
+        DynamicLabel::FullPreviewShadows,
+        "Быстрый просмотр оставляет карты теней у двух ближайших точечных источников. Полный показывает все тени проекта.",
     );
     dynamic_button(
         commands,
@@ -1031,13 +1114,16 @@ pub(crate) fn setup(
     commands.entity(tooltip_label).insert(TextLayout::default());
     commands.insert_resource(LightingUi {
         add,
+        choices,
+        folder_choice,
+        light_choice,
         menu,
         menu_first,
         inspector: panel,
         name,
         tooltip,
         tooltip_label,
-        menu_open: false,
+        open_menu: None,
         pointer_consumed: false,
         controls: controls::State::default(),
         name_draft: None,
@@ -1072,48 +1158,51 @@ pub(crate) fn edit_name(
     parents: Query<&ChildOf>,
 ) {
     ui.pointer_consumed = false;
-    let was_open = ui.menu_open;
+    let was_open = ui.open_menu;
     let mut force_commit = close.read().last().is_some();
     for action in actions.read() {
         force_commit = true;
         match *action {
+            Action::SceneAddMenu => {
+                ui.open_menu = ui.open_menu.is_none().then_some(AddMenu::Objects);
+            }
             Action::LightMenu => {
-                ui.menu_open = !ui.menu_open;
+                ui.open_menu = (ui.open_menu != Some(AddMenu::Lights)).then_some(AddMenu::Lights);
             }
             Action::Lighting(LightingAction::Add(_) | LightingAction::ApplyPreset(_))
-            | Action::Select(Selection::Environment) => {
-                ui.menu_open = false;
+            | Action::Hierarchy(HierarchyAction::AddFolder)
+            | Action::Select(Selection::Environment)
+            | Action::Open(_)
+            | Action::CloseTab(_) => {
+                ui.open_menu = None;
             }
             _ => {}
         }
     }
-    if !was_open && ui.menu_open {
-        focus.set(ui.menu_first, FocusCause::Navigated);
-    }
-    if ui.menu_open
+    if ui.is_menu_open()
         && (keys.just_pressed(KeyCode::Escape)
             || editor.pending.is_some()
             || editor.asset_viewer_open()
             || editor.browser_popup
             || !editor.has_scene())
     {
-        ui.menu_open = false;
+        ui.open_menu = None;
         ui.pointer_consumed = true;
     }
-    if ui.menu_open
+    if let Some(menu) = ui.open_menu.map(|open| ui.menu_entity(open))
         && let Some(cursor) = window.cursor_position()
     {
         let physical = cursor * window.scale_factor();
         if mouse.any_just_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
-            && !contains(ui.menu, physical, &geometry)
+            && !contains(menu, physical, &geometry)
             && !contains(ui.add, physical, &geometry)
         {
-            ui.menu_open = false;
+            ui.open_menu = None;
             ui.pointer_consumed = true;
-        } else if contains(ui.menu, physical, &geometry)
+        } else if contains(menu, physical, &geometry)
             && scroll.delta.y != 0.0
-            && let Ok((computed, _)) = geometry.get(ui.menu)
-            && let Ok(mut position) = offsets.get_mut(ui.menu)
+            && let Ok((computed, _)) = geometry.get(menu)
+            && let Ok(mut position) = offsets.get_mut(menu)
         {
             let amount = if scroll.unit == MouseScrollUnit::Line {
                 33.0
@@ -1126,17 +1215,23 @@ pub(crate) fn edit_name(
             position.y = (position.y - scroll.delta.y * amount).clamp(0.0, max);
         }
     }
-    if was_open && !ui.menu_open {
-        let menu_focused = focus.get().is_some_and(|entity| {
-            entity == ui.menu
-                || parents
-                    .iter_ancestors(entity)
-                    .any(|parent| parent == ui.menu)
-        });
-        if keys.just_pressed(KeyCode::Escape) && editor.pending.is_none() {
-            focus.set(ui.add, FocusCause::Navigated);
-        } else if menu_focused {
-            focus.clear();
+    if was_open != ui.open_menu {
+        if let Some(open) = ui.open_menu {
+            let first = match open {
+                AddMenu::Objects if editor.definition().is_native() => ui.folder_choice,
+                AddMenu::Objects => ui.light_choice,
+                AddMenu::Lights => ui.menu_first,
+            };
+            focus.set(first, FocusCause::Navigated);
+        } else if let Some(previous) = was_open {
+            let menu = ui.menu_entity(previous);
+            if keys.just_pressed(KeyCode::Escape) && editor.pending.is_none() {
+                focus.set(ui.add, FocusCause::Navigated);
+            } else if focus.get().is_some_and(|entity| {
+                entity == menu || parents.iter_ancestors(entity).any(|parent| parent == menu)
+            }) {
+                focus.clear();
+            }
         }
     }
     let Ok(mut input) = inputs.get_mut(ui.name) else {
@@ -1235,8 +1330,14 @@ pub(crate) fn refresh(
     if let Ok(mut panel) = nodes.get_mut(ui.inspector) {
         panel.display = if show { Display::Flex } else { Display::None };
     }
-    if let Ok(mut menu) = nodes.get_mut(ui.menu) {
-        menu.display = if ui.menu_open {
+    for (open, width) in [
+        (AddMenu::Objects, ADD_MENU_WIDTH),
+        (AddMenu::Lights, MENU_WIDTH),
+    ] {
+        let Ok(mut menu) = nodes.get_mut(ui.menu_entity(open)) else {
+            continue;
+        };
+        menu.display = if ui.open_menu == Some(open) {
             Display::Flex
         } else {
             Display::None
@@ -1245,8 +1346,8 @@ pub(crate) fn refresh(
             let size = computed.size() / window.scale_factor();
             let anchor = transform.affine().translation / window.scale_factor() - size * 0.5;
             let top = anchor.y + size.y + 6.0;
-            menu.left = px((anchor.x + size.x - MENU_WIDTH)
-                .clamp(8.0, (window.width() - MENU_WIDTH - 8.0).max(8.0)));
+            menu.left =
+                px((anchor.x + size.x - width).clamp(8.0, (window.width() - width - 8.0).max(8.0)));
             menu.top = px(top);
             menu.max_height = px((window.height() - FOOT - 12.0 - top).max(0.0));
         }
@@ -1320,6 +1421,13 @@ pub(crate) fn refresh(
                 "Свет из GLB: выкл."
             }
             .into(),
+            #[cfg(target_os = "macos")]
+            DynamicLabel::FullPreviewShadows => if editor.full_preview_shadows {
+                "Тени в редакторе · Полные"
+            } else {
+                "Тени в редакторе · Быстрые"
+            }
+            .into(),
             DynamicLabel::GlobalShadows => if environment.shadows {
                 "Тени сцены: вкл."
             } else {
@@ -1365,10 +1473,12 @@ pub(crate) fn refresh(
                 Choice::Shadows => light.is_some_and(|light| light.shadows),
                 Choice::ContactShadows => light.is_some_and(|light| light.contact_shadows),
                 Choice::Imported => environment.scene_lights,
+                #[cfg(target_os = "macos")]
+                Choice::FullPreviewShadows => editor.full_preview_shadows,
                 Choice::GlobalShadows => environment.shadows,
                 Choice::Fog => environment.fog.is_some(),
                 Choice::Resolution(value) => environment.shadow_resolution == value,
-                Choice::Menu => ui.menu_open,
+                Choice::Menu => ui.is_menu_open(),
                 Choice::Gizmos => editor.show_lights,
             };
             if active {
@@ -1386,7 +1496,7 @@ pub(crate) fn refresh(
     let hovered = hints
         .iter()
         .find(|(entity, _, hovered)| hovered.0 || focus.get() == Some(*entity))
-        .map(|(entity, help, _)| (entity, help.0));
+        .map(|(entity, help, _)| (entity, help.0.as_ref()));
     let target = hovered.map(|(entity, _)| entity);
     if target == ui.hint_target {
         ui.hint_elapsed += time.delta_secs();
@@ -1465,13 +1575,16 @@ mod tests {
         app.insert_resource(InputFocus::from_entity(name))
             .insert_resource(LightingUi {
                 add,
+                choices: menu,
+                folder_choice: first,
+                light_choice: first,
                 menu,
                 menu_first: first,
                 inspector: panel,
                 name,
                 tooltip: panel,
                 tooltip_label: panel,
-                menu_open: false,
+                open_menu: None,
                 pointer_consumed: false,
                 controls: controls::State::default(),
                 name_draft: None,

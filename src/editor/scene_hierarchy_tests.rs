@@ -863,3 +863,40 @@ fn scene_hierarchy_ui_browser_scene_drop_is_one_undo_step_and_preserves_saved_so
     assert_eq!(app.world().resource::<Editor>().edits.models.len(), 3);
     assert_eq!(std::fs::read(f.root.join("lamp.scene")).unwrap(), source);
 }
+
+#[test]
+fn world_batch_moves_descendants_once_even_when_the_child_is_listed_first() {
+    let f = fixture();
+    let mut app = app(&f);
+    let mut editor = app.world_mut().resource_mut::<Editor>();
+    let graph = editor.edits.hierarchy.as_ref().unwrap();
+    let root = graph.by_id("room").unwrap();
+    let descendant = graph
+        .nodes
+        .iter()
+        .find(|n| n.entity.model.is_some())
+        .unwrap();
+    let root_key = root.key;
+    let child_key = descendant.key;
+    let mut parent_pose = root.pose().transform();
+    let mut child_pose = descendant.pose().transform();
+    parent_pose.translation.x += 1.0;
+    child_pose.translation.x += 3.0;
+    editor.set_poses(&[
+        (Selection::Model(child_key), child_pose),
+        (Selection::Node(root_key), parent_pose),
+    ]);
+    let graph = editor.edits.hierarchy.as_ref().unwrap();
+    assert!(!editor.status.contains("не применено"), "{}", editor.status);
+    assert!(
+        graph
+            .node(child_key)
+            .unwrap()
+            .pose()
+            .transform()
+            .translation
+            .abs_diff_eq(child_pose.translation, 1e-5)
+    );
+    let full: RoomEdits = SceneHierarchy::project_shared(graph.clone()).unwrap();
+    assert_eq!(editor.edits, full);
+}

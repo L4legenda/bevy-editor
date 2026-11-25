@@ -428,7 +428,6 @@ impl Pipeline {
 }
 
 pub(super) struct Target {
-    pub output: Texture,
     pub view: TextureView,
     pub size: UVec2,
     accumulation: Buffer,
@@ -478,7 +477,6 @@ impl Target {
         });
         let view = output.create_view(&default());
         Some(Self {
-            output,
             view,
             size,
             accumulation: device.create_buffer(&BufferDescriptor {

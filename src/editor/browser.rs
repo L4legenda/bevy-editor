@@ -211,33 +211,30 @@ impl Browser {
                         && !hidden
                         && discover[folder]
                     {
-                        match crate::LevelEdits::<String>::read(&project.asset_root, &asset) {
-                            Ok(content) => {
-                                if let Some(settings) = content.scene {
-                                    let room = project.scenes.len();
-                                    scenes.insert(
-                                        asset.clone(),
-                                        vec![SceneLink {
-                                            room,
-                                            label: settings.label.clone(),
-                                        }],
-                                    );
-                                    project.scenes.push(crate::project::SceneDefinition {
-                                        uid: None,
-                                        label: settings.label,
-                                        asset: String::new(),
-                                        file: asset.clone(),
-                                        groups: Vec::new(),
-                                        excluded_nodes: Vec::new(),
-                                        node_policies: Default::default(),
-                                        cameras: settings.cameras,
-                                        initial_selection: None,
-                                        play: None,
-                                    });
-                                }
-                            }
-                            Err(error) => browser.record_error(&entry.path(), &error),
-                        }
+                        let label = crate::project::SceneDefinition::native_label(
+                            &project.asset_root,
+                            &asset,
+                        );
+                        let room = project.scenes.len();
+                        scenes.insert(
+                            asset.clone(),
+                            vec![SceneLink {
+                                room,
+                                label: label.clone(),
+                            }],
+                        );
+                        project.scenes.push(crate::project::SceneDefinition {
+                            uid: None,
+                            label,
+                            asset: String::new(),
+                            file: asset.clone(),
+                            groups: Vec::new(),
+                            excluded_nodes: Vec::new(),
+                            node_policies: Default::default(),
+                            cameras: Vec::new(),
+                            initial_selection: None,
+                            play: None,
+                        });
                     }
                     let links = scenes.get(&asset);
                     if let Some(indices) = catalog.get(&asset).filter(|_| links.is_none()) {

@@ -2042,6 +2042,7 @@ fn gpu_narrative_workflow() {
     assert!(app.world().get::<EditableText>(input).is_some());
     action(&mut app, NarrativeAction::Undo);
     click(&mut app, window, "+ Вариант ответа");
+    click(&mut app, window, "+ Вариант ответа");
     // Creating from output 2 must leave the first free output untouched.
     action(&mut app, NarrativeAction::Link(1, 1));
     action(&mut app, NarrativeAction::Add(NodeKind::End));

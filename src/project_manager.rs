@@ -75,6 +75,27 @@ impl Form {
     }
 }
 
+struct Launch {
+    file: PathBuf,
+    child: Child,
+    reply: tempfile::TempDir,
+}
+
+impl Launch {
+    fn result(&mut self) -> io::Result<Option<Result<String, String>>> {
+        let status = self.child.try_wait()?;
+        // The child renames the complete message into place before entering its event loop.
+        match std::fs::read(self.reply.path().join("ready")) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(io::Error::other),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(status
+                .map(|code| Err(format!("Редактор завершился при открытии проекта ({code})")))),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 #[derive(Resource)]
 struct Manager {
     recent: RecentProjects,
@@ -88,9 +109,8 @@ struct Manager {
     context: Option<ContextMenu>,
     status: String,
     last_click: Option<(PathBuf, f64)>,
-    running: Vec<(PathBuf, Child)>,
+    launch: Option<Launch>,
     executable: PathBuf,
-    project_opened: bool,
 }
 impl Manager {
     fn visible_projects(&self) -> Vec<&projects::RecentProject> {
@@ -159,9 +179,8 @@ impl Manager {
             context: None,
             status,
             last_click: None,
-            running: Vec::new(),
+            launch: None,
             executable,
-            project_opened: false,
         }
     }
     fn save(&mut self) {
@@ -172,27 +191,22 @@ impl Manager {
     }
     fn open(&mut self, path: &Path) -> io::Result<()> {
         let file = resolve_project_file(path)?;
-        let project = EditorProject::load(&file)?;
-        if self.running.iter().any(|(path, _)| *path == file) {
-            return Err(io::Error::other("Этот проект уже открыт в окне редактора"));
-        }
+        let reply = tempfile::tempdir()?;
         let mut command = Command::new(&self.executable);
-        command.arg("--project").arg(&file).stdin(Stdio::null());
+        command
+            .arg("--managed-project")
+            .arg(&file)
+            .arg(reply.path())
+            .stdin(Stdio::null());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
         let child = command.spawn()?;
-        self.running.push((file.clone(), child));
-        self.recent.remember(&file, &project.title);
-        self.selected = Some(file);
-        self.filter.clear();
-        self.status.clear();
-        self.save();
-        self.form = None;
-        self.dialog_revision += 1;
-        self.project_opened = true;
+        self.launch = Some(Launch { file, child, reply });
+        self.status = "Открытие проекта…".into();
+        self.revision += 1;
         Ok(())
     }
     fn show(&mut self, dialog: Dialog) {
@@ -223,9 +237,15 @@ impl Manager {
 pub fn remember_project(path: impl AsRef<Path>) -> io::Result<()> {
     let file = resolve_project_file(path)?;
     let project = EditorProject::load(&file)?;
+    remember_opened_project(&file, &project.title)
+}
+
+/// Record metadata already validated by the editor during launch.
+pub fn remember_opened_project(path: &Path, title: &str) -> io::Result<()> {
+    let file = resolve_project_file(path)?;
     let registry = projects::config_file()?;
     let mut recent = RecentProjects::read(&registry).unwrap_or_default();
-    recent.remember(&file, &project.title);
+    recent.remember(&file, title);
     recent.save(&registry)
 }
 
@@ -304,7 +324,7 @@ fn actions(
     mut updates: ResMut<update::Updates>,
 ) {
     for action in messages.read() {
-        if manager.project_opened || updates.downloading {
+        if manager.launch.is_some() || updates.downloading {
             break;
         }
         if picker.busy() && !matches!(action, Action::Close | Action::DismissContext) {
@@ -447,7 +467,7 @@ fn actions(
                 manager.revision += 1;
             }
             Action::ClearFilter => manager.set_filter(String::new()),
-            Action::UpdateEditor if manager.context.is_none() && manager.running.is_empty() => {
+            Action::UpdateEditor if manager.context.is_none() && manager.launch.is_none() => {
                 updates.install(manager.executable.clone());
             }
             Action::UpdateEditor => {}
@@ -462,28 +482,31 @@ fn actions(
 }
 
 fn poll_editors(mut manager: ResMut<Manager>, mut exit: MessageWriter<AppExit>) {
-    if std::mem::take(&mut manager.project_opened) {
-        exit.write(AppExit::Success);
+    let Some(launch) = &mut manager.launch else {
         return;
-    }
-    let mut errors = Vec::new();
-    manager
-        .running
-        .retain_mut(|(_, child)| match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(status)) => {
-                if !status.success() {
-                    errors.push(format!("Редактор завершился с ошибкой: {status}"));
-                }
-                false
-            }
-            Err(error) => {
-                errors.push(format!("Не удалось проверить окно редактора: {error}"));
-                false
-            }
-        });
-    if let Some(error) = errors.pop() {
-        manager.status = error;
+    };
+    let result = match launch.result() {
+        Ok(Some(result)) => result,
+        Ok(None) => return,
+        Err(e) => Err(e.to_string()),
+    };
+    let file = manager.launch.take().unwrap().file;
+    match result {
+        Ok(title) => {
+            manager.recent.remember(&file, &title);
+            manager.selected = Some(file);
+            manager.filter.clear();
+            manager.status.clear();
+            manager.save();
+            manager.form = None;
+            manager.dialog_revision += 1;
+            exit.write(AppExit::Success);
+        }
+        Err(error) => {
+            manager.status.clear();
+            manager.error(format!("Не удалось открыть проект · {error}"));
+            manager.revision += 1;
+        }
     }
 }
 

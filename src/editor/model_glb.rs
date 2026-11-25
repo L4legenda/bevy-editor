@@ -218,6 +218,7 @@ impl Glb {
             expected: Arc::new(bytes),
         })
     }
+    #[cfg(test)]
     pub fn encode(&self, objects: &[Object], original: &[Object]) -> Result<Vec<u8>, String> {
         self.encode_with_cage(objects, original, None)
     }

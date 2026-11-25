@@ -33,13 +33,16 @@ fn fixture() -> (App, Entity, Entity) {
     let dummy = app.world_mut().spawn_empty().id();
     app.insert_resource(LightingUi {
         add: dummy,
+        choices: dummy,
+        folder_choice: dummy,
+        light_choice: dummy,
         menu: dummy,
         menu_first: dummy,
         inspector: dummy,
         name: dummy,
         tooltip: dummy,
         tooltip_label: dummy,
-        menu_open: false,
+        open_menu: None,
         pointer_consumed: false,
         controls: State::default(),
         name_draft: None,
