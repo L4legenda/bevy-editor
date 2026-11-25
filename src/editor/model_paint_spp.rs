@@ -1621,7 +1621,8 @@ mod tests {
             let glb = Glb::load(&root.join(filename)).unwrap();
             let mut surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
             let (object, _) = import(&source, name).unwrap();
-            surface.bind_texture_fills(&object.geometry, 0, Vec2::ZERO, Transform::IDENTITY);
+            std::sync::Arc::make_mut(&mut surface)
+                .bind_texture_fills(&object.geometry, 0, Vec2::ZERO, Transform::IDENTITY);
             let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
             if bitmap.is_some() {
                 let fill = layer.texture_fill.as_ref().unwrap();
