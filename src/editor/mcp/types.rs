@@ -103,6 +103,19 @@ pub(super) struct ViewArgs {
 #[derive(Debug, Clone)]
 pub(super) enum Command {
     State,
+    PaintState,
+    PaintPresets,
+    PaintEdit(super::mcp_state::EditArgs),
+    PaintStroke(super::mcp_state::StrokeArgs),
+    PaintFill(super::mcp_state::FillArgs),
+    PaintSave(super::mcp_state::SaveArgs),
+    PaintExport(super::mcp_state::ExportArgs),
+    BakeStatus(super::mcp_state::BakeTarget),
+    BakeStart(super::mcp_state::BakeArgs),
+    BakeCancel(super::mcp_state::BakeTarget),
+    PaintView(super::mcp_state::PaintViewArgs),
+    CagePreview(super::mcp_state::CageArgs),
+    PaintCapture(super::mcp_state::CaptureArgs),
     Scenes,
     Objects(Page),
     Assets(Page),
@@ -123,9 +136,12 @@ pub(super) enum Command {
 
 impl Command {
     pub fn mutates(&self) -> bool {
+        if let Self::CagePreview(args) = self {
+            return args.show.is_some();
+        }
         !matches!(
             self,
-            Self::State | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture
+            Self::State | Self::PaintState | Self::PaintPresets | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_)
         )
     }
 }

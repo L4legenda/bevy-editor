@@ -111,6 +111,8 @@ fn model_transform_revert(doc: &Document, property: TransformProperty) -> Option
     (reverted != object.transform).then_some(reverted)
 }
 
+pub(in crate::editor) type SaveReply = Box<dyn FnOnce(Result<std::path::PathBuf, String>) + Send + Sync>;
+
 struct Saving {
     index: usize,
     objects: Vec<Object>,
@@ -119,6 +121,7 @@ struct Saving {
     cage_edits: Arc<crate::editor::model_cage_data::Edits>,
     recovery_edits: u64,
     task: Task<Result<document::glb::Glb, String>>,
+    reply: Option<SaveReply>,
 }
 
 #[path = "model_recovery.rs"]
@@ -239,34 +242,40 @@ impl State {
             .is_some_and(|saving| saving.index == index)
     }
     fn start_save(&mut self, index: usize, editor: &mut Editor) {
-        if let Some(error) = &self.input_error {
-            editor.status = format!("Не удалось сохранить модель · {error}");
-            return;
-        }
-        if self.saving.is_some() {
-            editor.status = "Дождитесь сохранения модели".into();
-            return;
-        }
-        let Some(doc) = self.documents.get_mut(&index) else {
-            return;
-        };
-        if doc.paint_busy {
-            editor.status = "Завершаем мазок перед сохранением…".into();
-            return;
-        }
-        if let Some(model) = editor.project.catalog.get(index) {
-            match document::source_path(&editor.root, &model.asset) {
-                Ok(path) => doc.source.path = path,
-                Err(error) => {
-                    editor.status = format!("Не удалось сохранить модель · {error}");
-                    return;
+        self.start_save_with_reply(index, editor, None);
+    }
+
+    pub(in crate::editor) fn start_save_with_reply(&mut self, index: usize, editor: &mut Editor, reply: Option<SaveReply>) {
+        match self.prepare_save(index, editor) {
+            Ok(mut saving) => {
+                saving.reply = reply;
+                self.saving = Some(saving);
+                editor.status = "Сохранение GLB…".into();
+            }
+            Err(error) => {
+                editor.status = format!("Не удалось сохранить модель · {error}");
+                if let Some(reply) = reply {
+                    reply(Err(error));
                 }
             }
         }
-        if let Err(error) = doc.validate() {
-            editor.status = format!("Не удалось сохранить модель · {error}");
-            return;
+    }
+
+    fn prepare_save(&mut self, index: usize, editor: &Editor) -> Result<Saving, String> {
+        if let Some(error) = &self.input_error {
+            return Err(error.clone());
         }
+        if self.saving.is_some() {
+            return Err("Дождитесь сохранения модели".into());
+        }
+        let doc = self.documents.get_mut(&index).ok_or("Модель ещё не открыта")?;
+        if doc.paint_busy {
+            return Err("Дождитесь завершения мазка".into());
+        }
+        if let Some(model) = editor.project.catalog.get(index) {
+            doc.source.path = document::source_path(&editor.root, &model.asset)?;
+        }
+        doc.validate()?;
         let mut source = doc.source_for_save();
         let custom_bakes = doc.custom_bakes.clone();
         let baked_recipes = custom_bakes.clone();
@@ -278,13 +287,14 @@ impl State {
         let original = doc.original.clone();
         let work = objects.clone();
         let root = editor.root.clone();
-        self.saving = Some(Saving {
+        Ok(Saving {
             index,
             objects,
             custom_bakes,
             bake_settings,
             cage_edits,
             recovery_edits: doc.recovery_edits,
+            reply: None,
             task: AsyncComputeTaskPool::get().spawn(async move {
                 write_model_metadata(&mut source, &baked_recipes, &settings)?;
                 source.save_with_cage(&work, &original, Some(&cage))?;
@@ -292,8 +302,7 @@ impl State {
                     .map_err(|e| format!("Модель сохранена, ошибка обновления реестра: {e}"))?;
                 Ok(source)
             }),
-        });
-        editor.status = "Сохранение GLB…".into();
+        })
     }
     pub fn mode(&self, index: Option<usize>) -> Mode {
         index
@@ -924,12 +933,13 @@ pub(super) fn process_actions(
     materials: &mut Assets<StandardMaterial>,
     shift: bool,
 ) {
-    if let Some((index, objects, custom_bakes, bake_settings, cage_edits, recovery_edits, result)) = state.saving.as_mut().and_then(|job| {
+    if let Some((index, objects, custom_bakes, bake_settings, cage_edits, recovery_edits, result, reply)) = state.saving.as_mut().and_then(|job| {
         block_on(poll_once(&mut job.task)).map(|result| {
-            (job.index, job.objects.clone(), job.custom_bakes.clone(), job.bake_settings.clone(), job.cage_edits.clone(), job.recovery_edits, result)
+            (job.index, job.objects.clone(), job.custom_bakes.clone(), job.bake_settings.clone(), job.cage_edits.clone(), job.recovery_edits, result, job.reply.take())
         })
     }) {
         state.saving = None;
+        let completion = reply.as_ref().map(|_| result.as_ref().map(|source| source.path.clone()).map_err(Clone::clone));
         match result {
             Ok(source) => {
                 if let Some(doc) = state.documents.get_mut(&index) {
@@ -974,6 +984,9 @@ pub(super) fn process_actions(
             Err(error) => {
                 editor.status = format!("Не удалось сохранить модель · {error}");
             }
+        }
+        if let Some((reply, completion)) = reply.zip(completion) {
+            reply(completion);
         }
     }
     for &action in actions {

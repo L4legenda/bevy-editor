@@ -20,6 +20,12 @@ pub(super) mod save_copy;
 mod history;
 #[path = "model_paint_diagnostics.rs"]
 mod diagnostics;
+#[cfg(feature = "mcp")]
+#[path = "model_paint_mcp.rs"]
+pub(in crate::editor) mod mcp_state;
+#[cfg(feature = "mcp")]
+#[path = "model_paint_mcp_preview.rs"]
+pub(in crate::editor::ui::model_viewer) mod mcp_preview;
 #[path = "model_paint_dock.rs"]
 pub(super) mod dock;
 #[path = "model_paint_sidebar.rs"]
@@ -80,6 +86,7 @@ pub(super) mod sets;
 pub(super) use ui::{ShaderMaker, decorate_shader_code, refresh, refresh_graph, refresh_shader_maker, setup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub(in crate::editor) enum PaintTool {
     Brush,
     Eraser,
@@ -89,6 +96,7 @@ pub(in crate::editor) enum PaintTool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema), serde(rename_all = "snake_case"), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum FillMode {
     Triangle,
     #[default]
@@ -133,6 +141,7 @@ pub(in crate::editor) enum Panel {
     Shader,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize, serde::Deserialize, rmcp::schemars::JsonSchema), serde(rename_all = "snake_case"), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum View {
     Split,
     Three,
@@ -155,6 +164,7 @@ pub(in crate::editor) enum Category {
     Graphs,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub(in crate::editor) enum Symmetry {
     #[default]
     Off,
@@ -164,6 +174,7 @@ pub(in crate::editor) enum Symmetry {
 }
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]
 pub(in crate::editor) enum BrushProjection {
     #[default]
     Screen = 0,
@@ -1138,6 +1149,16 @@ impl Session {
 
     fn showing_bake(&self) -> bool {
         self.panel == Panel::Maps && self.bake_view.is_some()
+    }
+
+    fn set_cage_inspection(&mut self, enabled: bool) {
+        self.bake_inspect_cage = enabled;
+        if !enabled {
+            self.bake_paint_cage = false;
+        } else if self.view == View::Two {
+            self.view = View::Split;
+        }
+        self.revision += 1;
     }
 
     fn active_bake_fix(&self) -> Option<bake::BakeMap> {
@@ -2775,11 +2796,16 @@ impl Session {
         self.filter_menu = false;
     }
 
-    fn rename_layer(&mut self, name: &str) -> Result<(), &'static str> {
+    fn valid_layer_name(name: &str) -> Result<&str, &'static str> {
         let name = name.trim();
         if name.is_empty() || name.chars().any(char::is_control) || name.chars().count() > 120 {
             return Err("Введите имя слоя от 1 до 120 символов без управляющих знаков");
         }
+        Ok(name)
+    }
+
+    fn rename_layer(&mut self, name: &str) -> Result<(), &'static str> {
+        let name = Self::valid_layer_name(name)?;
         let index = self.stack.selected;
         if self.stack.layers[index].name != name {
             self.checkpoint();
@@ -2787,6 +2813,16 @@ impl Session {
             self.revision += 1;
         }
         Ok(())
+    }
+
+    fn choose_set(&mut self, doc: &mut crate::editor::model_document::Document, set: usize, now: f64) -> bool {
+        let Some((object, slot)) = doc.paint_target(set) else { return false };
+        let id = object.id;
+        doc.select_object(id, false);
+        doc.paint_set = Some(set);
+        self.set_appearance.flash((id, slot), now);
+        self.edit(PaintAction::Set(set));
+        true
     }
     fn brush_color(&self) -> [u8; 3] {
         self.picked.unwrap_or(COLORS[self.color])
@@ -4091,15 +4127,9 @@ pub(super) fn actions(
             }
             if let PaintAction::Set(set) = action {
                 if let Some(doc) = editing.documents.get_mut(&index) {
-                    let object = doc.paint_target(set).map(|(object, slot)| (object.id, slot));
-                    if let Some((id, slot)) = object {
-                        doc.select_object(id, false);
-                        doc.paint_set = Some(set);
-                        session.set_appearance.flash((id, slot), time.elapsed_secs_f64());
-                    } else {
-                        continue;
-                    }
+                    session.choose_set(doc, set, time.elapsed_secs_f64());
                 }
+                continue;
             }
             if action == PaintAction::GraphRebake {
                 continue;

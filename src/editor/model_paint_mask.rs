@@ -21,6 +21,7 @@ pub(in crate::editor) const MAX_MASK_LAYERS: usize = 16;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum FilterKind {
     Levels = 0,
     Invert = 1,

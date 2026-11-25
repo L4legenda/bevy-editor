@@ -15,6 +15,12 @@ use bevy::{
 };
 use std::{collections::VecDeque, sync::Arc};
 
+#[cfg(feature = "mcp")]
+#[path = "model_paint_mcp_input.rs"]
+mod mcp_input;
+#[cfg(feature = "mcp")]
+pub(in crate::editor) use mcp_input::McpPaintInput;
+
 type Key = (usize, usize, usize);
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct TextureCanvas;
@@ -1346,7 +1352,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     }
 }
 
-fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool, erase: bool) -> Brush {
+fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool, erase: bool, fill: bool) -> Brush {
     let masking = session.editing_mask && session.has_mask();
     let channel = session.stroke_channels().trailing_zeros() as usize;
     let percent_byte = |value: f32| (value * 2.55).round() as u8;
@@ -1378,14 +1384,14 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
     let texture = session
         .grain
         .and_then(|i| tips.grains.get(i))
-        .filter(|_| session.grain_strength > 0. && session.tool != PaintTool::Fill);
-    let projection = if uv || session.tool == PaintTool::Fill {
+        .filter(|_| session.grain_strength > 0. && !fill);
+    let projection = if uv || fill {
         BrushProjection::Screen
     } else {
         session.projection
     };
     let grain_uv = session.grain_uv || projection == BrushProjection::Uv;
-    let symmetry = !uv && session.symmetry != Symmetry::Off && session.tool != PaintTool::Fill;
+    let symmetry = !uv && session.symmetry != Symmetry::Off && !fill;
     let mut mirror = [0.; 4];
     let mut extent = 1.;
     if symmetry || texture.is_some() {
@@ -1428,7 +1434,7 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
                     .mask
                     .as_ref()
                     .is_some_and(|m| m.affine)),
-        fill: session.tool == PaintTool::Fill,
+        fill,
         fill_mode: session.fill_mode,
         fill_angle: session.fill_angle,
         fill_padding: session.fill_padding,
@@ -1437,7 +1443,7 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
             size: session.brush_size_jitter / 100.,
             angle: session.brush_angle_jitter / 100.,
         },
-        tip: if session.tool == PaintTool::Fill {
+        tip: if fill {
             None
         } else {
             session
@@ -1464,7 +1470,7 @@ fn brush_for(session: &Session, tips: &tips::Library, object: &Object, uv: bool,
         mirror,
         projection,
         paint_through: !uv
-            && session.tool != PaintTool::Fill
+            && !fill
             && projection == BrushProjection::Screen
             && session.paint_through,
         facing_limit: session.angle_limit.to_radians().cos(),
@@ -1726,7 +1732,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
                 continue;
             }
             let erase = session.tool == PaintTool::Eraser;
-            let mut brush = brush_for(session, &paint.tips, object, uv, erase);
+            let mut brush = brush_for(session, &paint.tips, object, uv, erase, fill_tool);
             brush.channel = 1;
             brush.material = None;
             brush.color = [(session.bake_fix_value as f32 * 2.55).round() as u8; 3];
@@ -1877,7 +1883,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
             continue;
         }
         let erase = session.tool == PaintTool::Eraser || (fill_tool && (session.fill_erase != control));
-        let brush = brush_for(session, &paint.tips, object, uv, erase);
+        let brush = brush_for(session, &paint.tips, object, uv, erase, fill_tool);
         let cache_key = (key, (doc.revision, visibility.revision), camera, uv);
         let map = runtime
             .map_cache
@@ -1927,6 +1933,12 @@ pub(in crate::editor::ui::model_viewer) fn input(
     }
 }
 impl Runtime {
+    pub(super) fn layer_gpu_bytes(&self, model: usize, session: &Session, queue: &gpu::Queue) -> Vec<u64> {
+        session.binding
+            .and_then(|(object, slot)| self.lives.get(&(model, object, slot)))
+            .map_or_else(Vec::new, |live| queue.layer_bytes(live.controller.context_id()))
+    }
+
     pub(super) fn paint_gpu_bytes(&self, model: usize, queue: &gpu::Queue, images: &Assets<Image>) -> u64 {
         let lives = self.lives.iter().filter(|&(&(index, _, _), _)| index == model).map(|(_, live)| live);
         let mut textures = std::collections::HashSet::new();

@@ -27,6 +27,7 @@ pub(super) fn dielectric_f0(material: &serde_json::Value) -> f32 {
     ((ior - 1.) / (ior + 1.)).powi(2)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(super) enum LayerKind {
     Paint,
     Fill,
@@ -38,6 +39,7 @@ pub(super) mod texture_fill;
 // Discriminants match model_paint_gpu_blend.wgsl.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Blend {
     #[default]
     Normal = 0,

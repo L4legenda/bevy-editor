@@ -34,6 +34,8 @@ pub(in crate::editor::ui::model_viewer) struct State {
     entity: Option<Entity>,
     material: Option<Handle<StandardMaterial>>,
     status: String,
+    #[cfg(feature = "mcp")]
+    error: Option<String>,
 }
 
 impl State {
@@ -45,9 +47,33 @@ impl State {
         self.last_update = None;
         self.ready = None;
         self.status.clear();
+        #[cfg(feature = "mcp")]
+        {
+            self.error = None;
+        }
         if let Some(entity) = self.entity.take() {
             commands.entity(entity).try_despawn();
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(in crate::editor::ui::model_viewer::paint) fn report(
+        &self, model: usize, doc: &Document, binding: (usize, usize), version: u64,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        if !self.request.as_ref().is_some_and(|(key, _)| (key.model, key.object, key.slot) == (model, binding.0, binding.1) && key.matches_setup(doc))
+            || self.pending.is_some() || self.applied_version != Some(version)
+        {
+            return json!({"status": "pending"});
+        }
+        if let Some(error) = &self.error {
+            return json!({"status": "failed", "error": error});
+        }
+        self.ready.as_ref().map_or_else(|| json!({"status": "pending"}), |diagnostic| {
+            let [covered, tight, missed, overlapping] = diagnostic.counts();
+            json!({"status": "ready", "covered": covered, "tight": tight, "missed": missed,
+                "overlapping": overlapping, "sampled": diagnostic.sampled})
+        })
     }
 }
 
@@ -151,6 +177,10 @@ pub(in crate::editor::ui::model_viewer) fn draw(
         state.applied_version = state.pending.take().map(|job| job.version);
         match result {
             Ok((prepared, diagnostic)) => {
+                #[cfg(feature = "mcp")]
+                {
+                    state.error = None;
+                }
                 state.prepared = Some(prepared);
                 if let Some(entity) = state.entity.take() {
                     commands.entity(entity).try_despawn();
@@ -197,7 +227,13 @@ pub(in crate::editor::ui::model_viewer) fn draw(
                 state.status = diagnostic.summary();
                 state.ready = Some(diagnostic);
             }
-            Err(error) => state.status = format!("Не удалось проверить оболочку · {error}"),
+            Err(error) => {
+                state.status = format!("Не удалось проверить оболочку · {error}");
+                #[cfg(feature = "mcp")]
+                {
+                    state.error = Some(error);
+                }
+            }
         }
     }
     if session.bake_cage_status != state.status {

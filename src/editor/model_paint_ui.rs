@@ -1,4 +1,5 @@
 use super::*;
+use super::super::super::control_hints::Help;
 #[path = "model_paint_uv_overlay.rs"]
 mod uv_overlay;
 #[path = "model_paint_graph_canvas.rs"]
@@ -259,6 +260,14 @@ impl HistoryPreference {
 }
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct CustomMapName(pub u64);
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct LayerMemoryHint(usize);
+
+fn layer_memory_hint(bytes: u64) -> String {
+    format!("Буферы слоя на GPU · {:.2} МиБ", bytes as f64 / 1_048_576.)
+}
+
 #[derive(Resource)]
 pub(in crate::editor::ui::model_viewer) struct PaintUi {
     graph: graph_canvas::Canvas,
@@ -2312,11 +2321,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         (Without<Value>, Without<HistoryPreference>, Without<PreviewValue>),
     >,
     mut images: ResMut<Assets<Image>>,
-    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>, Res<engine::gpu::Queue>, Res<Time<bevy::time::Real>>),
+    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>, Res<engine::gpu::Queue>, Res<Time<bevy::time::Real>>, Query<(&LayerMemoryHint, &mut Help)>),
     (baked, mut preview_edits): (Res<bake::State>, MessageWriter<Action>),
     mut texture_nodes: Query<&mut ImageNode, Or<(With<engine::TextureCanvas>, With<UvWire>, With<UvSeams2d>)>>,
 ) {
-    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys, gpu_queue, time) = rendering;
+    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys, gpu_queue, time, mut layer_hints) = rendering;
     let doc = editor
         .viewing_model
         .and_then(|index| editing.documents.get(&index));
@@ -2476,6 +2485,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         let value = diagnostics::label(index, session, &runtime, &gpu_queue, &images, ms, triangles);
         if label.0 != value {
             label.0 = value;
+        }
+        let bytes = runtime.layer_gpu_bytes(index, session, &gpu_queue);
+        for (layer, mut hint) in &mut layer_hints {
+            let value = layer_memory_hint(bytes.get(layer.0).copied().unwrap_or_default());
+            if hint.0 != value {
+                hint.0 = value;
+            }
         }
     }
     if let Ok(mut label) = labels.get_mut(ui.three_label) {
@@ -2876,6 +2892,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 if let Some(layer) = session.stack.layers.get(session.stack.selected) {
                     layer_name(&mut commands, stack, font, index, session, layer);
                 }
+                let layer_bytes = runtime.layer_gpu_bytes(index, session, &gpu_queue);
                 for (i, layer) in session.stack.layers.iter().enumerate().rev() {
                     if !session.stack.listed(i) {
                         continue;
@@ -2914,7 +2931,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         LayerKind::Folder => "Группа",
                     };
                     let subtitle = if layer.kind == LayerKind::Folder {
-                        format!("{kind} · {:.0}%", layer.opacity)
+                        let children = session.stack.block(i).len() - 1;
+                        format!("{kind} · Слоёв {children} · {:.0}%", layer.opacity)
                     } else {
                         format!("{kind} · {} · {:.0}%", layer.blend.label(), layer.opacity)
                     };
@@ -2925,6 +2943,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         &format!("{}\n{subtitle}", layer.name),
                         PaintAction::Select(i),
                     );
+                    commands.entity(e).insert((
+                        LayerMemoryHint(i),
+                        Help(layer_memory_hint(layer_bytes.get(i).copied().unwrap_or_default())),
+                    ));
                     if layer.kind != LayerKind::Folder {
                         let thumb = layer_thumbs::Source::content(layer)
                             .map(|source| ui.layer_thumbs.thumbnail(source, &images));

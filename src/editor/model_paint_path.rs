@@ -307,7 +307,7 @@ pub(super) fn edit(
     if stamps.is_empty() {
         return Outcome::Status("Переместите контур в видимую часть окна.");
     }
-    let mut brush = brush_for(session, tips, input.object, view.uv, false);
+    let mut brush = brush_for(session, tips, input.object, view.uv, false, false);
     if let Some(tip) = &mut brush.tip {
         tip.follow |= session.path_align;
     }

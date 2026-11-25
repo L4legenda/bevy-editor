@@ -8,6 +8,7 @@ use std::io::{Seek, Write};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Format {
     #[default]
     Png,

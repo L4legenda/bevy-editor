@@ -12,6 +12,7 @@ pub(in crate::editor) const BASIC_MAP_BITS: u16 = ALL_MAP_BITS & !(LEGACY_MAP_BI
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Quality {
     #[default]
     Draft,
@@ -45,6 +46,7 @@ impl Quality {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum IdSource {
     #[default]
     MeshParts,

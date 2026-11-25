@@ -37,9 +37,22 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 17);
+    assert_eq!(tools.tools.len(), 30);
     for name in [
         "get_editor_state",
+        "get_paint_state",
+        "list_paint_presets",
+        "edit_paint",
+        "paint_stroke",
+        "poly_fill",
+        "save_model",
+        "export_textures",
+        "bake_maps",
+        "get_bake_state",
+        "cancel_bake",
+        "set_paint_view",
+        "cage_preview",
+        "capture_paint_view",
         "set_transform",
         "add_model",
         "save_scene",
@@ -48,6 +61,28 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     ] {
         assert!(tools.tools.iter().any(|tool| tool.name == name));
     }
+    let peer = client.peer().clone();
+    let request = serde_json::from_value(json!({ "name": "list_paint_presets" })).unwrap();
+    let result = tick_until(&mut app, tokio::spawn(async move { peer.call_tool(request).await }))
+        .await.unwrap();
+    let presets = result.structured_content.unwrap();
+    assert_eq!(presets["channels"].as_array().unwrap().len(), 8);
+    assert_eq!(presets["brush_tips"].as_array().unwrap().len(), 24);
+
+    let peer = client.peer().clone();
+    let request = serde_json::from_value(json!({ "name": "get_paint_state" })).unwrap();
+    let result = tick_until(&mut app, tokio::spawn(async move { peer.call_tool(request).await }))
+        .await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(serde_json::to_string(&result.content).unwrap().contains("Open a 3D model"));
+    let peer = client.peer().clone();
+    let request = serde_json::from_value(json!({ "name": "edit_paint", "arguments": {
+        "model_id": 0, "set": 0, "edit": {"operation": "add_layer", "kind": "Paint"}
+    }})).unwrap();
+    let result = tick_until(&mut app, tokio::spawn(async move { peer.call_tool(request).await }))
+        .await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    assert!(serde_json::to_string(&result.content).unwrap().contains("Open a 3D model"));
     let peer = client.peer().clone();
     let request = serde_json::from_value(
         json!({ "name": "add_model", "arguments": { "asset": project.catalog[0].asset } }),
@@ -368,6 +403,8 @@ fn app(editor: Editor) -> (App, Bridge) {
         .insert_resource(editor)
         .insert_resource(Inbox(Mutex::new(receiver)))
         .init_resource::<Scene>()
+        .init_resource::<editing::State>()
+        .init_resource::<PaintState>()
         .init_resource::<viewport::PointerState>()
         .init_resource::<ButtonInput<MouseButton>>()
         .add_systems(Update, process);
@@ -392,6 +429,387 @@ fn enqueue(bridge: &Bridge, command: Command, deadline: Instant) -> oneshot::Rec
         .ok()
         .unwrap();
     receiver
+}
+
+struct StdioClient {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    replies: mpsc::Receiver<String>,
+    next: u32,
+}
+
+impl StdioClient {
+    fn launch(project: &std::path::Path) -> Self {
+        use std::{
+            io::{BufRead, BufReader},
+            process::Stdio,
+        };
+
+        let binary = std::env::var_os("BEVY_EDITOR_MCP_STDIO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join(format!("bevy-editor-mcp{}", std::env::consts::EXE_SUFFIX))
+            });
+        let mut command = std::process::Command::new(binary);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command
+            .arg("--project")
+            .arg(project)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Build bevy-editor-mcp before running the stdio workflow test");
+        let input = child.stdin.take();
+        let output = child.stdout.take().unwrap();
+        let (send, replies) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            input,
+            replies,
+            next: 0,
+        }
+    }
+
+    fn send(&mut self, message: Value) {
+        use std::io::Write;
+        let input = self.input.as_mut().unwrap();
+        writeln!(input, "{message}").unwrap();
+        input.flush().unwrap();
+    }
+
+    fn request(&mut self, app: &mut App, method: &str, params: Value) -> Value {
+        self.next += 1;
+        let id = self.next;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        let started = Instant::now();
+        loop {
+            for line in self.replies.try_iter() {
+                let reply: Value = serde_json::from_str(&line)
+                    .expect("Stdout must contain only MCP JSON-RPC messages");
+                if reply["id"] == id {
+                    assert!(reply["error"].is_null(), "{method}: {reply}");
+                    return reply["result"].clone();
+                }
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "The stdio bridge exited while handling {method}"
+            );
+            assert!(
+                started.elapsed() < REQUEST_TIMEOUT,
+                "The stdio bridge did not respond to {method}"
+            );
+            crate::editor::selection_outline::render_tests::frame(app);
+        }
+    }
+
+    fn tool(&mut self, app: &mut App, name: &str, arguments: Value) -> Value {
+        let reply = self.request(
+            app,
+            "tools/call",
+            json!({"name": name, "arguments": arguments}),
+        );
+        assert_ne!(reply["isError"], true, "{name}: {reply}");
+        reply
+    }
+
+    fn close(mut self) {
+        self.input.take();
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "The stdio bridge failed to shut down: {status}"
+                );
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "The stdio bridge did not exit on EOF"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for StdioClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires GPU and a built bevy-editor-mcp binary; tests the complete stdio paint workflow"]
+fn gpu_stdio_paint_workflow_saves_and_exports() {
+    use crate::editor::{
+        Action,
+        model_document::{Mode, glb::Glb},
+        model_mesh::{Corner, Face, Geometry},
+        selection_outline::render_tests::frame,
+        tests::lighting_ui_render::fixture_project,
+        ui::model_viewer::ModelViewAction,
+    };
+    use std::{fs, path::Path};
+
+    let scratch = Scratch::new();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy");
+    let manifest = scratch.0.join("project.json");
+    fs::copy(fixture.join("project.json"), &manifest).unwrap();
+    for directory in ["levels", "models", "scenes"] {
+        let destination = scratch.0.join("assets").join(directory);
+        fs::create_dir_all(&destination).unwrap();
+        for file in fs::read_dir(fixture.join("assets").join(directory)).unwrap() {
+            let file = file.unwrap();
+            fs::copy(file.path(), destination.join(file.file_name())).unwrap();
+        }
+    }
+    let project = EditorProject::load(&manifest).unwrap();
+    let (mut app, _, _) = fixture_project(project.clone());
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let started = Instant::now();
+    while !app
+        .world()
+        .resource::<editing::State>()
+        .documents
+        .contains_key(&0)
+    {
+        frame(&mut app);
+        assert!(
+            started.elapsed() < REQUEST_TIMEOUT,
+            "Could not load the test model"
+        );
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let corners = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]
+            .into_iter()
+            .enumerate()
+            .map(|(vertex, uv)| {
+                let mut corner = Corner::new(vertex);
+                corner.uv = uv;
+                corner
+            })
+            .collect();
+        doc.objects[0].geometry = Geometry {
+            positions: vec![
+                Vec3::new(-1., -1., 0.),
+                Vec3::new(1., -1., 0.),
+                Vec3::new(1., 1., 0.),
+                Vec3::new(-1., 1., 0.),
+            ],
+            faces: vec![Face {
+                corners,
+                material: 0,
+                smooth: false,
+            }],
+            ..default()
+        }
+        .into();
+        doc.objects[0].transform = Transform::IDENTITY;
+        doc.paint_default_size = 512;
+        doc.auto_bake_pending = false;
+        doc.revision += 1;
+    }
+    app.world_mut()
+        .write_message(Action::ModelView(ModelViewAction::Edit(
+            editing::EditAction::Mode(Mode::Paint),
+        )));
+    let (sender, receiver) = mpsc::sync_channel(64);
+    let server = server::start(
+        &project,
+        Bridge {
+            sender,
+            wake: Arc::new(|| {}),
+        },
+    )
+    .unwrap();
+    app.insert_resource(Inbox(Mutex::new(receiver)))
+        .add_systems(
+            Update,
+            process
+                .after(super::super::handle_actions)
+                .before(super::super::begin_room),
+        );
+
+    let mut client = StdioClient::launch(&manifest);
+    let initialized = client.request(&mut app, "initialize", json!({
+        "protocolVersion": rmcp::model::ProtocolVersion::LATEST_WITH_INITIALIZE, "capabilities": {},
+        "clientInfo": {"name": "bevy-paint-stdio-test", "version": "1"},
+    }));
+    assert_eq!(initialized["serverInfo"]["name"], "bevy-editor");
+    client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let tools = client.request(&mut app, "tools/list", json!({}));
+    for name in [
+        "paint_stroke",
+        "save_model",
+        "export_textures",
+        "bake_maps",
+        "capture_paint_view",
+    ] {
+        assert!(
+            tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name)
+        );
+    }
+
+    let wait_for_paint = |client: &mut StdioClient, app: &mut App| {
+        let started = Instant::now();
+        loop {
+            let state = client.tool(app, "get_paint_state", json!({}));
+            let state = &state["structuredContent"];
+            if state["mode"] == "paint"
+                && state["paint_busy"] == false
+                && state["brush"].is_object()
+            {
+                return state.clone();
+            }
+            assert!(
+                started.elapsed() < REQUEST_TIMEOUT,
+                "Painting workspace stayed busy: {state}"
+            );
+        }
+    };
+    assert_eq!(wait_for_paint(&mut client, &mut app)["resolution"], 512);
+    let view = client.tool(
+        &mut app,
+        "set_paint_view",
+        json!({
+            "model_id": 0, "center": [0, 0, 0], "distance": 4, "yaw_degrees": 0, "pitch_degrees": 0,
+            "layout": "three", "preview": {"mode": "material"},
+        }),
+    );
+    assert_eq!(view["structuredContent"]["layout"], "three");
+    let started = client.tool(
+        &mut app,
+        "bake_maps",
+        json!({
+            "target": {"model_id": 0, "set": 0}, "quality": "draft", "maps": ["part_random"],
+        }),
+    );
+    assert_eq!(started["structuredContent"]["status"], "running");
+    let now = Instant::now();
+    loop {
+        let report = client.tool(&mut app, "get_bake_state", json!({"model_id": 0, "set": 0}));
+        let report = &report["structuredContent"];
+        if report["status"] == "ready" {
+            assert!(
+                report["maps"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("part_random"))
+            );
+            break;
+        }
+        assert_eq!(report["status"], "running", "{report}");
+        assert!(now.elapsed() < REQUEST_TIMEOUT, "The bake did not complete");
+    }
+
+    wait_for_paint(&mut client, &mut app);
+    let added = client.tool(
+        &mut app,
+        "edit_paint",
+        json!({
+            "model_id": 0, "set": 0, "edit": {"operation": "add_layer", "kind": "Paint"},
+        }),
+    );
+    let layer = added["structuredContent"]["layers_bottom_to_top"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|layer| layer["selected"] == true)
+        .unwrap()["index"]
+        .as_u64()
+        .unwrap() as usize;
+    let before = wait_for_paint(&mut client, &mut app);
+    let paint = client.tool(&mut app, "paint_stroke", json!({
+        "workspace": {"model_id": 0, "set": 0}, "target": {"layer": layer, "space": "uv"},
+        "samples": [{"position": [0.5, 0.5]}],
+        "brush": {"size_px": 96, "channels": {"base_color": [210, 10, 170]}, "hardness_percent": 100, "flow_percent": 100},
+    }));
+    assert_eq!(paint["structuredContent"]["paint_busy"], true);
+    let painted = wait_for_paint(&mut client, &mut app);
+    assert_eq!(
+        painted["undo_steps"].as_u64().unwrap(),
+        before["undo_steps"].as_u64().unwrap() + 1
+    );
+    let capture = client.tool(&mut app, "capture_paint_view", json!({"model_id": 0}));
+    let png = capture["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "image")
+        .unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(png["data"].as_str().unwrap())
+        .unwrap();
+    let image = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert!(image.width() > 1 && image.height() > 1);
+    assert!(
+        image
+            .pixels()
+            .any(|pixel| pixel[0] > pixel[1].saturating_add(35)
+                && pixel[2] > pixel[1].saturating_add(25))
+    );
+
+    let saved = client.tool(
+        &mut app,
+        "save_model",
+        json!({"model_id": 0, "copy_name": "stdio-painted.glb"}),
+    );
+    let path = saved["structuredContent"]["path"].as_str().unwrap();
+    let glb = Glb::load(Path::new(path)).unwrap();
+    let mesh = glb.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let surface = glb
+        .paint_surface(&glb.json["meshes"][mesh]["primitives"][0])
+        .unwrap()
+        .unwrap();
+    let middle = ((512 * 256) + 256) * 4;
+    assert_eq!(
+        &surface.stack.layers[layer].channels[0].as_ref().unwrap()[middle..middle + 4],
+        &[210, 10, 170, 255]
+    );
+
+    let export = client.tool(&mut app, "export_textures", json!({
+        "model_id": 0, "folder": ".", "all_sets": false, "template": "separate", "format": "png", "bit_depth": 8, "size": 512,
+    }));
+    let color = export["structuredContent"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|file| file.contains("BaseColor"))
+        .unwrap();
+    let exported = image::open(color).unwrap().to_rgba8();
+    assert_eq!(exported.get_pixel(256, 256).0, [210, 10, 170, 255]);
+    client.close();
+    drop(server);
 }
 
 #[test]

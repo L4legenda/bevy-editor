@@ -98,6 +98,160 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Read the open 3D model's texture sets, active paint layers, brush, bake status and paint undo/redo counts",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_paint_state(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintState, context).await
+    }
+
+    #[tool(
+        description = "List 3D paint channels, material and generator presets, brush tips, blend and fill modes, bake qualities and export templates",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_paint_presets(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintPresets, context).await
+    }
+
+    #[tool(
+        description = "Edit the active 3D paint workspace: select a texture set or layer, add, change, duplicate, remove or move a layer, edit its mask, or undo or redo. Returns updated paint state",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn edit_paint(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::EditArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintEdit(args), context).await
+    }
+
+    #[tool(
+        description = "Queue one GPU brush stroke on a 3D paint layer or mask. Use normalized coordinates in the model viewport or active UV tile. Poll get_paint_state until paint_busy is false",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn paint_stroke(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::StrokeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintStroke(args), context).await
+    }
+
+    #[tool(
+        description = "Queue a polygon fill from a normalized viewport or UV position on a paint layer or mask. Returns queued paint state",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn poly_fill(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::FillArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintFill(args), context).await
+    }
+
+    #[tool(
+        description = "Save the open painting model as editable GLB, optionally under a new name beside the source. Returns the path after writing",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn save_model(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::SaveArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintSave(args), context).await
+    }
+
+    #[tool(
+        description = "Export composed maps for the active or all texture sets into a new folder, using the editor's export settings with optional overrides. Returns the written paths",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn export_textures(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::ExportArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintExport(args), context).await
+    }
+
+    #[tool(
+        description = "Start baking mesh maps for the active paint texture set using its resolution, with optional quality and high-poly settings. Poll get_bake_state for completion",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn bake_maps(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::BakeArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::BakeStart(args), context).await
+    }
+
+    #[tool(
+        description = "Read bake progress, cached maps, coverage, and failure or cancellation status for a texture set",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_bake_state(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::BakeTarget>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::BakeStatus(args), context).await
+    }
+
+    #[tool(
+        description = "Cancel the running bake for the requested model and texture set",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn cancel_bake(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::BakeTarget>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::BakeCancel(args), context).await
+    }
+
+    #[tool(
+        description = "Set the live paint viewport's camera, layout, channel or baked-map preview, path tracing and exposure",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn set_paint_view(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::PaintViewArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintView(args), context).await
+    }
+
+    #[tool(
+        description = "Show or hide the high-poly projection cage, or read its coverage report when show is omitted",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn cage_preview(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::CageArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::CagePreview(args), context).await
+    }
+
+    #[tool(
+        description = "Capture the displayed model paint viewport as a PNG, including active overlays or the current path-traced image",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn capture_paint_view(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::CaptureArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintCapture(args), context).await
+    }
+
+    #[tool(
         description = "List the project's configured scenes and their open, active and unsaved states",
         annotations(read_only_hint = true, open_world_hint = false)
     )]

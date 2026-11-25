@@ -31,6 +31,11 @@ pub(in crate::editor::ui::model_viewer) mod live;
 pub(in crate::editor::ui::model_viewer) mod view3d;
 #[path = "model_paint_bake_mesh.rs"]
 mod mesh;
+#[cfg(feature = "mcp")]
+#[path = "model_paint_mcp_bake.rs"]
+mod mcp_bake;
+#[cfg(feature = "mcp")]
+pub(in crate::editor) use mcp_bake::{BakeArgs, BakeTarget, McpBake};
 #[path = "model_paint_bake_levels.rs"]
 pub(super) mod levels;
 pub(in crate::editor) use levels::import_levels;
@@ -727,6 +732,8 @@ impl Drop for Job {
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct State {
     running: Option<Job>,
+    #[cfg(feature = "mcp")]
+    outcomes: HashMap<(usize, usize, usize), mcp_bake::Outcome>,
     automatic: HashMap<usize, VecDeque<(usize, usize)>>,
     picking: Option<(usize, BakeInput, Task<std::io::Result<Option<PathBuf>>>)>,
     cache: VecDeque<(Key, Arc<Maps>)>,
@@ -748,6 +755,59 @@ pub(super) struct FixPreview {
     pub fixes: Arc<Fixes>,
 }
 impl State {
+    fn start_manual(
+        &mut self,
+        model: usize,
+        doc: &Document,
+        session: &mut Session,
+        gpu: Option<mesh::RayDevice>,
+        preview: bool,
+    ) -> Result<&'static str, String> {
+        if self.running.is_some() || self.picking.is_some() || self.clearing_cache.is_some() || doc.paint_busy {
+            return Err("Дождитесь завершения текущей операции".into());
+        }
+        let mut key = session.binding.and_then(|binding| Key::new(model, doc, binding, session.texture_size))
+            .ok_or("Выберите набор текстур для запекания")?;
+        key.settings = session.bake_projection.saved();
+        let status = if key.settings == doc.bake_settings && session.bake_projection.path.is_none()
+            && let Some(maps) = self.maps(model, doc, (key.object, key.slot), key.size)
+        {
+            if preview && session.bake_view.is_none_or(|map| !maps.has_map(map)) {
+                session.bake_view = Some(if maps.has_map(BakeMap::Occlusion) {
+                    BakeMap::Occlusion
+                } else {
+                    BakeMap::WorldNormal
+                });
+            }
+            #[cfg(feature = "mcp")]
+            self.outcomes.remove(&(key.model, key.object, key.slot));
+            "Использованы готовые карты меша"
+        } else {
+            let object = doc.objects.iter().find(|item| item.id == key.object).unwrap();
+            let projection = projection_for(session, object);
+            let has_projection = projection.path.is_some();
+            self.begin(key, doc, projection, gpu);
+            if preview && !matches!(session.bake_view, Some(BakeMap::Custom(_))) {
+                session.bake_view = [BakeMap::ProjectedNormal, BakeMap::ProjectedHeight, BakeMap::Occlusion, BakeMap::WorldNormal]
+                    .into_iter().find(|&map| (has_projection || !map.requires_high_poly()) && session.bake_projection.maps.contains(map));
+            }
+            "Запекание карт меша…"
+        };
+        if preview && session.view == View::Three && !session.bake_on_model && !session.bake_live_masks {
+            session.view = View::Split;
+        }
+        session.revision += 1;
+        Ok(status)
+    }
+
+    fn cancel_running(&mut self) -> Option<usize> {
+        let job = self.running.take()?;
+        let model = job.key.model;
+        #[cfg(feature = "mcp")]
+        self.outcomes.insert((model, job.key.object, job.key.slot), mcp_bake::Outcome::Cancelled);
+        Some(model)
+    }
+
     pub(super) fn cancel_mesh_work(&mut self, model: usize) {
         if self.running.as_ref().is_some_and(|job| job.key.model == model) {
             self.running = None;
@@ -767,6 +827,8 @@ impl State {
     ) {
         let objects = doc.objects.clone();
         let (model, object, slot, size) = (key.model, key.object, key.slot, key.size);
+        #[cfg(feature = "mcp")]
+        self.outcomes.remove(&(model, object, slot));
         projection.custom = doc.custom_bakes.clone();
         if projection.path.is_some() {
             self.cache.retain(|(entry, _)| {
@@ -989,6 +1051,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
         mesh::RayDevice { device: device.clone(), queue: queue.clone() }
     });
     state.automatic.retain(|model, _| editing.documents.contains_key(model));
+    #[cfg(feature = "mcp")]
+    state.outcomes.retain(|(model, _, _), _| editing.documents.contains_key(model));
     if let Some(result) = state.clearing_cache.as_mut().and_then(|task| block_on(poll_once(task))) {
         state.clearing_cache = None;
         editor.status = match result {
@@ -1003,7 +1067,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             .get(&job.key.model)
             .is_none_or(|doc| !job.key.matches_scene(doc))
     }) {
-        state.running = None;
+        state.cancel_running();
         editor.status = "Запекание остановлено после изменения модели".into();
     }
     state.cache.retain_mut(|(key, maps)| {
@@ -1030,6 +1094,11 @@ pub(in crate::editor::ui::model_viewer) fn update(
         .and_then(|job| block_on(poll_once(&mut job.task)))
     {
         let job = state.running.take().unwrap();
+        #[cfg(feature = "mcp")]
+        state.outcomes.insert((job.key.model, job.key.object, job.key.slot), match &result {
+            Ok((_, from_disk)) => mcp_bake::Outcome::Ready { from_disk: *from_disk },
+            Err(error) => mcp_bake::Outcome::Failed(error.clone()),
+        });
         match result {
             Ok((maps, from_disk)) => {
                 let status = if from_disk {
@@ -1114,7 +1183,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     if session.bake_projection.saved() != *settings {
         session.bake_projection.restore(settings);
         if state.running.as_ref().is_some_and(|job| job.key.model == index) {
-            state.running = None;
+            state.cancel_running();
         }
         state.cache.retain(|(key, _)| key.model != index);
         session.bake_view = session.bake_view.filter(|&map| session.bake_projection.maps.contains(map));
@@ -1423,14 +1492,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
             }
             PaintAction::BakeInspectCage if session.bake_projection.path.is_some() => {
-                session.bake_inspect_cage = !session.bake_inspect_cage;
-                if !session.bake_inspect_cage {
-                    session.bake_paint_cage = false;
-                }
-                if session.bake_inspect_cage && session.view == View::Two {
-                    session.view = View::Split;
-                }
-                session.revision += 1;
+                session.set_cage_inspection(!session.bake_inspect_cage);
             }
             PaintAction::BakePickHigh | PaintAction::BakePickCage
                 if state.picking.is_none()
@@ -1496,9 +1558,9 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 session.revision += 1;
             }
             PaintAction::BakeCancel if state.running.is_some() => {
-                let model = state.running.as_ref().unwrap().key.model;
-                state.running = None;
-                state.automatic.remove(&model);
+                if let Some(model) = state.cancel_running() {
+                    state.automatic.remove(&model);
+                }
                 state.automatic.remove(&index);
                 editing.documents.get_mut(&index).unwrap().auto_bake_pending = false;
                 editor.status = "Запекание отменено".into();
@@ -1516,47 +1578,9 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 if state.running.is_none() && state.picking.is_none()
                     && state.clearing_cache.is_none() && !doc.paint_busy =>
             {
-                let Some(mut key) = session
-                    .binding
-                    .and_then(|binding| Key::new(index, doc, binding, session.texture_size))
-                else {
-                    continue;
-                };
-                key.settings = session.bake_projection.saved();
-                if key.settings == doc.bake_settings
-                    && session.bake_projection.path.is_none()
-                    && let Some(maps) = state.maps(index, doc, (key.object, key.slot), key.size)
-                {
-                    if session.bake_view.is_none_or(|map| !maps.has_map(map)) {
-                        session.bake_view = Some(if maps.has_map(BakeMap::Occlusion) {
-                            BakeMap::Occlusion
-                        } else {
-                            BakeMap::WorldNormal
-                        });
-                    }
-                    editor.status = "Использованы готовые карты меша".into();
-                } else {
-                    let projection = projection_for(
-                        session,
-                        doc.objects.iter().find(|item| item.id == key.object).unwrap(),
-                    );
-                    let has_projection = projection.path.is_some();
-                    state.begin(key, doc, projection, ray_device());
-                    if !matches!(session.bake_view, Some(BakeMap::Custom(_))) {
-                        session.bake_view = [
-                            BakeMap::ProjectedNormal, BakeMap::ProjectedHeight,
-                            BakeMap::Occlusion, BakeMap::WorldNormal,
-                        ].into_iter().find(|&map| {
-                            (has_projection || !map.requires_high_poly())
-                                && session.bake_projection.maps.contains(map)
-                        });
-                    }
-                    editor.status = "Запекание карт меша…".into();
+                if let Ok(status) = state.start_manual(index, doc, session, ray_device(), true) {
+                    editor.status = status.into();
                 }
-                if session.view == View::Three && !session.bake_on_model && !session.bake_live_masks {
-                    session.view = View::Split;
-                }
-                session.revision += 1;
             }
             PaintAction::BakePreview(map) => {
                 session.preview_3d = Preview3d::Material;

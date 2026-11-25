@@ -173,6 +173,7 @@ mod tests {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum GeneratorKind {
     Clouds,
     Height,

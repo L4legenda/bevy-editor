@@ -99,6 +99,18 @@ impl Snapshot {
     }
 }
 
+#[cfg(feature = "mcp")]
+pub(super) fn prepare_copy(doc: &Document, root: &Path, name: &str) -> Result<impl FnOnce() -> Result<PathBuf, String> + Send + 'static, String> {
+    browser_files::validate_name(name)?;
+    let path = doc.source.path.with_file_name(name);
+    if !path.extension().is_none_or(|ext| ext.eq_ignore_ascii_case("glb")) {
+        return Err("Используйте расширение .glb".into());
+    }
+    let snapshot = Snapshot::capture(doc)?;
+    let root = root.to_owned();
+    Ok(move || snapshot.write(&root, &path).map(|relative| root.join(relative)))
+}
+
 fn publish(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     let staged = destination.with_file_name(format!(
         ".bevy-editor-model-{}.tmp",

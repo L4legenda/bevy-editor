@@ -114,6 +114,15 @@ pub(super) fn splatter_alpha() -> &'static image::GrayImage {
 }
 
 impl Library {
+    #[cfg(feature = "mcp")]
+    pub(super) fn names(&self) -> Vec<&str> {
+        if self.entries.is_empty() {
+            LABELS.to_vec()
+        } else {
+            self.entries.iter().map(|tip| tip.name.as_str()).collect()
+        }
+    }
+
     pub fn ensure(&mut self, images: &mut Assets<Image>) {
         Self::fill(&mut self.entries, images, ATLAS, COLUMNS, &LABELS);
     }

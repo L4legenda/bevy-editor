@@ -27,7 +27,12 @@ pub(super) struct Statistics {
     pub batches: AtomicU64,
     pub stamps: AtomicU64,
     pub readbacks: AtomicU64,
-    contexts: Mutex<HashMap<u64, u64>>,
+    contexts: Mutex<HashMap<u64, ContextMemory>>,
+}
+
+struct ContextMemory {
+    total: u64,
+    layers: Vec<u64>,
 }
 #[derive(Clone)]
 pub(super) struct Scene {
@@ -138,7 +143,12 @@ pub(in crate::editor::ui::model_viewer) struct Queue {
 impl Queue {
     pub fn context_bytes(&self, ids: impl Iterator<Item = u64>) -> u64 {
         let contexts = self.stats.contexts.lock().unwrap();
-        ids.filter_map(|id| contexts.get(&id)).sum()
+        ids.filter_map(|id| contexts.get(&id)).map(|memory| memory.total).sum()
+    }
+
+    pub fn layer_bytes(&self, id: u64) -> Vec<u64> {
+        self.stats.contexts.lock().unwrap().get(&id)
+            .map_or_else(Vec::new, |memory| memory.layers.clone())
     }
 
     #[cfg(test)]
@@ -920,39 +930,41 @@ impl Context {
             .map(Target::bytes).sum()
     }
 
-    fn bytes(&self) -> u64 {
-        let mut bytes = self.texture_bytes();
+    fn memory(&self) -> ContextMemory {
+        let mut layers = vec![0; self.composition.layers.len()];
         let mut seen = HashSet::new();
-        let mut count = |buffer: &Buffer| {
+        let mut unique_size = |buffer: &Buffer| {
             if seen.insert(buffer.id()) {
-                bytes += buffer.size();
+                buffer.size()
+            } else {
+                0
             }
         };
-        for buffer in [&self.vertices, &self.auxiliary, &self.baked_normal, &self.snapshot, &self.dirty, &self.tiles, &self.grid]
+        let mut total = self.texture_bytes();
+        total += [&self.vertices, &self.auxiliary, &self.baked_normal, &self.snapshot, &self.dirty, &self.tiles, &self.grid]
             .into_iter().chain(self.additional.iter().map(|channel| &channel.snapshot))
-        {
-            count(buffer);
-        }
+            .map(&mut unique_size).sum::<u64>();
         for composition in std::iter::once(&self.composition)
             .chain(self.additional.iter().map(|channel| &channel.composition))
             .chain(&self.mask_compositions)
         {
-            for buffer in [&composition.base, &composition.result, &composition.below]
-                .into_iter()
-                .chain(&composition.saved)
-                .chain(composition.layers.iter().flat_map(|layer| std::iter::once(&layer.buffer).chain(&layer.mask)))
-            {
-                count(buffer);
+            total += [&composition.base, &composition.result, &composition.below]
+                .into_iter().chain(&composition.saved).map(&mut unique_size).sum::<u64>();
+            for (bytes, layer) in layers.iter_mut().zip(&composition.layers) {
+                let content = unique_size(&layer.buffer);
+                let mask = layer.mask.as_ref().map_or(0, &mut unique_size);
+                total += content + mask;
+                // Four-byte placeholders are bindings for absent channels.
+                *bytes += if content > 4 { content } else { 0 };
+                *bytes += mask;
             }
         }
         if let Some(filters) = &self.mask_filter {
-            count(&filters.raw);
-            if let Some(bounds) = &filters.bounds {
-                count(bounds);
-            }
-            bytes += filters.pass_bytes;
+            total += unique_size(&filters.raw);
+            total += filters.bounds.as_ref().map_or(0, &mut unique_size);
+            total += filters.pass_bytes;
         }
-        bytes
+        ContextMemory { total, layers }
     }
 }
 fn composition_for_channel(
@@ -2369,7 +2381,7 @@ fn execute(
                         baked_preview.as_ref().and_then(|bake| bake.normal.as_deref()),
                         fix,
                 );
-                pending.stats.contexts.lock().unwrap().insert(id, context.bytes());
+                pending.stats.contexts.lock().unwrap().insert(id, context.memory());
                 contexts.insert(id, context);
             }
             Command::Begin {
@@ -2393,9 +2405,9 @@ fn execute(
                     );
                     let after = context.texture_bytes();
                     if before != after
-                        && let Some(bytes) = pending.stats.contexts.lock().unwrap().get_mut(&id)
+                        && let Some(memory) = pending.stats.contexts.lock().unwrap().get_mut(&id)
                     {
-                        *bytes = *bytes - before + after;
+                        memory.total = memory.total - before + after;
                     }
                 }
             }

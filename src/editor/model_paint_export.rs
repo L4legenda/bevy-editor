@@ -15,6 +15,11 @@ mod templates;
 pub(super) use templates::Template;
 #[path = "model_paint_export_image.rs"]
 mod image_output;
+#[cfg(feature = "mcp")]
+#[path = "model_paint_mcp_output.rs"]
+mod mcp_output;
+#[cfg(feature = "mcp")]
+pub(in crate::editor) use mcp_output::{ExportArgs, McpOutput, OutputReply};
 #[path = "model_paint_export_mesh.rs"]
 mod mesh;
 #[path = "model_paint_export_prefs.rs"]
@@ -27,6 +32,7 @@ pub(super) use image_output::{Depth, Format, Options as FileOptions};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Padding {
     #[default]
     Infinite,
@@ -341,6 +347,8 @@ impl ExportDirectory {
         Report {
             path: self.path.clone(),
             files: self.files.len(),
+            #[cfg(feature = "mcp")]
+            paths: std::mem::take(&mut self.files),
             kind,
         }
     }
@@ -460,6 +468,8 @@ fn material_normal_rows(
 pub(in crate::editor::ui::model_viewer) struct Report {
     pub path: PathBuf,
     pub files: usize,
+    #[cfg(feature = "mcp")]
+    paths: Vec<PathBuf>,
     kind: ExportKind,
 }
 

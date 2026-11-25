@@ -249,6 +249,8 @@ impl Plugin for ModelViewerPlugin {
                 .before(crate::editor::ui::refresh_inspector),
         );
         app.add_systems(Update, shading::refresh.after(crate::editor::ui::refresh));
+        #[cfg(feature = "mcp")]
+        app.add_systems(PostUpdate, paint::mcp_preview::capture_requests);
         app.add_systems(
             PostUpdate,
             editing::input::draw.after(bevy::transform::TransformSystems::Propagate),
@@ -266,12 +268,19 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut handles: ResMut<Assets<crate::editor::viewport::HandleMaterial>>,
 ) {
-    let image = images.add(Image::new_target_texture(
+    let image = Image::new_target_texture(
         640,
         480,
         TextureFormat::Rgba8UnormSrgb,
         None,
-    ));
+    );
+    #[cfg(feature = "mcp")]
+    let image = {
+        let mut image = image;
+        image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+        image
+    };
+    let image = images.add(image);
     let overlay = commands
         .spawn((
             Node {

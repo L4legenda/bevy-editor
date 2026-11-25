@@ -782,6 +782,39 @@ fn gpu_paint_save_copy_opens_a_separate_editable_tab() {
     paint_message(&mut app, PaintAction::Add(LayerKind::Fill));
     let original_stack = app.world().resource::<PaintState>().sessions[&0].stack.clone();
     assert!(app.world().resource::<editing::State>().documents[&0].dirty());
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        use serde_json::json;
+        let (send, receive) = std::sync::mpsc::channel();
+        let args: mcp_state::ExportArgs = serde_json::from_value(json!({
+            "model_id": 0, "folder": ".", "format": "png", "bit_depth": 8,
+            "template": "separate", "prefix": "mcp-export", "size": 512,
+        })).unwrap();
+        app.world_mut().run_system_once(move |mut output: mcp_state::McpOutput,
+            editor: Res<Editor>, editing: Res<editing::State>, paint: Res<PaintState>| {
+            let send = send.clone();
+            mcp_state::export_textures(&mut output, &editor, &editing, &paint, args.clone(), Box::new(move |result| {
+                send.send(result).unwrap();
+            }));
+        }).unwrap();
+        let export = drive_paint_file_reply(&mut app, receive);
+        let files = export["files"].as_array().unwrap();
+        let color = files.iter().map(|path| path.as_str().unwrap())
+            .find(|path| path.contains("BaseColor")).expect("Exported base color map");
+        let color = image::open(color).unwrap().to_rgba8();
+        assert_eq!(color.dimensions(), (512, 512));
+        assert!(color.pixels().any(|pixel| pixel[3] > 0));
+
+        let copy = mcp_save_reply(&mut app, json!({"model_id": 0, "copy_name": "mcp-paint-copy.glb"}));
+        let saved = crate::editor::model_document::glb::Glb::load(
+            std::path::Path::new(copy["path"].as_str().unwrap()),
+        ).unwrap();
+        let mesh = saved.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+        let primitive = &saved.json["meshes"][mesh]["primitives"][0];
+        assert_eq!(saved.paint_surface(primitive).unwrap().unwrap().stack, original_stack);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
     app.world_mut().resource_mut::<save_copy::State>().test_path = Some(destination.clone());
     paint_click(&mut app, window, PaintAction::SaveCopy);
     let started = std::time::Instant::now();
@@ -804,8 +837,53 @@ fn gpu_paint_save_copy_opens_a_separate_editable_tab() {
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert!(app.world().resource::<editing::State>().documents[&0].dirty());
     assert!(app.world().resource::<Editor>().model_tabs.contains(&0));
+    #[cfg(feature = "mcp")]
+    {
+        let model = app.world().resource::<Editor>().viewing_model.unwrap();
+        paint_ready(&mut app);
+        paint_message(&mut app, PaintAction::Add(LayerKind::Fill));
+        let expected = original_stack.layers.len() + 1;
+        let doc = &app.world().resource::<editing::State>().documents[&model];
+        assert!(doc.dirty());
+        assert_eq!(doc.objects[0].materials[0].paint.as_ref().unwrap().stack.layers.len(), expected);
+        let saved = mcp_save_reply(&mut app, serde_json::json!({"model_id": model}));
+        assert_eq!(saved["copy"], false);
+        assert_eq!(std::path::Path::new(saved["path"].as_str().unwrap()).canonicalize().unwrap(), destination.canonicalize().unwrap());
+        assert!(!app.world().resource::<editing::State>().documents[&model].dirty());
+        let saved = crate::editor::model_document::glb::Glb::load(&destination).unwrap();
+        let mesh = saved.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+        let primitive = &saved.json["meshes"][mesh]["primitives"][0];
+        assert_eq!(saved.paint_surface(primitive).unwrap().unwrap().stack.layers.len(), expected);
+    }
     drop(app);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(feature = "mcp")]
+fn drive_paint_file_reply(app: &mut App, receive: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(result) = receive.try_recv() {
+            return result.unwrap();
+        }
+        frame(app);
+        assert!(started.elapsed().as_secs() < 30, "No paint file reply");
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_save_reply(app: &mut App, request: serde_json::Value) -> serde_json::Value {
+    use bevy::ecs::system::RunSystemOnce;
+    let args: mcp_state::SaveArgs = serde_json::from_value(request).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    app.world_mut().run_system_once(move |mut output: mcp_state::McpOutput, mut editor: ResMut<Editor>,
+        mut editing: ResMut<editing::State>, paint: Res<PaintState>| {
+        let send = send.clone();
+        mcp_state::save_model(&mut output, &mut editor, &mut editing, &paint, args.clone(), Box::new(move |result| {
+            send.send(result).unwrap();
+        }));
+    }).unwrap();
+    drive_paint_file_reply(app, receive)
 }
 
 #[test]
@@ -1137,6 +1215,14 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     assert!(!painted(&before));
     capture_when(&mut app, &target, &output.join("viewport-painted.png"), painted);
     assert_eq!(canvas_image(&mut app), traced);
+    #[cfg(feature = "mcp")]
+    {
+        let expected = app.world().resource::<Assets<Image>>().get(&traced).unwrap().size();
+        let capture = mcp_capture_model(&mut app);
+        assert_eq!((capture.width(), capture.height()), (expected.x, expected.y));
+        let pixel = capture.to_rgba8().get_pixel(expected.x / 2, expected.y / 2).0;
+        assert!(pixel[0] > pixel[1].saturating_add(35) && pixel[2] > pixel[1].saturating_add(25));
+    }
     warm(&mut app, 10);
     let accumulated = samples(app.world()).unwrap();
     let dispatched = dispatches(app.world());
@@ -1194,6 +1280,12 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     paint_message(&mut app, PaintAction::PreviewShader(None));
     assert_eq!(canvas_image(&mut app), raster);
     capture_when(&mut app, &target, &output.join("viewport-raster-graded.png"), gray);
+    #[cfg(feature = "mcp")]
+    {
+        let capture = mcp_capture_model(&mut app);
+        let pixel = capture.to_rgba8().get_pixel(capture.width() / 2, capture.height() / 2).0;
+        assert!(pixel[0].abs_diff(pixel[1]) < 3 && pixel[0].abs_diff(pixel[2]) < 3);
+    }
     app.world_mut().write_message(saturation(1.0));
     capture_when(&mut app, &target, &output.join("viewport-raster-reset.png"), |image| !gray(image));
     let exposure = Action::ModelView(ModelViewAction::Environment(
@@ -1205,6 +1297,43 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
     let grade = world.query::<&super::post::RasterGrade>().single(world).unwrap();
     assert_eq!(grade.0.exposure, 1.5 - preferences.paint_post(None).exposure);
     assert_eq!(*world.resource::<environment::Settings>(), preferences);
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        let request = |app: &mut App, settings| {
+            let args: mcp_state::PaintViewArgs = serde_json::from_value(settings).unwrap();
+            app.world_mut().run_system_once(move |mut input: mcp_state::McpPreview,
+                editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::set_view(&mut input, &editor, &mut editing, &mut paint, args.clone())
+            }).unwrap()
+        };
+        let previous = app.world().resource::<Viewer>().camera();
+        assert!(request(&mut app, serde_json::json!({"model_id": 0, "yaw_degrees": 30, "fov_degrees": 0})).is_err());
+        assert_eq!(app.world().resource::<Viewer>().camera(), previous);
+        let view = request(&mut app, serde_json::json!({"model_id": 0, "yaw_degrees": 30, "fov_degrees": 60,
+            "orthographic": true, "preview": {"mode": "channel", "channel": "roughness"}})).unwrap();
+        assert_eq!(view["channel"], "roughness");
+        assert_eq!(view["camera"]["orthographic"], true);
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        assert!((doc.model_camera.unwrap().yaw.to_degrees() - 30.).abs() < 0.01);
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_capture_model(app: &mut App) -> image::DynamicImage {
+    use bevy::ecs::system::RunSystemOnce;
+    let args: mcp_state::CaptureArgs = serde_json::from_value(serde_json::json!({"model_id": 0})).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    app.world_mut().run_system_once(move |mut commands: Commands, editor: Res<Editor>| {
+        let send = send.clone();
+        mcp_state::capture(&mut commands, &editor, args, Box::new(move |result| { send.send(result).unwrap(); }));
+    }).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        frame(app);
+        if let Ok(result) = receive.try_recv() { return result.unwrap(); }
+        assert!(std::time::Instant::now() < deadline, "No model viewport capture");
+    }
 }
 
 #[test]
@@ -1618,7 +1747,35 @@ fn gpu_mesh_map_graph_updates_after_a_real_bake() {
     paint_message(&mut app, choose);
     assert!(app.world().resource::<PaintState>().sessions[&0].graph_map_menu.is_none());
 
+    #[cfg(not(feature = "mcp"))]
     paint_message(&mut app, PaintAction::BakeStart);
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        use serde_json::json;
+        let start = |app: &mut App, front| {
+            let args: mcp_state::BakeArgs = serde_json::from_value(json!({
+                "target": {"model_id": 0, "set": 0}, "quality": "draft",
+                "maps": ["part_random"], "front_percent": front,
+            })).unwrap();
+            app.world_mut().run_system_once(move |mut input: mcp_state::McpBake,
+                mut editor: ResMut<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::start_bake(&mut input, &mut editor, &mut editing, &mut paint, args.clone())
+            }).unwrap()
+        };
+        assert!(start(&mut app, 0).is_err());
+        let started = start(&mut app, 6).unwrap();
+        assert_eq!(started["status"], "running");
+        let target = serde_json::from_value(json!({"model_id": 0, "set": 0})).unwrap();
+        let cancelled = app.world_mut().run_system_once(move |mut input: mcp_state::McpBake,
+            mut editor: ResMut<Editor>, mut editing: ResMut<editing::State>, paint: Res<PaintState>| {
+            mcp_state::cancel_bake(&mut input, &mut editor, &mut editing, &paint, target)
+        }).unwrap().unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        let started = start(&mut app, 7).unwrap();
+        assert_eq!(started["status"], "running");
+        assert_eq!(started["resolution"], 512);
+    }
     let binding = app.world().resource::<PaintState>().sessions[&0].binding.unwrap();
     wait(&mut app, &|world| {
         let session = &world.resource::<PaintState>().sessions[&0];
@@ -1627,6 +1784,18 @@ fn gpu_mesh_map_graph_updates_after_a_real_bake() {
         current.is_some_and(|maps| session.graph_bake.as_ref()
             .is_some_and(|rendered| rendered.ptr_eq(&Arc::downgrade(maps))))
     });
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        let target = serde_json::from_value(serde_json::json!({"model_id": 0, "set": 0})).unwrap();
+        let state = app.world_mut().run_system_once(move |input: mcp_state::McpBake,
+            editor: Res<Editor>, editing: Res<editing::State>, paint: Res<PaintState>| {
+            mcp_state::bake_status(&input, &editor, &editing, &paint, target)
+        }).unwrap().unwrap();
+        assert_eq!(state["status"], "ready");
+        assert!(state["maps"].as_array().unwrap().iter().any(|map| map == "part_random"));
+        assert!(state["report"]["uv_texels"].as_u64().unwrap() > 0);
+    }
     let world = app.world();
     let doc = &world.resource::<editing::State>().documents[&0];
     let maps = world.resource::<bake::State>().maps(0, doc, binding, bake_size).unwrap();
@@ -2421,6 +2590,31 @@ fn gpu_paint_cage_stroke_saves_and_reopens() {
     warm(&mut app, 12);
     paint_message(&mut app, PaintAction::Panel(Panel::Maps));
     paint_message(&mut app, PaintAction::View(View::Split));
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        let toggle = |app: &mut App, show: Option<bool>| {
+            let args: mcp_state::CageArgs = serde_json::from_value(serde_json::json!({"model_id": 0, "show": show})).unwrap();
+            app.world_mut().run_system_once(move |input: mcp_state::McpPreview, editor: Res<Editor>,
+                editing: Res<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::cage(&input, &editor, &editing, &mut paint, args.clone())
+            }).unwrap().unwrap()
+        };
+        assert_eq!(toggle(&mut app, Some(true))["visible"], true);
+        let start = std::time::Instant::now();
+        loop {
+            frame(&mut app);
+            let report = toggle(&mut app, None);
+            if report["report"]["status"] == "ready" {
+                let samples = ["covered", "tight", "missed", "overlapping"].map(|key| report["report"][key].as_u64().unwrap());
+                assert!(samples.into_iter().sum::<u64>() > 0);
+                break;
+            }
+            assert_ne!(report["report"]["status"], "failed", "{report}");
+            assert!(start.elapsed().as_secs() < 30, "{report}");
+        }
+        assert_eq!(toggle(&mut app, Some(false))["report"]["status"], "hidden");
+    }
     paint_message(&mut app, PaintAction::BakePaintCage);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
     while !app.world().resource::<bake::cage_brush::Brush>().pick_ready() {
@@ -6337,6 +6531,15 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
     stroke(&mut app, panned.center());
     assert_eq!(undo_len(&app), before_undo + 1);
     assert_eq!(app.world().resource::<engine::gpu::Queue>().statistics().2, readbacks + 1);
+    {
+        let world = app.world();
+        let runtime = world.resource::<engine::Runtime>();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let queue = world.resource::<engine::gpu::Queue>();
+        let bytes = runtime.layer_gpu_bytes(0, session, queue);
+        assert_eq!(bytes.first().copied(), Some(8 * 512 * 512 * 4));
+        assert!(runtime.paint_gpu_bytes(0, queue, world.resource::<Assets<Image>>()) > bytes[0]);
+    }
     let expected = [
         [120, 50, 220], [102; 3], [153; 3], [51; 3], [89; 3],
         [51, 153, 255], [128, 128, 255], [204; 3],
@@ -6557,6 +6760,64 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
     assert!(world.resource::<engine::Runtime>().paint_gpu_bytes(
         0, world.resource::<engine::gpu::Queue>(), world.resource::<Assets<Image>>(),
     ) > 0);
+
+    #[cfg(feature = "mcp")]
+    {
+        use bevy::ecs::system::RunSystemOnce;
+        use serde_json::json;
+
+        paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
+        let layer = app.world().resource::<PaintState>().sessions[&0].stack.selected;
+        let workspace = json!({"model_id": 0, "set": 0});
+        let stroke_request = |app: &mut App, space, position: [f32; 2], color| {
+            let args: mcp_state::StrokeArgs = serde_json::from_value(json!({
+                "workspace": workspace,
+                "target": {"layer": layer, "space": space},
+                "samples": [{"position": position, "pressure": 1.0}],
+                "brush": {"size_px": 28.0, "hardness_percent": 100.0, "channels": {"base_color": color}},
+            })).unwrap();
+            app.world_mut().run_system_once(move |mut input: mcp_state::McpPaintInput,
+                editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::stroke(&mut input, &editor, &mut editing, &mut paint, args.clone())
+            }).unwrap()
+        };
+        let before_mcp = undo_len(&app);
+        assert!(stroke_request(&mut app, "uv", [-0.1, 0.5], [1, 2, 3]).is_err());
+        let screen_position = ((point - rect.min) / rect.size()).to_array();
+        let queued = stroke_request(&mut app, "viewport", screen_position, [17, 150, 240]).unwrap();
+        assert_eq!(queued["paint_busy"], true);
+        paint_ready(&mut app);
+        assert_eq!(undo_len(&app), before_mcp + 1);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[0].as_ref().unwrap();
+        assert_eq!(&pixels[side..side + 4], &[17, 150, 240, 255]);
+
+        stroke_request(&mut app, "uv", [0.5, 0.5], [210, 60, 30]).unwrap();
+        paint_ready(&mut app);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[0].as_ref().unwrap();
+        assert_eq!(&pixels[center..center + 4], &[210, 60, 30, 255]);
+        assert_eq!(&pixels[side..side + 4], &[17, 150, 240, 255]);
+
+        let args: mcp_state::FillArgs = serde_json::from_value(json!({
+            "workspace": workspace,
+            "target": {"layer": layer, "space": "uv"},
+            "position": [0.5, 0.5], "mode": "polygon",
+            "brush": {"channels": {"roughness": 77}},
+        })).unwrap();
+        app.world_mut().run_system_once(move |mut input: mcp_state::McpPaintInput,
+            editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+            mcp_state::fill(&mut input, &editor, &mut editing, &mut paint, args.clone())
+        }).unwrap().unwrap();
+        paint_ready(&mut app);
+        assert_eq!(undo_len(&app), before_mcp + 3);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[1].as_ref().unwrap();
+        assert_eq!(&pixels[center..center + 4], &[77, 77, 77, 255]);
+        assert_eq!(&pixels[side..side + 4], &[77, 77, 77, 255]);
+        paint_message(&mut app, PaintAction::Undo);
+        assert!(current(&app).unwrap().stack.layers[layer].channels[1].is_none());
+    }
 }
 
 #[test]
@@ -7692,6 +7953,7 @@ fn gpu_paint_layer_rows_drag_into_and_across_groups() {
     paint_message(&mut app, PaintAction::Add(LayerKind::Fill));
     paint_message(&mut app, PaintAction::Add(LayerKind::Folder));
     paint_message(&mut app, PaintAction::CollapseFolder(2));
+    scroll_to_paint_control(&mut app, PaintAction::Select(1));
 
     let snapshot = |app: &App| app.world().resource::<PaintState>().sessions[&0].stack.clone();
     let layers = |app: &App| snapshot(app).layers.into_iter()
@@ -7703,6 +7965,13 @@ fn gpu_paint_layer_rows_drag_into_and_across_groups() {
     assert_eq!(layers(&app), [(LayerKind::Fill, 0), (LayerKind::Paint, 1), (LayerKind::Folder, 0)]);
     assert!(snapshot(&app).listed(1));
     assert_eq!(snapshot(&app).selected, 1);
+    {
+        let world = app.world_mut();
+        let mut rows = world.query::<(&AccessibleLabel, &crate::editor::ui::control_hints::Help)>();
+        assert!(rows.iter(world).any(|(label, hint)| {
+            label.0.contains("Слоёв 1") && hint.0.starts_with("Буферы слоя на GPU")
+        }));
+    }
     let grouped = snapshot(&app);
 
     let child = paint_button_rect(&mut app, PaintAction::Select(1)).center();

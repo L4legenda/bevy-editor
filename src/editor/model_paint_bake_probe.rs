@@ -19,6 +19,11 @@ pub(in crate::editor::ui::model_viewer::paint) struct Diagnostic {
 }
 
 impl Diagnostic {
+    #[cfg(feature = "mcp")]
+    pub(in crate::editor::ui::model_viewer::paint) fn counts(&self) -> [usize; 4] {
+        self.counts
+    }
+
     pub fn summary(&self) -> String {
         let percent =
             |index: usize| self.counts[index] as f32 * 100. / self.points.len().max(1) as f32;
