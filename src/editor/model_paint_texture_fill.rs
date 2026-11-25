@@ -56,6 +56,7 @@ pub(in crate::editor) struct Settings {
     pub sharpness: f32,
     pub normal_strength: f32,
     pub height_strength: f32,
+    pub height_offset: f32,
     pub opacity_source: OpacitySource,
     pub opacity_strength: f32,
     pub emission_tint: [f32; 3],
@@ -76,6 +77,7 @@ impl Default for Settings {
             sharpness: 4.,
             normal_strength: 1.,
             height_strength: 1.,
+            height_offset: 0.,
             opacity_source: OpacitySource::Auto,
             opacity_strength: 1.,
             emission_tint: [1.; 3],
@@ -145,7 +147,8 @@ impl Settings {
             && self.offset.iter().all(|v| (-1.0..=1.0).contains(v))
             && (1.0..=16.0).contains(&self.sharpness)
             && (0.0..=2.0).contains(&self.normal_strength)
-            && (-2.0..=2.0).contains(&self.height_strength)
+            && (-10.0..=10.0).contains(&self.height_strength)
+            && (-100.0..=100.0).contains(&self.height_offset)
             && (0.0..=1.0).contains(&self.opacity_strength)
             && self.emission_tint.iter().all(|v| (0.0..=1.0).contains(v))
             && (0.0..=2.0).contains(&self.specular_strength)
@@ -462,7 +465,8 @@ impl Fill {
                     let opacity = self.settings.opacity_source.value(mixed, source.has_alpha);
                     Vec3::splat(opacity * self.settings.opacity_strength).extend(1.)
                 } else if channel == 3 {
-                    Vec3::splat(0.5 + (mixed.x - 0.5) * self.settings.height_strength).extend(1.)
+                    Vec3::splat(0.5 + (mixed.x - 0.5) * self.settings.height_strength
+                        + self.settings.height_offset * 0.5).extend(1.)
                 } else if channel == 5 {
                     (mixed.truncate() * Vec3::from_array(self.settings.emission_tint))
                         .extend(if self.settings.image_alpha_coverage { mixed.w } else { 1. })

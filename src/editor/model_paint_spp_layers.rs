@@ -21,7 +21,7 @@ use subcraft_spp::{
     FileReader,
     document::{
         ActionInfo, ActionKind, BrushInfo, GraphRef, LayerInfo, LayerKind as SourceKind,
-        LevelsInfo, SourceInfo, StrokeInfo, UvTransform,
+        LevelsInfo, SourceInfo, StrokeInfo, UvTransform, channel_bits,
     },
 };
 
@@ -301,6 +301,10 @@ impl Rebuild<'_> {
                             partial |= self.paint_stroke(&mut layer, action.channels, stroke);
                         } else if let ActionKind::Anchor { uid } = action.kind {
                             partial |= !self.capture_content(uid, &layer, None);
+                        } else if let ActionKind::Filter { graph } = &action.kind
+                            && is_height_adjust(graph)
+                        {
+                            partial |= self.adjust_height(&mut layer, None, action, graph);
                         } else {
                             partial = true;
                         }
@@ -568,6 +572,9 @@ impl Rebuild<'_> {
                 ActionKind::Anchor { uid } => {
                     omitted |= !self.capture_content(*uid, layer, Some(&fill))
                 }
+                ActionKind::Filter { graph } if is_height_adjust(graph) => {
+                    omitted |= self.adjust_height(layer, Some(&mut fill), action, graph);
+                }
                 _ => omitted = true,
             }
         }
@@ -595,6 +602,9 @@ impl Rebuild<'_> {
                 for (index, (bit, ..)) in CHANNELS.into_iter().enumerate() {
                     if channels & bit != 0 && layer.channels[index].is_some() {
                         fill.images[index] = None;
+                        if bit == channel_bits::HEIGHT {
+                            reset_height(&mut fill.settings);
+                        }
                     }
                 }
             }
@@ -606,6 +616,9 @@ impl Rebuild<'_> {
                             && self.reserve(self.size as usize * self.size as usize * 4)
                         {
                             fill.images[index] = image.clone();
+                            if bit == channel_bits::HEIGHT {
+                                reset_height(&mut fill.settings);
+                            }
                         } else {
                             omitted = true;
                         }
@@ -623,6 +636,53 @@ impl Rebuild<'_> {
             _ => omitted = true,
         }
         omitted
+    }
+
+    fn adjust_height(
+        &mut self,
+        layer: &mut Layer,
+        fill: Option<&mut Fill>,
+        action: &ActionInfo,
+        graph: &GraphRef,
+    ) -> bool {
+        if action.channels & channel_bits::HEIGHT == 0 {
+            return false;
+        }
+        let Some([multiply, offset, invert]) = height_adjust_values(graph) else {
+            return true;
+        };
+        let (mode, opacity) = action.own_blends.iter().chain(&action.blends)
+            .find(|(channels, _, _)| channels & channel_bits::HEIGHT != 0)
+            .map_or((25, 1.), |&(_, mode, opacity)| (mode, opacity));
+        if !matches!(mode, 1 | 25) || !(0. ..=1.).contains(&opacity) {
+            return true;
+        }
+        let multiplier = if invert == 0. { multiply } else { -multiply };
+        // Convert the filter and its opacity to a single operation on signed height.
+        let gain = 1. - opacity + opacity * multiplier;
+        let bias = opacity * multiplier * offset;
+        if let Some(fill) = fill.filter(|fill| fill.images[3].is_some()) {
+            let strength = fill.settings.height_strength * gain;
+            let offset = fill.settings.height_offset * gain + bias;
+            if !(-10. ..=10.).contains(&strength) || !(-100. ..=100.).contains(&offset) {
+                return true;
+            }
+            fill.settings.height_strength = strength;
+            fill.settings.height_offset = offset;
+        } else if layer.channels[3].is_some() {
+            let Some(plane) = self.paint_plane(&mut layer.channels[3]) else {
+                return true;
+            };
+            for rgba in plane.chunks_exact_mut(4).filter(|pixel| pixel[3] != 0) {
+                let height = 2. * f32::from(rgba[0]) / 255. - 1.;
+                rgba[..3].fill(byte(0.5 + 0.5 * (height * gain + bias)));
+            }
+        } else {
+            // A filter without a height input has no restored pixels to adjust.
+            return true;
+        }
+        self.summary.height_adjustments += 1;
+        false
     }
 
     fn capture_content(&mut self, uid: i64, layer: &Layer, fill: Option<&Fill>) -> bool {
@@ -706,6 +766,9 @@ impl Rebuild<'_> {
             layer.channels[index] = Some(output);
             if let Some(fill) = fill.as_deref_mut() {
                 fill.images[index] = None;
+                if bit == channel_bits::HEIGHT {
+                    reset_height(&mut fill.settings);
+                }
             }
             applied = true;
         }
@@ -782,6 +845,7 @@ impl Rebuild<'_> {
                 } else {
                     filters.push(filter);
                     self.summary.mask_effects += 1;
+                    self.summary.height_adjustments += usize::from(filter.kind == FilterKind::HeightAdjust);
                     omitted |= approximate;
                 }
                 continue;
@@ -1304,7 +1368,7 @@ pub(super) fn mask_generators(layers: &[LayerInfo], generators: &mut Vec<Generat
     }
 }
 
-fn gradient_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
+fn pattern_mapping(action: &ActionInfo) -> Option<GradientMapping> {
     let ActionKind::Fill { projection, .. } = action.kind else { return None };
     let volume = match projection {
         0 => None,
@@ -1328,6 +1392,11 @@ fn gradient_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo
         mapping.rotation = uv.rotation;
         mapping.offset = uv.offset;
     }
+    Some(mapping)
+}
+
+fn gradient_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
+    let mapping = pattern_mapping(action)?;
     // Linear 3 exposes both "Position" (balance) and "position" (peak).
     let value = |key, default: f32, min: f32, max: f32| {
         graph.tweaks.iter().find(|(name, _)| name == key)
@@ -1349,12 +1418,83 @@ fn gradient_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo
     generator.valid().then_some(generator)
 }
 
+fn shape_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
+    let mapping = pattern_mapping(action)?;
+    let mut generator = Generator::new(kind);
+    // Reconstruct the default as a disc. Leave unconfirmed shape variants in the import report.
+    if kind == GeneratorKind::ShapeDisc && graph.value("shape").is_some_and(|shape| shape != 0.) {
+        return None;
+    }
+    let unit = |key| graph.value(key).filter(|value| value.is_finite()).map(|v| v.clamp(0., 1.));
+    if let Some(size) = unit("scale") {
+        generator.values[0] = size * 100.;
+    }
+    if let Some(hardness) = unit("hardness") {
+        generator.values[1] = hardness * 100.;
+    }
+    let width = match kind {
+        GeneratorKind::ShapeSquareBorder => unit("border_size"),
+        GeneratorKind::ShapeCircleBorder => unit("width"),
+        _ => None,
+    };
+    if let Some(width) = width {
+        generator.values[2] = width * 100.;
+    }
+    generator.invert = unit("invert").is_some_and(|invert| invert >= 0.5);
+    generator.gradient_mapping = (mapping != GradientMapping::default()).then_some(mapping);
+    generator.valid().then_some(generator)
+}
+
+fn tile_generator(graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
+    let mapping = pattern_mapping(action)?;
+    let mut generator = Generator::new(GeneratorKind::TilePattern);
+    let value = |key, component: usize, default| graph.tweaks.iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, values)| values.get(component).copied())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default);
+    let scalar = |key, default| value(key, 0, default);
+    let shape = match scalar("Pattern_Type", 9.) {
+        2. => 0., // Square, Disc and Brick use these IDs in Painter's parameter metadata.
+        3. => 1.,
+        9. => 2.,
+        _ => return None,
+    };
+    let fixed_rotation = scalar("Fixed_Rotation", 0.) * 90.;
+    let angle = (fixed_rotation + (scalar("Angle", 0.) + scalar("Free_Rotation", 0.)) * 360.)
+        .rem_euclid(360.);
+    let size = scalar("Size", 1.);
+    let width = value("Size_xy", 0, 1.) * size * (1. - value("Interstice", 0, 0.));
+    let height = value("Size_xy", 1, 1.) * size * (1. - value("Interstice", 2, 0.));
+    for (index, setting) in [
+        scalar("Number_X", 4.), scalar("Number_Y", 4.), width * 100., height * 100.,
+        scalar("Scale", 1.) * 100., shape, scalar("Pattern_Specific", 0.5) * 100.,
+        scalar("Offset", 0.) * 100., scalar("Offset_Random", 0.) * 100.,
+        scalar("Vertical_Offset", 0.), scalar("Scale_Variation", 0.) * 100.,
+        scalar("Random_Mask", 0.) * 100., scalar("$randomseed", 0.).rem_euclid(65536.),
+        scalar("Scale_Variation_Seed", 0.), scalar("Offset_Random_Seed", 0.),
+        value("Global_Offset", 0, 0.) * 100., value("Global_Offset", 1, 0.) * 100.,
+        angle, scalar("Global_Opacity", 1.) * 100., scalar("Background_Color", 0.) * 100.,
+        scalar("Checker_Mask", 0.), scalar("Horizontal_Mask", 0.), scalar("Vertical_Mask", 0.),
+        scalar("Invert_Mask", 0.),
+    ].into_iter().enumerate() {
+        generator.set_value(index, setting);
+    }
+    generator.gradient_mapping = (mapping != GradientMapping::default()).then_some(mapping);
+    generator.valid().then_some(generator)
+}
+
 fn generator(graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
     let name = graph.name().to_ascii_lowercase();
     let kind = match name.as_str() {
         "gradient_linear_1" => return gradient_generator(GeneratorKind::GradientLinear, graph, action),
         "gradient_linear_2" => return gradient_generator(GeneratorKind::GradientMirror, graph, action),
         "gradient_linear_3" => return gradient_generator(GeneratorKind::GradientPeak, graph, action),
+        "shape" => return shape_generator(GeneratorKind::ShapeDisc, graph, action),
+        "shape_cone" => return shape_generator(GeneratorKind::ShapeCone, graph, action),
+        "shape_border_square" => return shape_generator(GeneratorKind::ShapeSquareBorder, graph, action),
+        "shape_border_circle" => return shape_generator(GeneratorKind::ShapeCircleBorder, graph, action),
+        "tile_generator" => return tile_generator(graph, action),
         "mg_dirt" | "mg_ambient_occlusion" | "mg_mask_editor" | "mg_mask_builder" => {
             GeneratorKind::Dirt
         }
@@ -1448,6 +1588,23 @@ fn set_spp_map_weight(generator: &mut Generator, input: GeneratorInput, amount: 
     }
 }
 
+fn is_height_adjust(graph: &GraphRef) -> bool {
+    graph.name().eq_ignore_ascii_case("height_adjust")
+}
+
+fn height_adjust_values(graph: &GraphRef) -> Option<[f32; 3]> {
+    let multiply = graph.value("height_multiplier").unwrap_or(1.);
+    let offset = graph.value("offset").unwrap_or(0.);
+    let invert = graph.value("invert").unwrap_or(0.);
+    ((0. ..=10.).contains(&multiply) && (-10. ..=10.).contains(&offset)
+        && matches!(invert, 0. | 1.)).then_some([multiply, offset, invert])
+}
+
+fn reset_height(settings: &mut crate::editor::model_paint_data::texture_fill::Settings) {
+    settings.height_strength = 1.;
+    settings.height_offset = 0.;
+}
+
 fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {
     match &action.kind {
         ActionKind::Levels(levels) => {
@@ -1469,6 +1626,11 @@ fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {
             Some((filter, partial))
         }
         ActionKind::Filter { graph } => {
+            if is_height_adjust(graph) {
+                let mut filter = Filter::new(FilterKind::HeightAdjust);
+                filter.values = height_adjust_values(graph)?;
+                return Some((filter, true));
+            }
             let name = graph.name().to_ascii_lowercase();
             let kind = match name.as_str() {
                 "blur" => FilterKind::Blur,
@@ -1486,6 +1648,7 @@ fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {
                 "smoothstep" => FilterKind::Smoothstep,
                 "posterize" => FilterKind::Posterize,
                 "pixelate" => FilterKind::Pixelate,
+                "mirror" => FilterKind::Mirror,
                 _ => return None,
             };
             let mut filter = Filter::new(kind);
@@ -1499,6 +1662,14 @@ fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {
                 FilterKind::Clamp | FilterKind::Smoothstep => &[("min", 0., 100.), ("max", 1., 100.)],
                 FilterKind::Posterize => &[("colors_amount", 8., 1.)],
                 FilterKind::Pixelate => &[("pixel_amount", 32., 1.)],
+                FilterKind::Mirror => &[
+                    ("mirror_type", 0., 1.),
+                    ("Axis_X_Offset", 0.5, 100.),
+                    ("Axis_Y_Offset", 0.5, 100.),
+                    ("Invert_Axis_X", 0., 1.),
+                    ("Invert_Axis_Y", 0., 1.),
+                    ("Corner_Type", 0., 1.),
+                ],
                 _ => &[],
             };
             if !controls.is_empty() {

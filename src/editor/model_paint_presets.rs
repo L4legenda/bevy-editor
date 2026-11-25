@@ -1755,6 +1755,20 @@ fn paint_library_exports_mpsmart_with_embedded_images_and_round_trips() {
     if let Some(path) = std::env::var_os("BEVY_MPSMART_QA_ARCHIVE") {
         fs::copy(&report.path, path).unwrap();
     }
+    layers[0].blend = Blend::Normal;
+    let fill = Arc::make_mut(layers[0].texture_fill.as_mut().unwrap());
+    fill.images[3] = fill.images[0].clone();
+    fill.settings.height_strength = -3.;
+    fill.settings.height_offset = 0.375;
+    let report = export_material(&directory, Capture::Material {
+        name: "Высота".into(),
+        layers,
+    }).unwrap();
+    assert_eq!(report.adjusted, 1);
+    let restored = load_material(&report.path, 16).unwrap();
+    let settings = restored[0].texture_fill.as_ref().unwrap().settings;
+    assert_eq!(settings.height_strength, -3.);
+    assert_eq!(settings.height_offset, 0.375);
     fs::remove_dir_all(directory).unwrap();
 }
 

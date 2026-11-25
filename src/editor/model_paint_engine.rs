@@ -142,6 +142,8 @@ struct Batch {
     work: Work,
     maps: Option<Updates>,
     history: Vec<Stack>,
+    #[cfg(feature = "mcp")]
+    surface_selection: Option<Result<super::surface_selection::Report, String>>,
 }
 struct Gpu {
     material: Handle<StandardMaterial>,
@@ -529,6 +531,8 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
         work,
         maps,
         history,
+        #[cfg(feature = "mcp")]
+        surface_selection: None,
     }
 }
 #[cfg(test)]
@@ -564,6 +568,8 @@ fn compose(work: Work) -> Batch {
         work,
         maps: Some(maps),
         history: Vec::new(),
+        #[cfg(feature = "mcp")]
+        surface_selection: None,
     }
 }
 
@@ -1109,6 +1115,13 @@ pub(in crate::editor::ui::model_viewer) fn update(
             let history_changed = !result.history.is_empty();
             doc.recovery_edits += result.history.len() as u64 + u64::from(resized);
             if bound {
+                #[cfg(feature = "mcp")]
+                if let Some(selection) = result.surface_selection {
+                    if selection.is_ok() {
+                        session.editing_mask = true;
+                    }
+                    session.surface_selection = Some(((object, slot), selection));
+                }
                 for history in result.history {
                     session.record_undo(history);
                 }
@@ -1280,7 +1293,11 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     if recompose {
                         compose(work)
                     } else {
-                        Batch { work, maps: None, history: Vec::new() }
+                        Batch {
+                            work, maps: None, history: Vec::new(),
+                            #[cfg(feature = "mcp")]
+                            surface_selection: None,
+                        }
                     }
                 }));
             }

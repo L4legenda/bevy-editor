@@ -39,10 +39,12 @@ pub(in crate::editor) enum FilterKind {
     Smoothstep = 15,
     Posterize = 16,
     Pixelate = 17,
+    Mirror = 18,
+    HeightAdjust = 19,
 }
 
 impl FilterKind {
-    pub(in crate::editor) const ALL: [Self; 16] = [
+    pub(in crate::editor) const ALL: [Self; 18] = [
         Self::Levels,
         Self::Invert,
         Self::Contrast,
@@ -59,6 +61,8 @@ impl FilterKind {
         Self::Smoothstep,
         Self::Posterize,
         Self::Pixelate,
+        Self::Mirror,
+        Self::HeightAdjust,
     ];
 
     pub(in crate::editor) fn label(self) -> &'static str {
@@ -79,6 +83,8 @@ impl FilterKind {
             Self::Smoothstep => "Плавный порог",
             Self::Posterize => "Постеризация",
             Self::Pixelate => "Пикселизация",
+            Self::Mirror => "Зеркало",
+            Self::HeightAdjust => "Настройка высоты",
         }
     }
 
@@ -128,6 +134,19 @@ impl FilterKind {
             Self::Clamp | Self::Smoothstep => &[("Минимум, %", 0., 0., 100.), ("Максимум, %", 100., 0., 100.)],
             Self::Posterize => &[("Градации", 8., 1., 64.)],
             Self::Pixelate => &[("Ячеек на сторону", 32., 1., 128.)],
+            Self::Mirror => &[
+                ("Ось (0 — X, 1 — Y, 2 — угол)", 0., 0., 2.),
+                ("Позиция X, %", 50., 0., 100.),
+                ("Позиция Y, %", 50., 0., 100.),
+                ("Обратить X", 0., 0., 1.),
+                ("Обратить Y", 0., 0., 1.),
+                ("Угол (слева сверху = 0)", 0., 0., 3.),
+            ],
+            Self::HeightAdjust => &[
+                ("Множитель", 1., 0., 10.),
+                ("Смещение", 0., -10., 10.),
+                ("Инверсия", 0., 0., 1.),
+            ],
         }
     }
 
@@ -140,6 +159,9 @@ impl FilterKind {
             (Self::Outline, 2 | 5) => 1.,
             (Self::Threshold, 1) | (Self::HistogramScan, 2) => 1.,
             (Self::DirectionalBlur, 0) => 0.25,
+            (Self::Mirror, _) => 1.,
+            (Self::HeightAdjust, 0 | 1) => 0.05,
+            (Self::HeightAdjust, 2) => 1.,
             (Self::Clamp | Self::Smoothstep | Self::Posterize | Self::Pixelate, _) => 1.,
             _ => 5.,
         }
@@ -148,13 +170,14 @@ impl FilterKind {
     pub(in crate::editor) fn spatial(self) -> bool {
         matches!(
             self,
-            Self::Blur | Self::Sharpen | Self::Warp | Self::Noise | Self::Outline | Self::DirectionalBlur | Self::Pixelate
+            Self::Blur | Self::Sharpen | Self::Warp | Self::Noise | Self::Outline | Self::DirectionalBlur | Self::Pixelate | Self::Mirror
         )
     }
 
     fn discrete(self, slot: usize) -> bool {
         matches!((self, slot),
             (Self::Threshold, 1) | (Self::HistogramScan, 2) | (Self::Posterize | Self::Pixelate, 0)
+            | (Self::Mirror, 0 | 3..=5) | (Self::HeightAdjust, 2)
         )
     }
 }
@@ -173,6 +196,8 @@ pub(in crate::editor) struct Filter {
     pub wrap: bool,
     #[serde(default, skip_serializing_if = "OutlineOptions::is_default")]
     outline: OutlineOptions,
+    #[serde(default, skip_serializing_if = "MirrorOptions::is_default")]
+    mirror: MirrorOptions,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -183,6 +208,19 @@ struct OutlineOptions {
 }
 
 impl OutlineOptions {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct MirrorOptions {
+    reverse_x: bool,
+    reverse_y: bool,
+    corner: u8,
+}
+
+impl MirrorOptions {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -209,6 +247,7 @@ impl Filter {
             output: default_levels_output(),
             wrap: false,
             outline: OutlineOptions::default(),
+            mirror: MirrorOptions::default(),
         }
     }
 
@@ -236,6 +275,14 @@ impl Filter {
                 3 => self.outline.blur,
                 4 => self.outline.curve,
                 5 => f32::from(u8::from(self.outline.inverted)),
+                _ => self.values.get(slot).copied().unwrap_or_default(),
+            };
+        }
+        if self.kind == FilterKind::Mirror {
+            return match slot {
+                3 => f32::from(u8::from(self.mirror.reverse_x)),
+                4 => f32::from(u8::from(self.mirror.reverse_y)),
+                5 => f32::from(self.mirror.corner),
                 _ => self.values.get(slot).copied().unwrap_or_default(),
             };
         }
@@ -267,6 +314,13 @@ impl Filter {
                 4 => self.outline.curve = value,
                 5 => self.outline.inverted = value >= 0.5,
                 _ => self.values[slot] = value,
+            }
+        } else if self.kind == FilterKind::Mirror && slot >= 3 {
+            match slot {
+                3 => self.mirror.reverse_x = value >= 0.5,
+                4 => self.mirror.reverse_y = value >= 0.5,
+                5 => self.mirror.corner = value.round() as u8,
+                _ => unreachable!(),
             }
         } else if let Some(target) = self.values.iter_mut().chain(&mut self.output).nth(slot) {
             *target = if self.kind.discrete(slot) { value.round() } else { value };
@@ -318,6 +372,11 @@ impl Filter {
             FilterKind::Posterize => {
                 let intervals = self.values[0] - 1.;
                 if intervals > 0. { (s * intervals).round() / intervals } else { 0.5 }
+            }
+            FilterKind::HeightAdjust => {
+                let [multiply, offset, invert] = self.values;
+                let value = (s + offset) * multiply;
+                if invert != 0. { 1. - value } else { value }
             }
             _ => unreachable!("spatial filters use a separate pass"),
         };

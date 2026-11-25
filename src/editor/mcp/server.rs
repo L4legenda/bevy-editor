@@ -109,6 +109,30 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Open a project model from list_assets in the 3D painting workspace. Poll get_paint_state for mode paint and the returned model_id",
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn open_paint_model(
+        &self,
+        Parameters(args): Parameters<PaintOpenArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintOpen(args), context).await
+    }
+
+    #[tool(
+        description = "Replace the active model geometry with an OBJ, FBX or built-in primitive while preserving matching paint sets, or undo or redo a replacement. Returns after the editor applies the change",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn replace_paint_mesh(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::MeshArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintReplaceMesh(args), context).await
+    }
+
+    #[tool(
         description = "List 3D paint channels, material and generator presets, brush tips, blend and fill modes, bake qualities and export templates",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -153,6 +177,18 @@ impl EditorServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call(Command::PaintFill(args), context).await
+    }
+
+    #[tool(
+        description = "Select connected mesh parts or grow a surface from a 3D point or viewport position and write it into the active texture set's layer mask. Poll get_paint_state for the selection result",
+        annotations(destructive_hint = true, open_world_hint = false)
+    )]
+    async fn select_surface(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::SurfaceArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintSelectSurface(args), context).await
     }
 
     #[tool(

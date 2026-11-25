@@ -104,10 +104,13 @@ pub(super) struct ViewArgs {
 pub(super) enum Command {
     State,
     PaintState,
+    PaintOpen(PaintOpenArgs),
+    PaintReplaceMesh(super::mcp_state::MeshArgs),
     PaintPresets,
     PaintEdit(super::mcp_state::EditArgs),
     PaintStroke(super::mcp_state::StrokeArgs),
     PaintFill(super::mcp_state::FillArgs),
+    PaintSelectSurface(super::mcp_state::SurfaceArgs),
     PaintSave(super::mcp_state::SaveArgs),
     PaintExport(super::mcp_state::ExportArgs),
     BakeStatus(super::mcp_state::BakeTarget),
@@ -132,6 +135,14 @@ pub(super) enum Command {
     Undo,
     Redo,
     Capture,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(super) struct PaintOpenArgs {
+    /// Exact project-relative model path returned by list_assets.
+    pub asset: String,
 }
 
 impl Command {

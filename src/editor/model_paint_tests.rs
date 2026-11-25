@@ -8039,6 +8039,7 @@ fn gpu_model_paint_shelf_material_and_generator_drop() {
         assert!(session.editing_mask);
     }
 
+    scroll_to_paint_control(&mut app, PaintAction::Select(0));
     let to = paint_button_rect(&mut app, PaintAction::Select(0)).center();
     drag_shelf_item(&mut app, window, PaintAction::ApplyGenerator(GeneratorKind::Height, None), to);
     paint_ready(&mut app);
@@ -8053,6 +8054,7 @@ fn gpu_model_paint_shelf_material_and_generator_drop() {
         .join("target/model-paint-qa/generator-shelf.png");
     std::fs::create_dir_all(screenshot.parent().unwrap()).unwrap();
     capture_when(&mut app, &target, &screenshot, |_| true);
+    scroll_to_paint_control(&mut app, PaintAction::Undo);
     paint_click(&mut app, window, PaintAction::Undo);
     let session = &app.world().resource::<PaintState>().sessions[&0];
     assert_eq!(session.stack.selected, 1);
@@ -8060,8 +8062,10 @@ fn gpu_model_paint_shelf_material_and_generator_drop() {
 
     paint_click(&mut app, window, PaintAction::Category(Category::Materials));
     set_shelf_query(&mut app, "Gold");
+    scroll_to_paint_control(&mut app, PaintAction::Add(LayerKind::Folder));
     paint_click(&mut app, window, PaintAction::Add(LayerKind::Folder));
     let folder = app.world().resource::<PaintState>().sessions[&0].stack.selected;
+    scroll_to_paint_control(&mut app, PaintAction::Select(folder));
     let to = paint_button_rect(&mut app, PaintAction::Select(folder)).center();
     drag_shelf_item(&mut app, window, PaintAction::Preset(0), to);
     paint_ready(&mut app);
@@ -8082,6 +8086,7 @@ fn gpu_model_paint_shelf_material_and_generator_drop() {
         assert_eq!(stack.layers[stack.selected].name, "Gold");
         assert_eq!(stack.layers[stack.selected].depth, 0);
     }
+    scroll_to_paint_control(&mut app, PaintAction::Undo);
     paint_click(&mut app, window, PaintAction::Undo);
     let stack = &app.world().resource::<PaintState>().sessions[&0].stack;
     assert_eq!(stack.layers.iter().filter(|layer| layer.name == "Gold").count(), 2);

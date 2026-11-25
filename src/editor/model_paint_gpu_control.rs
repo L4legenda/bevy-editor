@@ -119,6 +119,8 @@ impl Controller {
                 }),
                 work,
                 history: if changed { vec![before] } else { Vec::new() },
+                #[cfg(feature = "mcp")]
+                surface_selection: None,
             }
         }))
     }

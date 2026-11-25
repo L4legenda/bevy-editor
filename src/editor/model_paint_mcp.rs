@@ -149,6 +149,50 @@ struct PaintWorkspace {
     revision: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct MeshArgs {
+    workspace: PaintWorkspace,
+    replacement: MeshOperation,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum MeshOperation {
+    Primitive { shape: paint_mesh_replacement::Shape },
+    File {
+        /// Absolute OBJ or FBX path, or a path relative to the project asset root.
+        path: std::path::PathBuf,
+    },
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct SurfaceArgs {
+    workspace: PaintWorkspace,
+    layer: usize,
+    source: SurfaceSeed,
+    #[serde(default)]
+    mode: surface_selection::MaskMode,
+    #[serde(default)]
+    stop_at: surface_selection::StopAt,
+    crease_angle: Option<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum SurfaceSeed {
+    Parts { indices: Vec<usize> },
+    Point { position: [f32; 3] },
+    Viewport { position: [f32; 2] },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
@@ -392,7 +436,8 @@ pub(in crate::editor) fn state(
     let doc = editing
         .documents
         .get(&index)
-        .ok_or("Wait for the model to load")?;
+        .ok_or_else(|| editing.errors.get(&index).cloned()
+            .unwrap_or_else(|| "Wait for the model to load".into()))?;
     Ok(snapshot(
         index,
         doc,
@@ -447,6 +492,7 @@ fn bound_workspace<'a>(
     }
     if doc.paint_busy
         || session.busy
+        || session.mesh_loading
         || session.resize_request.is_some()
         || !doc
             .paint_target(workspace.set)
@@ -455,6 +501,42 @@ fn bound_workspace<'a>(
         return Err("Wait for the active texture set or paint operation to finish".into());
     }
     Ok((index, doc, session))
+}
+
+pub(in crate::editor) fn replace_mesh(
+    requests: &mut mesh_tools::Requests,
+    editor: &Editor,
+    editing: &mut editing::State,
+    paint: &mut PaintState,
+    args: MeshArgs,
+    reply: Box<dyn mesh_tools::Reply>,
+) {
+    use mesh_tools::Operation;
+
+    if requests.0.is_some() {
+        reply.finish(Err("Wait for the current mesh replacement to finish".into()));
+        return;
+    }
+    let (index, _, session) = match bound_workspace(editor, editing, &mut paint.sessions, args.workspace) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            reply.finish(Err(error));
+            return;
+        }
+    };
+    let operation = match args.replacement {
+        MeshOperation::Primitive { shape } => Operation::Primitive(shape),
+        MeshOperation::File { path } => Operation::Import(Some(editor.project.asset_root.join(path))),
+        MeshOperation::Undo => Operation::Undo,
+        MeshOperation::Redo => Operation::Redo,
+    };
+    requests.0 = Some(mesh_tools::Request {
+        model: index,
+        set: session.set,
+        revision: session.revision,
+        operation,
+        reply,
+    });
 }
 
 pub(in crate::editor) fn stroke(
@@ -493,6 +575,33 @@ pub(in crate::editor) fn fill(
         args.brush,
         RasterOperation::Fill(args.position, args.mode),
     )
+}
+
+pub(in crate::editor) fn select_surface(
+    input: &mut McpPaintInput,
+    editor: &Editor,
+    editing: &mut editing::State,
+    paint: &mut PaintState,
+    args: SurfaceArgs,
+) -> Result<Value, String> {
+    if editor.browser_popup || editor.hdri_library_open {
+        return Err("Close the open editor overlay before selecting a surface".into());
+    }
+    let crease_angle = args.crease_angle.unwrap_or(30.);
+    if !(1. ..=179.).contains(&crease_angle) {
+        return Err("The crease angle must be between 1 and 179 degrees".into());
+    }
+    let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace)?;
+    let source = input.surface_source(session, args.source)?;
+    input.submit_surface(index, doc, session, args.layer, surface_selection::Selection {
+        source,
+        crease_angle,
+        stop_at: args.stop_at,
+        mode: args.mode,
+    })?;
+    let mut result = snapshot(index, doc, Some(session), &paint.tips);
+    result["surface_selection"] = json!({"status": "running"});
+    Ok(result)
 }
 
 fn raster(
@@ -691,10 +800,29 @@ fn snapshot(
     json!({
         "model_id": index,
         "revision": session.map(|s| s.revision),
-        "mesh": {"name": doc.source.path.file_name().map(|name| name.to_string_lossy()), "triangles": triangles},
+        "mesh": {
+            "name": doc.source.path.file_name().map(|name| name.to_string_lossy()),
+            "triangles": triangles,
+            "loading": session.is_some_and(|s| s.mesh_loading),
+            "can_undo_replacement": doc.can_restore_paint_mesh(false),
+            "can_redo_replacement": doc.can_restore_paint_mesh(true),
+        },
         "mode": match doc.mode { Mode::Object => "object", Mode::Edit => "edit", Mode::Uv => "uv", Mode::Paint => "paint" },
         "dirty": doc.dirty(),
         "paint_busy": doc.paint_busy,
+        "surface_selection": bound.and_then(|session| {
+            let (binding, result) = session.surface_selection.as_ref()?;
+            (session.binding == Some(*binding)).then(|| match result {
+                Ok(report) => json!({
+                    "status": "complete",
+                    "triangles_selected": report.selected,
+                    "triangles_total": report.total,
+                    "triangles_in_active_set": report.active_set,
+                    "bounds": report.bounds.map(|bounds| bounds.map(|point| point.to_array())),
+                }),
+                Err(error) => json!({"status": "failed", "error": error}),
+            })
+        }),
         "texture_sets": texture_sets,
         "active_set": target.map(|_| active),
         "resolution": texture_sets.get(active).map(|set| &set["resolution"]),

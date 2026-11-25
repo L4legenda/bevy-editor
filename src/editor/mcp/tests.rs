@@ -37,14 +37,16 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 30);
+    assert_eq!(tools.tools.len(), 33);
     for name in [
         "get_editor_state",
         "get_paint_state",
+        "replace_paint_mesh",
         "list_paint_presets",
         "edit_paint",
         "paint_stroke",
         "poly_fill",
+        "select_surface",
         "save_model",
         "export_textures",
         "bake_maps",
@@ -564,12 +566,10 @@ impl Drop for StdioClient {
 #[ignore = "requires GPU and a built bevy-editor-mcp binary; tests the complete stdio paint workflow"]
 fn gpu_stdio_paint_workflow_saves_and_exports() {
     use crate::editor::{
-        Action,
         model_document::{Mode, glb::Glb},
         model_mesh::{Corner, Face, Geometry},
         selection_outline::render_tests::frame,
         tests::lighting_ui_render::fixture_project,
-        ui::model_viewer::ModelViewAction,
     };
     use std::{fs, path::Path};
 
@@ -588,19 +588,78 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let project = EditorProject::load(&manifest).unwrap();
     let (mut app, _, _) = fixture_project(project.clone());
     app.world_mut().resource_mut::<Editor>().drawer = false;
-    app.world_mut().write_message(Action::ViewModel(0));
-    let started = Instant::now();
-    while !app
-        .world()
-        .resource::<editing::State>()
-        .documents
-        .contains_key(&0)
-    {
-        frame(&mut app);
-        assert!(
-            started.elapsed() < REQUEST_TIMEOUT,
-            "Could not load the test model"
+    let (sender, receiver) = mpsc::sync_channel(64);
+    let server = server::start(
+        &project,
+        Bridge {
+            sender,
+            wake: Arc::new(|| {}),
+        },
+    )
+    .unwrap();
+    app.insert_resource(Inbox(Mutex::new(receiver)))
+        .add_systems(
+            Update,
+            process
+                .after(super::super::handle_actions)
+                .before(super::super::begin_room),
         );
+
+    let mut client = StdioClient::launch(&manifest);
+    let initialized = client.request(&mut app, "initialize", json!({
+        "protocolVersion": rmcp::model::ProtocolVersion::LATEST_WITH_INITIALIZE, "capabilities": {},
+        "clientInfo": {"name": "bevy-paint-stdio-test", "version": "1"},
+    }));
+    assert_eq!(initialized["serverInfo"]["name"], "bevy-editor");
+    client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let tools = client.request(&mut app, "tools/list", json!({}));
+    for name in [
+        "open_paint_model",
+        "replace_paint_mesh",
+        "select_surface",
+        "paint_stroke",
+        "save_model",
+        "export_textures",
+        "bake_maps",
+        "capture_paint_view",
+    ] {
+        assert!(
+            tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name)
+        );
+    }
+
+    let open = |client: &mut StdioClient, app: &mut App, asset: &str, index: usize| {
+        let reply = client.tool(app, "open_paint_model", json!({"asset": asset}));
+        assert_eq!(reply["structuredContent"]["model_id"], index);
+        assert_eq!(app.world().resource::<Editor>().viewing_model, Some(index));
+    };
+    let wait_for_mode = |app: &mut App, index: usize| {
+        let started = Instant::now();
+        loop {
+            let editing = app.world().resource::<editing::State>();
+            if editing.mode(Some(index)) == Mode::Paint {
+                assert_eq!(app.world().resource::<Editor>().viewing_model, Some(index));
+                break;
+            }
+            assert!(!editing.errors.contains_key(&index), "{:?}", editing.errors);
+            assert!(started.elapsed() < REQUEST_TIMEOUT, "Could not open model {index}");
+            frame(app);
+        }
+    };
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "open_paint_model", "arguments": {"asset": "models/missing.glb"},
+    }));
+    assert_eq!(invalid["isError"], true);
+    assert_eq!(app.world().resource::<Editor>().viewing_model, None);
+    open(&mut client, &mut app, "models/block.glb", 0);
+    let started = Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        assert!(started.elapsed() < REQUEST_TIMEOUT, "Could not load the test model");
+        frame(&mut app);
     }
     {
         let mut editing = app.world_mut().resource_mut::<editing::State>();
@@ -634,51 +693,7 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         doc.auto_bake_pending = false;
         doc.revision += 1;
     }
-    app.world_mut()
-        .write_message(Action::ModelView(ModelViewAction::Edit(
-            editing::EditAction::Mode(Mode::Paint),
-        )));
-    let (sender, receiver) = mpsc::sync_channel(64);
-    let server = server::start(
-        &project,
-        Bridge {
-            sender,
-            wake: Arc::new(|| {}),
-        },
-    )
-    .unwrap();
-    app.insert_resource(Inbox(Mutex::new(receiver)))
-        .add_systems(
-            Update,
-            process
-                .after(super::super::handle_actions)
-                .before(super::super::begin_room),
-        );
-
-    let mut client = StdioClient::launch(&manifest);
-    let initialized = client.request(&mut app, "initialize", json!({
-        "protocolVersion": rmcp::model::ProtocolVersion::LATEST_WITH_INITIALIZE, "capabilities": {},
-        "clientInfo": {"name": "bevy-paint-stdio-test", "version": "1"},
-    }));
-    assert_eq!(initialized["serverInfo"]["name"], "bevy-editor");
-    client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-    let tools = client.request(&mut app, "tools/list", json!({}));
-    for name in [
-        "paint_stroke",
-        "save_model",
-        "export_textures",
-        "bake_maps",
-        "capture_paint_view",
-    ] {
-        assert!(
-            tools["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == name)
-        );
-    }
-
+    wait_for_mode(&mut app, 0);
     let wait_for_paint = |client: &mut StdioClient, app: &mut App| {
         let started = Instant::now();
         loop {
@@ -778,6 +793,87 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
                 && pixel[2] > pixel[1].saturating_add(25))
     );
 
+    open(&mut client, &mut app, "models/blue_block.glb", 1);
+    wait_for_mode(&mut app, 1);
+    open(&mut client, &mut app, "models/block.glb", 0);
+    let reopened = wait_for_paint(&mut client, &mut app);
+    assert_eq!(reopened["model_id"], 0);
+    assert_eq!(reopened["active_set"], painted["active_set"]);
+    assert_eq!(reopened["layers_bottom_to_top"], painted["layers_bottom_to_top"]);
+    assert_eq!(app.world().resource::<Editor>().model_tabs, vec![0, 1]);
+
+    let select = |client: &mut StdioClient, app: &mut App, source: Value, mode: &str| {
+        let reply = client.tool(app, "select_surface", json!({
+            "workspace": {"model_id": 0, "set": 0},
+            "layer": layer, "source": source, "mode": mode,
+        }));
+        assert_eq!(reply["structuredContent"]["surface_selection"]["status"], "running");
+        wait_for_paint(client, app)
+    };
+    let selection = select(&mut client, &mut app, json!({"kind":"point","position":[0,0,0]}), "replace");
+    assert_eq!(selection["surface_selection"]["status"], "complete", "{selection}");
+    assert_eq!(selection["surface_selection"]["triangles_selected"], 2);
+    assert_eq!(selection["undo_steps"].as_u64().unwrap(), reopened["undo_steps"].as_u64().unwrap() + 1);
+    let invalid = select(&mut client, &mut app, json!({"kind":"parts","indices":[1]}), "subtract");
+    assert_eq!(invalid["surface_selection"]["status"], "failed");
+    assert_eq!(invalid["undo_steps"], selection["undo_steps"]);
+    let parts = json!({"kind":"parts","indices":[0]});
+    let subtracted = select(&mut client, &mut app, parts.clone(), "subtract");
+    assert_eq!(subtracted["surface_selection"]["triangles_in_active_set"], 2);
+    assert_eq!(subtracted["undo_steps"].as_u64().unwrap(), selection["undo_steps"].as_u64().unwrap() + 1);
+    let added = select(&mut client, &mut app, parts, "add");
+    assert_eq!(added["undo_steps"].as_u64().unwrap(), subtracted["undo_steps"].as_u64().unwrap() + 1);
+    for _ in 0..2 {
+        client.tool(&mut app, "edit_paint", json!({
+            "model_id": 0, "set": 0, "edit": {"operation": "undo"},
+        }));
+        wait_for_paint(&mut client, &mut app);
+    }
+    let masked = wait_for_paint(&mut client, &mut app);
+    assert_eq!(masked["undo_steps"], selection["undo_steps"]);
+
+    let replace = |client: &mut StdioClient, app: &mut App, replacement: Value| {
+        let reply = client.tool(app, "replace_paint_mesh", json!({
+            "workspace": {"model_id": 0, "set": 0}, "replacement": replacement,
+        }));
+        reply["structuredContent"].clone()
+    };
+    let primitive = replace(&mut client, &mut app, json!({"kind":"primitive","shape":"rounded_cube"}));
+    assert_eq!(primitive["status"], "replaced");
+    assert_eq!(primitive["transferred_sets"], 1);
+    assert!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"].as_u64().unwrap() > 2);
+    assert_eq!(
+        replace(&mut client, &mut app, json!({"kind":"undo"}))["status"],
+        "undone"
+    );
+    assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 2);
+
+    let missing = client.request(&mut app, "tools/call", json!({
+        "name": "replace_paint_mesh",
+        "arguments": {
+            "workspace": {"model_id": 0, "set": 0},
+            "replacement": {"kind": "file", "path": "models/missing.obj"},
+        },
+    }));
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 2);
+    fs::write(project.asset_root.join("models/replacement.obj"), concat!(
+        "v -1 -1 0\nv 1 -1 0\nv 0 1 0\n",
+        "vt 0 0\nvt 1 0\nvt 0.5 1\n",
+        "f 1/1 2/2 3/3\n",
+    )).unwrap();
+    let imported = replace(&mut client, &mut app, json!({"kind":"file","path":"models/replacement.obj"}));
+    assert_eq!(imported["status"], "replaced");
+    assert_eq!(imported["transferred_sets"], 1);
+    let replaced = wait_for_paint(&mut client, &mut app);
+    assert_eq!(replaced["mesh"]["triangles"], 1);
+    assert_eq!(replaced["active_set"], reopened["active_set"]);
+    assert_eq!(replaced["layers_bottom_to_top"], masked["layers_bottom_to_top"]);
+    assert_eq!(replace(&mut client, &mut app, json!({"kind":"undo"}))["status"], "undone");
+    assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 2);
+    assert_eq!(replace(&mut client, &mut app, json!({"kind":"redo"}))["status"], "redone");
+    assert_eq!(wait_for_paint(&mut client, &mut app)["mesh"]["triangles"], 1);
+
     let saved = client.tool(
         &mut app,
         "save_model",
@@ -785,7 +881,12 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     );
     let path = saved["structuredContent"]["path"].as_str().unwrap();
     let glb = Glb::load(Path::new(path)).unwrap();
-    let mesh = glb.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let mesh = glb.json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|node| node["mesh"].as_u64())
+        .unwrap() as usize;
     let surface = glb
         .paint_surface(&glb.json["meshes"][mesh]["primitives"][0])
         .unwrap()
@@ -795,6 +896,7 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         &surface.stack.layers[layer].channels[0].as_ref().unwrap()[middle..middle + 4],
         &[210, 10, 170, 255]
     );
+    assert_eq!(&surface.stack.layers[layer].mask.as_ref().unwrap().pixels[middle..middle + 4], &[255; 4]);
 
     let export = client.tool(&mut app, "export_textures", json!({
         "model_id": 0, "folder": ".", "all_sets": false, "template": "separate", "format": "png", "bit_depth": 8, "size": 512,

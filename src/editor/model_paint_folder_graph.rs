@@ -85,7 +85,7 @@ pub(super) fn can_open(stack: &Stack) -> bool {
     for index in fills(stack, stack.selected) {
         let layer = &stack.layers[index];
         total += usize::from(layer.mask.as_ref().is_some_and(|mask| {
-            mask.generator.is_some() || has_gradient(mask)
+            mask.generator.is_some() || has_mapped_pattern(mask)
         }));
         for (output, channel) in outputs.iter_mut().zip(CHANNELS) {
             if layer
@@ -188,7 +188,7 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64, previous: Optio
         let x = column as f32 * 260.;
         let position = [x, -220.];
         let mask = layer.mask.as_ref().and_then(|mask| {
-            if has_gradient(mask) {
+            if has_mapped_pattern(mask) {
                 let path = format!("graph-images/folder-mask-{layer_id}.png");
                 let source = Arc::downgrade(mask);
                 let image = previous
@@ -196,7 +196,7 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64, previous: Optio
                         view.preview_masks.get(&layer_id).is_some_and(|old| old.ptr_eq(&source))
                     })
                     .and_then(|view| view.images.get(&path).cloned())
-                    .or_else(|| gradient_mask_bitmap(mask, &path))?;
+                    .or_else(|| pattern_mask_bitmap(mask, &path))?;
                 preview_masks.insert(layer_id, source);
                 images.insert(path.clone(), image);
                 let node = ensure(&mut graph, layer_id, Role::Mask, "bitmap", position);
@@ -379,15 +379,15 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64, previous: Optio
     }
 }
 
-fn has_gradient(mask: &Mask) -> bool {
-    mask.generator.is_some_and(|generator| generator.kind.is_gradient())
+fn has_mapped_pattern(mask: &Mask) -> bool {
+    mask.generator.is_some_and(|generator| generator.kind.uses_pattern_mapping())
         || mask.layers.iter().any(|layer| {
             layer.enabled && layer.opacity != 0
-                && layer.generator.is_some_and(|generator| generator.kind.is_gradient())
+                && layer.generator.is_some_and(|generator| generator.kind.uses_pattern_mapping())
         })
 }
 
-fn gradient_mask_bitmap(mask: &Mask, path: &str) -> Option<Arc<texture_fill::Bitmap>> {
+fn pattern_mask_bitmap(mask: &Mask, path: &str) -> Option<Arc<texture_fill::Bitmap>> {
     let pixels = mask.effective();
     let edge = (pixels.len() / 4).isqrt() as u32;
     let pixels = if edge > material_graph::previews::PREVIEW_SIZE {
@@ -1236,7 +1236,7 @@ pub(super) fn adjust(
                     let Some(&(_, min, max, _)) = generator.controls().get(index) else {
                         return false;
                     };
-                    generator.values[index] = (value * scale).clamp(min, max);
+                    generator.set_value(index, (value * scale).clamp(min, max));
                 }
                 _ => return false,
             }

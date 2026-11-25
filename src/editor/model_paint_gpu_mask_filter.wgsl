@@ -197,6 +197,13 @@ fn filter_mask(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocatio
             let cell = ((c * 2 + 1) * cells) / (2 * size);
             v = at(((cell * 2 + 1) * size) / (2 * cells));
         }
+        case 18u: {
+            let dir = select(vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0), u.vertical != 0u);
+            let coordinate = dot(vec2<f32>(p), dir) + 0.5;
+            let axis = a * f32(u.size);
+            let reflected = axis + b * abs(coordinate - axis);
+            v = bilinear(vec2<f32>(p) + dir * (reflected - coordinate));
+        }
         default: {
             effective[index] = table[raw] * 0x00010101u | 0xff000000u;
             return;

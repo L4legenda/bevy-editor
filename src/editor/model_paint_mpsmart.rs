@@ -371,7 +371,8 @@ fn read_fill(
         offset,
         sharpness: number(value, "triplanar_sharpness", 4.),
         normal_strength: number(value, "normal_strength", 1.),
-        height_strength: if has_image(3) { 2. * height } else { 1. },
+        height_strength: if has_image(3) { number(value, "bevy_height_strength", 2. * height) } else { 1. },
+        height_offset: if has_image(3) { number(value, "bevy_height_offset", 0.) } else { 0. },
         opacity_source: if graph.is_some() {
             OpacitySource::Red
         } else {
@@ -697,7 +698,7 @@ fn mpsmart_warp_seed_uses_the_editor_extension() {
 
 #[cfg(test)]
 #[test]
-fn mpsmart_gradient_keeps_native_parameters_and_reports_external_limit() {
+fn mpsmart_patterns_keep_native_parameters_and_report_external_limits() {
     use crate::editor::model_paint_data::mask::GradientMapping;
 
     let mut generator = Generator::new(GeneratorKind::GradientPeak);
@@ -713,6 +714,21 @@ fn mpsmart_gradient_keeps_native_parameters_and_reports_external_limit() {
     assert_eq!(data["kind"], "Clouds");
     assert_eq!(read_generator(&data, &mut adjusted, &[]).unwrap(), generator);
     assert_eq!(adjusted, 1);
+    let mut shape = Generator::new(GeneratorKind::ShapeSquareBorder);
+    shape.values[2] = 12.5;
+    shape.gradient_mapping = generator.gradient_mapping;
+    let data = write_generator(shape, &mut adjusted);
+    assert!(data["bevy_shape"].is_object());
+    assert_eq!(read_generator(&data, &mut adjusted, &[]).unwrap(), shape);
+    assert_eq!(adjusted, 2);
+    let mut tiles = Generator::new(GeneratorKind::TilePattern);
+    tiles.set_value(10, 30.);
+    tiles.set_value(12, 85.);
+    tiles.gradient_mapping = generator.gradient_mapping;
+    let data = write_generator(tiles, &mut adjusted);
+    assert!(data["bevy_tiles"].is_object());
+    assert_eq!(read_generator(&data, &mut adjusted, &[]).unwrap(), tiles);
+    assert_eq!(adjusted, 3);
 }
 
 #[cfg(test)]
@@ -737,10 +753,15 @@ fn mpsmart_mask_outline_survives_through_an_editor_extension() {
 fn mpsmart_native_filters_round_trip_and_report_external_limit() {
     let filters = [FilterKind::Threshold, FilterKind::HistogramScan, FilterKind::ContrastLuminosity,
         FilterKind::DirectionalBlur, FilterKind::Clamp, FilterKind::Smoothstep,
-        FilterKind::Posterize, FilterKind::Pixelate]
+        FilterKind::Posterize, FilterKind::Pixelate, FilterKind::Mirror, FilterKind::HeightAdjust]
         .map(|kind| {
             let mut filter = Filter::new(kind);
             filter.set_value(0, 43.);
+            if kind == FilterKind::Mirror {
+                filter.set_value(2, 20.);
+                filter.set_value(4, 1.);
+                filter.set_value(5, 3.);
+            }
             filter
         });
     let mask = Mask::new(solid(16, [255; 4]), filters.to_vec());
@@ -765,6 +786,20 @@ fn read_generator(
         return (generator.kind.is_gradient() && generator.valid())
             .then_some(generator)
             .ok_or_else(|| "Недопустимые параметры градиента маски".into());
+    }
+    if let Some(data) = value.get("bevy_shape") {
+        let generator: Generator = serde_json::from_value(data.clone())
+            .map_err(|error| format!("Повреждена фигура маски: {error}"))?;
+        return (generator.kind.is_shape() && generator.valid())
+            .then_some(generator)
+            .ok_or_else(|| "Недопустимые параметры фигуры маски".into());
+    }
+    if let Some(data) = value.get("bevy_tiles") {
+        let generator: Generator = serde_json::from_value(data.clone())
+            .map_err(|error| format!("Повреждена плиточная маска: {error}"))?;
+        return (generator.kind == GeneratorKind::TilePattern && generator.valid())
+            .then_some(generator)
+            .ok_or_else(|| "Недопустимые параметры плиточной маски".into());
     }
     let name = value["kind"].as_str().unwrap_or("");
     let &(kind, _) = GENERATORS
@@ -1049,8 +1084,10 @@ fn write_fill(
     let rgb =
         |i: usize, fallback| row.channels[i].map_or(fallback, |[r, g, b, _]| [r, g, b].map(byte));
     let scalar = |i, fallback| rgb(i, [fallback; 3])[0];
+    let height_fallback = has_image(3) && (settings.height_offset != 0.
+        || !(-2. ..=2.).contains(&settings.height_strength));
     let height = if has_image(3) {
-        settings.height_strength / 2.
+        (settings.height_strength / 2.).clamp(-1., 1.)
     } else {
         2. * scalar(3, 0.5) - 1.
     };
@@ -1108,8 +1145,7 @@ fn write_fill(
             json!({"file": image.file, "name": name, "source": format!("{source:?}")})
         })
     });
-    (
-        json!({"kind": "fill", "fill": {
+    let mut saved = json!({"kind": "fill", "fill": {
             "enabled": enabled, "color": rgb(0, [0.8; 3]), "roughness": scalar(1, 0.5),
             "metallic": scalar(2, 0.), "height": height, "opacity": opacity,
             "emission": emission, "specular": specular, "normal_strength": settings.normal_strength,
@@ -1120,9 +1156,13 @@ fn write_fill(
             "height_variation": varying(var_height, variation.height),
             "part_variation": part_variation, "variation_scale": variation.scale, "seed": variation.seed,
             "graph": null,
-        }}),
-        images,
-    )
+        }});
+    if height_fallback {
+        *adjusted += 1;
+        saved["fill"]["bevy_height_strength"] = json!(settings.height_strength);
+        saved["fill"]["bevy_height_offset"] = json!(settings.height_offset);
+    }
+    (saved, images)
 }
 
 fn mask_base_layers([scale, offset]: [u8; 2], generated: bool) -> Vec<Value> {
@@ -1219,12 +1259,17 @@ fn write_mask(mask: &MaskPreset, kind: LayerKind, adjusted: &mut usize) -> Value
 }
 
 fn write_generator(generator: Generator, adjusted: &mut usize) -> Value {
-    if generator.kind.is_gradient() {
+    if generator.kind.uses_pattern_mapping() {
         let mut fallback = Generator::new(GeneratorKind::Clouds);
         fallback.values[0] = -100.;
         *adjusted += 1;
         let mut stored = write_generator(fallback, adjusted);
-        stored["bevy_gradient"] = json!(generator);
+        let key = match generator.kind {
+            GeneratorKind::TilePattern => "bevy_tiles",
+            kind if kind.is_gradient() => "bevy_gradient",
+            _ => "bevy_shape",
+        };
+        stored[key] = json!(generator);
         return stored;
     }
     let (_, kind) = GENERATORS

@@ -1,4 +1,4 @@
-//! Texture-space and projected gradients for procedural masks.
+//! Texture-space and projected patterns for procedural masks.
 use super::{Generator, GeneratorKind};
 use bevy::prelude::{EulerRot, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,7 @@ pub(super) struct Sampler {
     uv_angle: Vec2,
     direction: Vec2,
     inverse_rotation: Quat,
+    tiles: Option<super::tiles::Sampler>,
 }
 
 impl Sampler {
@@ -92,6 +93,8 @@ impl Sampler {
             uv_angle: Vec2::from_angle(mapping.rotation),
             direction: Vec2::from_angle(generator.values[3].to_radians()),
             inverse_rotation,
+            tiles: (generator.kind == GeneratorKind::TilePattern)
+                .then(|| super::tiles::Sampler::new(generator.values, generator.tile_options.unwrap_or_default())),
         }
     }
 
@@ -113,6 +116,14 @@ impl Sampler {
             } else if !(0. ..=1.).contains(value) {
                 return None;
             }
+        }
+        if let Some(tiles) = &self.tiles {
+            let value = tiles.sample(Vec2::from_array(uv));
+            return Some(if self.generator.invert { 1. - value } else { value });
+        }
+        if self.generator.kind.is_shape() {
+            let value = self.shape(Vec2::from_array(uv) - center);
+            return Some(if self.generator.invert { 1. - value } else { value });
         }
         let [position, contrast, repeats, _, peak] = self.generator.values;
         let axis = 0.5 + (Vec2::from_array(uv) - center).dot(self.direction.perp());
@@ -148,6 +159,35 @@ impl Sampler {
         } else {
             value
         })
+    }
+
+    fn shape(&self, point: Vec2) -> f32 {
+        let [size, hardness, width, ..] = self.generator.values;
+        if size == 0. {
+            return 0.;
+        }
+        let radius = match self.generator.kind {
+            GeneratorKind::ShapeSquareBorder => point.abs().max_element(),
+            _ => point.length(),
+        } * 200. / size;
+        if self.generator.kind == GeneratorKind::ShapeCone {
+            return (1. - radius).max(0.).powf(2. - hardness / 100.);
+        }
+        let edge = (1. - hardness / 100.).max(1e-5);
+        if self.generator.kind == GeneratorKind::ShapeDisc {
+            return super::smooth(((1. - radius) / edge).clamp(0., 1.));
+        }
+        let width = width / 100.;
+        if width == 0. {
+            return 0.;
+        }
+        let softness = edge.min(width * 0.5);
+        let outer = super::smooth(((1. - radius) / softness).clamp(0., 1.));
+        if width == 1. {
+            return outer;
+        }
+        let inner = super::smooth(((radius - (1. - width)) / softness).clamp(0., 1.));
+        outer * inner
     }
 
     pub fn projected(&self, point: Vec3, normal: Vec3) -> [u8; 2] {

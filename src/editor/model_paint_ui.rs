@@ -472,7 +472,7 @@ fn generator_controls(
             commands,
             line,
             font,
-            &format!("{label} · {}", generator.values[i]),
+            &format!("{label} · {}", generator.value(i)),
             11.,
             MUTED,
         );
@@ -491,7 +491,7 @@ fn generator_controls(
             action(GeneratorEdit::Adjust(i, 1)),
         );
     }
-    if generator.kind.is_gradient() {
+    if generator.kind.uses_pattern_mapping() {
         return;
     }
     button(commands, parent, font, "Входы генератора", PaintAction::GeneratorInputs(index));
@@ -774,7 +774,7 @@ const SHELF_HEIGHT: f32 = 219.;
 
 fn texture_decimal(parameter: Parameter) -> bool {
     matches!(parameter, Parameter::TextureTiling | Parameter::TextureOffsetU
-        | Parameter::TextureOffsetV | Parameter::TextureNormalStrength | Parameter::TextureHeightStrength
+        | Parameter::TextureOffsetV | Parameter::TextureNormalStrength | Parameter::TextureHeightStrength | Parameter::TextureHeightOffset
         | Parameter::TextureOpacityStrength | Parameter::TextureEmissionTint(_) | Parameter::TextureSpecularStrength
         | Parameter::FillVariationScale | Parameter::ExportHeightStrength)
 }
@@ -3074,6 +3074,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         }
                         if fill.images[3].is_some() {
                             number(&mut commands, stack, font, Parameter::TextureHeightStrength, false);
+                            number(&mut commands, stack, font, Parameter::TextureHeightOffset, false);
                         }
                         if fill.images[4].is_some() {
                             number(&mut commands, stack, font, Parameter::TextureOpacityStrength, false);

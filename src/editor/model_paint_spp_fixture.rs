@@ -400,7 +400,7 @@ pub fn document_with_generator_tweaks(url: &str, tweaks: &[GeneratorTweak]) -> V
     document_options(0, None, TestMask::TunedGenerator(url, tweaks, None))
 }
 
-pub fn document_with_projected_gradient(url: &str, tweaks: &[GeneratorTweak], projection: u32) -> Vec<u8> {
+pub fn document_with_projected_generator(url: &str, tweaks: &[GeneratorTweak], projection: u32) -> Vec<u8> {
     document_options(0, None, TestMask::TunedGenerator(url, tweaks, Some(projection)))
 }
 
@@ -414,6 +414,14 @@ pub fn document_with_ordered_mask_filters() -> Vec<u8> {
 
 pub fn document_with_tonal_mask_filters() -> Vec<u8> {
     document_options(0, None, TestMask::TonalFilters)
+}
+
+pub fn document_with_mirror_mask(url: &str) -> Vec<u8> {
+    document_options(0, None, TestMask::Mirror(url))
+}
+
+pub fn document_with_height_adjust(bitmap: Option<&str>) -> Vec<u8> {
+    document_options(0, bitmap, TestMask::HeightAdjust)
 }
 
 pub fn document_with_anchors() -> Vec<u8> {
@@ -503,6 +511,8 @@ enum TestMask<'a> {
     TunedGenerator(&'a str, &'a [GeneratorTweak], Option<u32>),
     OrderedFilters,
     TonalFilters,
+    Mirror(&'a str),
+    HeightAdjust,
     Anchors,
     Udim,
     Stencil(&'a str, bool, Option<bool>, Option<u32>),
@@ -516,6 +526,7 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     let anchors = matches!(mask, TestMask::Anchors);
     let udim = matches!(mask, TestMask::Udim);
     let pressure = matches!(mask, TestMask::Pressure);
+    let height_adjust = matches!(mask, TestMask::HeightAdjust);
     let stencil = match mask {
         TestMask::Stencil(url, uv, inverted, wrap) => Some((url, uv, inverted, wrap)),
         _ => None,
@@ -604,11 +615,11 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     );
     w.u32(0x301);
     w.class("DataStackActions", &[("items", 19)]);
-    w.u32(if anchors { 3 } else { 1 });
+    w.u32(if anchors || height_adjust { 3 } else { 1 });
     w.u32(0x302);
     w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
     w.out.extend(u64::MAX.to_le_bytes());
-    w.u32(if bitmap.is_some() { 2 } else { 1 });
+    w.u32(if bitmap.is_some() || height_adjust { 2 } else { 1 });
     w.u32(0x303);
     w.class("DataSourceUniform", &[("channelTypes", 12), ("color", 3)]);
     w.out.extend(1u64.to_le_bytes());
@@ -618,14 +629,25 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
     if let Some(url) = bitmap {
         w.u32(0x304);
         w.class("DataSourceBitmap", &[("channelTypes", 12), ("bitmap", 18)]);
-        w.out.extend(128u64.to_le_bytes());
+        w.out.extend((if height_adjust { 2u64 } else { 128 }).to_le_bytes());
         w.u32(0x305);
         w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
         w.string(url);
+    } else if height_adjust {
+        w.u32(0x304);
+        w.class("DataSourceUniform", &[("channelTypes", 12), ("color", 3)]);
+        w.out.extend(2u64.to_le_bytes());
+        for _ in 0..3 {
+            w.u32(0.625_f32.to_bits());
+        }
     }
     if anchors {
         write_anchor(&mut w, 0x702, 16_777_217);
         write_uniform(&mut w, 0x704, 0.);
+    }
+    if height_adjust {
+        write_height_adjust(&mut w, 0x390, 1.5, 0.25, 1.);
+        write_height_adjust(&mut w, 0x3a0, 0.5, 0.25, 0.);
     }
     w.out.push(1);
     w.string("Rust");
@@ -635,6 +657,28 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         write_strokes(&mut w, 0x400, true, None, None, false, false);
     } else if let Some(url) = mask_image {
         write_mask_effects(&mut w, url, matches!(mask, TestMask::Effects(_, true)));
+    } else if let TestMask::Mirror(url) = mask {
+        write_bitmap_mask_base(&mut w, url, 2);
+        w.u32(0x604);
+        w.class("DataActionFilterProcedural", &[("procedural", 18)]);
+        w.u32(0x605);
+        w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
+        w.string("starter/mirror/mirror");
+        let tweaks = [
+            ("mirror_type", 0.0_f32),
+            ("Axis_X_Offset", 0.375),
+            ("Axis_Y_Offset", 0.2),
+            ("Invert_Axis_X", 1.),
+            ("Invert_Axis_Y", 1.),
+            ("Corner_Type", 3.),
+        ];
+        w.u32(tweaks.len() as u32);
+        for (index, (key, value)) in tweaks.into_iter().enumerate() {
+            w.u32(0x606 + index as u32);
+            w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
+            w.string(key);
+            w.u32(value.to_bits());
+        }
     } else if let TestMask::BitmapProjection(url, projection) = mask {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);
@@ -649,6 +693,12 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         w.u32(0x603);
         w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
         w.string(url);
+    } else if height_adjust {
+        w.u32(0x600);
+        w.class("DataStackActions", &[("items", 19)]);
+        w.u32(2);
+        write_uniform(&mut w, 0x601, 0.25);
+        write_height_adjust(&mut w, 0x610, 2., 0.125, 1.);
     } else if let TestMask::TunedGenerator(url, tweaks, projection) = mask {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);
@@ -849,6 +899,22 @@ fn write_anchor(w: &mut DocWriter, id: u32, uid: u32) {
     w.u32(uid);
 }
 
+fn write_height_adjust(w: &mut DocWriter, id: u32, multiply: f32, offset: f32, invert: f32) {
+    w.u32(id);
+    w.class("DataActionFilterProcedural", &[("procedural", 18)]);
+    w.u32(id + 1);
+    w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
+    w.string("starter/height_adjust/height_adjust");
+    let tweaks = [("height_multiplier", multiply), ("offset", offset), ("invert", invert)];
+    w.u32(tweaks.len() as u32);
+    for (index, (key, value)) in tweaks.into_iter().enumerate() {
+        w.u32(id + index as u32 + 2);
+        w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
+        w.string(key);
+        w.u32(value.to_bits());
+    }
+}
+
 fn write_uniform(w: &mut DocWriter, id: u32, gray: f32) {
     w.u32(id);
     w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
@@ -888,10 +954,10 @@ fn write_reference(w: &mut DocWriter, id: u32, channels: u64, anchor: u32, level
     }
 }
 
-fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
+fn write_bitmap_mask_base(w: &mut DocWriter, url: &str, steps: u32) {
     w.u32(0x600);
     w.class("DataStackActions", &[("items", 19)]);
-    w.u32(6 + u32::from(outline));
+    w.u32(steps);
     w.u32(0x601);
     w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
     w.out.extend(u64::MAX.to_le_bytes());
@@ -902,6 +968,10 @@ fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
     w.u32(0x603);
     w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
     w.string(url);
+}
+
+fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
+    write_bitmap_mask_base(w, url, 6 + u32::from(outline));
     w.u32(0x604);
     w.class("DataActionFilterLevels", &[("levels", 18)]);
     w.u32(0x607);

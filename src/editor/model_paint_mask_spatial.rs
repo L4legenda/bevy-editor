@@ -20,6 +20,7 @@ impl Spatial {
                 (samples * x.abs().max(y.abs())).ceil() as u32 + 1
             }
             FilterKind::Pixelate => size.div_ceil(self.params[0] as u32),
+            FilterKind::Mirror => size,
             FilterKind::Sharpen => self.params[1] as u32,
             FilterKind::Warp => (self.params[0] * size as f32 * 0.5).ceil() as u32 + 1,
             _ => 0,
@@ -62,6 +63,20 @@ impl Spatial {
             }
             FilterKind::Pixelate if a >= 1. && a < size as f32 => {
                 vec![pass(false, [a, 0., 0., 0.], Vec::new())]
+            }
+            FilterKind::Mirror => {
+                let axis = |vertical, offset: f32, higher: bool| {
+                    pass(vertical, [offset, if higher { 1. } else { -1. }, 0., 0.], Vec::new())
+                };
+                match a as u32 {
+                    0 => vec![axis(false, b / 100., filter.mirror.reverse_x)],
+                    // Painter stores the vertical offset in UV coordinates, with V increasing upward.
+                    1 => vec![axis(true, 1. - c / 100., !filter.mirror.reverse_y)],
+                    _ => vec![
+                        axis(false, 0.5, filter.mirror.corner & 1 != 0),
+                        axis(true, 0.5, filter.mirror.corner & 2 != 0),
+                    ],
+                }
             }
             FilterKind::Sharpen if a > 0. => vec![pass(
                 false,
@@ -155,6 +170,12 @@ impl Spatial {
                     let size = size as i32;
                     let cell = ((p * 2 + IVec2::ONE) * cells) / (2 * size);
                     at(((cell * 2 + IVec2::ONE) * size) / (2 * cells))
+                }
+                FilterKind::Mirror => {
+                    let coordinate = p.dot(dir) as f32 + 0.5;
+                    let axis = a * size as f32;
+                    let reflected = axis + b * (coordinate - axis).abs();
+                    bilinear(p.as_vec2() + dir.as_vec2() * (reflected - coordinate))
                 }
                 FilterKind::Sharpen => {
                     let x = IVec2::X * b as i32;
@@ -256,6 +277,37 @@ fn pixelate_reads_the_center_of_each_cell_on_a_nondivisible_map() {
     assert_eq!(passes[0].reach(size as u32), 3);
     filter.set_value(0, 8.);
     assert!(Spatial::passes(filter, size as u32).is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn mirror_mask_samples_from_the_selected_side_or_corner() {
+    let size = 8;
+    let input: Vec<u8> = (0..64).collect();
+    let apply = |values: [f32; 6]| {
+        let mut filter = Filter::new(FilterKind::Mirror);
+        for (slot, value) in values.into_iter().enumerate() {
+            filter.set_value(slot, value);
+        }
+        let mut plane = input.clone();
+        let mut output = vec![0; size * size];
+        for pass in Spatial::passes(filter, size as u32) {
+            assert_eq!(pass.reach(size as u32), size as u32);
+            pass.apply(&plane, &mut output, size);
+            std::mem::swap(&mut plane, &mut output);
+        }
+        plane
+    };
+    let x = apply([0., 37.5, 50., 0., 0., 0.]);
+    assert_eq!(&x[..8], &[0, 1, 2, 2, 1, 0, 0, 0]);
+    let reverse = apply([0., 37.5, 50., 1., 0., 0.]);
+    assert_eq!(&reverse[..8], &[5, 4, 3, 3, 4, 5, 6, 7]);
+    let y = apply([1., 50., 25., 0., 0., 0.]);
+    assert_eq!(y.chunks_exact(size).map(|r| r[0]).collect::<Vec<_>>(), [56, 56, 56, 56, 56, 48, 48, 56]);
+    for (corner, expected) in [0, 7, 56, 63].into_iter().enumerate() {
+        let mask = apply([2., 50., 50., 0., 0., corner as f32]);
+        assert_eq!([mask[0], mask[7], mask[56], mask[63]], [expected; 4]);
+    }
 }
 
 fn mix(a: f32, b: f32, t: f32) -> f32 {

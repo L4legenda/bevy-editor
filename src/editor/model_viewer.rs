@@ -133,6 +133,7 @@ impl Plugin for ModelViewerPlugin {
             .init_resource::<editing::State>()
             .init_resource::<editing::recovery::Preferences>()
             .init_resource::<paint::PaintState>()
+            .init_resource::<paint::mesh_tools::Requests>()
             .init_resource::<paint::save_copy::State>()
             .init_resource::<paint::sets::ShelfPick>()
             .init_resource::<paint::export::prefs::Store>()
@@ -516,6 +517,30 @@ fn actions(
         editing.bisect = false;
         editing.bisect_start = None;
         editing.bvh_stamp = None;
+    }
+    if let Some(index) = editing.paint_open_request {
+        if editor.viewing_model != Some(index)
+            || editor.viewing_image.is_some()
+            || editing.errors.contains_key(&index)
+        {
+            editing.paint_open_request = None;
+        } else if viewer.model == Some(index)
+            && let Some(error) = viewer.error.as_ref()
+        {
+            editing.errors.insert(index, error.clone());
+            editing.paint_open_request = None;
+        } else if editor.pending.is_none()
+            && !editor.browser_popup
+            && !editor.hdri_library_open
+            && editing.gesture.is_none()
+            && editing.documents.contains_key(&index)
+        {
+            editing.paint_open_request = None;
+            if editing.mode(Some(index)) != crate::editor::model_document::Mode::Paint {
+                editing.set_model_mode(index, crate::editor::model_document::Mode::Paint, &mut viewer);
+                focus.clear();
+            }
+        }
     }
     if editor.viewing_model == viewer.model && !retry {
         return;

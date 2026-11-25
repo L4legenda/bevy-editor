@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[path = "model_paint_brush_defaults.rs"]
 mod brush_defaults;
 #[path = "model_paint_mesh_tools.rs"]
-pub(super) mod mesh_tools;
+pub(in crate::editor) mod mesh_tools;
 #[path = "model_paint_save_copy.rs"]
 pub(super) mod save_copy;
 #[path = "model_paint_history.rs"]
@@ -23,6 +23,9 @@ mod diagnostics;
 #[cfg(feature = "mcp")]
 #[path = "model_paint_mcp.rs"]
 pub(in crate::editor) mod mcp_state;
+#[cfg(feature = "mcp")]
+#[path = "model_paint_surface_selection.rs"]
+mod surface_selection;
 #[cfg(feature = "mcp")]
 #[path = "model_paint_mcp_preview.rs"]
 pub(in crate::editor::ui::model_viewer) mod mcp_preview;
@@ -215,6 +218,7 @@ pub(in crate::editor) enum Parameter {
     TextureSharpness,
     TextureNormalStrength,
     TextureHeightStrength,
+    TextureHeightOffset,
     TextureOpacityStrength,
     TextureEmissionTint(usize),
     TextureSpecularStrength,
@@ -264,6 +268,7 @@ impl Parameter {
             Self::TextureSharpness => "Резкость смешивания",
             Self::TextureNormalStrength => "Сила нормалей",
             Self::TextureHeightStrength => "Сила карты высоты",
+            Self::TextureHeightOffset => "Смещение карты высоты",
             Self::TextureOpacityStrength => "Сила карты непрозрачности",
             Self::TextureEmissionTint(channel) => ["Оттенок свечения R", "Оттенок свечения G", "Оттенок свечения B"][channel],
             Self::TextureSpecularStrength => "Сила карты бликов",
@@ -307,7 +312,8 @@ impl Parameter {
             Self::TextureSharpness => (1., 16.),
             Self::TextureNormalStrength | Self::TextureSpecularStrength => (0., 2.),
             Self::TextureOpacityStrength | Self::TextureEmissionTint(_) => (0., 1.),
-            Self::TextureHeightStrength => (-2., 2.),
+            Self::TextureHeightStrength => (-10., 10.),
+            Self::TextureHeightOffset => (-100., 100.),
             Self::FillVariationScale => (0.5, 60.),
             Self::ExportPaddingWidth => (1., 256.),
             Self::ExportHeightStrength => (0., 8.),
@@ -324,7 +330,7 @@ impl Parameter {
 
     fn fill_parameter(self) -> bool {
         matches!(self, Self::TextureTiling | Self::TextureRotation | Self::TextureOffsetU
-            | Self::TextureOffsetV | Self::TextureSharpness | Self::TextureNormalStrength | Self::TextureHeightStrength
+            | Self::TextureOffsetV | Self::TextureSharpness | Self::TextureNormalStrength | Self::TextureHeightStrength | Self::TextureHeightOffset
             | Self::TextureOpacityStrength | Self::TextureEmissionTint(_) | Self::TextureSpecularStrength
             | Self::FillColorVariation | Self::FillRoughVariation | Self::FillHeightVariation
             | Self::FillVariationScale | Self::FillVariationSeed | Self::FillPartVariation)
@@ -873,6 +879,8 @@ struct Session {
     set_menu: bool,
     mesh_menu: bool,
     mesh_loading: bool,
+    #[cfg(feature = "mcp")]
+    surface_selection: Option<((usize, usize), Result<surface_selection::Report, String>)>,
     color: usize,
     preset: usize,
     size: f32,
@@ -1004,6 +1012,8 @@ impl Default for Session {
             set_menu: false,
             mesh_menu: false,
             mesh_loading: false,
+            #[cfg(feature = "mcp")]
+            surface_selection: None,
             color: 0,
             preset: 0,
             size: defaults.size,
@@ -1477,9 +1487,9 @@ impl Session {
                     GeneratorEdit::Adjust(i, direction) => generator.is_some_and(|g| {
                         g.controls().get(i).is_some_and(|&(_, min, max, _)| {
                             if direction > 0 {
-                                g.values[i] < max
+                                g.value(i) < max
                             } else {
-                                g.values[i] > min
+                                g.value(i) > min
                             }
                         })
                     }),
@@ -1728,9 +1738,8 @@ impl Session {
             }
             GeneratorEdit::Adjust(i, direction) => {
                 let generator = generator.as_mut().unwrap();
-                let (_, min, max, step) = generator.controls()[i];
-                generator.values[i] =
-                    (generator.values[i] + direction.signum() as f32 * step).clamp(min, max);
+                let (_, _, _, step) = generator.controls()[i];
+                generator.set_value(i, generator.value(i) + direction.signum() as f32 * step);
             }
         }
     }
@@ -1759,6 +1768,7 @@ impl Session {
             Parameter::TextureSharpness => fill.sharpness,
             Parameter::TextureNormalStrength => fill.normal_strength,
             Parameter::TextureHeightStrength => fill.height_strength,
+            Parameter::TextureHeightOffset => fill.height_offset,
             Parameter::TextureOpacityStrength => fill.opacity_strength,
             Parameter::TextureEmissionTint(channel) => fill.emission_tint[channel],
             Parameter::TextureSpecularStrength => fill.specular_strength,
@@ -1811,6 +1821,7 @@ impl Session {
                     Parameter::TextureSharpness => settings.sharpness = value,
                     Parameter::TextureNormalStrength => settings.normal_strength = value,
                     Parameter::TextureHeightStrength => settings.height_strength = value,
+                    Parameter::TextureHeightOffset => settings.height_offset = value,
                     Parameter::TextureOpacityStrength => settings.opacity_strength = value,
                     Parameter::TextureEmissionTint(channel) => settings.emission_tint[channel] = value,
                     Parameter::TextureSpecularStrength => settings.specular_strength = value,
@@ -1877,7 +1888,7 @@ impl Session {
             Parameter::FillAngle => self.fill_angle = value,
             Parameter::FillPadding => self.fill_padding = value,
             Parameter::TextureTiling | Parameter::TextureRotation | Parameter::TextureOffsetU
-            | Parameter::TextureOffsetV | Parameter::TextureSharpness | Parameter::TextureNormalStrength | Parameter::TextureHeightStrength
+            | Parameter::TextureOffsetV | Parameter::TextureSharpness | Parameter::TextureNormalStrength | Parameter::TextureHeightStrength | Parameter::TextureHeightOffset
             | Parameter::TextureOpacityStrength | Parameter::TextureEmissionTint(_) | Parameter::TextureSpecularStrength
             | Parameter::FillColorVariation | Parameter::FillRoughVariation | Parameter::FillHeightVariation
             | Parameter::FillVariationScale | Parameter::FillVariationSeed | Parameter::FillPartVariation => unreachable!(),

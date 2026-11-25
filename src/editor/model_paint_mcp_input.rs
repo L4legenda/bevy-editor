@@ -1,17 +1,107 @@
 //! Convert MCP points into the same queued strokes as pointer input.
 use super::*;
 use crate::editor::ui::model_viewer::paint::mcp_state::{
-    BrushValues, PaintSpace, RasterOperation, RasterTarget, StrokeSample,
+    BrushValues, PaintSpace, RasterOperation, RasterTarget, StrokeSample, SurfaceSeed,
 };
+use crate::editor::ui::model_viewer::paint::surface_selection::{self, Selection, Source};
 
 #[derive(SystemParam)]
 pub(in crate::editor) struct McpPaintInput<'w, 's> {
     runtime: Option<ResMut<'w, Runtime>>,
+    gpu_queue: Option<ResMut<'w, gpu::Queue>>,
     viewer: Option<Res<'w, Viewer>>,
     canvas: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<Canvas>>,
 }
 
 impl McpPaintInput<'_, '_> {
+    pub(in crate::editor::ui::model_viewer::paint) fn surface_source(
+        &self,
+        session: &Session,
+        seed: SurfaceSeed,
+    ) -> Result<Source, String> {
+        Ok(match seed {
+            SurfaceSeed::Parts { indices } => Source::Parts(indices),
+            SurfaceSeed::Point { position } => {
+                let point = Vec3::from_array(position);
+                if !point.is_finite() {
+                    return Err("The world-space selection point must be finite".into());
+                }
+                Source::Point(point)
+            }
+            SurfaceSeed::Viewport { position } => {
+                if session.view == View::Two {
+                    return Err("Open the 3D viewport before selecting from it".into());
+                }
+                let viewer = self.viewer.as_deref().ok_or("The model viewport is unavailable")?;
+                let rect = self.canvas.single().ok()
+                    .and_then(|(node, transform)| node_rect(node, transform))
+                    .ok_or("The 3D viewport has no visible canvas")?;
+                let (origin, direction) = camera_map(viewer, rect).ray(point(position, rect)?);
+                Source::Ray(origin, direction)
+            }
+        })
+    }
+
+    pub(in crate::editor::ui::model_viewer::paint) fn submit_surface(
+        &mut self,
+        model: usize,
+        doc: &mut Document,
+        session: &mut Session,
+        layer: usize,
+        selection: Selection,
+    ) -> Result<(), String> {
+        let runtime = self.runtime.as_deref_mut().ok_or("The paint engine is unavailable")?;
+        check_gesture(runtime, session)?;
+        let queue = self.gpu_queue.as_deref_mut().ok_or("The paint engine is unavailable")?;
+        if layer >= session.stack.layers.len() || !session.stack.shown(layer) {
+            return Err("Select a visible layer".into());
+        }
+        let (object, slot) = doc.paint_target(session.set).ok_or("Unknown texture set")?;
+        let target = (object.id, slot);
+        if object.hidden || !session.set_appearance.visibility.shown(target.0, target.1)
+            || !has_uv(object, slot)
+        {
+            return Err("Selection requires a visible texture set with UVs".into());
+        }
+        let live = runtime.lives.get_mut(&(model, target.0, target.1))
+            .filter(|live| live.task.is_none() && live.queue.is_empty() && !live.controller.busy())
+            .ok_or("Wait for the active texture set to be ready")?;
+        if !data::same_layer_list(&session.stack, &live.ui_stack) {
+            return Err("Wait for the active layer changes to finish".into());
+        }
+        let mut work = live.work.take().ok_or("Wait for the active texture set to be ready")?;
+        let objects = doc.objects.clone();
+        let visibility = session.set_appearance.visibility.clone();
+        work.surface.stack.selected = session.stack.selected;
+        live.controller.invalidate(queue);
+        live.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+            let before = work.surface.stack.clone();
+            let result = surface_selection::apply(
+                &mut work.surface.stack, layer, work.surface.size,
+                &objects, target, &visibility, selection,
+            );
+            let changed = matches!(&result, Ok((_, true)));
+            if result.is_ok() {
+                work.surface.stack.selected = layer;
+            }
+            let mut batch = if changed || before.selected != work.surface.stack.selected {
+                compose(work)
+            } else {
+                Batch { work, maps: None, history: Vec::new(), surface_selection: None }
+            };
+            if changed {
+                batch.history.push(before);
+            }
+            batch.surface_selection = Some(result.map(|(report, _)| report));
+            batch
+        }));
+        session.surface_selection = None;
+        session.busy = true;
+        doc.paint_busy = true;
+        doc.paint_pending = true;
+        Ok(())
+    }
+
     pub(in crate::editor::ui::model_viewer::paint) fn submit(
         &mut self,
         model: usize,
@@ -30,17 +120,7 @@ impl McpPaintInput<'_, '_> {
             .runtime
             .as_deref_mut()
             .ok_or("The paint engine is unavailable")?;
-        if runtime.gesture.is_some()
-            || runtime.brush_adjustment.is_some()
-            || session.panel == Panel::Shader
-            || session.graph_canvas_open()
-            || session.cage_brush_active()
-            || session.custom_gizmo_active()
-            || session.showing_bake()
-            || session.diagnostic_bake().is_some()
-        {
-            return Err("Finish the current paint gesture or return to the paint workspace".into());
-        }
+        check_gesture(runtime, session)?;
         let (object, slot) = doc.paint_target(session.set).ok_or("Unknown texture set")?;
         let key = (model, object.id, slot);
         if object.hidden
@@ -84,6 +164,21 @@ impl McpPaintInput<'_, '_> {
         doc.paint_pending = true;
         Ok(())
     }
+}
+
+fn check_gesture(runtime: &Runtime, session: &Session) -> Result<(), String> {
+    if runtime.gesture.is_some()
+        || runtime.brush_adjustment.is_some()
+        || session.panel == Panel::Shader
+        || session.graph_canvas_open()
+        || session.cage_brush_active()
+        || session.custom_gizmo_active()
+        || session.showing_bake()
+        || session.diagnostic_bake().is_some()
+    {
+        return Err("Finish the current paint gesture or return to the paint workspace".into());
+    }
+    Ok(())
 }
 
 fn queue_operation(

@@ -13,6 +13,8 @@ use super::spatial::{fbm, noise, smooth};
 mod patterns;
 #[path = "model_paint_mask_gradient.rs"]
 mod gradient;
+#[path = "model_paint_mask_tiles.rs"]
+mod tiles;
 pub(in crate::editor) use gradient::{GradientMapping, GradientProjection, GradientVolume};
 
 #[repr(usize)]
@@ -192,10 +194,15 @@ pub(in crate::editor) enum GeneratorKind {
     GradientLinear,
     GradientMirror,
     GradientPeak,
+    ShapeDisc,
+    ShapeCone,
+    ShapeSquareBorder,
+    ShapeCircleBorder,
+    TilePattern,
 }
 
 impl GeneratorKind {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 22] = [
         Self::Clouds,
         Self::Height,
         Self::EdgeWear,
@@ -213,6 +220,11 @@ impl GeneratorKind {
         Self::GradientLinear,
         Self::GradientMirror,
         Self::GradientPeak,
+        Self::ShapeDisc,
+        Self::ShapeCone,
+        Self::ShapeSquareBorder,
+        Self::ShapeCircleBorder,
+        Self::TilePattern,
     ];
 
     pub fn label(self) -> &'static str {
@@ -234,6 +246,11 @@ impl GeneratorKind {
             Self::GradientLinear => "Линейный градиент",
             Self::GradientMirror => "Закруглённый градиент",
             Self::GradientPeak => "Треугольный градиент",
+            Self::ShapeDisc => "Диск",
+            Self::ShapeCone => "Конус",
+            Self::ShapeSquareBorder => "Квадратная рамка",
+            Self::ShapeCircleBorder => "Круглая рамка",
+            Self::TilePattern => "Плитки",
         }
     }
 
@@ -258,7 +275,9 @@ impl GeneratorKind {
             Self::PartGradient => &[(I::PartGradient, 100)],
             Self::PartRandom => &[(I::PartRandom, 100)],
             Self::IdMask => &[(I::Id, 100)],
-            Self::CustomMap | Self::GradientLinear | Self::GradientMirror | Self::GradientPeak => &[],
+            Self::CustomMap | Self::GradientLinear | Self::GradientMirror | Self::GradientPeak
+            | Self::ShapeDisc | Self::ShapeCone | Self::ShapeSquareBorder | Self::ShapeCircleBorder
+            | Self::TilePattern => &[],
         };
         let mut weights = [0; GENERATOR_INPUT_COUNT];
         for &(input, weight) in inputs {
@@ -269,6 +288,14 @@ impl GeneratorKind {
 
     pub fn is_gradient(self) -> bool {
         matches!(self, Self::GradientLinear | Self::GradientMirror | Self::GradientPeak)
+    }
+
+    pub fn is_shape(self) -> bool {
+        matches!(self, Self::ShapeDisc | Self::ShapeCone | Self::ShapeSquareBorder | Self::ShapeCircleBorder)
+    }
+
+    pub fn uses_pattern_mapping(self) -> bool {
+        self.is_gradient() || self.is_shape() || self == Self::TilePattern
     }
 }
 
@@ -354,6 +381,8 @@ pub(in crate::editor) struct Generator {
     pub custom: [custom::Input; custom::MAX_MIX_INPUTS],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gradient_mapping: Option<GradientMapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tile_options: Option<tiles::TileOptions>,
 }
 
 fn empty_custom_inputs(inputs: &[custom::Input; custom::MAX_MIX_INPUTS]) -> bool {
@@ -389,10 +418,19 @@ impl Generator {
         ("Вершина, %", 0., 100., 5.),
     ];
 
+    const SHAPE_CONTROLS: [Control; 3] = [
+        ("Размер, %", 0., 100., 5.),
+        ("Жёсткость, %", 0., 100., 5.),
+        ("Ширина, %", 0., 100., 1.),
+    ];
+
     pub fn controls(self) -> &'static [Control] {
         match self.kind {
             GeneratorKind::GradientPeak => &Self::GRADIENT_CONTROLS,
             GeneratorKind::GradientLinear | GeneratorKind::GradientMirror => &Self::GRADIENT_CONTROLS[..4],
+            GeneratorKind::ShapeDisc | GeneratorKind::ShapeCone => &Self::SHAPE_CONTROLS[..2],
+            GeneratorKind::ShapeSquareBorder | GeneratorKind::ShapeCircleBorder => &Self::SHAPE_CONTROLS,
+            GeneratorKind::TilePattern => &tiles::EDITOR_CONTROLS,
             _ => &Self::CONTROLS,
         }
     }
@@ -416,6 +454,10 @@ impl Generator {
             GeneratorKind::GradientLinear | GeneratorKind::GradientMirror | GeneratorKind::GradientPeak => {
                 [50., 0., 1., 0., 50.]
             }
+            GeneratorKind::ShapeDisc => [100., 50., 0., 0., 0.],
+            GeneratorKind::ShapeCone => [100., 100., 0., 0., 0.],
+            GeneratorKind::ShapeSquareBorder | GeneratorKind::ShapeCircleBorder => [100., 100., 5., 0., 0.],
+            GeneratorKind::TilePattern => [4., 4., 100., 100., 85.],
         };
         Self {
             kind,
@@ -427,12 +469,41 @@ impl Generator {
             edge_width: default_edge_width(),
             custom: Default::default(),
             gradient_mapping: None,
+            tile_options: None,
+        }
+    }
+
+    pub fn value(self, index: usize) -> f32 {
+        self.values.get(index).copied().unwrap_or_else(|| {
+            if self.kind == GeneratorKind::TilePattern && index < tiles::EDITOR_CONTROLS.len() {
+                self.tile_options.unwrap_or_default().value(index)
+            } else {
+                0.
+            }
+        })
+    }
+
+    pub fn set_value(&mut self, index: usize, value: f32) {
+        let Some(&(_, min, max, _)) = self.controls().get(index) else { return };
+        let value = value.clamp(min, max);
+        let value = if self.kind == GeneratorKind::TilePattern && tiles::discrete(index) {
+            value.round()
+        } else {
+            value
+        };
+        if let Some(slot) = self.values.get_mut(index) {
+            *slot = value;
+        } else {
+            let mut options = self.tile_options.unwrap_or_default();
+            options.set(index, value);
+            self.tile_options = (options != tiles::TileOptions::default()).then_some(options);
         }
     }
 
     pub fn valid(self) -> bool {
         (1..=100).contains(&self.id_tolerance)
-            && self.gradient_mapping.is_none_or(|mapping| self.kind.is_gradient() && mapping.valid())
+            && self.gradient_mapping.is_none_or(|mapping| self.kind.uses_pattern_mapping() && mapping.valid())
+            && (self.tile_options.is_none() || self.kind == GeneratorKind::TilePattern)
             && (2..=500).contains(&self.edge_width)
             && self.custom.iter().enumerate().all(|(i, input)| {
                 if input.id == 0 {
@@ -445,11 +516,11 @@ impl Generator {
             && self
                 .weights
                 .is_none_or(|weights| weights.into_iter().all(|w| (-Self::WEIGHT_LIMIT..=Self::WEIGHT_LIMIT).contains(&w)))
-            && self
-                .values
-                .into_iter()
-                .zip(self.controls())
-                .all(|(v, &(_, min, max, _))| (min..=max).contains(&v))
+            && self.controls().iter().enumerate().all(|(index, &(_, min, max, _))| {
+                let value = self.value(index);
+                (min..=max).contains(&value)
+                    && (self.kind != GeneratorKind::TilePattern || !tiles::discrete(index) || value.fract() == 0.)
+            })
     }
 
     pub fn weights(self) -> [i16; GENERATOR_INPUT_COUNT] {
@@ -484,7 +555,7 @@ impl Generator {
 
     /// A lit preview sphere with synthetic bake inputs. The actual mask uses the model's maps.
     pub fn shelf_preview(self, size: u32) -> image::RgbaImage {
-        if self.kind.is_gradient() {
+        if self.kind.uses_pattern_mapping() {
             let sample = gradient::Sampler::new(self);
             return image::RgbaImage::from_fn(size, size, |x, y| {
                 let uv = (Vec2::new(x as f32 + 0.5, size as f32 - y as f32 - 0.5)) / size as f32;
@@ -789,8 +860,8 @@ impl GeneratorSurface {
             cache.push(entry);
             return pixels;
         }
-        let pixels = if generator.kind.is_gradient() {
-            self.gradient_map(generator)
+        let pixels = if generator.kind.uses_pattern_mapping() {
+            self.pattern_map(generator)
         } else {
             GeneratorMap { values: self.geometry_map(generator), coverage: None }
         };
@@ -802,7 +873,7 @@ impl GeneratorSurface {
         pixels
     }
 
-    fn gradient_map(&self, generator: Generator) -> GeneratorMap {
+    fn pattern_map(&self, generator: Generator) -> GeneratorMap {
         use crate::editor::model_paint_data::texture_fill::{pad_texels, raster};
         let size = self.size as usize;
         let sampler = gradient::Sampler::new(generator);

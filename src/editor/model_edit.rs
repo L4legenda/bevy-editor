@@ -147,7 +147,8 @@ struct RenderedObject {
 #[derive(Resource)]
 pub(in crate::editor) struct State {
     pub documents: HashMap<usize, Document>,
-    pub(super) errors: HashMap<usize, String>,
+    pub(in crate::editor) errors: HashMap<usize, String>,
+    pub(in crate::editor) paint_open_request: Option<usize>,
     rendered: Option<(Entity, u64)>,
     render_objects: HashMap<usize, RenderedObject>,
     default_material: Handle<StandardMaterial>,
@@ -185,6 +186,7 @@ impl Default for State {
         Self {
             documents: HashMap::new(),
             errors: HashMap::new(),
+            paint_open_request: None,
             rendered: None,
             render_objects: HashMap::new(),
             default_material: default(),
@@ -475,6 +477,23 @@ impl State {
             _ => true,
         }
     }
+    pub(super) fn set_model_mode(&mut self, index: usize, mode: Mode, viewer: &mut Viewer) {
+        self.clear_gesture(Some(index), false);
+        let Some(doc) = self.documents.get_mut(&index) else {
+            self.status = self.errors.get(&index).cloned()
+                .unwrap_or_else(|| "Модель ещё загружается".into());
+            return;
+        };
+        self.extrude_tool = false;
+        self.box_start = None;
+        self.menu = false;
+        self.bisect = false;
+        self.bisect_start = None;
+        viewer.gesture = None;
+        doc.set_mode(mode);
+        self.status.clear();
+    }
+
     pub(super) fn clear_gesture(&mut self, _doc_index: Option<usize>, cancel: bool) {
         if let Some(gesture) = self.gesture.take() {
             if gesture.is_loop_cutting() || gesture.is_knifing() {
@@ -1246,6 +1265,7 @@ pub(super) fn process_actions(
                     }
                 }
             }
+            EditAction::Mode(mode) => state.set_model_mode(index, mode, viewer),
             _ => {
                 state.clear_gesture(Some(index), false);
                 let Some(doc) = state.documents.get_mut(&index) else {
@@ -1258,15 +1278,6 @@ pub(super) fn process_actions(
                 };
                 let result: Result<(), String> = (|| {
                     match action {
-                        EditAction::Mode(mode) => {
-                            state.extrude_tool = false;
-                            state.box_start = None;
-                            doc.set_mode(mode);
-                            state.menu = false;
-                            state.bisect = false;
-                            state.bisect_start = None;
-                            viewer.gesture = None;
-                        }
                         EditAction::ToggleMode => {
                             state.extrude_tool = false;
                             state.box_start = None;

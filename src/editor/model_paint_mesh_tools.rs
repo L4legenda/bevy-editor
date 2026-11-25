@@ -3,14 +3,47 @@ use crate::editor::{model_document::Object, model_import_mesh};
 use bevy::tasks::{IoTaskPool, Task, block_on, poll_once};
 use std::path::PathBuf;
 
+pub(in crate::editor) enum Operation {
+    Primitive(paint_mesh_replacement::Shape),
+    Import(Option<PathBuf>),
+    Undo,
+    Redo,
+}
+
+pub(in crate::editor) enum Outcome {
+    Replaced(paint_mesh_replacement::Report),
+    Undone,
+    Redone,
+}
+
+pub(in crate::editor) trait Reply: Send + Sync {
+    fn is_closed(&self) -> bool;
+    fn finish(self: Box<Self>, result: Result<Outcome, String>);
+}
+
+type Completion = Box<dyn Reply>;
+
+pub(in crate::editor) struct Request {
+    pub model: usize,
+    pub set: usize,
+    pub revision: u64,
+    pub operation: Operation,
+    pub reply: Completion,
+}
+
+#[derive(Resource, Default)]
+pub(in crate::editor) struct Requests(pub Option<Request>);
+
 pub(in crate::editor::ui::model_viewer) struct Import {
     model: usize,
     document: PathBuf,
     task: Task<Result<Option<Vec<Object>>, String>>,
+    reply: Option<Completion>,
 }
 
 pub(in crate::editor::ui::model_viewer) fn update(
     mut messages: MessageReader<Action>,
+    mut requests: ResMut<Requests>,
     mut import: Local<Option<Import>>,
     mut editor: ResMut<Editor>,
     mut editing: ResMut<editing::State>,
@@ -38,22 +71,32 @@ pub(in crate::editor::ui::model_viewer) fn update(
     });
     if import.as_ref().is_some_and(|job| {
         active != Some(job.model)
+            || job.reply.as_ref().is_some_and(|reply| reply.is_closed())
             || editing
                 .documents
                 .get(&job.model)
                 .is_none_or(|doc| doc.source.path != job.document)
     }) && let Some(job) = import.take()
-        && let Some(session) = paint.sessions.get_mut(&job.model)
     {
-        session.mesh_loading = false;
-        session.revision += 1;
+        if let Some(session) = paint.sessions.get_mut(&job.model) {
+            session.mesh_loading = false;
+            session.revision += 1;
+        }
+        if let Some(reply) = job.reply {
+            reply.finish(Err("The model changed during mesh import".into()));
+        }
     }
-    let Some(index) = active else { return };
-    let saving = editing.saving_model(index);
-    let Some(doc) = editing.documents.get_mut(&index) else {
-        return;
-    };
-    let Some(session) = paint.sessions.get_mut(&index) else {
+
+    let request = requests.0.take().filter(|request| !request.reply.is_closed());
+    let saving = active.is_some_and(|index| editing.saving_model(index));
+    let Some((index, doc, session)) = active.and_then(|index| {
+        let doc = editing.documents.get_mut(&index)?;
+        let session = paint.sessions.get_mut(&index)?;
+        Some((index, doc, session))
+    }) else {
+        if let Some(request) = request {
+            request.reply.finish(Err("There is no active painting workspace".into()));
+        }
         return;
     };
     let idle = !saving
@@ -61,81 +104,121 @@ pub(in crate::editor::ui::model_viewer) fn update(
         && !doc.paint_pending
         && !runtime.stroke_active()
         && !session.busy
-        && !session.smart_loading;
-    let result = if idle {
-        import
-            .as_mut()
-            .and_then(|job| block_on(poll_once(&mut job.task)))
+        && !session.smart_loading
+        && session.resize_request.is_none();
+    let imported = if idle {
+        import.as_mut().and_then(|job| block_on(poll_once(&mut job.task)))
     } else {
         None
     };
+    let mut result = None;
     let mut replacement = None;
-    if let Some(result) = result {
-        *import = None;
+    let mut reply = None;
+    if let Some(imported) = imported {
+        reply = import.take().and_then(|job| job.reply);
         session.mesh_loading = false;
         session.revision += 1;
-        match result {
+        match imported {
             Ok(Some(objects)) => replacement = Some((objects, false)),
             Ok(None) => {}
-            Err(error) => editor.status = format!("Не удалось загрузить сетку · {error}"),
+            Err(error) => {
+                editor.status = format!("Не удалось загрузить сетку · {error}");
+                result = Some(Err(error));
+            }
         }
     }
-    let mut restored = false;
-    let mut new_geometry = false;
-    for command in commands {
-        if editor.browser_popup || editor.hdri_library_open {
-            continue;
+
+    let busy = !idle || import.is_some() || replacement.is_some() || result.is_some();
+    let blocked = editor.browser_popup || editor.hdri_library_open;
+    let requested = request.and_then(|request| {
+        if request.model != index
+            || request.set != session.set
+            || request.revision != session.revision
+        {
+            request.reply.finish(Err("The paint workspace changed; call get_paint_state again".into()));
+            None
+        } else if blocked || busy {
+            request.reply.finish(Err("Finish the current paint, mesh or dialog operation first".into()));
+            None
+        } else {
+            Some((request.operation, Some(request.reply)))
         }
-        if command == MeshCommand::Toggle {
-            session.mesh_menu = !session.mesh_menu;
-            session.revision += 1;
-            continue;
+    });
+    let command = requested.or_else(|| {
+        if blocked {
+            return None;
         }
-        if !idle || import.is_some() {
-            editor.status = "Дождитесь завершения текущей операции".into();
-            continue;
+        for command in commands {
+            if command == MeshCommand::Toggle {
+                session.mesh_menu = !session.mesh_menu;
+                session.revision += 1;
+                continue;
+            }
+            if busy {
+                editor.status = "Дождитесь завершения текущей операции".into();
+                continue;
+            }
+            let operation = match command {
+                MeshCommand::Primitive(shape) => Operation::Primitive(shape),
+                MeshCommand::Import => Operation::Import(None),
+                MeshCommand::Undo => Operation::Undo,
+                MeshCommand::Redo => Operation::Redo,
+                MeshCommand::Toggle => unreachable!(),
+            };
+            return Some((operation, None));
         }
-        match command {
-            MeshCommand::Primitive(shape) => match paint_mesh_replacement::primitive(shape) {
+        None
+    });
+    if let Some((operation, completion)) = command {
+        reply = completion;
+        match operation {
+            Operation::Primitive(shape) => match paint_mesh_replacement::primitive(shape) {
                 Ok(objects) => replacement = Some((objects, true)),
-                Err(error) => editor.status = format!("Не удалось создать сетку · {error}"),
+                Err(error) => {
+                    editor.status = format!("Не удалось создать сетку · {error}");
+                    result = Some(Err(error));
+                }
             },
-            MeshCommand::Import => {
+            Operation::Import(path) => {
                 let directory = editor.project.asset_root.clone();
                 let unwrap = uv.auto_unwrap();
                 let task = IoTaskPool::get().spawn(async move {
-                    crate::editor::asset_monitor::choose_file_path(&directory)
-                        .map_err(|error| error.to_string())?
-                        .map(|path| model_import_mesh::replacement(&path, unwrap))
-                        .transpose()
+                    let path = match path {
+                        Some(path) => Some(path),
+                        None => crate::editor::asset_monitor::choose_file_path(&directory)
+                            .map_err(|error| error.to_string())?,
+                    };
+                    path.map(|path| model_import_mesh::replacement(&path, unwrap)).transpose()
                 });
                 *import = Some(Import {
                     model: index,
                     document: doc.source.path.clone(),
                     task,
+                    reply: reply.take(),
                 });
                 session.mesh_loading = true;
                 session.revision += 1;
             }
-            MeshCommand::Undo if doc.can_restore_paint_mesh(false) => {
+            Operation::Undo if doc.can_restore_paint_mesh(false) => {
                 doc.undo();
                 doc.auto_bake_pending = false;
                 editor.status = "Замена сетки отменена".into();
-                restored = true;
+                result = Some(Ok(Outcome::Undone));
             }
-            MeshCommand::Redo if doc.can_restore_paint_mesh(true) => {
+            Operation::Redo if doc.can_restore_paint_mesh(true) => {
                 doc.redo();
                 doc.auto_bake_pending = uv.bake_on_load();
                 editor.status = "Замена сетки повторена".into();
-                restored = true;
-                new_geometry = true;
+                result = Some(Ok(Outcome::Redone));
             }
-            _ => {}
+            _ => result = Some(Err("No mesh replacement is available to undo or redo".into())),
         }
-        break;
     }
     if let Some((objects, use_active_set)) = replacement {
-        match doc.replace_paint_mesh(
+        if reply.as_ref().is_some_and(|reply| reply.is_closed()) {
+            return;
+        }
+        result = Some(match doc.replace_paint_mesh(
             objects,
             use_active_set,
             uv.detect_udim_on_import(),
@@ -152,13 +235,16 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         .status
                         .push_str(&format!(" · Доступно через отмену: {}", report.omitted));
                 }
-                restored = true;
-                new_geometry = true;
+                Ok(Outcome::Replaced(report))
             }
-            Err(error) => editor.status = format!("Не удалось заменить сетку · {error}"),
-        }
+            Err(error) => {
+                editor.status = format!("Не удалось заменить сетку · {error}");
+                Err(error)
+            }
+        });
     }
-    if restored {
+    if let Some(Ok(outcome)) = result.as_ref() {
+        let new_geometry = !matches!(outcome, Outcome::Undone);
         baked.cancel_mesh_work(index);
         runtime.discard_mesh(index, &mut queue);
         session.binding = None;
@@ -174,6 +260,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
         session.path_command = None;
         session.folder_view = None;
         session.graph_surfaces.clear();
+        #[cfg(feature = "mcp")]
+        {
+            session.surface_selection = None;
+        }
         session.mesh_graph_refresh.clear();
         if new_geometry {
             session.mesh_graph_refresh.extend(
@@ -195,5 +285,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
         viewer.fitted = false;
         viewer.restore = None;
         viewer.pending_document_camera = false;
+    }
+    if let (Some(reply), Some(result)) = (reply, result) {
+        reply.finish(result);
     }
 }

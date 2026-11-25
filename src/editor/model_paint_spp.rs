@@ -64,6 +64,9 @@ struct Summary {
     triplanar_mask_bitmaps: usize,
     tuned_mask_generators: usize,
     gradient_masks: usize,
+    shape_masks: usize,
+    tile_masks: usize,
+    height_adjustments: usize,
     baked_mask_filters: usize,
     baked_mask_generators: usize,
     baked_generator_sets: usize,
@@ -84,6 +87,8 @@ impl Summary {
     fn mask_generator(&mut self, generator: Generator) {
         self.tuned_mask_generators += usize::from(generator != Generator::new(generator.kind));
         self.gradient_masks += usize::from(generator.kind.is_gradient());
+        self.shape_masks += usize::from(generator.kind.is_shape());
+        self.tile_masks += usize::from(generator.kind == crate::editor::model_paint_data::mask::GeneratorKind::TilePattern);
     }
 
     fn overview(&self) -> String {
@@ -124,6 +129,15 @@ impl Summary {
         if self.gradient_masks > 0 {
             summary.push_str(&format!(" · градиентных масок: {}", self.gradient_masks));
         }
+        if self.shape_masks > 0 {
+            summary.push_str(&format!(" · масок с фигурами: {}", self.shape_masks));
+        }
+        if self.tile_masks > 0 {
+            summary.push_str(&format!(" · плиточных масок: {}", self.tile_masks));
+        }
+        if self.height_adjustments > 0 {
+            summary.push_str(&format!(" · поправок высоты: {}", self.height_adjustments));
+        }
         if self.baked_mask_filters > 0 {
             summary.push_str(&format!(
                 " · фильтров сведено в основу маски: {}",
@@ -160,6 +174,12 @@ impl Summary {
         }
         if self.gradient_masks > 0 {
             self.notes.push("Кривые градиентных масок и затухание объёмной проекции восстановлены приближённо".into());
+        }
+        if self.shape_masks > 0 {
+            self.notes.push("Контуры, мягкость и затухание проекции фигур восстановлены приближённо".into());
+        }
+        if self.tile_masks > 0 {
+            self.notes.push("Формы плиток, случайный разброс и затухание проекции восстановлены приближённо".into());
         }
         let overview = self.overview();
         let mut label = overview.clone();
@@ -1283,6 +1303,38 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_mirror_mask_retains_controls_and_reflects_the_input() {
+        use crate::editor::model_paint_data::mask::FilterKind;
+        let root = std::env::temp_dir().join(format!("bevy-spp-mirror-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Mirror.spp");
+        let key = "1234567890123456789012345678901234567890.image";
+        let mut row = [0, 0, 0, 255].repeat(8);
+        row.extend([255; 32]);
+        fs::write(&source, fixture::hdf5_file(&[
+            ("paint/scene.assbin", fixture::assbin_quad()),
+            ("paint/document.bin", fixture::document_with_mirror_mask(&format!("Mask?version={key}"))),
+            (&format!("resources/{key}"), fixture::bitmap_row(&row)),
+        ])).unwrap();
+        let (name, report) = convert(&source, &root).unwrap();
+        assert!(report.overview.contains("эффектов маски: 2"), "{}", report.overview);
+        let glb = Glb::load(&root.join(name)).unwrap();
+        let surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+        let mask = surface.stack.layers.iter().find(|layer| layer.name == "Rust")
+            .unwrap().mask.as_deref().unwrap();
+        let filter = mask.filters[0];
+        assert_eq!(filter.kind, FilterKind::Mirror);
+        assert_eq!(std::array::from_fn::<_, 6, _>(|slot| filter.value(slot)), [0., 37.5, 20., 1., 1., 3.]);
+        let size = surface.size as usize;
+        let pixel = |x| (size * (size / 2) + x) * 4;
+        assert_eq!(mask.pixels[pixel(size / 8)], 0);
+        assert_eq!(mask.effective()[pixel(size / 8)], 255);
+        assert_eq!(mask.effective()[pixel(size * 3 / 8)], 0);
+        assert_eq!(mask.effective()[pixel(size * 7 / 8)], 255);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn spp_import_projects_triplanar_bitmap_masks_through_the_mesh() {
         let root = std::env::temp_dir().join(format!("bevy-spp-mask-projection-{}", bevy::asset::uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
@@ -1389,7 +1441,7 @@ mod tests {
         ] {
             let source = root.join(format!("{name}.spp"));
             let document = if kind == GeneratorKind::GradientLinear {
-                fixture::document_with_projected_gradient(&format!("starter/{name}/{name}"), &tweaks, projection)
+                fixture::document_with_projected_generator(&format!("starter/{name}/{name}"), &tweaks, projection)
             } else {
                 fixture::document_with_generator_tweaks(&format!("starter/{name}/{name}"), &tweaks)
             };
@@ -1437,6 +1489,155 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_reopens_editable_shapes_with_uv_and_planar_coverage() {
+        use crate::editor::model_paint_data::mask::{GeneratorKind, GeneratorSurface};
+        use fixture::GeneratorTweak::{Bool, Float};
+
+        let root = std::env::temp_dir().join(format!("bevy-spp-shapes-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for (name, kind, projection, tweaks, values) in [
+            ("shape", GeneratorKind::ShapeDisc, None,
+                vec![Float("scale", 0.5), Float("hardness", 1.)], [50., 100., 0.]),
+            ("shape_cone", GeneratorKind::ShapeCone, None,
+                vec![Float("hardness", 1.)], [100., 100., 0.]),
+            ("shape_border_square", GeneratorKind::ShapeSquareBorder, Some(1),
+                vec![Float("border_size", 0.25), Float("hardness", 1.)], [100., 100., 25.]),
+            ("shape_border_circle", GeneratorKind::ShapeCircleBorder, None,
+                vec![Float("width", 0.25), Bool("invert", true)], [100., 100., 25.]),
+        ] {
+            let source = root.join(format!("{name}.spp"));
+            let url = format!("starter/{name}/{name}");
+            let document = match projection {
+                Some(projection) => fixture::document_with_projected_generator(&url, &tweaks, projection),
+                None => fixture::document_with_generator_tweaks(&url, &tweaks),
+            };
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad()),
+                ("paint/document.bin", document),
+            ])).unwrap();
+            let (filename, report) = convert(&source, &root).unwrap();
+            assert!(report.overview.contains("масок с фигурами: 1"), "{}", report.overview);
+            let model = Glb::load(&root.join(filename)).unwrap();
+            let surface = model.paint_surface(&model.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+            let mut mask = (**surface.stack.layers.iter().find(|layer| layer.name == "Rust")
+                .unwrap().mask.as_ref().unwrap()).clone();
+            let generator = mask.generator.or_else(|| mask.layers.last()?.generator).unwrap();
+            assert_eq!(generator.kind, kind);
+            assert_eq!(&generator.values[..3], &values);
+            let (object, _) = import(&source, name).unwrap();
+            mask.bind(Arc::new(GeneratorSurface::new(
+                object.geometry, 0, surface.size, Vec2::ZERO, Transform::IDENTITY, None,
+            )));
+            let size = surface.size as usize;
+            let value = |x, y| mask.effective()[(y * size + x) * 4];
+            match kind {
+                GeneratorKind::ShapeDisc => {
+                    assert_eq!(value(size / 2, size / 2), 255);
+                    assert_eq!(value(size / 8, size / 2), 0);
+                }
+                GeneratorKind::ShapeCone => {
+                    assert!(value(size / 2, size / 2) > 250);
+                    assert!(value(size / 4, size / 2).abs_diff(128) < 3);
+                }
+                GeneratorKind::ShapeSquareBorder => {
+                    assert_eq!(generator.gradient_mapping.unwrap().volume.unwrap().size, [0.5, 1., 0.4]);
+                    assert_eq!(value(size * 7 / 8, size / 2), 64);
+                    assert_eq!(value(size / 2, size / 2), 0);
+                    assert_eq!(value(size * 23 / 32, size / 2), 255);
+                }
+                GeneratorKind::ShapeCircleBorder => {
+                    assert_eq!(value(size / 2, size / 2), 255);
+                    assert_eq!(value(size * 15 / 16, size / 2), 0);
+                    assert_eq!(value(size * 15 / 16, size * 15 / 16), 255);
+                }
+                _ => unreachable!(),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_reopens_editable_tile_pattern_with_planar_coverage() {
+        use crate::editor::model_paint_data::mask::{GeneratorKind, GeneratorSurface};
+        use fixture::GeneratorTweak::{Float, Int};
+        let root = std::env::temp_dir().join(format!("bevy-spp-tiles-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Stripes.spp");
+        let document = fixture::document_with_projected_generator(
+            "starter/tile_generator/tile_generator",
+            &[Int("Pattern_Type", 2), Int("Number_X", 4), Int("Number_Y", 1),
+                Float("Scale", 0.5), Float("Background_Color", 0.125)],
+            1,
+        );
+        fs::write(&source, fixture::hdf5_file(&[
+            ("paint/scene.assbin", fixture::assbin_quad()),
+            ("paint/document.bin", document),
+        ])).unwrap();
+        let (filename, report) = convert(&source, &root).unwrap();
+        assert!(report.overview.contains("плиточных масок: 1"), "{}", report.overview);
+        let model = Glb::load(&root.join(filename)).unwrap();
+        let surface = model.paint_surface(&model.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+        let mut mask = (**surface.stack.layers.iter().find(|layer| layer.name == "Rust")
+            .unwrap().mask.as_ref().unwrap()).clone();
+        let generator = mask.layers.last().unwrap().generator.unwrap();
+        assert_eq!(generator.kind, GeneratorKind::TilePattern);
+        assert_eq!(generator.values, [4., 1., 100., 100., 50.]);
+        assert_eq!(generator.value(5), 0.);
+        assert_eq!(generator.value(19), 12.5);
+        let (object, _) = import(&source, "Stripes").unwrap();
+        mask.bind(Arc::new(GeneratorSurface::new(
+            object.geometry, 0, surface.size, Vec2::ZERO, Transform::IDENTITY, None,
+        )));
+        let size = surface.size as usize;
+        let value = |x| mask.effective()[(size / 2 * size + x) * 4];
+        assert_eq!(value(size / 8), 64);
+        assert_eq!(value(size * 5 / 16), 255);
+        assert_eq!(value(size * 3 / 8), 32);
+        assert_eq!(value(size * 7 / 16), 255);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_restores_ordered_height_adjustments_on_layers_and_masks() {
+        use crate::editor::model_paint_data::mask::FilterKind;
+        let root = std::env::temp_dir().join(format!("bevy-spp-height-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let key = "1234567890123456789012345678901234567890.image";
+        let url = format!("Gray?version={key}");
+        for (name, bitmap) in [("Solid", None), ("Bitmap", Some(url.as_str()))] {
+            let source = root.join(format!("{name}.spp"));
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad()),
+                ("paint/document.bin", fixture::document_with_height_adjust(bitmap)),
+                (&format!("resources/{key}"), fixture::bitmap_blob([159, 159, 159, 255])),
+            ])).unwrap();
+            let (filename, report) = convert(&source, &root).unwrap();
+            assert!(report.overview.contains("поправок высоты: 3"), "{}", report.overview);
+            let glb = Glb::load(&root.join(filename)).unwrap();
+            let mut surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+            let (object, _) = import(&source, name).unwrap();
+            surface.bind_texture_fills(&object.geometry, 0, Vec2::ZERO, Transform::IDENTITY);
+            let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
+            if bitmap.is_some() {
+                let fill = layer.texture_fill.as_ref().unwrap();
+                assert!(fill.images[3].is_some());
+                assert_eq!(fill.settings.height_strength, -0.75);
+                assert_eq!(fill.settings.height_offset, -0.0625);
+            } else {
+                assert!(layer.texture_fill.is_none());
+            }
+            let middle = (surface.size as usize * (surface.size as usize / 2) + surface.size as usize / 2) * 4;
+            assert_eq!(&layer.channel(3).unwrap()[middle..middle + 4], &[96, 96, 96, 255]);
+            let mask = layer.mask.as_ref().unwrap();
+            assert_eq!(mask.filters[0].kind, FilterKind::HeightAdjust);
+            assert_eq!(mask.filters[0].values, [2., 0.125, 1.]);
+            assert_eq!(mask.effective()[middle], 63);
+            assert_eq!(layer.channel(0).unwrap()[middle], 137);
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2249,6 +2450,7 @@ mod tests {
             }
             if name == "FrenchRestaurantTable" {
                 assert!(status.contains("градиентных масок:"), "{status}");
+                assert!(status.contains("плиточных масок:"), "{status}");
             }
             let path = root.join(output);
             let glb = Glb::load(&path).unwrap();

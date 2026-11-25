@@ -18,6 +18,9 @@ pub(in crate::editor) enum Command {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "mcp", derive(serde::Deserialize, serde::Serialize, rmcp::schemars::JsonSchema))]
+#[cfg_attr(feature = "mcp", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "mcp", schemars(crate = "rmcp::schemars"))]
 pub(in crate::editor) enum Shape {
     RoundedCube,
     Sphere,

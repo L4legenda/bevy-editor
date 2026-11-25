@@ -3,8 +3,8 @@ use super::*;
 use std::time::Instant;
 
 #[test]
-#[ignore = "requires GPU; compares directional blur and pixelation mask passes with the CPU"]
-fn gpu_directional_blur_and_pixelate_match_cpu_mask() {
+#[ignore = "requires GPU; compares spatial mask passes with the CPU"]
+fn gpu_spatial_filters_match_cpu_mask() {
     use data::mask::{Filter, FilterKind, Mask};
 
     let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
@@ -27,11 +27,16 @@ fn gpu_directional_blur_and_pixelate_match_cpu_mask() {
     }).collect());
     let bounds: Vec<_> = [size; 4].into_iter().flat_map(u32::to_le_bytes).collect();
     for (kind, params) in [
-        (FilterKind::DirectionalBlur, [8.5, 0.]),
-        (FilterKind::DirectionalBlur, [8.5, 37.]),
-        (FilterKind::DirectionalBlur, [8.5, 90.]),
-        (FilterKind::Pixelate, [32., 0.]),
-        (FilterKind::Pixelate, [37., 0.]),
+        (FilterKind::DirectionalBlur, [8.5, 0., 0., 0., 0., 0.]),
+        (FilterKind::DirectionalBlur, [8.5, 37., 0., 0., 0., 0.]),
+        (FilterKind::DirectionalBlur, [8.5, 90., 0., 0., 0., 0.]),
+        (FilterKind::Pixelate, [32., 0., 0., 0., 0., 0.]),
+        (FilterKind::Pixelate, [37., 0., 0., 0., 0., 0.]),
+        (FilterKind::Mirror, [0., 37.3, 50., 0., 0., 0.]),
+        (FilterKind::Mirror, [1., 50., 20., 0., 0., 0.]),
+        (FilterKind::Mirror, [1., 50., 63., 0., 1., 0.]),
+        (FilterKind::Mirror, [2., 50., 50., 0., 0., 1.]),
+        (FilterKind::Mirror, [2., 50., 50., 0., 0., 2.]),
     ] {
         let mut filter = Filter::new(kind);
         for (slot, value) in params.into_iter().enumerate() {
@@ -56,7 +61,7 @@ fn gpu_directional_blur_and_pixelate_match_cpu_mask() {
         }).unwrap();
         let gpu = readback.slice(..).get_mapped_range().unwrap();
         let max_error = gpu.iter().zip(mask.effective()).map(|(a, b)| a.abs_diff(*b)).max();
-        let tolerance = u8::from(kind == FilterKind::DirectionalBlur);
+        let tolerance = u8::from(matches!(kind, FilterKind::DirectionalBlur | FilterKind::Mirror));
         assert!(max_error.is_some_and(|error| error <= tolerance), "{kind:?} {params:?}, max error {max_error:?}");
         assert_ne!(&gpu[..], &pixels[..]);
         drop(gpu);

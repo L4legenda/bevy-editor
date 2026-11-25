@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use super::{Editor, Field, Scene, Selection, ui, viewport};
-use ui::model_viewer::{editing, paint::{PaintState, mcp_state}};
+use ui::model_viewer::{editing, paint::{PaintState, mcp_state, mesh_tools}};
 use types::Command;
 use types::*;
 
@@ -42,6 +42,27 @@ pub(super) enum Payload {
     },
 }
 type Reply = Result<Payload, String>;
+
+struct MeshReply(oneshot::Sender<Reply>);
+
+impl mesh_tools::Reply for MeshReply {
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+
+    fn finish(self: Box<Self>, result: Result<mesh_tools::Outcome, String>) {
+        use mesh_tools::Outcome;
+        let _ = self.0.send(result.map(|outcome| Payload::Json(match outcome {
+            Outcome::Replaced(report) => json!({
+                "status": "replaced",
+                "transferred_sets": report.transferred,
+                "omitted_sets": report.omitted,
+            }),
+            Outcome::Undone => json!({"status": "undone"}),
+            Outcome::Redone => json!({"status": "redone"}),
+        })));
+    }
+}
 
 fn png_payload(image: image::DynamicImage) -> Reply {
     let image = image.thumbnail(1600, 1000);
@@ -68,7 +89,10 @@ struct Bridge {
 
 impl Bridge {
     async fn request(&self, command: Command) -> Reply {
-        let timeout = if matches!(command, Command::PaintSave(_) | Command::PaintExport(_)) {
+        let timeout = if matches!(
+            command,
+            Command::PaintSave(_) | Command::PaintExport(_) | Command::PaintReplaceMesh(_)
+        ) {
             Duration::from_secs(300)
         } else {
             REQUEST_TIMEOUT
@@ -159,7 +183,7 @@ fn process(
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
     mut focus: Option<ResMut<InputFocus>>,
-    (mut model_editing, mut paint, real_time, mut paint_io): (Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>),
+    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io): (Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>, Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>),
 ) {
     let Some(inbox) = inbox else { return };
     for _ in 0..16 {
@@ -194,6 +218,18 @@ fn process(
                 "Finish the active edit, drag, camera navigation or confirmation dialog first"
                     .into(),
             ));
+            continue;
+        }
+        if let Command::PaintReplaceMesh(args) = job.command {
+            if let (Some(editing), Some(paint), Some(requests)) = (
+                model_editing.as_deref_mut(),
+                paint.as_deref_mut(),
+                mesh_requests.as_deref_mut(),
+            ) {
+                mcp_state::replace_mesh(requests, &editor, editing, paint, args, Box::new(MeshReply(job.reply)));
+            } else {
+                let _ = job.reply.send(Err("This editor has no model paint workspace".into()));
+            }
             continue;
         }
         if matches!(job.command, Command::PaintSave(_) | Command::PaintExport(_)) {
@@ -272,6 +308,10 @@ fn process(
             model_editing.as_deref().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::state(&editor, editing, paint))
+        } else if let Command::PaintOpen(args) = job.command {
+            model_editing.as_deref_mut().zip(paint.as_deref())
+                .ok_or_else(|| "This editor has no model paint workspace".to_string())
+                .and_then(|(editing, _)| open_paint_model(&mut editor, editing, args))
         } else if matches!(job.command, Command::PaintPresets) {
             paint.as_deref().map(mcp_state::catalog)
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
@@ -287,6 +327,10 @@ fn process(
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::fill(&mut paint_io.p0(), &editor, editing, paint, args))
+        } else if let Command::PaintSelectSurface(args) = job.command {
+            model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                .ok_or_else(|| "This editor has no model paint workspace".to_string())
+                .and_then(|(editing, paint)| mcp_state::select_surface(&mut paint_io.p0(), &editor, editing, paint, args))
         } else if let Command::BakeStatus(args) = job.command {
             model_editing.as_deref().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
@@ -525,6 +569,34 @@ fn patch_pose(
     Ok(pose)
 }
 
+fn open_paint_model(
+    editor: &mut Editor,
+    editing: &mut editing::State,
+    args: PaintOpenArgs,
+) -> Result<Value, String> {
+    if editor.browser_popup || editor.hdri_library_open || editing.gesture.is_some() {
+        return Err("Finish the active edit or close the asset picker first".into());
+    }
+    let index = editor
+        .project
+        .catalog
+        .iter()
+        .position(|item| item.asset == args.asset)
+        .ok_or("Choose a project model from list_assets")?;
+    if !std::path::Path::new(&args.asset)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("glb"))
+    {
+        return Err("Choose a GLB model for painting".into());
+    }
+    if let Some(error) = editing.errors.get(&index) {
+        return Err(error.clone());
+    }
+    editor.open_model_tab(index);
+    editing.paint_open_request = Some(index);
+    Ok(json!({"model_id": index, "asset": args.asset, "status": "opening"}))
+}
+
 fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
     if command.mutates() && editor.pending.is_some() {
         return Err("Resolve the editor confirmation dialog first".into());
@@ -668,7 +740,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }
-        Command::Save | Command::Capture | Command::PaintState | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSave(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) => {
+        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) => {
             Err("This operation requires the live editor".into())
         }
     }
