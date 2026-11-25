@@ -1,10 +1,11 @@
 //! Projects high-poly source geometry onto the low-poly UV raster.
-use super::super::ProjectionFormat;
-use super::{Progress, ProjectionSettings};
+use super::super::{IdSource, ProjectionFormat, material_id_color};
+use super::{Progress, ProjectionSettings, triangle_id_color};
+use crate::editor::model_document::glb::read_id_colors;
 use crate::editor::ui::model_viewer::editing::input::{Bvh, PickTriangle};
 use bevy::{gltf::gltf, prelude::*};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, HashMap, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -26,6 +27,8 @@ struct SourceTriangle {
     points: [Vec3; 3],
     normals: [Vec3; 3],
     part: usize,
+    material: Option<u32>,
+    color: Option<[u8; 3]>,
     usage: SourceUse,
 }
 
@@ -49,6 +52,8 @@ impl SourceTriangle {
             points,
             normals: normals.map(|normal| normal.try_normalize().unwrap_or(geo)),
             part,
+            material: None,
+            color: None,
             usage: SourceUse::Project,
         })
     }
@@ -57,11 +62,18 @@ impl SourceTriangle {
         self.usage = usage;
         self
     }
+
+    fn with_id(mut self, material: Option<u32>, color: Option<[u8; 3]>) -> Self {
+        self.material = material;
+        self.color = color;
+        self
+    }
 }
 
 struct SourceGeometry {
     bvh: Bvh,
     triangles: Vec<SourceTriangle>,
+    material_colors: HashMap<Option<u32>, [u8; 3]>,
     relief: Mutex<high_relief::Cache>,
 }
 
@@ -80,6 +92,8 @@ pub(super) struct Projection {
     front: f32,
     rear: f32,
     fill_misses: bool,
+    prefer_front_faces: bool,
+    id_source: IdSource,
 }
 
 pub(super) struct Segment {
@@ -95,6 +109,7 @@ pub(super) struct Query {
     pub point: Vec3,
     pub normal: Vec3,
     pub fill: bool,
+    pub prefer_front_faces: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -223,6 +238,14 @@ impl Projection {
     }
 
     fn new(triangles: Vec<SourceTriangle>, scale: f32, settings: &ProjectionSettings) -> Self {
+        let materials: BTreeSet<_> = triangles.iter().map(|triangle| triangle.material).collect();
+        let material_colors = if materials.len() > 1 {
+            materials.into_iter().enumerate()
+                .map(|(index, material)| (material, material_id_color(index as u32)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let bvh = Bvh::from_triangles(
             triangles
                 .iter()
@@ -238,6 +261,7 @@ impl Projection {
             Arc::new(SourceGeometry {
                 bvh,
                 triangles,
+                material_colors,
                 relief: Mutex::default(),
             }),
             scale,
@@ -251,11 +275,21 @@ impl Projection {
             front: scale * f32::from(settings.front) / 100.,
             rear: scale * f32::from(settings.rear) / 100.,
             fill_misses: settings.fill_misses,
+            prefer_front_faces: settings.prefer_front_faces,
+            id_source: settings.id_source,
         }
     }
 
     pub(super) fn scene(&self) -> &Bvh {
         &self.source.bvh
+    }
+
+    pub(super) fn id_color(&self, triangle: usize) -> Option<[u8; 3]> {
+        match self.id_source {
+            IdSource::MeshParts => None,
+            IdSource::Materials => self.source.material_colors.get(&self.source.triangles[triangle].material).copied(),
+            IdSource::VertexColors => self.source.triangles[triangle].color,
+        }
     }
 
     pub(super) fn surface_normal(&self, triangle: usize, point: Vec3) -> Vec3 {
@@ -287,6 +321,7 @@ impl Projection {
             point,
             normal,
             fill: fill && self.fill_misses,
+            prefer_front_faces: self.prefer_front_faces,
         }
     }
 
@@ -328,7 +363,11 @@ impl Projection {
                         && (!filter_backfaces || (b - a).cross(c - a).dot(outward) > 0.)
                 })
         };
-        nearest(true).or_else(|| nearest(false))
+        if self.prefer_front_faces {
+            nearest(true).or_else(|| nearest(false))
+        } else {
+            nearest(false)
+        }
     }
 
     pub(super) fn closest_crossing(
@@ -469,6 +508,9 @@ fn glb_triangles(
             continue;
         }
         let normal_matrix = matrix.inverse().transpose();
+        let editor_topology = mesh.extras().as_ref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+            .is_some_and(|extras| extras["bevy_editor_topology"]["version"].as_u64() == Some(1));
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {
                 continue;
@@ -488,6 +530,14 @@ fn glb_triangles(
                 .flatten()
                 .map(|n| normal_matrix * Vec3::from(n))
                 .collect();
+            let id_colors = read_id_colors(&source.document, &primitive, blob, points.len())?;
+            let visible_colors = if id_colors.is_none() {
+                reader.read_colors(0).map(|colors| colors.into_rgba_f32().collect::<Vec<_>>())
+                    .filter(|colors| !editor_topology || colors.iter().any(|rgba| *rgba != [1.; 4]))
+            } else {
+                None
+            };
+            let material = primitive.material().index().map(|index| index as u32);
             let indices: Box<dyn Iterator<Item = u32>> = match reader.read_indices() {
                 Some(indices) => Box::new(indices.into_u32()),
                 None => Box::new(0..points.len() as u32),
@@ -506,13 +556,19 @@ fn glb_triangles(
                 let [Some(a), Some(b), Some(c)] = ids.map(|i| points.get(i).copied()) else {
                     return Err("В high-poly есть недействительный индекс вершины".into());
                 };
+                let color = triangle_id_color(ids.map(|i| {
+                    id_colors.as_ref().and_then(|colors| colors[i]).or_else(|| {
+                        visible_colors.as_ref().and_then(|colors| colors.get(i))
+                            .map(|rgba| Vec4::from_array(*rgba).truncate())
+                    })
+                }));
                 triangles.extend(
                     SourceTriangle::new(
                         [a, b, c],
                         ids.map(|i| normals.get(i).copied().unwrap_or_default()),
                         node.index(),
                     )
-                    .map(|triangle| triangle.with_usage(usage)),
+                    .map(|triangle| triangle.with_usage(usage).with_id(material, color)),
                 );
             }
         }

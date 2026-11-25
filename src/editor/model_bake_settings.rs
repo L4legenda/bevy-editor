@@ -38,6 +38,27 @@ impl Quality {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::editor) enum IdSource {
+    #[default]
+    MeshParts,
+    Materials,
+    VertexColors,
+}
+
+impl IdSource {
+    pub(in crate::editor) const ALL: [Self; 3] = [Self::MeshParts, Self::Materials, Self::VertexColors];
+
+    pub(in crate::editor) fn label(self) -> &'static str {
+        match self {
+            Self::MeshParts => "Части сетки",
+            Self::Materials => "Материалы",
+            Self::VertexColors => "Цвета вершин",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub(in crate::editor) struct Defaults {
@@ -61,10 +82,13 @@ pub(in crate::editor) struct Settings {
     pub cage: Option<PathBuf>,
     pub quality: Quality,
     pub map_bits: u8,
+    pub id_source: IdSource,
     pub front: u8,
     pub rear: u8,
     pub match_names: bool,
     pub fill_misses: bool,
+    pub prefer_front_faces: bool,
+    pub average_normals: bool,
     pub auto_fit: bool,
 }
 
@@ -76,10 +100,13 @@ impl Default for Settings {
             cage: None,
             quality: defaults.quality,
             map_bits: 0b111_1111,
+            id_source: IdSource::default(),
             front: 5,
             rear: 5,
             match_names: defaults.match_names,
             fill_misses: true,
+            prefer_front_faces: true,
+            average_normals: true,
             auto_fit: false,
         }
     }

@@ -50,6 +50,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) struct Scene {
     high_parts: Option<Arc<project::HighRelief>>,
     target: usize,
     triangles: Vec<UvTriangle>,
+    average_normals: bool,
     rasters: Mutex<Rasters>,
     padding: Mutex<Padding>,
     gpu: Mutex<Option<Gpu>>,
@@ -99,6 +100,7 @@ impl Scene {
         Ok(Self {
             geometry,
             high_parts,
+            average_normals: settings.average_normals,
             target,
             triangles,
             rasters: Mutex::default(),
@@ -157,9 +159,12 @@ impl Scene {
                     normals: triangle.normals,
                     geometric: geo,
                     axes,
-                    directions: triangle
-                        .vertices
-                        .map(|v| scene.projection_normals[v].try_normalize().unwrap_or(geo)),
+                    directions: triangle_ray_directions(
+                        triangle.vertices,
+                        triangle.normals,
+                        self.average_normals.then_some(scene.projection_normals.as_slice()),
+                        geo,
+                    ),
                     cage: cage.as_ref(),
                 });
             let width = two_texel_width(points, uv);

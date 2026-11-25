@@ -16,6 +16,19 @@ pub(super) mod previews;
 pub(super) mod surface;
 pub(super) use material_painter_graph::presets::PRESETS;
 
+pub(super) const MPP_GRAPH_PENDING: &str = "bevy_mpp_graph_pending";
+pub(super) const MPP_GRAPH_KEEP_CACHE: &str = "bevy_mpp_graph_keep_cache";
+
+pub(super) fn encode_without_rebuild(graph: &Graph, previous: &serde_json::Value) -> serde_json::Value {
+    let mut payload = encode(graph);
+    for key in [MPP_GRAPH_PENDING, MPP_GRAPH_KEEP_CACHE] {
+        if previous[key].as_bool() == Some(true) {
+            payload[key] = serde_json::Value::Bool(true);
+        }
+    }
+    payload
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum ParameterTarget {
     Node(u64, usize),
@@ -283,6 +296,14 @@ fn graph_payloads(layer: &Layer) -> [Option<&serde_json::Value>; 2] {
     [fill, mask]
 }
 
+fn pending_import(payload: &serde_json::Value) -> bool {
+    payload[MPP_GRAPH_PENDING].as_bool() == Some(true)
+}
+
+pub(super) fn needs_initial_render(stack: &Stack) -> bool {
+    stack.layers.iter().flat_map(graph_payloads).flatten().any(pending_import)
+}
+
 pub(super) fn affected_layers(
     stack: &Stack,
     maps: bool,
@@ -297,8 +318,13 @@ pub(super) fn affected_layers(
             [(false, fill), (true, mask)]
                 .into_iter()
                 .filter_map(move |(mask, payload)| {
-                    let graph = read(payload?).ok()?;
-                    ((maps && !mesh_maps::used(&graph).is_empty())
+                    let payload = payload?;
+                    if payload[MPP_GRAPH_KEEP_CACHE].as_bool() == Some(true) {
+                        return None;
+                    }
+                    let graph = read(payload).ok()?;
+                    ((geometry && pending_import(payload))
+                        || (maps && !mesh_maps::used(&graph).is_empty())
                         || ((maps || geometry) && surface::used(&graph)))
                     .then_some((index, mask, graph))
                 })

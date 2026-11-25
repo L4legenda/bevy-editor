@@ -1,7 +1,7 @@
 //! Samples projection coverage on the same shell and rays used by the baker.
 use super::{
-    Bounds, Object, Progress, ProjectionSettings, project, projection_cage, projection_directions,
-    world_normal,
+    Bounds, Object, Progress, ProjectionSettings, mesh_normals, project, projection_cage,
+    projection_directions, triangle_ray_directions, world_normal,
 };
 use bevy::{color::ColorToComponents, prelude::*};
 
@@ -55,6 +55,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) struct Prepared {
     parts: Vec<usize>,
     positions: Vec<Vec3>,
     directions: Vec<Vec3>,
+    corner_normals: Option<Vec<Vec<Vec3>>>,
     cage: Option<project::Cage>,
 }
 
@@ -91,7 +92,12 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         .iter()
         .map(|&point| object.transform.transform_point(point))
         .collect();
-    let directions = projection_directions(object, &positions, settings.cage.is_none(), progress)?;
+    let corner_normals = (!settings.average_normals)
+        .then(|| mesh_normals(object, progress).map(|(_, normals)| normals))
+        .transpose()?;
+    let directions = projection_directions(
+        object, &positions, settings.cage.is_none(), corner_normals.as_deref(), progress,
+    )?;
     let mut baseline = settings.clone();
     baseline.manual = None;
     let (cage, _) = projection_cage(
@@ -110,6 +116,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         parts,
         positions,
         directions,
+        corner_normals,
         cage,
     })
 }
@@ -128,6 +135,7 @@ impl Prepared {
             parts,
             positions,
             directions,
+            corner_normals,
             cage,
         } = self;
         let span = *span;
@@ -167,7 +175,7 @@ impl Prepared {
             ..default()
         };
         let mut ordinal = 0;
-        for face in mesh.faces.iter().filter(|face| face.material == slot) {
+        for (face_index, face) in mesh.faces.iter().enumerate().filter(|(_, face)| face.material == slot) {
             progress.check()?;
             let geo = to_world(mesh.normal(face));
             for triangle in mesh.triangles(face) {
@@ -178,7 +186,14 @@ impl Prepared {
                 }
                 let vertices = triangle.map(|i| face.corners[i].vertex);
                 let points = vertices.map(|i| positions[i]);
-                let normals = vertices.map(|i| directions[i].try_normalize().unwrap_or(geo));
+                let normals = triangle_ray_directions(
+                    vertices,
+                    corner_normals.as_ref().map_or([geo; 3], |normals| {
+                        triangle.map(|corner| normals[face_index][corner])
+                    }),
+                    corner_normals.is_none().then_some(directions.as_slice()),
+                    geo,
+                );
                 let longest = points[0]
                     .distance(points[1])
                     .max(points[1].distance(points[2]))

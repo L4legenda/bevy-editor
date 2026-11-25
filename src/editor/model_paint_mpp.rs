@@ -1,10 +1,12 @@
 //! Import Material Painter's MPP manifest and compressed layer data into an editable GLB.
 use super::{
-    model_document::{MaterialSlot, Object, glb::Glb},
+    model_document::{MaterialSlot, Object, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
     model_mesh::{Corner, Face, Geometry},
     model_paint_data::{Blend, CHANNEL_COUNT, Layer, LayerKind, MAX_LAYERS, Stack, Surface, solid},
     model_paint_spp::{ImportDetails, project_name, publish_project},
-    ui::model_viewer::paint::{project_fill, project_graph, project_mask},
+    ui::model_viewer::paint::{
+        ProjectGraph, project_fill, project_graph, project_mask, project_preview_shader,
+    },
 };
 use bevy::prelude::*;
 use serde_json::{Value, json};
@@ -185,6 +187,7 @@ fn geometry(
     indices: &[u8],
     sets: &[TextureSet<'_>],
     materials: &[MaterialSlot],
+    colors: Option<&[u8]>,
 ) -> Result<(Geometry, usize)> {
     let center =
         Vec3::from_array(serde_json::from_value(mesh["center"].clone()).unwrap_or([0.; 3]));
@@ -211,7 +214,16 @@ fn geometry(
         let offset = materials[material]
             .udim()
             .map_or(Vec2::ZERO, |tile| tile.offset());
-        for triangle in indices[set.triangles.start * 12..set.triangles.end * 12].chunks_exact(12) {
+        for (ordinal, triangle) in indices[set.triangles.start * 12..set.triangles.end * 12]
+            .chunks_exact(12)
+            .enumerate()
+        {
+            let offset_bytes = (set.triangles.start + ordinal) * 3;
+            let id_color = colors.map(|colors| {
+                Vec3::from_array(std::array::from_fn(|channel| {
+                    f32::from(colors[offset_bytes + channel]) / 255.
+                }))
+            });
             let mut corners = Vec::with_capacity(3);
             for index in triangle.chunks_exact(4) {
                 let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
@@ -221,6 +233,7 @@ fn geometry(
                 let mut corner = Corner::new(index);
                 corner.uv = uv + offset;
                 corner.source_normal = normal;
+                corner.id_color = id_color;
                 corners.push(corner);
             }
             let face = Face {
@@ -410,6 +423,30 @@ fn texture(
     }
 }
 
+fn split_graph_mask_cache(
+    size: u32,
+    pixels: &mut Arc<Vec<u8>>,
+    remaining: &mut usize,
+) -> Result<Arc<Bitmap>> {
+    // Material Painter saves the last graph output in the multiplier channel.
+    // Keep the additive channel on the editable Bevy mask.
+    let gray: Vec<u8> = Arc::make_mut(pixels)
+        .chunks_exact_mut(4)
+        .flat_map(|pixel| {
+            let value = std::mem::replace(&mut pixel[0], 255);
+            [value, value, value, 255]
+        })
+        .collect();
+    let rgba = image::RgbaImage::from_raw(size, size, gray)
+        .ok_or("Некорректный размер растрового кэша маски MPP")?;
+    let bitmap = Bitmap::from_rgba("Маска MPP.png".into(), rgba)?;
+    reserve(
+        remaining,
+        bitmap.bytes.len() + bitmap.pixels().as_raw().len(),
+    )?;
+    Ok(Arc::new(bitmap))
+}
+
 fn blend(value: &Value, height: bool) -> Result<Blend> {
     Ok(match value.as_str().unwrap_or("Normal") {
         "Normal" => Blend::Normal,
@@ -425,30 +462,16 @@ fn blend(value: &Value, height: bool) -> Result<Blend> {
     })
 }
 
-fn read_graph(
-    graphs: &HashMap<u64, &Value>,
-    reference: &Value,
-    layer: &str,
-    warnings: &mut Vec<String>,
-) -> Option<Arc<Value>> {
-    let id = reference.as_u64()?;
-    let result = graphs
-        .get(&id)
-        .ok_or_else(|| "Нет данных графа".to_owned())
-        .and_then(|data| project_graph(data));
-    match result {
-        Ok(graph) => Some(graph),
-        Err(error) => {
-            warnings.push(format!("«{layer}» · граф {id}: {error}"));
-            None
-        }
-    }
+struct Graphs<'a> {
+    directory: &'a Path,
+    entries: HashMap<u64, &'a Value>,
+    imported: HashMap<u64, Option<Arc<ProjectGraph>>>,
 }
 
 struct Layers<'a, 'b> {
     archive: &'a mut Archive,
     remaining: &'a mut usize,
-    graphs: &'a HashMap<u64, &'b Value>,
+    graphs: &'a mut Graphs<'b>,
     warnings: &'a mut Vec<String>,
     recipes: &'a [super::model_paint_data::custom::Recipe],
     size: u32,
@@ -456,6 +479,49 @@ struct Layers<'a, 'b> {
 }
 
 impl Layers<'_, '_> {
+    fn read_graph(&mut self, reference: &Value, layer: &str) -> Option<Arc<ProjectGraph>> {
+        let id = reference.as_u64()?;
+        if let Some(cached) = self.graphs.imported.get(&id) {
+            let graph = cached.as_ref()?;
+            // GLB stores and decodes a separate bitmap for each layer reference.
+            let size = graph
+                .images
+                .values()
+                .map(|image| image.bytes.len() + image.pixels().as_raw().len())
+                .sum();
+            if let Err(error) = reserve(self.remaining, size) {
+                self.warnings
+                    .push(format!("«{layer}» · граф {id}: {error}"));
+                return None;
+            }
+            return Some(graph.clone());
+        }
+        let result = self
+            .graphs
+            .entries
+            .get(&id)
+            .ok_or_else(|| "Нет данных графа".to_owned())
+            .and_then(|data| {
+                project_graph(
+                    data,
+                    self.graphs.directory,
+                    id,
+                    |bytes| reserve(self.remaining, bytes),
+                    self.warnings,
+                )
+            });
+        let imported = match result {
+            Ok(graph) => Some(Arc::new(graph)),
+            Err(error) => {
+                self.warnings
+                    .push(format!("«{layer}» · граф {id}: {error}"));
+                None
+            }
+        };
+        self.graphs.imported.insert(id, imported.clone());
+        imported
+    }
+
     fn read(&mut self, set: &Value) -> Result<Stack> {
         let rows = set["layers_bottom_to_top"]
             .as_array()
@@ -499,8 +565,10 @@ impl Layers<'_, '_> {
                 LayerKind::Folder => {
                     ancestors.push(id);
                     layer.collapsed = !content["open"].as_bool().unwrap_or(true);
-                    layer.folder_graph =
-                        read_graph(self.graphs, &content["graph"], name, self.warnings);
+                    if let Some(graph) = self.read_graph(&content["graph"], name) {
+                        layer.folder_graph = Some(graph.payload.clone());
+                        layer.folder_images = graph.images.clone();
+                    }
                 }
                 LayerKind::Fill => {
                     let mut images = std::array::from_fn(|_| None);
@@ -535,16 +603,23 @@ impl Layers<'_, '_> {
                         }
                     }
                     let value = &content["fill"];
-                    let graph = read_graph(self.graphs, &value["graph"], name, self.warnings);
-                    project_fill(&mut layer, value, images, opacity, graph, |rgba| {
-                        if let Some(existing) = self.planes.get(&rgba) {
-                            return Ok(existing.clone());
-                        }
-                        reserve(self.remaining, layer_bytes)?;
-                        let pixels = solid(self.size, rgba);
-                        self.planes.insert(rgba, pixels.clone());
-                        Ok(pixels)
-                    })?;
+                    let graph = self.read_graph(&value["graph"], name);
+                    project_fill(
+                        &mut layer,
+                        value,
+                        images,
+                        opacity,
+                        graph.as_deref(),
+                        |rgba| {
+                            if let Some(existing) = self.planes.get(&rgba) {
+                                return Ok(existing.clone());
+                            }
+                            reserve(self.remaining, layer_bytes)?;
+                            let pixels = solid(self.size, rgba);
+                            self.planes.insert(rgba, pixels.clone());
+                            Ok(pixels)
+                        },
+                    )?;
                 }
                 LayerKind::Paint => {
                     for (channel, row) in content["channels"]
@@ -568,17 +643,22 @@ impl Layers<'_, '_> {
             layer.blend = blend(&row["blend"], layer.channels[3].is_some())?;
             if let Some(mask) = row.get("mask").filter(|v| !v.is_null()) {
                 reserve(self.remaining, layer_bytes)?;
-                let pixels = if mask["paint"].is_null() {
-                    solid(self.size, [255, 0, 0, 255])
-                } else {
+                let cached = !mask["paint"].is_null();
+                let mut pixels = if cached {
                     texture(self.archive, &mask["paint"], self.size, None)?
+                } else {
+                    solid(self.size, [255, 0, 0, 255])
                 };
-                let graph = read_graph(self.graphs, &mask["graph"], name, self.warnings);
+                let graph = self.read_graph(&mask["graph"], name);
+                let output = (cached && graph.is_some())
+                    .then(|| split_graph_mask_cache(self.size, &mut pixels, self.remaining))
+                    .transpose()?;
                 let mut omitted = 0;
                 layer.mask = Some(project_mask(
                     mask,
                     pixels,
-                    graph,
+                    graph.as_deref(),
+                    output,
                     self.recipes,
                     &mut omitted,
                 )?);
@@ -607,7 +687,15 @@ impl Layers<'_, '_> {
     }
 }
 
-fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, ImportDetails)> {
+struct Imported {
+    object: Object,
+    bake: bake_metadata::Bake,
+    preview: Option<Value>,
+    active_set: usize,
+    report: ImportDetails,
+}
+
+fn import(path: &Path, name: &str) -> Result<Imported> {
     let (mut archive, manifest) = Archive::open(path)?;
     let mesh = &manifest["mesh"];
     let vertices = archive.read(&mesh["vertices"], None, MAX_BLOB)?;
@@ -620,6 +708,10 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
         return Err("Некорректные вершины или треугольники MPP".into());
     }
     let sets = texture_sets(&manifest, indices.len() / 12)?;
+    let active_set = manifest["active_set"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(sets.len().saturating_sub(1) as u64) as usize;
     let materials: Vec<_> = sets.iter().map(|set| {
         let name = set.row["name"].as_str().unwrap_or("Материал");
         let mut source = json!({"name": name});
@@ -635,7 +727,17 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
             bake_fixes: Default::default(),
         }
     }).collect();
-    let (geometry, skipped) = geometry(mesh, &vertices, &indices, &sets, &materials)?;
+    let colors = (!mesh["tri_color"].is_null())
+        .then(|| archive.read(&mesh["tri_color"], Some(indices.len() / 4), MAX_BLOB))
+        .transpose()?;
+    let (geometry, skipped) = geometry(
+        mesh,
+        &vertices,
+        &indices,
+        &sets,
+        &materials,
+        colors.as_deref(),
+    )?;
     let mut object = Object {
         id: 0,
         source_node: None,
@@ -645,12 +747,16 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
         materials,
         hidden: false,
     };
-    let graphs: HashMap<_, _> = manifest["graphs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| Some((entry["id"].as_u64()?, &entry["graph"])))
-        .collect();
+    let mut graphs = Graphs {
+        directory: path.parent().unwrap_or_else(|| Path::new(".")),
+        entries: manifest["graphs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some((entry["id"].as_u64()?, &entry["graph"])))
+            .collect(),
+        imported: HashMap::new(),
+    };
     let mut remaining = MAX_TEXTURES;
     let mut warnings = Vec::new();
     if skipped != 0 {
@@ -665,9 +771,23 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
                 .into(),
         );
     }
-    if !manifest["view"]["preview_shader"].is_null() {
-        warnings.push("Шейдер предпросмотра используется только в исходном проекте".into());
-    }
+    let preview_ref = &manifest["view"]["preview_shader"];
+    let preview = if preview_ref.is_null() {
+        None
+    } else {
+        let shader = preview_ref
+            .as_u64()
+            .and_then(|id| graphs.entries.get(&id))
+            .ok_or_else(|| "Данные графа отсутствуют".to_owned())
+            .and_then(|data| project_preview_shader(data));
+        match shader {
+            Ok(shader) => Some(shader),
+            Err(error) => {
+                warnings.push(format!("Шейдер предпросмотра · {error}"));
+                None
+            }
+        }
+    };
     let bake = bake_metadata::Bake::read(path, &object, mesh, &manifest["bake"], &mut warnings);
     let mut layer_count = 0;
     let mut fix_count = 0;
@@ -686,7 +806,7 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
         let stack = Layers {
             archive: &mut archive,
             remaining: &mut remaining,
-            graphs: &graphs,
+            graphs: &mut graphs,
             warnings: &mut warnings,
             recipes: &bake.recipes,
             size,
@@ -737,26 +857,39 @@ fn import(path: &Path, name: &str) -> Result<(Object, bake_metadata::Bake, Impor
     } else {
         format!("{overview} · замечаний: {}", warnings.len())
     };
-    Ok((
+    Ok(Imported {
         object,
         bake,
-        ImportDetails {
+        preview,
+        active_set,
+        report: ImportDetails {
             label,
             overview,
             warnings,
         },
-    ))
+    })
 }
 
 pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, ImportDetails)> {
     let name = project_name(source);
-    let (object, bake, report) =
-        import(source, &name).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let Imported {
+        object,
+        bake,
+        preview,
+        active_set,
+        report,
+    } = import(source, &name).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let model = target.join("MPP.glb");
     let bytes = Glb::new_asset_configured(
         &[object],
         &[],
-        |root| bake.write(root, &model),
+        |root| {
+            root["extras"][PAINT_SET_EXTRA] = json!(active_set);
+            if let Some(preview) = preview {
+                root["extras"][PREVIEW_SHADER_EXTRA] = preview;
+            }
+            bake.write(root, &model)
+        },
         Some(&bake.cage),
     )
     .map_err(io::Error::other)?;
@@ -784,6 +917,8 @@ mod tests {
 
     #[test]
     fn mpp_browser_import_restores_sets_and_editable_layers() {
+        use material_painter_graph::{Graph, GraphParam, Library, Value as ParamValue};
+
         let directory =
             std::env::temp_dir().join(format!("bevy-mpp-{}", bevy::asset::uuid::Uuid::new_v4()));
         let source = directory.join("Материал.mpp");
@@ -819,14 +954,46 @@ mod tests {
             image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 25, 50, 255])),
         )
         .unwrap();
+        let texture = directory.join("Graph.png");
+        std::fs::write(&texture, &bitmap.bytes).unwrap();
+        let library = Library::load(None);
+        let mut graph = Graph::new("Tint graph");
+        let node = graph.add("bitmap", [0., 0.]);
+        let image_ref = ParamValue::Image(Some("Graph.png".into()));
+        graph
+            .node_mut(node)
+            .unwrap()
+            .params
+            .insert("image".into(), image_ref.clone());
+        graph.params.push(GraphParam {
+            name: "Tint bitmap".into(),
+            group: "Textures".into(),
+            binds: vec![(node, "image".into())],
+            default: Some(image_ref),
+        });
+        let missing_node = graph.add("bitmap", [0., 120.]);
+        graph.node_mut(missing_node).unwrap().params.insert(
+            "image".into(),
+            ParamValue::Image(Some("Missing.png".into())),
+        );
+        let output = graph.add("output", [300., 0.]);
+        assert!(graph.connect(node, output, "input"));
+        let graph = graph.to_json(&library);
+        let preview = material_painter_graph::shading::starter("Project look");
+        let preview = preview.to_json(&library);
         let texture = |blob, format| json!({"blob": blob, "format": format, "width": set_size, "height": set_size});
         let manifest = json!({
             "app": "Material Painter", "version": 3,
-            "mesh": {"name": "Panels", "vertices": 0, "indices": 1, "center": [1, 2, 3], "scale": 2},
+            "active_set": 1,
+            "graphs": [{"id": 4, "graph": graph}, {"id": 5, "graph": preview}],
+            "view": {"preview_shader": 5},
+            "mesh": {"name": "Panels", "vertices": 0, "indices": 1, "center": [1, 2, 3], "scale": 2, "tri_color": 7},
             "bake": {
                 "quality": "High", "high_poly": "high.obj", "cage": "missing.fbx",
                 "front": 0.2, "rear": 0.3, "maps": 547,
                 "fill_misses": false, "match_by_name": false,
+                "ignore_backfaces": false, "average_normals": false,
+                "id_source": "VertexColors",
                 "cage_paint": [0.8, 1, 1, 1, 1, 1],
                 "custom": [{"id": 20, "name": "Wear", "kind": "Point", "distance": 0.75, "point": [0.3, 0.6, 0.0]}],
             },
@@ -840,17 +1007,18 @@ mod tests {
                     ],
                     "map_levels": [[0.1, 0.8, 1.5], [0.2, 0.9, 0.75]],
                     "layers_bottom_to_top": [
-                        {"id": 10, "name": "Tint", "content": {"kind": "fill", "fill": {"color": [1,1,1]}},
+                        {"id": 10, "name": "Tint", "content": {"kind": "fill", "fill": {"color": [1,1,1], "graph": 4}},
                             "images": [{"name": "Tint.png", "data": 5, "source": "Auto"}]},
                         {"id": 11, "parent": 20, "name": "Strokes", "opacity": 0.75,
                             "content": {"kind":"paint", "channels": [null, texture(2, "Rg8Unorm"), null, texture(3, "Rg16Float")]},
                             "mask": {"paint": texture(4, "Rg8Unorm"), "filters": [{"kind": "invert"}]}},
-                        {"id": 20, "name": "Details", "content": {"kind":"folder", "open": false}},
+                        {"id": 20, "name": "Details", "content": {"kind":"folder", "open": false, "graph": 4}},
                     ],
                 },
                 {"name": "Panel.1013", "tris": [1, 2], "udim": 1013, "resolution": set_size,
                     "layers_bottom_to_top": [{"id": 1, "name": "Base", "content": {"kind":"paint", "channels": []},
-                        "mask": {"generator": {"kind": "Dust", "custom": [{"id": 20, "weight": 0.5}]}}}]},
+                        "mask": {"graph": 4, "paint": texture(4, "Rg8Unorm"),
+                            "generator": {"kind": "Dust", "custom": [{"id": 20, "weight": 0.5}]}}}]},
             ],
         });
         let broken = directory.join("Broken.mpp");
@@ -864,6 +1032,7 @@ mod tests {
                 [128, 32].repeat(texels),
                 bitmap.bytes,
                 [200, 128].repeat(texels),
+                vec![127, 10, 35, 25, 150, 220],
             ],
         );
         std::fs::write(&source, &bytes).unwrap();
@@ -888,12 +1057,30 @@ mod tests {
                 .contains("MPP · наборов: 2 · слоёв: 4")
         );
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
-        let (object, _, _) = import(&source, "Fallback").unwrap();
+        let Imported {
+            object,
+            report: imported,
+            ..
+        } = import(&source, "Fallback").unwrap();
+        assert_eq!(
+            imported
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("Missing.png"))
+                .count(),
+            1
+        );
+        std::fs::remove_file(directory.join("Graph.png")).unwrap();
         assert_eq!(object.geometry.positions[0], Vec3::new(1., 2., 3.));
         assert_eq!(object.geometry.faces[1].corners[0].uv, Vec2::new(2., -1.));
         assert_eq!(object.materials[1].udim().unwrap().number(), 1013);
 
         let glb = Glb::load(&assets.join(&report.imported[0])).unwrap();
+        assert_eq!(glb.json["extras"][PAINT_SET_EXTRA], 1);
+        let preview = &glb.json["extras"][PREVIEW_SHADER_EXTRA];
+        assert_eq!(preview["name"], "Project look");
+        let shader = Graph::from_json(preview, &library).unwrap();
+        assert!(material_painter_graph::shading::compile(&shader, &library).is_ok());
         let settings = super::super::model_bake_settings::read(&glb.json, &glb.path);
         assert_eq!(
             settings.quality,
@@ -904,6 +1091,36 @@ mod tests {
             (6, 9, 49)
         );
         assert!(!settings.fill_misses && !settings.match_names);
+        assert!(!settings.prefer_front_faces && !settings.average_normals);
+        assert_eq!(
+            settings.id_source,
+            super::super::model_bake_settings::IdSource::VertexColors
+        );
+        let scene = bevy::gltf::gltf::Gltf::from_slice(glb.data()).unwrap();
+        let bin = scene.blob.as_deref().unwrap();
+        let mesh = scene.meshes().next().unwrap();
+        for (primitive, rgb) in mesh.primitives().zip([[127u8, 10, 35], [25, 150, 220]]) {
+            let colors = super::super::model_document::glb::read_id_colors(
+                &scene.document,
+                &primitive,
+                bin,
+                3,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                colors,
+                vec![Some(Vec3::from_array(rgb.map(|v| f32::from(v) / 255.))); 3]
+            );
+            let reader = primitive.reader(|_| Some(bin));
+            assert!(
+                reader
+                    .read_colors(0)
+                    .unwrap()
+                    .into_rgba_f32()
+                    .all(|rgba| rgba == [1.; 4])
+            );
+        }
         assert_eq!(
             settings.high_poly.unwrap(),
             directory.join("high.obj").canonicalize().unwrap()
@@ -973,15 +1190,66 @@ mod tests {
         assert_eq!(mask.effective()[0], 95);
         let second = glb.paint_surface(&primitives[1]).unwrap().unwrap();
         assert_eq!(second.stack.layers[0].name, "Base");
-        let generator = second.stack.layers[0]
-            .mask
-            .as_ref()
-            .unwrap()
-            .generator
-            .unwrap();
+        let mask = second.stack.layers[0].mask.as_ref().unwrap();
+        let generator = mask.generator.unwrap();
+        let mask_graph = mask.graph.as_ref().unwrap();
+        assert_eq!(&mask.pixels[..4], &[255, 32, 0, 255]);
+        assert_eq!(
+            mask_graph
+                .output
+                .as_ref()
+                .unwrap()
+                .pixels()
+                .get_pixel(0, 0)
+                .0,
+            [128, 128, 128, 255]
+        );
+        assert_eq!(mask.effective()[0], 160);
+        assert_eq!(mask_graph.payload["bevy_mpp_graph_keep_cache"], true);
+        let fill = rows[0].texture_fill.as_ref().unwrap();
+        let key = "graph-images/mpp-4/1.png";
+        for (payload, images) in [
+            (fill.graph.as_ref().unwrap(), &fill.graph_images),
+            (
+                rows[2].folder_graph.as_ref().unwrap(),
+                &rows[2].folder_images,
+            ),
+            (&mask_graph.payload, &mask_graph.images),
+        ] {
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[key].pixels().get_pixel(0, 0).0, [200, 25, 50, 255]);
+            let reopened = Graph::from_json(payload, &library).unwrap();
+            assert_eq!(
+                reopened.node(node).unwrap().params["image"],
+                ParamValue::Image(Some(key.into()))
+            );
+            assert_eq!(
+                reopened.params[0].default,
+                Some(ParamValue::Image(Some(key.into())))
+            );
+            assert_eq!(
+                reopened.node(missing_node).unwrap().params["image"],
+                ParamValue::Image(None)
+            );
+        }
         assert_eq!(
             (generator.custom[0].id, generator.custom[0].weight),
             (20, 50)
+        );
+        let mut object = object;
+        object.source_node = Some(0);
+        let path = glb.path.clone();
+        let mut doc = super::super::model_document::Document::new(glb, vec![object]);
+        assert_eq!(doc.paint_set_index(), 1);
+        assert!(!doc.dirty());
+        Arc::make_mut(doc.preview_shader.as_mut().unwrap())["name"] = json!("Updated look");
+        assert!(doc.dirty());
+        doc.save().unwrap();
+        assert!(!doc.dirty());
+        let reopened = Glb::load(&path).unwrap();
+        assert_eq!(
+            reopened.json["extras"][PREVIEW_SHADER_EXTRA]["name"],
+            "Updated look"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1001,7 +1269,8 @@ mod tests {
             })
             .collect();
         let manifest = json!({
-            "app": "Material Painter", "version": 1,
+            "app": "Material Painter", "version": 1, "active_set": u64::MAX,
+            "view": {"preview_shader": 42},
             "mesh": {"vertices": 0, "indices": 1},
             "resolution": 128,
             "map_levels": [[0.05, 0.9, 0.5]],
@@ -1025,7 +1294,19 @@ mod tests {
             ),
         )
         .unwrap();
-        let (object, _, report) = import(&path, "Legacy").unwrap();
+        let Imported {
+            object,
+            report,
+            active_set,
+            ..
+        } = import(&path, "Legacy").unwrap();
+        assert_eq!(active_set, 0);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Данные графа отсутствуют"))
+        );
         assert_eq!(object.geometry.faces.len(), 1);
         assert_eq!(
             object.materials[0].source["extras"]["bevy_editor_bake_levels"],
@@ -1059,7 +1340,7 @@ mod tests {
             bevy::asset::uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&directory).unwrap();
-        let (object, _, _) = import(&source, "Native").unwrap();
+        let Imported { object, .. } = import(&source, "Native").unwrap();
         if source
             .file_stem()
             .is_some_and(|stem| stem == "folder_graph")

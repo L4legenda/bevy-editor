@@ -1,7 +1,7 @@
 //! Convert MPP's normalized bake data into Bevy Editor's document settings.
 use super::{MPP_BAKE_MAPS, Result};
 use crate::editor::{
-    model_bake_settings::{self, Quality, Settings},
+    model_bake_settings::{self, IdSource, Quality, Settings},
     model_cage_data::{Edit, Edits, Scales},
     model_document::Object,
     model_paint_data::custom::{self, Kind, Recipe},
@@ -69,20 +69,25 @@ impl Bake {
             high_poly: source_file(path, &bake["high_poly"], "high-poly", warnings),
             cage: source_file(path, &bake["cage"], "cage", warnings),
             map_bits,
+            id_source: match bake["id_source"].as_str() {
+                Some("Materials") => IdSource::Materials,
+                Some("VertexColors") => IdSource::VertexColors,
+                _ => IdSource::MeshParts,
+            },
             front,
             rear,
             match_names: bake["match_by_name"].as_bool().unwrap_or(true),
             fill_misses: bake["fill_misses"].as_bool().unwrap_or(true),
+            prefer_front_faces: bake["ignore_backfaces"].as_bool().unwrap_or(true),
+            average_normals: bake["average_normals"].as_bool().unwrap_or(true),
             ..Settings::default()
         };
-        if bake["average_normals"].as_bool() == Some(false)
-            || bake["ignore_backfaces"].as_bool() == Some(false)
-            || bake["id_source"]
+        if bake["id_source"]
                 .as_str()
-                .is_some_and(|id| id != "MeshParts")
+                .is_some_and(|id| !matches!(id, "MeshParts" | "Materials" | "VertexColors"))
         {
             warnings.push(
-                "Для направления лучей и источника ID используются настройки Bevy Editor".into(),
+                "Для источника ID используются настройки Bevy Editor".into(),
             );
         }
         let unit = f64::from((extent.max_element() * 0.5).max(1e-6));

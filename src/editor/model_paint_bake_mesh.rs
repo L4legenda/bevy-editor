@@ -1,5 +1,5 @@
 //! UV baking. Distances are relative to the visible mesh bounds.
-use super::{BakeMap, MapSelection, Progress, ProjectionSettings, Sampling};
+use super::{BakeMap, IdSource, MapSelection, Progress, ProjectionSettings, Sampling, material_id_color};
 use crate::editor::{
     model_document::Object,
     model_paint_data::custom::Plane,
@@ -8,7 +8,7 @@ use crate::editor::{
     ui::model_viewer::editing::input::{Bvh, PickTriangle},
 };
 use bevy::prelude::*;
-use std::{collections::VecDeque, sync::{Arc, OnceLock, atomic::Ordering}};
+use std::{collections::{BTreeSet, HashMap, VecDeque}, sync::{Arc, OnceLock, atomic::Ordering}};
 
 #[path = "model_paint_bake_aa.rs"]
 mod aa;
@@ -446,15 +446,20 @@ fn projection_directions(
     object: &Object,
     positions: &[Vec3],
     generated: bool,
+    authored: Option<&[Vec<Vec3>]>,
     progress: &Progress,
 ) -> Result<Vec<Vec3>, String> {
     let mesh = &object.geometry;
     let to_world = world_normal(object.transform);
     let mut directions = vec![Vec3::ZERO; positions.len()];
-    for face in &mesh.faces {
+    for (index, face) in mesh.faces.iter().enumerate() {
         progress.check()?;
         let world = to_world(mesh.normal(face));
-        if generated {
+        if let Some(normals) = authored {
+            for (corner, &normal) in face.corners.iter().zip(&normals[index]) {
+                directions[corner.vertex] += normal.try_normalize().unwrap_or(world);
+            }
+        } else if generated {
             for triangle in mesh.triangles(face) {
                 let indices = triangle.map(|i| face.corners[i].vertex);
                 let points = indices.map(|vertex| positions[vertex]);
@@ -479,7 +484,7 @@ fn projection_directions(
             }
         }
     }
-    if generated {
+    if generated && authored.is_none() {
         let key = |p: Vec3| p.to_array().map(|v| if v == 0. { 0 } else { v.to_bits() });
         let mut sums = std::collections::HashMap::<[u32; 3], Vec3>::new();
         for (i, (&point, &direction)) in positions.iter().zip(&directions).enumerate() {
@@ -493,6 +498,20 @@ fn projection_directions(
         }
     }
     Ok(directions)
+}
+
+fn triangle_ray_directions(
+    vertices: [usize; 3],
+    normals: [Vec3; 3],
+    averaged: Option<&[Vec3]>,
+    geometric: Vec3,
+) -> [Vec3; 3] {
+    let directions = averaged.map_or(normals, |values| {
+        std::array::from_fn(|i| values.get(vertices[i]).copied().unwrap_or(normals[i]))
+    });
+    std::array::from_fn(|i| {
+        directions[i].try_normalize().or_else(|| normals[i].try_normalize()).unwrap_or(geometric)
+    })
 }
 
 fn projection_cage(
@@ -533,6 +552,37 @@ fn byte(value: f32) -> u8 {
 
 fn rgb(vector: Vec3) -> [u8; 3] {
     vector.to_array().map(byte)
+}
+
+fn triangle_id_color(colors: [Option<Vec3>; 3]) -> Option<[u8; 3]> {
+    colors.into_iter().sum::<Option<Vec3>>().map(|sum| rgb(sum / 3.))
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum MaterialKey {
+    Shared(u64, Option<u32>),
+    Local(usize, usize),
+}
+
+fn low_material_color(objects: &[Object], target: usize, slot: usize) -> Option<[u8; 3]> {
+    let mut palette = HashMap::new();
+    let mut selected = None;
+    for object in objects.iter().filter(|object| !object.hidden) {
+        let used: BTreeSet<_> = object.geometry.faces.iter().map(|face| face.material).collect();
+        for index in used {
+            let key = object.materials.get(index)
+                .and_then(|slot| slot.source["material"].as_u64().map(|id| {
+                    MaterialKey::Shared(id, slot.udim().map(|tile| tile.number()))
+                }))
+                .unwrap_or(MaterialKey::Local(object.id, index));
+            let next = palette.len() as u32;
+            let id = *palette.entry(key).or_insert(next);
+            if (object.id, index) == (target, slot) {
+                selected = Some(id);
+            }
+        }
+    }
+    selected.filter(|_| palette.len() > 1).map(material_id_color)
 }
 
 fn two_texel_width(points: [Vec3; 3], uv: [Vec2; 3]) -> f32 {
@@ -754,6 +804,9 @@ impl ProjectionPass<'_> {
             } else {
                 self.rays.sample(surface, pixel, |_| true)
             };
+            if let Some(color) = self.projector.id_color(hit.triangle) {
+                texel[15..18].copy_from_slice(&color);
+            }
             if batch.is_none() {
                 for (recipe, plane) in self.custom.iter().zip(&mut maps.custom) {
                     Arc::get_mut(&mut plane.values).unwrap()[pixel] =
@@ -936,7 +989,13 @@ fn prepare_scene(
         .map(|&point| transform.transform_point(point))
         .collect();
     let projection_normals = if projection.is_some() {
-        projection_directions(object, &positions, settings.cage.is_none(), progress)?
+        projection_directions(
+            object,
+            &positions,
+            settings.cage.is_none(),
+            (!settings.average_normals).then_some(corner_normals.as_slice()),
+            progress,
+        )?
     } else {
         Vec::new()
     };
@@ -1008,6 +1067,11 @@ pub(super) fn bake_on_device(
         low_scene, projection, parts, positions, projection_normals, cage, cage_fit,
     } = prepare_scene(&objects, object, settings, flow, progress)?;
     let sampling = settings.quality.sampling();
+    let material_color = if projection.is_none() && settings.id_source == IdSource::Materials {
+        low_material_color(&objects, target, slot)
+    } else {
+        None
+    };
     let low_rays = low_scene.as_ref().map(|scene| Rays {
         scene,
         scale,
@@ -1127,20 +1191,23 @@ pub(super) fn bake_on_device(
         let polygon = &mesh.faces[face];
         let geo = geometric[face];
         let corners = triangle.corners.map(|i| &polygon.corners[i]);
+        let id_color = match settings.id_source {
+            IdSource::Materials => material_color,
+            IdSource::VertexColors if projection.is_none() => triangle_id_color(corners.map(|corner| corner.id_color)),
+            _ => None,
+        };
         let uv = triangle.uv;
         let points = corners.map(|corner| positions[corner.vertex]);
         let cage_triangle = cage
             .as_ref()
             .map(|cage| cage.triangle(corners.map(|corner| corner.vertex)));
         let normals = triangle.corners.map(|i| corner_normals[face][i]);
-        let directions = corners.map(|corner| {
-            projection_normals
-                .get(corner.vertex)
-                .copied()
-                .unwrap_or_default()
-                .try_normalize()
-                .unwrap_or(geo)
-        });
+        let directions = triangle_ray_directions(
+            corners.map(|corner| corner.vertex),
+            normals,
+            settings.average_normals.then_some(projection_normals.as_slice()),
+            geo,
+        );
         let axes = projection
             .as_ref()
             .and_then(|_| project::tangent_axes(points, uv));
@@ -1246,6 +1313,9 @@ pub(super) fn bake_on_device(
             } else {
                 texel = neutral_texel(normal);
             }
+            if let Some(color) = id_color {
+                texel[15..18].copy_from_slice(&color);
+            }
             texel[12..15].copy_from_slice(&rgb(bounds.normalize(p)));
             maps.values[pixel] = texel;
             if let Some(batch) = &mut batch && batch.full() {
@@ -1332,6 +1402,178 @@ mod tests {
             materials: Vec::new(),
             hidden: false,
         }
+    }
+
+    #[test]
+    fn vertex_ids_use_triangle_rgb_and_fall_back_for_uncolored_meshes() {
+        let mut object = quad(0, 0.);
+        let settings = ProjectionSettings { id_source: IdSource::VertexColors, ..default() };
+        let progress = Progress::default();
+        let bake = |object| bake_with_projection(vec![object], 0, 0, 16, &settings, &progress).unwrap();
+        let original = bake(object.clone());
+        let color = Vec3::new(0.25, 0.5, 0.75);
+        for corner in &mut object.geometry.faces[0].corners {
+            corner.id_color = Some(color);
+        }
+        let painted = bake(object);
+        let center = (8 * 16 + 8) * 4;
+        assert_eq!(&painted.rgba(BakeMap::PartId)[center..center + 3], &[64, 128, 191]);
+        assert_ne!(painted.rgba(BakeMap::PartId), original.rgba(BakeMap::PartId));
+        assert_eq!(painted.rgba(BakeMap::PartRandom), original.rgba(BakeMap::PartRandom));
+        assert_eq!(triangle_id_color([Some(Vec3::X), Some(Vec3::Y), Some(Vec3::Z)]), Some([85; 3]));
+    }
+
+    #[test]
+    #[ignore = "requires Bevy's native GPU device"]
+    fn gpu_projected_id_uses_glb_colors_without_changing_visible_vertex_colors() {
+        use crate::editor::model_document::glb::Glb;
+        let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+        let device = RayDevice {
+            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
+            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
+        };
+        let path = std::env::temp_dir().join(format!("bevy-bake-vertex-id-{}.glb", bevy::asset::uuid::Uuid::new_v4()));
+        let piece = |id, color| {
+            let mut object = quad(id, 0.02);
+            for position in &mut object.geometry.positions {
+                position.x = (position.x + id as f32) * 0.5;
+            }
+            for corner in &mut object.geometry.faces[0].corners {
+                corner.id_color = Some(color);
+            }
+            object
+        };
+        std::fs::write(&path, Glb::new_asset(&[piece(0, Vec3::X), piece(1, Vec3::Z)]).unwrap()).unwrap();
+        let settings = ProjectionSettings {
+            path: Some(path.clone()),
+            id_source: IdSource::VertexColors,
+            match_names: false,
+            ..default()
+        };
+        let progress = Progress::default();
+        let objects = vec![quad(0, 0.)];
+        let cpu = bake_with_projection(objects.clone(), 0, 0, 16, &settings, &progress).unwrap();
+        let gpu = bake_on_device(objects, 0, 0, 16, &settings, &progress, Some(&device)).unwrap();
+        assert!(gpu.gpu_projection);
+        let ids = cpu.rgba(BakeMap::PartId);
+        assert_eq!(ids, gpu.rgba(BakeMap::PartId));
+        for (column, expected) in [(3, [255, 0, 0]), (12, [0, 0, 255])] {
+            let offset = (8 * 16 + column) * 4;
+            assert_eq!(&ids[offset..offset + 3], &expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn material_ids_use_low_poly_slots_without_changing_the_mesh_part() {
+        let mut object = quad(0, 0.);
+        let mut other = object.geometry.faces[0].clone();
+        other.material = 1;
+        object.geometry.faces.push(other);
+        let settings = ProjectionSettings { id_source: IdSource::Materials, ..Default::default() };
+        let progress = Progress::default();
+        let first = bake_with_projection(vec![object.clone()], 0, 0, 16, &settings, &progress).unwrap();
+        let second = bake_with_projection(vec![object], 0, 1, 16, &settings, &progress).unwrap();
+        let center = (8 * 16 + 8) * 4;
+        assert_eq!(&first.rgba(BakeMap::PartId)[center..center + 3], &material_id_color(0));
+        assert_eq!(&second.rgba(BakeMap::PartId)[center..center + 3], &material_id_color(1));
+        assert_eq!(first.rgba(BakeMap::PartRandom), second.rgba(BakeMap::PartRandom));
+    }
+
+    #[test]
+    #[ignore = "requires Bevy's native GPU device"]
+    fn gpu_projected_id_map_uses_high_poly_material_assignments() {
+        let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+        let device = RayDevice {
+            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
+            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "bevy-bake-material-ids-{}.obj",
+            bevy::asset::uuid::Uuid::new_v4(),
+        ));
+        std::fs::write(&path, concat!(
+            "o Source\n",
+            "v 0 0.02 0\nv 0.5 0.02 0\nv 1 0.02 0\n",
+            "v 0 0.02 -1\nv 0.5 0.02 -1\nv 1 0.02 -1\n",
+            "usemtl Copper\nf 1 2 5 4\nusemtl Rubber\nf 2 3 6 5\n",
+        )).unwrap();
+        let settings = ProjectionSettings {
+            path: Some(path.clone()),
+            match_names: false,
+            id_source: IdSource::Materials,
+            ..Default::default()
+        };
+        let progress = Progress::default();
+        let low = vec![quad(0, 0.)];
+        let cpu = bake_with_projection(low.clone(), 0, 0, 16, &settings, &progress).unwrap();
+        let gpu = bake_on_device(low.clone(), 0, 0, 16, &settings, &progress, Some(&device)).unwrap();
+        assert!(gpu.gpu_projection);
+        let ids = cpu.rgba(BakeMap::PartId);
+        assert_eq!(ids, gpu.rgba(BakeMap::PartId));
+        for (column, material) in [(3, 0), (12, 1)] {
+            let offset = (8 * 16 + column) * 4;
+            assert_eq!(&ids[offset..offset + 3], &material_id_color(material));
+        }
+        let parts = bake_with_projection(low, 0, 0, 16, &ProjectionSettings {
+            id_source: IdSource::MeshParts,
+            ..settings
+        }, &progress).unwrap();
+        assert_ne!(parts.rgba(BakeMap::PartId), ids);
+        assert_eq!(parts.rgba(BakeMap::PartRandom), cpu.rgba(BakeMap::PartRandom));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires Bevy's native GPU device"]
+    fn gpu_baked_projection_uses_face_priority_and_authored_directions() {
+        let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+        let device = RayDevice {
+            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
+            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "bevy-bake-ray-options-{}.obj",
+            bevy::asset::uuid::Uuid::new_v4(),
+        ));
+        std::fs::write(&path, concat!(
+            "o Stacked\n",
+            "v 0 0 0\nv 1 0 0\nv 1 0 -1\nv 0 0 -1\n",
+            "v 0 0.03 0\nv 1 0.03 0\nv 1 0.03 -1\nv 0 0.03 -1\n",
+            "f 1 2 3 4\nf 8 7 6 5\n",
+        )).unwrap();
+        let mut low = quad(0, 0.);
+        for corner in &mut low.geometry.faces[0].corners {
+            corner.source_normal = Some(Vec3::X);
+        }
+        let settings = ProjectionSettings {
+            path: Some(path.clone()),
+            match_names: false,
+            fill_misses: false,
+            ..Default::default()
+        };
+        let progress = Progress::default();
+        let compare = |settings: &ProjectionSettings| {
+            let cpu = bake_with_projection(vec![low.clone()], 0, 0, 16, settings, &progress).unwrap();
+            let gpu = bake_on_device(vec![low.clone()], 0, 0, 16, settings, &progress, Some(&device)).unwrap();
+            let center = (8 * 16 + 8) * 4;
+            let cpu_height = cpu.rgba(BakeMap::ProjectedHeight)[center];
+            let gpu_height = gpu.rgba(BakeMap::ProjectedHeight)[center];
+            assert!(gpu.gpu_projection);
+            assert_eq!(cpu.hits, gpu.hits);
+            assert!(cpu_height.abs_diff(gpu_height) <= 1);
+            (cpu.hits, cpu_height)
+        };
+        let (hits, floor) = compare(&settings);
+        assert!(hits > 0);
+        assert!(floor.abs_diff(128) <= 1);
+        let (_, lid) = compare(&ProjectionSettings { prefer_front_faces: false, ..settings.clone() });
+        assert!(lid > floor + 20);
+        let unaveraged = ProjectionSettings { average_normals: false, ..settings };
+        assert_eq!(compare(&unaveraged).0, 0);
+        let probe = probe::build(vec![low], 0, 0, &unaveraged, &progress).unwrap();
+        assert!(probe.summary().contains("промахи 100%"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

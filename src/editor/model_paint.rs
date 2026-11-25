@@ -35,7 +35,15 @@ mod materials;
 use materials::{MATERIALS, MaterialType};
 #[path = "model_paint_presets.rs"]
 pub(super) mod presets;
-pub(in crate::editor) use presets::{project_fill, project_graph, project_mask};
+pub(in crate::editor) use presets::{ProjectGraph, project_fill, project_graph, project_mask};
+
+pub(in crate::editor) fn project_preview_shader(
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let graph = material_graph::read(payload)?;
+    material_graph::file::validate_shader(&graph)?;
+    Ok(material_graph::encode(&graph))
+}
 #[path = "model_paint_graph.rs"]
 mod material_graph;
 #[path = "model_paint_folder_graph.rs"]
@@ -428,8 +436,11 @@ pub(in crate::editor) enum PaintAction {
     BakeResetCagePaint,
     BakeMatchNames,
     BakeFillMisses,
+    BakePreferFrontFaces,
+    BakeAverageNormals,
     BakeRange { front: bool, percent: u8 },
     BakeQuality(bake::Quality),
+    BakeIdSource(bake::IdSource),
     BakeMapOptions,
     BakeAdjustLevels(bake::BakeMap, bake::levels::Field, i8),
     BakeResetLevels(bake::BakeMap),
@@ -617,8 +628,11 @@ impl PaintAction {
             Self::BakeResetCagePaint => "Сбросить ручную правку оболочки текущего объекта.",
             Self::BakeMatchNames => "Сопоставить объекты по именам с учётом окончаний _low и _high.",
             Self::BakeFillMisses => "Заполнить промахи данными ближайшей поверхности high-poly в пределах зоны поиска.",
+            Self::BakePreferFrontFaces => "Сначала искать лицевые стороны. Если их нет на луче, учитывать обратные.",
+            Self::BakeAverageNormals => "Усреднять направления лучей на совпадающих вершинах и UV-швах.",
             Self::BakeRange { .. } => "Дальность лучей в процентах от диагонали видимой модели.",
             Self::BakeQuality(quality) => quality.hint(),
+            Self::BakeIdSource(_) => "Задать источник цветов карты ID.",
             Self::BakeMapOptions => "Выбрать дополнительные карты для следующего запекания.",
             Self::BakeToggleMap(_) => "Включить или пропустить карту при следующем запекании.",
             Self::BakeSelectAllMaps(true) => "Запечь все встроенные карты.",
@@ -1198,7 +1212,8 @@ impl Session {
             PaintAction::BakeClearCage => return self.bake_projection.cage.is_some() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeAutoFitCage => return self.bake_projection.path.is_some() && self.bake_projection.cage.is_none() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeInspectCage => return self.bake_projection.path.is_some(),
-            PaintAction::BakeQuality(_) | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_) => {
+            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_)
+            | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_) => {
                 return !self.bake_busy;
             }
             PaintAction::BakeAdjustLevels(..) | PaintAction::BakeResetLevels(_) => return self.bake_ready,
@@ -1217,7 +1232,8 @@ impl Session {
                 return self.bake_projection.path.is_some() && self.bake_projection.cage.is_none() && !self.bake_busy && !self.bake_picking;
             }
             PaintAction::BakeResetCagePaint => return !self.bake_busy && self.binding.is_some_and(|(object, _)| self.cage_edits.contains_key(&object)),
-            PaintAction::BakeClearHigh | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakeRange { .. } => {
+            PaintAction::BakeClearHigh | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses
+            | PaintAction::BakePreferFrontFaces | PaintAction::BakeAverageNormals | PaintAction::BakeRange { .. } => {
                 return self.bake_projection.path.is_some() && !self.bake_busy && !self.bake_picking;
             }
             PaintAction::BakePreview(map) => return map.is_none_or(|map| {
@@ -2212,8 +2228,10 @@ impl Session {
             PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
             | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
             | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
-            | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => {}
-            PaintAction::BakeQuality(_) | PaintAction::BakeMapOptions | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
+            | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
+            | PaintAction::BakeAverageNormals | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => {}
+            PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions
+            | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
             | PaintAction::BakeAdjustLevels(..) | PaintAction::BakeResetLevels(_)
             | PaintAction::BakeFixTool(_) | PaintAction::BakeClearFix(_) | PaintAction::BakeFixValue(_) => {}
             PaintAction::BakeCustomAdd(_) | PaintAction::BakeCustomRemove(_) | PaintAction::BakeCustomAdjust(..)
@@ -2555,7 +2573,7 @@ impl Session {
         self.shader_import = None;
         match result {
             Ok(Some(graph)) => {
-                let count = shader_preview::presets().len();
+                let count = shader_preview::presets().len() + 1;
                 let id = self.shader_graphs.last_key_value()
                     .map_or(count, |(&id, _)| count.max(id + 1));
                 self.shader_graphs.insert(id, shader_preview::Document::new(&graph));
@@ -2570,6 +2588,24 @@ impl Session {
             }
         }
         self.revision += 1;
+    }
+
+    fn sync_project_shader(&mut self, preview: Option<&Arc<serde_json::Value>>) {
+        let id = shader_preview::presets().len();
+        if let Some(payload) = preview {
+            let current = self.shader_graphs.get(&id);
+            if current.is_none_or(|shader| !Arc::ptr_eq(shader.data().0, payload)) {
+                self.shader_graphs.insert(id, shader_preview::Document::from_payload(payload.clone()));
+                self.edit(PaintAction::PreviewShader(Some(id)));
+                self.revision += 1;
+            }
+        } else if self.shader_graphs.remove(&id).is_some() {
+            if self.preview_shader == Some(id) {
+                self.edit(PaintAction::PreviewShader(None));
+                self.shader_canvas = false;
+            }
+            self.revision += 1;
+        }
     }
 
     fn viewport_layout(&self, draft_preview: bool) -> View {
@@ -2730,8 +2766,11 @@ impl Session {
             PaintAction::BakePreview(map) => self.bake_view == map,
             PaintAction::BakeMatchNames => self.bake_projection.match_names,
             PaintAction::BakeFillMisses => self.bake_projection.fill_misses,
+            PaintAction::BakePreferFrontFaces => self.bake_projection.prefer_front_faces,
+            PaintAction::BakeAverageNormals => self.bake_projection.average_normals,
             PaintAction::BakeAutoFitCage => self.bake_projection.auto_fit,
             PaintAction::BakeQuality(quality) => self.bake_projection.quality == quality,
+            PaintAction::BakeIdSource(source) => self.bake_projection.id_source == source,
             PaintAction::BakeMapOptions => self.bake_map_options,
             PaintAction::BakeToggleMap(map) => self.bake_projection.maps.contains(map),
             PaintAction::BakeInspectCage => self.bake_inspect_cage,
@@ -3159,18 +3198,22 @@ pub(super) fn actions(
     let Some(index) = editor.viewing_model else {
         return;
     };
-    if editor.pending.is_some()
-        || editor.viewing_image.is_some()
-        || !editing
-            .documents
-            .get(&index)
-            .is_some_and(|doc| doc.mode == Mode::Paint)
-    {
+    if editor.pending.is_some() || editor.viewing_image.is_some() {
         return;
     }
+    let Some(doc) = editing.documents.get(&index).filter(|doc| doc.mode == Mode::Paint) else {
+        return;
+    };
     paint.activate(index, recovery.settings().undo_steps);
     let paint = &mut *paint;
     let session = paint.sessions.get_mut(&index).unwrap();
+    session.sync_project_shader(doc.preview_shader.as_ref());
+    let saved_set = doc.paint_set_index();
+    if session.set != saved_set {
+        session.set = saved_set;
+        session.set_menu = false;
+        session.revision += 1;
+    }
     let stored_settings = export_preferences.settings();
     if session.export_settings != stored_settings {
         if session.export_settings.template != stored_settings.template {
@@ -3227,6 +3270,9 @@ pub(super) fn actions(
                     if !deferred {
                         doc.select_object(id, false);
                         session.edit(PaintAction::Set(set));
+                        if session.set == set {
+                            doc.paint_set = Some(set);
+                        }
                     }
                     paint.shelf_drop = Some((index, key, material));
                     continue;
@@ -3329,7 +3375,8 @@ pub(super) fn actions(
                 if !session.available(action) {
                     continue;
                 }
-                let shader = session.shader_graphs.get_mut(&session.preview_shader.unwrap()).unwrap();
+                let id = session.preview_shader.unwrap();
+                let shader = session.shader_graphs.get_mut(&id).unwrap();
                 match action {
                     PaintAction::Undo | PaintAction::Redo => {
                         shader.restore(action == PaintAction::Redo);
@@ -3365,6 +3412,15 @@ pub(super) fn actions(
                             editor.status = format!("Не удалось изменить граф · {error}");
                         }
                     }
+                }
+                if id == shader_preview::presets().len()
+                    && let Some(doc) = editing.documents.get_mut(&index)
+                    && let Some(saved_graph) = &mut doc.preview_shader
+                    && !Arc::ptr_eq(saved_graph, shader.data().0)
+                {
+                    *saved_graph = shader.data().0.clone();
+                    doc.recovery_edits += 1;
+                    doc.ui_revision += 1;
                 }
                 session.revision += 1;
                 continue;
@@ -3662,11 +3718,16 @@ pub(super) fn actions(
                                     };
                                     match edit.apply(&mut graph, label.as_deref()) {
                                         Ok(node) => {
-                                            let payload = material_graph::encode(&graph);
+                                            let rebuilds = edit.rebuilds();
+                                            let payload = if rebuilds {
+                                                material_graph::encode(&graph)
+                                            } else {
+                                                material_graph::encode_without_rebuild(&graph, previous_payload)
+                                            };
                                             if previous_payload.as_ref() == &payload {
                                                 continue;
                                             }
-                                            if !edit.rebuilds() {
+                                            if !rebuilds {
                                                 session.checkpoint();
                                                 let layer = &mut session.stack.layers[session.stack.selected];
                                                 if mask {
@@ -3827,8 +3888,10 @@ pub(super) fn actions(
                 PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
                 | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
                 | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
-                | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => continue,
-                PaintAction::BakeQuality(_) | PaintAction::BakeMapOptions | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
+                | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
+                | PaintAction::BakeAverageNormals | PaintAction::BakeInspectCage | PaintAction::BakeRange { .. } => continue,
+                PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeMapOptions
+                | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
                 | PaintAction::BakeAdjustLevels(..) | PaintAction::BakeResetLevels(_)
                 | PaintAction::BakeFixTool(_) | PaintAction::BakeClearFix(_) | PaintAction::BakeFixValue(_) => continue,
                 PaintAction::BakeCustomAdd(_) | PaintAction::BakeCustomRemove(_) | PaintAction::BakeCustomAdjust(..)
@@ -3858,13 +3921,10 @@ pub(super) fn actions(
             }
             if let PaintAction::Set(set) = action {
                 if let Some(doc) = editing.documents.get_mut(&index) {
-                    let object = doc
-                        .objects
-                        .iter()
-                        .flat_map(|object| (0..object.materials.len()).map(move |slot| (object.id, slot)))
-                        .nth(set);
+                    let object = doc.paint_target(set).map(|(object, slot)| (object.id, slot));
                     if let Some((id, slot)) = object {
                         doc.select_object(id, false);
+                        doc.paint_set = Some(set);
                         session.set_appearance.flash((id, slot), time.elapsed_secs_f64());
                     } else {
                         continue;

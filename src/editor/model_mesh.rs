@@ -41,6 +41,8 @@ pub(super) struct Corner {
     pub uv: Vec2,
     pub uv1: Vec2,
     pub color: Vec4,
+    // Source for ID baking. MPP can supply this without a visible vertex color.
+    pub id_color: Option<Vec3>,
     pub source_normal: Option<Vec3>,
 }
 impl Corner {
@@ -50,6 +52,7 @@ impl Corner {
             uv: Vec2::ZERO,
             uv1: Vec2::ZERO,
             color: Vec4::ONE,
+            id_color: None,
             source_normal: None,
         }
     }
@@ -59,6 +62,7 @@ impl Corner {
             uv: self.uv.lerp(other.uv, t),
             uv1: self.uv1.lerp(other.uv1, t),
             color: self.color.lerp(other.color, t),
+            id_color: self.id_color.zip(other.id_color).map(|(a, b)| a.lerp(b, t)),
             source_normal: None,
         }
     }
@@ -94,6 +98,7 @@ pub(super) struct Buffers {
     pub uv: Vec<[f32; 2]>,
     pub uv1: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
+    pub id_colors: Vec<Option<Vec3>>,
     pub indices: Vec<u32>,
     pub polygons: Vec<Vec<u32>>,
 }
@@ -343,6 +348,7 @@ impl Geometry {
                     || !c.uv.is_finite()
                     || !c.uv1.is_finite()
                     || !c.color.is_finite()
+                    || c.id_color.is_some_and(|color| !color.is_finite())
                     || c.source_normal.is_some_and(|n| !n.is_finite())
             }) {
                 return Err("Повреждённая топология или UV".into());
@@ -1015,6 +1021,8 @@ impl Geometry {
                     uv: corners.iter().map(|c| c.uv).sum::<Vec2>() / count,
                     uv1: corners.iter().map(|c| c.uv1).sum::<Vec2>() / count,
                     color: corners.iter().map(|c| c.color).sum::<Vec4>() / count,
+                    id_color: corners.iter().map(|c| c.id_color).sum::<Option<Vec3>>()
+                        .map(|color| color / count),
                 };
                 for j in 0..corners.len() {
                     polygons.push(vec![
@@ -1112,7 +1120,7 @@ impl Geometry {
                 || [edge.0, edge.1].into_iter().any(|v| {
                     let a = fa.corners.iter().find(|c| c.vertex == v).unwrap();
                     let b = fb.corners.iter().find(|c| c.vertex == v).unwrap();
-                    a.uv != b.uv || a.uv1 != b.uv1 || a.color != b.color
+                    a.uv != b.uv || a.uv1 != b.uv1 || a.color != b.color || a.id_color != b.id_color
                 })
                 || (quads_only
                     && (fa.corners.len() != 3
@@ -1709,7 +1717,7 @@ impl Geometry {
     pub fn buffers(&self) -> BTreeMap<usize, Buffers> {
         let normals = self.smooth_normals();
         let mut output: BTreeMap<usize, Buffers> = BTreeMap::new();
-        let mut maps: BTreeMap<usize, HashMap<[u32; 12], u32>> = BTreeMap::new();
+        let mut maps: BTreeMap<usize, HashMap<[u32; 16], u32>> = BTreeMap::new();
         for f in &self.faces {
             let normal = self.normal(f).normalize_or_zero();
             let mut polygon = vec![0; f.corners.len()];
@@ -1717,6 +1725,7 @@ impl Geometry {
                 for i in triangle {
                     let c = &f.corners[i];
                     let n = Self::corner_normal(f, c, normal, &normals);
+                    let [r, g, b] = c.id_color.unwrap_or_default().to_array().map(f32::to_bits);
                     let key = [
                         c.vertex as u32,
                         n.x.to_bits(),
@@ -1730,6 +1739,7 @@ impl Geometry {
                         c.color.y.to_bits(),
                         c.color.z.to_bits(),
                         c.color.w.to_bits(),
+                        r, g, b, u32::from(c.id_color.is_some()),
                     ];
                     let buffers = output.entry(f.material).or_default();
                     let index = *maps
@@ -1743,6 +1753,12 @@ impl Geometry {
                             buffers.uv.push(c.uv.to_array());
                             buffers.uv1.push(c.uv1.to_array());
                             buffers.colors.push(c.color.to_array());
+                            if buffers.id_colors.is_empty() && c.id_color.is_some() {
+                                buffers.id_colors.resize(index as usize, None);
+                            }
+                            if !buffers.id_colors.is_empty() || c.id_color.is_some() {
+                                buffers.id_colors.push(c.id_color);
+                            }
                             index
                         });
                     buffers.indices.push(index);

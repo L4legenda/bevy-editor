@@ -1,5 +1,5 @@
 //! Persistent, content-addressed cache of packed bake maps and their reports.
-use super::{Progress, ProjectionSettings, mesh, mesh::Maps};
+use super::{IdSource, Progress, ProjectionSettings, mesh, mesh::Maps};
 use crate::editor::{model_document::Object, model_paint_data::custom};
 use lz4_flex::frame::{FrameDecoder, FrameEncoder, FrameInfo};
 use bevy::log::warn;
@@ -152,6 +152,7 @@ fn key(
     hash.number(size);
     hash.number(settings.quality as u8);
     hash.number(settings.maps.bits());
+    hash.number(settings.id_source as u8);
     let mut recipes = settings.custom.as_ref().clone();
     for recipe in &mut recipes {
         recipe.name.clear();
@@ -166,6 +167,8 @@ fn key(
             u8::from(settings.auto_fit),
             u8::from(settings.match_names),
             u8::from(settings.fill_misses),
+            u8::from(settings.prefer_front_faces),
+            u8::from(settings.average_normals),
             settings.front,
             settings.rear,
         ]);
@@ -191,6 +194,11 @@ fn key(
         hash.number(object.materials.len() as u64);
         for slot in 0..object.materials.len() {
             hash.floats(object.uv_offset(slot).to_array());
+            if settings.id_source == IdSource::Materials && settings.path.is_none() {
+                let material = object.materials[slot].source["material"].as_u64();
+                hash.number(u8::from(material.is_some()));
+                hash.number(material.unwrap_or(0));
+            }
         }
         let geometry = &object.geometry;
         hash.number(geometry.positions.len() as u64);
@@ -212,6 +220,12 @@ fn key(
                 hash.number(u8::from(corner.source_normal.is_some()));
                 if let Some(normal) = corner.source_normal {
                     hash.floats(normal.to_array());
+                }
+                if settings.id_source == IdSource::VertexColors && settings.path.is_none() {
+                    hash.number(u8::from(corner.id_color.is_some()));
+                    if let Some(rgb) = corner.id_color {
+                        hash.floats(rgb.to_array());
+                    }
                 }
             }
         }

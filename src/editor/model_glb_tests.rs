@@ -79,7 +79,7 @@ fn imported_bake_defaults_are_clean_and_explicit_factory_settings_survive_profil
 
 #[test]
 fn bake_settings_survive_glb_reopen_move_and_document_undo() {
-    use crate::editor::model_bake_settings::{self as bake, Quality, Settings};
+    use crate::editor::model_bake_settings::{self as bake, IdSource, Quality, Settings};
 
     let (source, object) = fixture();
     let model = source.path.clone();
@@ -93,10 +93,13 @@ fn bake_settings_survive_glb_reopen_move_and_document_undo() {
         cage: Some(external_cage.clone()),
         quality: Quality::Ultra,
         map_bits: 9,
+        id_source: IdSource::Materials,
         front: 12,
         rear: 37,
         match_names: false,
         fill_misses: false,
+        prefer_front_faces: false,
+        average_normals: false,
         auto_fit: true,
     };
     doc.bake_settings = settings.clone();
@@ -847,12 +850,14 @@ fn import_geometry(source: &Glb) -> Result<Geometry, String> {
         if let Some(indices) = reader.read_indices() {
             mesh.insert_indices(bevy::mesh::Indices::U32(indices.into_u32().collect()));
         }
+        let id_colors = read_id_colors(&parsed.document, &primitive, blob, mesh.count_vertices())?;
         from_mesh_with_topology(
             &mesh,
             &mut geometry,
             primitive.index(),
             (topology["version"].as_u64() == Some(1))
                 .then(|| &topology["primitives"][primitive.index()]),
+            id_colors.as_deref(),
         )?;
     }
     if topology["version"].as_u64() == Some(1) {
@@ -860,6 +865,29 @@ fn import_geometry(source: &Glb) -> Result<Geometry, String> {
     }
     geometry.validate()?;
     Ok(geometry)
+}
+
+#[test]
+fn id_colors_survive_glb_reopen_and_subdivision_without_tinting_vertices() {
+    let (source, mut object) = fixture();
+    object.source_node = None;
+    let color = Vec3::new(0.21, 0.40, 0.79);
+    for corner in &mut object.geometry.faces[0].corners {
+        corner.id_color = Some(color);
+    }
+    fs::write(&source.path, Glb::new_asset(&[object]).unwrap()).unwrap();
+    let reopened = Glb::load(&source.path).unwrap();
+    let mut mesh = import_geometry(&reopened).unwrap();
+    let mut selection = crate::editor::model_mesh::Selection::default();
+    selection.kind = crate::editor::model_mesh::Element::Face;
+    selection.faces.insert(0);
+    mesh.subdivide(&mut selection).unwrap();
+    assert!(mesh.faces.len() > 1);
+    for corner in mesh.faces.iter().flat_map(|face| &face.corners) {
+        assert_eq!(corner.color, Vec4::ONE);
+        assert!(corner.id_color.unwrap().abs_diff_eq(color, f32::EPSILON));
+    }
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
 
 #[test]

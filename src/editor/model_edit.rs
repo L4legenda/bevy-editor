@@ -229,6 +229,7 @@ impl State {
                 |state| doc.paint_pending || state.objects != doc.saved
                     || state.custom_bakes != doc.saved_custom_bakes
                     || state.bake_settings != doc.saved_bake_settings
+                    || doc.preview_shader_dirty()
                     || (!Arc::ptr_eq(&state.cage_edits, &doc.saved_cage_edits)
                         && state.cage_edits != doc.saved_cage_edits),
             )
@@ -268,7 +269,7 @@ impl State {
             editor.status = format!("Не удалось сохранить модель · {error}");
             return;
         }
-        let mut source = doc.source.clone();
+        let mut source = doc.source_for_save();
         let custom_bakes = doc.custom_bakes.clone();
         let baked_recipes = custom_bakes.clone();
         let bake_settings = doc.bake_settings.clone();
@@ -410,7 +411,7 @@ impl State {
                 .is_some_and(|last| doc.mode == Mode::Edit && last.revision == doc.revision),
             EditAction::Undo => !doc.undo.is_empty() && self.gesture.is_none(),
             EditAction::Redo => !doc.redo.is_empty() && self.gesture.is_none(),
-            EditAction::Save => doc.dirty() || doc.paint_busy,
+            EditAction::Save => doc.dirty() || doc.paint_busy || doc.paint_set_changed(),
             EditAction::Element(_) => doc.mode == Mode::Edit,
             EditAction::CreateMaterial | EditAction::AssignMaterial { .. } => {
                 doc.can_assign_material() && self.gesture.is_none() && !doc.paint_busy
@@ -556,6 +557,7 @@ pub(super) fn initialize(
             pool: &'a mut HashMap<bevy::asset::AssetId<GltfMaterial>, Handle<StandardMaterial>>,
             default: Handle<StandardMaterial>,
             blob: &'a [u8],
+            gltf: &'a bevy::gltf::gltf::Document,
             json: &'a serde_json::Value,
             source: &'a document::glb::Glb,
             detect_udim: bool,
@@ -641,12 +643,16 @@ pub(super) fn initialize(
                     }
                     let topology =
                         &ctx.json["meshes"][mesh.index()]["extras"]["bevy_editor_topology"];
+                    let id_colors = document::glb::read_id_colors(
+                        ctx.gltf, &primitive, ctx.blob, data.count_vertices(),
+                    )?;
                     document::from_mesh_with_topology(
                         &data,
                         &mut geometry,
                         i,
                         (topology["version"].as_u64() == Some(1))
                             .then(|| &topology["primitives"][i]),
+                        id_colors.as_deref(),
                     )?;
                     let material = if let Some(handle) =
                         loaded.primitives.get(i).and_then(|p| p.material.as_ref())
@@ -711,6 +717,7 @@ pub(super) fn initialize(
                 pool: &mut pool,
                 default: state.default_material.clone(),
                 blob,
+                gltf: &parsed.document,
                 json: &source.json,
                 source: &source,
                 detect_udim: uv.detect_udim_on_import(),

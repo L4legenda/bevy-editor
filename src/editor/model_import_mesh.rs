@@ -173,6 +173,7 @@ pub(super) fn convert(
                             color.z as f32,
                             color.w as f32,
                         );
+                        corner.id_color = Some(corner.color.truncate());
                     }
                     corner
                 })

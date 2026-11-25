@@ -542,7 +542,7 @@ impl ProjectBatch {
                     q.normal.x.to_bits(),
                     q.normal.y.to_bits(),
                     q.normal.z.to_bits(),
-                    u32::from(q.fill),
+                    u32::from(q.fill) | (u32::from(q.prefer_front_faces) << 1),
                 ],
             );
         }

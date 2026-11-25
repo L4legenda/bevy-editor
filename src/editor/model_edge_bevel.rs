@@ -603,6 +603,8 @@ impl Geometry {
                                 color: c.color
                                     + (prev.color - c.color) * ap
                                     + (next.color - c.color) * an,
+                                id_color: c.id_color.zip(prev.id_color).zip(next.id_color)
+                                    .map(|((c, prev), next)| c + (prev - c) * ap + (next - c) * an),
                                 source_normal: if options.harden_normals || options.preserve_sharp {
                                     c.source_normal
                                 } else {

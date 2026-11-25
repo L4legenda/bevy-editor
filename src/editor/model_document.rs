@@ -204,6 +204,9 @@ pub(in crate::editor) enum Operation {
     OriginToGeometry,
 }
 
+pub(super) const PREVIEW_SHADER_EXTRA: &str = "bevy_editor_preview_shader";
+pub(super) const PAINT_SET_EXTRA: &str = "bevy_editor_active_paint_set";
+
 pub(super) struct Document {
     pub source: glb::Glb,
     pub objects: Vec<Object>,
@@ -213,6 +216,8 @@ pub(super) struct Document {
     pub saved_custom_bakes: Arc<Vec<super::model_paint_data::custom::Recipe>>,
     pub bake_settings: super::model_bake_settings::Settings,
     pub saved_bake_settings: super::model_bake_settings::Settings,
+    pub preview_shader: Option<Arc<serde_json::Value>>,
+    pub paint_set: Option<usize>,
     pub cage_edits: Arc<super::model_cage_data::Edits>,
     pub saved_cage_edits: Arc<super::model_cage_data::Edits>,
     pub active: Option<usize>,
@@ -240,6 +245,10 @@ impl Document {
         let selected = active.into_iter().collect();
         let custom_bakes = Arc::new(super::model_paint_data::custom::read_document(&source.json));
         let bake_settings = super::model_bake_settings::read(&source.json, &source.path);
+        let preview = &source.json["extras"][PREVIEW_SHADER_EXTRA];
+        let preview_shader = preview.is_object().then(|| Arc::new(preview.clone()));
+        let paint_set = source.json["extras"][PAINT_SET_EXTRA].as_u64()
+            .and_then(|index| usize::try_from(index).ok());
         let cage_edits = Arc::new(objects.iter().filter_map(|object| {
             let node = source.json["nodes"].get(object.source_node?)?;
             super::model_cage_data::read(node, object).map(|edit| (object.id, edit))
@@ -251,6 +260,8 @@ impl Document {
             saved_custom_bakes: custom_bakes.clone(),
             saved_bake_settings: bake_settings.clone(),
             bake_settings,
+            preview_shader,
+            paint_set,
             saved_cage_edits: cage_edits.clone(),
             cage_edits,
             custom_bakes,
@@ -289,8 +300,49 @@ impl Document {
     pub fn dirty(&self) -> bool {
         self.paint_pending || self.objects != self.saved || self.custom_bakes != self.saved_custom_bakes
             || self.bake_settings != self.saved_bake_settings
+            || self.preview_shader_dirty()
             || (!Arc::ptr_eq(&self.cage_edits, &self.saved_cage_edits)
                 && self.cage_edits != self.saved_cage_edits)
+    }
+
+    pub(super) fn preview_shader_dirty(&self) -> bool {
+        self.preview_shader.as_deref().is_some_and(|graph| {
+            graph != &self.source.json["extras"][PREVIEW_SHADER_EXTRA]
+        })
+    }
+
+    pub(super) fn source_for_save(&self) -> glb::Glb {
+        let mut source = self.source.clone();
+        if let Some(graph) = &self.preview_shader {
+            source.json["extras"][PREVIEW_SHADER_EXTRA] = graph.as_ref().clone();
+        }
+        if let Some(set) = self.writable_paint_set() {
+            source.json["extras"][PAINT_SET_EXTRA] = serde_json::json!(set);
+        }
+        source
+    }
+
+    pub(super) fn paint_set_index(&self) -> usize {
+        let count: usize = self.objects.iter().map(|object| object.materials.len()).sum();
+        self.paint_set.unwrap_or(0).min(count.saturating_sub(1))
+    }
+
+    fn writable_paint_set(&self) -> Option<usize> {
+        let extras = &self.source.json["extras"];
+        self.paint_set.filter(|_| extras.is_null() || extras.is_object())
+            .map(|_| self.paint_set_index())
+    }
+
+    pub(super) fn paint_set_changed(&self) -> bool {
+        self.writable_paint_set().is_some_and(|index| {
+            self.source.json["extras"][PAINT_SET_EXTRA].as_u64().unwrap_or(0) != index as u64
+        })
+    }
+
+    pub(super) fn paint_target(&self, set: usize) -> Option<(&Object, usize)> {
+        self.objects.iter()
+            .flat_map(|object| (0..object.materials.len()).map(move |slot| (object, slot)))
+            .nth(set)
     }
     pub fn active(&self) -> Option<&Object> {
         let id = self.active?;
@@ -396,6 +448,12 @@ impl Document {
     }
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+        if mode == Mode::Paint && self.paint_set.is_some()
+            && let Some((object, _)) = self.paint_target(self.paint_set_index())
+            && self.active != Some(object.id)
+        {
+            self.select_object(object.id, false);
+        }
         if mode == Mode::Edit
             && self
                 .selection
@@ -544,8 +602,10 @@ impl Document {
     #[cfg(test)]
     pub fn save(&mut self) -> Result<(), String> {
         self.validate()?;
-        super::model_bake_settings::write(&mut self.source.json, &self.source.path, &self.bake_settings)?;
-        self.source.save_with_cage(&self.objects, &self.original, Some(&self.cage_edits))?;
+        let mut source = self.source_for_save();
+        super::model_bake_settings::write(&mut source.json, &source.path, &self.bake_settings)?;
+        source.save_with_cage(&self.objects, &self.original, Some(&self.cage_edits))?;
+        self.source = source;
         self.saved = self.objects.clone();
         self.saved_bake_settings = self.bake_settings.clone();
         self.saved_recovery_edits = self.recovery_edits;
@@ -917,7 +977,7 @@ pub(super) fn from_mesh(
     geometry: &mut Geometry,
     material: usize,
 ) -> Result<(), String> {
-    from_mesh_with_topology(mesh, geometry, material, None)
+    from_mesh_with_topology(mesh, geometry, material, None, None)
 }
 
 pub(super) fn from_mesh_with_topology(
@@ -925,6 +985,7 @@ pub(super) fn from_mesh_with_topology(
     geometry: &mut Geometry,
     material: usize,
     polygons: Option<&serde_json::Value>,
+    id_colors: Option<&[Option<Vec3>]>,
 ) -> Result<(), String> {
     let Some(VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute(Mesh::ATTRIBUTE_POSITION)
@@ -947,11 +1008,15 @@ pub(super) fn from_mesh_with_topology(
         Some(VertexAttributeValues::Float32x4(v)) => Some(v),
         _ => None,
     };
+    let use_visible_colors = colors.is_some_and(|values| {
+        polygons.is_none() || values.iter().any(|rgba| *rgba != [1.; 4])
+    });
     if [
         normals.map(Vec::len),
         uv.map(Vec::len),
         uv1.map(Vec::len),
         colors.map(Vec::len),
+        id_colors.map(<[_]>::len),
     ]
     .into_iter()
     .flatten()
@@ -1031,6 +1096,10 @@ pub(super) fn from_mesh_with_topology(
                     uv: uv.map_or(Vec2::ZERO, |v| Vec2::from_array(v[i])),
                     uv1: uv1.map_or(Vec2::ZERO, |v| Vec2::from_array(v[i])),
                     color: colors.map_or(Vec4::ONE, |v| Vec4::from_array(v[i])),
+                    id_color: id_colors.map_or_else(
+                        || colors.filter(|_| use_visible_colors).map(|values| Vec4::from_array(values[i]).truncate()),
+                        |values| values[i],
+                    ),
                     source_normal: normals
                         .map(|v| Vec3::from_array(v[i]).normalize_or_zero())
                         .filter(|n| n.length_squared() > 0.0),

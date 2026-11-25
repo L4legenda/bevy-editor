@@ -439,13 +439,39 @@ fn read_fill(
     ))
 }
 
-pub(in crate::editor) fn project_graph(value: &Value) -> Result<Arc<Value>, String> {
-    let graph = material_graph::read(value)?;
-    graph.validate_texture_graph(material_graph::library().as_ref())?;
-    if material_graph::file::image_paths(&graph).next().is_some() {
-        return Err("Граф ссылается на внешнее изображение".into());
-    }
-    Ok(Arc::new(value.clone()))
+pub(in crate::editor) struct ProjectGraph {
+    pub payload: Arc<Value>,
+    pub images: Arc<texture_fill::GraphImages>,
+    outputs: [Option<u64>; CHANNEL_COUNT],
+    incomplete: bool,
+}
+
+pub(in crate::editor) fn project_graph(
+    value: &Value,
+    directory: &Path,
+    id: u64,
+    reserve: impl FnMut(usize) -> Result<(), String>,
+    warnings: &mut Vec<String>,
+) -> Result<ProjectGraph, String> {
+    let mut graph = material_graph::read(value)?;
+    let library = material_graph::library();
+    graph.validate_texture_graph(&library)?;
+    let outputs = material_painter_graph::channel_outputs(&graph.outputs(&library));
+    let warning_count = warnings.len();
+    let (payload, images) = if material_graph::file::image_paths(&graph).next().is_some() {
+        let images = material_graph::file::embed_project_images(
+            &mut graph, directory, id, reserve, warnings,
+        );
+        (material_graph::encode(&graph), images)
+    } else {
+        (value.clone(), texture_fill::GraphImages::new())
+    };
+    Ok(ProjectGraph {
+        payload: Arc::new(payload),
+        images: Arc::new(images),
+        outputs,
+        incomplete: warnings.len() != warning_count,
+    })
 }
 
 pub(in crate::editor) fn project_fill(
@@ -453,40 +479,52 @@ pub(in crate::editor) fn project_fill(
     value: &Value,
     images: [Option<Arc<texture_fill::Bitmap>>; CHANNEL_COUNT],
     opacity_source: OpacitySource,
-    graph: Option<Arc<Value>>,
+    graph: Option<&ProjectGraph>,
     mut plane: impl FnMut([u8; 4]) -> Result<Arc<Vec<u8>>, String>,
 ) -> Result<(), String> {
-    let graph = graph.map(|payload| {
-        let parsed = material_graph::read(&payload)?;
-        let outputs = material_painter_graph::channel_outputs(&parsed.outputs(material_graph::library().as_ref()));
-        Ok::<_, String>(ArchiveGraph { mask: project_graph_preset(payload), outputs })
-    }).transpose()?;
+    let archive_graph = graph.map(|graph| ArchiveGraph {
+        mask: project_graph_preset(graph),
+        outputs: graph.outputs,
+    });
     // The common fill reader uses image presence to pick the correct factors and channels.
     let references = std::array::from_fn(|channel| {
         images[channel].as_ref().map(|image| ImageRef { file: String::new(), name: image.name.clone() })
     });
-    let (channels, fill) = read_fill(value, references, opacity_source, graph.as_ref())?;
+    let (channels, fill) = read_fill(value, references, opacity_source, archive_graph.as_ref())?;
     for (target, source) in layer.channels.iter_mut().zip(channels) {
         *target = source.map(&mut plane).transpose()?;
     }
     if let Some(payload) = fill {
         let mut fill = texture_fill::Fill::default();
         fill.settings = payload.settings;
-        fill.graph = payload.graph;
+        fill.graph = payload.graph.map(pending_graph);
+        if let Some(graph) = graph {
+            fill.graph_images = graph.images.clone();
+        }
         fill.images = std::array::from_fn(|i| payload.images[i].as_ref().and(images[i].clone()));
         layer.texture_fill = Some(Arc::new(fill));
     }
     Ok(())
 }
 
-fn project_graph_preset(payload: Arc<Value>) -> MaskGraphPreset {
-    MaskGraphPreset { payload, images: BTreeMap::new(), output: None }
+fn pending_graph(mut payload: Arc<Value>) -> Arc<Value> {
+    Arc::make_mut(&mut payload)[material_graph::MPP_GRAPH_PENDING] = Value::Bool(true);
+    payload
+}
+
+fn project_graph_preset(graph: &ProjectGraph) -> MaskGraphPreset {
+    MaskGraphPreset {
+        payload: graph.payload.clone(),
+        images: BTreeMap::new(),
+        output: None,
+    }
 }
 
 pub(in crate::editor) fn project_mask(
     value: &Value,
     pixels: Arc<Vec<u8>>,
-    graph: Option<Arc<Value>>,
+    graph: Option<&ProjectGraph>,
+    output: Option<Arc<texture_fill::Bitmap>>,
     maps: &[crate::editor::model_paint_data::custom::Recipe],
     omitted: &mut usize,
 ) -> Result<Arc<Mask>, String> {
@@ -494,7 +532,21 @@ pub(in crate::editor) fn project_mask(
     if !preset.valid() {
         return Err("Параметры маски Material Painter вне поддерживаемого диапазона".into());
     }
-    preset.load(pixels, &mut |_| Err("Граф ссылается на внешнее изображение".into()))
+    let mut mask = preset.with_pixels(pixels);
+    if let Some(graph) = graph {
+        let mut payload = graph.payload.clone();
+        if output.is_none() {
+            payload = pending_graph(payload);
+        } else if graph.incomplete {
+            Arc::make_mut(&mut payload)[material_graph::MPP_GRAPH_KEEP_CACHE] = Value::Bool(true);
+        }
+        Arc::make_mut(&mut mask).set_graph(Arc::new(GraphMask::new(
+            payload,
+            graph.images.clone(),
+            output,
+        )));
+    }
+    Ok(mask)
 }
 
 fn read_mask(

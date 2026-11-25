@@ -755,6 +755,7 @@ fn split_quad() -> Geometry {
                         uv: uv[vertex],
                         uv1: uv[vertex] * 0.5,
                         color: Vec4::new(vertex as f32 / 4.0, 0.5, 0.7, 1.0),
+                        id_color: None,
                         source_normal: Some(Vec3::Z),
                     })
                     .collect(),

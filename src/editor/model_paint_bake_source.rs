@@ -1,5 +1,6 @@
 //! Static OBJ and FBX geometry for projection, in the same coordinates as Bevy's FBX loader.
 use super::{Progress, SourceTriangle, SourceUse};
+use super::super::triangle_id_color;
 use crate::runtime::fbx::{geometry_matrix, load_mesh_file};
 use bevy::prelude::*;
 use std::path::Path;
@@ -47,6 +48,9 @@ pub(super) fn mesh_triangles(
             if face.num_indices < 3 {
                 continue;
             }
+            let slot = mesh.face_material.get(i).copied().unwrap_or_default() as usize;
+            let material = node.materials.get(slot).or_else(|| mesh.materials.get(slot));
+            let material = material.map(|material| material.element.typed_id);
             let count = ufbx::triangulate_face_vec(&mut indices, mesh, face) as usize * 3;
             for triangle in indices[..count].chunks_exact(3) {
                 let mut corners = [triangle[0], triangle[1], triangle[2]].map(|i| i as usize);
@@ -60,9 +64,14 @@ pub(super) fn mesh_triangles(
                 } else {
                     [Vec3::ZERO; 3]
                 };
+                let color = triangle_id_color(corners.map(|i| {
+                    mesh.vertex_color.indices.get(i)
+                        .and_then(|&index| mesh.vertex_color.values.get(index as usize))
+                        .map(|color| Vec3::new(color.x as f32, color.y as f32, color.z as f32))
+                }));
                 output.extend(
                     SourceTriangle::new(points, normals, named_node.element.typed_id as usize)
-                        .map(|triangle| triangle.with_usage(usage)),
+                        .map(|triangle| triangle.with_usage(usage).with_id(material, color)),
                 );
             }
         }

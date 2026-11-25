@@ -1,6 +1,6 @@
 //! Lossless-container GLB updates: retain textures, materials, extras and untouched nodes.
 use super::Object;
-use bevy::prelude::*;
+use bevy::{gltf::gltf, prelude::*};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -11,6 +11,65 @@ use std::{
 };
 #[path = "model_paint_io.rs"]
 mod paint_io;
+
+const ID_COLORS: &str = "bevy_editor_id_colors";
+
+pub(in crate::editor) fn read_id_colors(
+    source: &gltf::Document,
+    primitive: &gltf::Primitive,
+    bin: &[u8],
+    count: usize,
+) -> Result<Option<Vec<Option<Vec3>>>, String> {
+    let Some(raw) = primitive.extras().as_ref() else { return Ok(None) };
+    let extras: Value = serde_json::from_str(raw.get()).map_err(|error| error.to_string())?;
+    let Some(index) = extras.get(ID_COLORS) else { return Ok(None) };
+    let error = "Повреждены цвета карты ID в GLB";
+    let view = index.as_u64().and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| source.views().nth(index)).ok_or(error)?;
+    if view.buffer().index() != 0 || view.stride().is_some()
+        || count.checked_mul(16) != Some(view.length())
+    {
+        return Err(error.into());
+    }
+    let end = view.offset().checked_add(view.length()).ok_or(error)?;
+    let colors = bin.get(view.offset()..end).ok_or(error)?.chunks_exact(16).map(|entry| {
+        let component = |i| f32::from_le_bytes(entry[i..i + 4].try_into().unwrap());
+        match component(12) {
+            0. => Ok(None),
+            1. => {
+                let rgb = Vec3::new(component(0), component(4), component(8));
+                rgb.is_finite().then_some(Some(rgb)).ok_or(error)
+            }
+            _ => Err(error),
+        }
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(colors))
+}
+
+fn write_id_colors(root: &mut Value, bin: &mut Vec<u8>, primitive: &mut Value, colors: &[Option<Vec3>]) -> Result<(), String> {
+    if colors.iter().all(Option::is_none) {
+        if let Some(extras) = primitive.get_mut("extras").and_then(Value::as_object_mut) {
+            extras.remove(ID_COLORS);
+        }
+        return Ok(());
+    }
+    if primitive["extras"].is_null() {
+        primitive["extras"] = json!({});
+    }
+    let extras = primitive["extras"].as_object_mut().ok_or("Некорректные дополнительные данные GLB")?;
+    align(bin, 0);
+    let start = bin.len();
+    for color in colors {
+        let rgba = color.map_or([0.; 4], |rgb| rgb.extend(1.).to_array());
+        for value in rgba {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let views = root["bufferViews"].as_array_mut().unwrap();
+    extras.insert(ID_COLORS.into(), json!(views.len()));
+    views.push(json!({"buffer":0,"byteOffset":start,"byteLength":bin.len() - start}));
+    Ok(())
+}
 
 #[derive(Clone)]
 pub(in crate::editor) struct Glb {
@@ -345,6 +404,7 @@ impl Glb {
                 if let Some(material) = object.materials.get(slot) {
                     paint_io::encode_fixes(&mut root, &mut bin, &mut primitive, &material.bake_fixes)?;
                 }
+                write_id_colors(&mut root, &mut bin, &mut primitive, &buffers.id_colors)?;
                 let map = primitive
                     .as_object_mut()
                     .ok_or("Некорректный примитив GLB")?;

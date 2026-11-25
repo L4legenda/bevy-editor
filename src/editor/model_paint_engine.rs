@@ -940,11 +940,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             paint.activate(index, recovery.settings().undo_steps);
             let session = paint.sessions.get_mut(&index).unwrap();
             session.set_appearance.count(doc);
-            let target = doc
-                .objects
-                .iter()
-                .flat_map(|o| (0..o.materials.len()).map(move |s| (o, s)))
-                .nth(session.set);
+            let target = doc.paint_target(session.set);
             if let Some((object, slot)) = target {
                 let key = (index, object.id, slot);
                 if session.binding != Some((object.id, slot)) {
@@ -973,6 +969,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     // Keep the saved graph result when opening a set. A new bake
                     // or a subsequent mesh change will refresh the generated maps.
                     if !runtime.lives.contains_key(&key)
+                        && !super::material_graph::needs_initial_render(&session.stack)
                         && let Some(source) = super::material_graph::surface::Source::capture(
                             doc, (object.id, slot),
                         )

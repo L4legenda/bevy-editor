@@ -1076,6 +1076,127 @@ fn gpu_paint_trace_view_uses_the_live_brush_and_camera() {
 }
 
 #[test]
+#[ignore = "requires GPU; evaluates imported MPP graphs when entering Paint mode"]
+fn gpu_mpp_bitmap_graph_refreshes_when_opening_paint() {
+    use crate::editor::model_paint_data::solid;
+    use material_graph::file::tests as graph_fixture;
+
+    let directory = std::env::temp_dir().join(format!(
+        "bevy-mpp-graph-gpu-{}",
+        bevy::asset::uuid::Uuid::new_v4()
+    ));
+    let textures = directory.join("textures");
+    let (_, mut graph) = graph_fixture::fixture(&directory, &textures);
+    let node = graph.nodes[0].id;
+    let output = graph.nodes[1].id;
+    let bitmap = graph.nodes[0].params["image"].clone();
+    let second_bitmap = graph.add("bitmap", [40., 150.]);
+    graph.node_mut(second_bitmap).unwrap().params.insert("image".into(), bitmap);
+    let mut warnings = Vec::new();
+    let imported = project_graph(
+        &material_graph::encode(&graph), &directory, 1, |_| Ok(()), &mut warnings,
+    ).unwrap();
+    assert!(warnings.is_empty());
+    std::fs::remove_dir_all(textures).unwrap();
+
+    let size = 128;
+    let mut layer = Layer::new("Imported bitmap".into(), LayerKind::Fill);
+    project_fill(
+        &mut layer,
+        &serde_json::json!({"color": [1., 1., 1.]}),
+        Default::default(),
+        texture_fill::OpacitySource::Auto,
+        Some(&imported),
+        |color| Ok(solid(size, color)),
+    ).unwrap();
+    let mut omitted = 0;
+    layer.mask = Some(project_mask(
+        &serde_json::Value::Null,
+        solid(size, [255, 0, 0, 255]),
+        Some(&imported),
+        None,
+        &[],
+        &mut omitted,
+    ).unwrap());
+    let size_px = image::RgbaImage::from_pixel(size, size, image::Rgba([96, 96, 96, 255]));
+    let cached_output = Arc::new(texture_fill::Bitmap::from_rgba("Cached mask.png".into(), size_px).unwrap());
+    let mut cached = Layer::new("Cached graph mask".into(), LayerKind::Paint);
+    cached.mask = Some(project_mask(
+        &serde_json::Value::Null,
+        solid(size, [255, 32, 0, 255]),
+        Some(&imported),
+        Some(cached_output),
+        &[],
+        &mut omitted,
+    ).unwrap());
+    let (mut app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) {
+            break;
+        }
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        doc.objects[0].materials[0].paint = Some(Arc::new(Surface {
+            size,
+            base: std::array::from_fn(|_| solid(size, [255; 4])),
+            stack: Stack { layers: vec![layer, cached], selected: 0 },
+            material: serde_json::Value::Null,
+            baked: None,
+        }));
+        doc.revision += 1;
+    }
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(
+        editing::EditAction::Mode(Mode::Paint),
+    )));
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let paint = app.world().resource::<PaintState>();
+        if let Some(session) = paint.sessions.get(&0)
+            && let Some(layer) = session.stack.layers.first()
+            && let Some(fill) = layer.texture_fill.as_ref()
+            && let Some(color) = fill.images[0].as_ref()
+        {
+            let mask = layer.mask.as_ref().unwrap().graph.as_ref().unwrap();
+            let mask_pixel = mask.output.as_ref().unwrap().pixels().get_pixel(0, 0).0;
+            for pixel in [color.pixels().get_pixel(0, 0).0, mask_pixel] {
+                assert!(pixel.into_iter().zip(graph_fixture::PIXEL)
+                    .all(|(actual, expected)| actual.abs_diff(expected) <= 1), "{pixel:?}");
+            }
+            assert!(fill.graph.as_ref().unwrap().get(material_graph::MPP_GRAPH_PENDING).is_none());
+            assert_eq!(session.stack.layers[1].mask.as_ref().unwrap().effective()[0], 128);
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::SelectLayerMask(1));
+    paint_message(&mut app, PaintAction::GraphEdit(material_graph::Edit::Move(node, IVec2::new(40, 52))));
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers[1]
+        .mask.as_ref().unwrap().effective()[0], 128);
+    paint_message(&mut app, PaintAction::GraphEdit(material_graph::Edit::Connect(second_bitmap, output, 0)));
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        let mask = session.stack.layers[1].mask.as_ref().unwrap();
+        let output = mask.graph.as_ref().unwrap().output.as_ref().unwrap().pixels().get_pixel(0, 0).0;
+        if output[0].abs_diff(graph_fixture::PIXEL[0]) <= 1 {
+            assert_eq!(&mask.pixels[..4], &[255, 32, 0, 255]);
+            assert_eq!(mask.effective()[0], output[0] + 32);
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "requires GPU; renders a bitmap graph and checks persisted source images"]
 fn gpu_mpgraph_bitmap_renders_and_survives_presets_and_glb() {
     use crate::editor::model_document::glb::Glb;
@@ -1780,6 +1901,109 @@ fn gpu_paint_uses_import_resolution_and_bakes_unprepared_sets() {
 }
 
 #[test]
+#[ignore = "requires GPU; opens and saves a model with multiple paint sets"]
+fn gpu_paint_restores_saved_texture_set_and_its_selected_layer() {
+    use crate::editor::{
+        model_document::{MaterialSlot, Object, PAINT_SET_EXTRA, glb::Glb},
+        model_paint_data::solid,
+        model_primitives::Primitive,
+    };
+    use serde_json::json;
+
+    let directory = std::env::temp_dir().join(format!(
+        "bevy-paint-active-set-{}", bevy::asset::uuid::Uuid::new_v4(),
+    ));
+    let mut project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    copy_tree(&project.asset_root, &directory);
+    project.asset_root = directory.clone();
+    let path = directory.join("models/block.glb");
+
+    let mut mesh = Primitive::Cube.geometry(&Primitive::Cube.defaults()).unwrap();
+    for (index, face) in mesh.faces.iter_mut().enumerate() {
+        face.material = index % 2;
+    }
+    let materials = (0..2).map(|set| MaterialSlot {
+        material: Default::default(),
+        source: json!({"material": 0}),
+        paint: Some(Arc::new(Surface {
+            size: 128,
+            base: std::array::from_fn(|_| solid(128, [255; 4])),
+            stack: Stack {
+                layers: (0..2).map(|layer| Layer::new(format!("Слой {set}/{layer}"), LayerKind::Paint)).collect(),
+                selected: set,
+            },
+            material: serde_json::Value::Null,
+            baked: None,
+        })),
+        authored: None,
+        bake_fixes: Default::default(),
+    }).collect();
+    let object = Object {
+        id: 0,
+        source_node: None,
+        name: "Два набора".into(),
+        geometry: mesh.into(),
+        transform: Transform::IDENTITY,
+        materials,
+        hidden: false,
+    };
+    let bytes = Glb::new_asset_configured(&[object], &[], |root| {
+        root["extras"][PAINT_SET_EXTRA] = json!(1);
+        Ok(())
+    }, None).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+
+    let (mut app, _, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    let open = |app: &mut App| {
+        app.world_mut().write_message(Action::ViewModel(0));
+        for _ in 0..240 {
+            frame(app);
+            if app.world().resource::<editing::State>().documents.contains_key(&0) {
+                break;
+            }
+        }
+        app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(
+            editing::EditAction::Mode(Mode::Paint),
+        )));
+        warm(app, 10);
+        paint_ready(app);
+    };
+    let selection = |app: &App| {
+        let paint = app.world().resource::<PaintState>();
+        let session = &paint.sessions[&0];
+        (session.set, session.stack.selected, session.stack.layers[session.stack.selected].name.clone())
+    };
+    open(&mut app);
+    assert_eq!(selection(&app), (1, 1, "Слой 1/1".into()));
+    paint_message(&mut app, PaintAction::Set(0));
+    assert_eq!(selection(&app), (0, 0, "Слой 0/0".into()));
+    assert!(app.world().resource::<editing::State>().available(editing::EditAction::Save, Some(0)));
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)));
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        if doc.source.json["extras"][PAINT_SET_EXTRA] == 0 {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 45, "{}", app.world().resource::<Editor>().status);
+    }
+    assert_eq!(Glb::load(&path).unwrap().json["extras"][PAINT_SET_EXTRA], 0);
+    paint_message(&mut app, PaintAction::Set(1));
+    assert_eq!(selection(&app), (1, 1, "Слой 1/1".into()));
+    app.world_mut().write_message(Action::CloseModelTab(0));
+    warm(&mut app, 8);
+    assert!(!app.world().resource::<editing::State>().documents.contains_key(&0));
+    open(&mut app);
+    assert_eq!(selection(&app), (0, 0, "Слой 0/0".into()));
+    drop(app);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "requires GPU; saves bake settings through the editor and restores them after reopening"]
 fn gpu_paint_bake_settings_save_and_reopen() {
     use crate::editor::model_document::glb::Glb;
@@ -1810,12 +2034,17 @@ fn gpu_paint_bake_settings_save_and_reopen() {
     doc_loaded(&mut app);
     enter_paint(&mut app);
     paint_message(&mut app, PaintAction::BakeQuality(bake::Quality::Standard));
+    paint_message(&mut app, PaintAction::BakeIdSource(bake::IdSource::Materials));
     paint_message(&mut app, PaintAction::BakeSelectAllMaps(false));
     paint_message(&mut app, PaintAction::BakeRange { front: true, percent: 17 });
+    paint_message(&mut app, PaintAction::BakePreferFrontFaces);
+    paint_message(&mut app, PaintAction::BakeAverageNormals);
     let doc = &app.world().resource::<editing::State>().documents[&0];
     assert_eq!(doc.bake_settings.quality, bake::Quality::Standard);
+    assert_eq!(doc.bake_settings.id_source, bake::IdSource::Materials);
     assert_eq!(doc.bake_settings.map_bits, 0);
     assert_eq!(doc.bake_settings.front, 17);
+    assert!(!doc.bake_settings.prefer_front_faces && !doc.bake_settings.average_normals);
     assert!(doc.dirty());
     let expected = doc.bake_settings.clone();
 
@@ -1839,8 +2068,10 @@ fn gpu_paint_bake_settings_save_and_reopen() {
     let world = app.world();
     let projection = &world.resource::<PaintState>().sessions[&0].bake_projection;
     assert_eq!(projection.quality, bake::Quality::Standard);
+    assert_eq!(projection.id_source, bake::IdSource::Materials);
     assert_eq!(projection.maps.bits(), 0);
     assert_eq!(projection.front, 17);
+    assert!(!projection.prefer_front_faces && !projection.average_normals);
     assert!(!world.resource::<editing::State>().documents[&0].dirty());
     drop(app);
     std::fs::remove_dir_all(directory).unwrap();
@@ -2711,6 +2942,25 @@ fn gpu_shader_preview_uses_the_painted_material_and_scene_lighting() {
     assert_ne!(app.world().resource::<PaintState>().sessions[&0].preview_shader, Some(imported));
     paint_message(&mut app, PaintAction::PreviewShader(Some(imported)));
     assert_eq!(graph(&app), edited);
+
+    let payload = Arc::new(project_preview_shader(&edited.to_json(library)).unwrap());
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap()
+        .preview_shader = Some(payload.clone());
+    warm(&mut app, 2);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].preview_shader,
+        Some(shader_preview::presets().len()));
+    assert_eq!(graph(&app), edited);
+    assert!(!app.world().resource::<PaintState>().sessions[&0].available(PaintAction::Undo));
+    capture_when(&mut app, &target, &path, |image| preview(image) == dim);
+    paint_message(&mut app, PaintAction::GraphEdit(Edit::Move(output, IVec2::new(900, 45))));
+    {
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        let moved = material_graph::read(doc.preview_shader.as_ref().unwrap()).unwrap();
+        assert_eq!(moved.node(output).unwrap().pos, [900., 45.]);
+    }
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(app.world().resource::<editing::State>().documents[&0].preview_shader.as_ref(), Some(&payload));
+
     fs::remove_dir_all(directory).unwrap();
     fs::remove_file(path).unwrap();
 
@@ -2831,7 +3081,7 @@ fn gpu_compare_paint_shading_viewport() {
     let output = coverage.add("shade_output", [200., 0.]);
     coverage.connect(color, output, "color");
     let presets = shader_preview::presets();
-    let coverage_id = presets.len();
+    let coverage_id = presets.len() + 1;
     app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap().shader_graphs
         .insert(coverage_id, shader_preview::Document::new(&coverage));
     paint_message(&mut app, PaintAction::PreviewShader(Some(coverage_id)));

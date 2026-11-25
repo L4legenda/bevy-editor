@@ -217,7 +217,24 @@ pub(in crate::editor) fn import_bake_map_bits(maps: impl Iterator<Item = BakeMap
     maps.fold(0, |bits, map| bits | MapSelection::bit(map))
 }
 
-pub(in crate::editor) use crate::editor::model_bake_settings::Quality;
+pub(in crate::editor) use crate::editor::model_bake_settings::{IdSource, Quality};
+
+fn material_id_color(index: u32) -> [u8; 3] {
+    // Material Painter steps through hues by the golden ratio.
+    let hue = (index as f32 * 0.618_034).fract() * 6.;
+    let value = 0.95 - 0.25 * ((index / 7) % 2) as f32;
+    let chroma = value * 0.75;
+    let other = chroma * (1. - ((hue % 2.) - 1.).abs());
+    let rgb = match hue as u32 {
+        0 => [chroma, other, 0.],
+        1 => [other, chroma, 0.],
+        2 => [0., chroma, other],
+        3 => [0., other, chroma],
+        4 => [other, 0., chroma],
+        _ => [chroma, 0., other],
+    };
+    rgb.map(|color| ((color + value - chroma) * 255.).round() as u8)
+}
 
 #[derive(Clone, Copy)]
 struct Sampling {
@@ -276,11 +293,14 @@ pub(super) struct ProjectionSettings {
     pub(super) auto_fit: bool,
     pub(super) match_names: bool,
     pub(super) fill_misses: bool,
+    pub(super) prefer_front_faces: bool,
+    pub(super) average_normals: bool,
     pub(super) front: u8,
     pub(super) rear: u8,
     pub(super) manual: Option<cage_brush::Scales>,
     pub(super) quality: Quality,
     pub(super) maps: MapSelection,
+    pub(super) id_source: IdSource,
     source_generation: u64,
 }
 
@@ -314,11 +334,14 @@ impl Default for ProjectionSettings {
             auto_fit: false,
             match_names: true,
             fill_misses: true,
+            prefer_front_faces: true,
+            average_normals: true,
             front: 5,
             rear: 5,
             manual: None,
             quality: Quality::default(),
             maps: MapSelection::ALL,
+            id_source: IdSource::default(),
             source_generation: 0,
         }
     }
@@ -331,10 +354,13 @@ impl ProjectionSettings {
             cage: self.cage.clone(),
             quality: self.quality,
             map_bits: self.maps.bits(),
+            id_source: self.id_source,
             front: self.front,
             rear: self.rear,
             match_names: self.match_names,
             fill_misses: self.fill_misses,
+            prefer_front_faces: self.prefer_front_faces,
+            average_normals: self.average_normals,
             auto_fit: self.auto_fit,
         }
     }
@@ -344,10 +370,13 @@ impl ProjectionSettings {
         self.cage = settings.cage.clone();
         self.quality = settings.quality;
         self.maps = MapSelection(settings.map_bits);
+        self.id_source = settings.id_source;
         self.front = settings.front;
         self.rear = settings.rear;
         self.match_names = settings.match_names;
         self.fill_misses = settings.fill_misses;
+        self.prefer_front_faces = settings.prefer_front_faces;
+        self.average_normals = settings.average_normals;
         self.auto_fit = settings.auto_fit;
         self.source_generation = self.source_generation.wrapping_add(1);
     }
@@ -1125,6 +1154,13 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
+            PaintAction::BakeIdSource(source)
+                if state.running.is_none() && session.bake_projection.id_source != source =>
+            {
+                session.bake_projection.id_source = source;
+                state.cache.retain(|(key, _)| key.model != index);
+                session.revision += 1;
+            }
             PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
                 if state.running.is_none() =>
             {
@@ -1208,6 +1244,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
             | PaintAction::BakeAutoFitCage
             | PaintAction::BakeMatchNames
             | PaintAction::BakeFillMisses
+            | PaintAction::BakePreferFrontFaces
+            | PaintAction::BakeAverageNormals
             | PaintAction::BakeRange { .. }
                 if state.running.is_none() && state.picking.is_none() =>
             {
@@ -1225,6 +1263,12 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     }
                     PaintAction::BakeFillMisses => {
                         session.bake_projection.fill_misses = !session.bake_projection.fill_misses;
+                    }
+                    PaintAction::BakePreferFrontFaces => {
+                        session.bake_projection.prefer_front_faces = !session.bake_projection.prefer_front_faces;
+                    }
+                    PaintAction::BakeAverageNormals => {
+                        session.bake_projection.average_normals = !session.bake_projection.average_normals;
                     }
                     PaintAction::BakeRange {
                         front: true,

@@ -171,7 +171,7 @@ struct Snapshot {
 impl Snapshot {
     fn capture(doc: &Document) -> Self {
         Self {
-            source: doc.source.clone(),
+            source: doc.source_for_save(),
             objects: doc.objects.clone(),
             original: doc.original.clone(),
             custom: doc.custom_bakes.clone(),

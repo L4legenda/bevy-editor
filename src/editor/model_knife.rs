@@ -86,6 +86,8 @@ impl<'a> Surface<'a> {
                 uv: a.uv * u + b.uv * v + c.uv * w,
                 uv1: a.uv1 * u + b.uv1 * v + c.uv1 * w,
                 color: a.color * u + b.color * v + c.color * w,
+                id_color: a.id_color.zip(b.id_color).zip(c.id_color)
+                    .map(|((a, b), c)| a * u + b * v + c * w),
                 source_normal,
             },
         ))

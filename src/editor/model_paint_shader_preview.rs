@@ -30,8 +30,12 @@ pub(super) struct Document {
 
 impl Document {
     pub(super) fn new(graph: &Graph) -> Self {
+        Self::from_payload(Arc::new(material_graph::encode(graph)))
+    }
+
+    pub(super) fn from_payload(payload: Arc<serde_json::Value>) -> Self {
         Self {
-            payload: Arc::new(material_graph::encode(graph)),
+            payload,
             undo: Vec::new(),
             redo: Vec::new(),
         }

@@ -3441,6 +3441,15 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     }
                     button(&mut commands, options, font, "Все карты", PaintAction::BakeSelectAllMaps(true));
                     button(&mut commands, options, font, "Только основные", PaintAction::BakeSelectAllMaps(false));
+                    text(&mut commands, stack, font, "Источник карты ID", 11., MUTED);
+                    let sources = node(&mut commands, stack, Node {
+                        flex_wrap: FlexWrap::Wrap,
+                        row_gap: px(3.),
+                        ..row(4.)
+                    });
+                    for source in bake::IdSource::ALL {
+                        button(&mut commands, sources, font, source.label(), PaintAction::BakeIdSource(source));
+                    }
                     button(
                         &mut commands, stack, font,
                         if session.bake_cache_clearing { "Очистка кэша…" } else { "Очистить дисковый кэш" },
@@ -3469,6 +3478,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     }
                     button(&mut commands, stack, font, "Сопоставлять по именам", PaintAction::BakeMatchNames);
                     button(&mut commands, stack, font, "Заполнять промахи", PaintAction::BakeFillMisses);
+                    button(&mut commands, stack, font, "Приоритет лицевых сторон", PaintAction::BakePreferFrontFaces);
+                    button(&mut commands, stack, font, "Усреднять нормали лучей", PaintAction::BakeAverageNormals);
                     button(&mut commands, stack, font, "Выбрать оболочку…", PaintAction::BakePickCage);
                     if let Some(path) = &session.bake_projection.cage {
                         let filename = path.file_name().unwrap_or_default().to_string_lossy();

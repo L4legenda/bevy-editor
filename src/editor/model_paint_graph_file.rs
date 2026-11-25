@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use std::{
     fs::{self, File},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
 };
 use texture_fill::{Bitmap, GraphImages};
 #[path = "model_paint_graph_package.rs"]
@@ -19,6 +19,10 @@ const RELOCATIONS: &str = "bevy_image_files";
 pub(super) const EXTENSION: &str = "mpgraph";
 
 fn paths(graph: &mut Graph) -> impl Iterator<Item = &mut PathBuf> {
+    image_values(graph).filter_map(Option::as_mut)
+}
+
+fn image_values(graph: &mut Graph) -> impl Iterator<Item = &mut Option<PathBuf>> {
     graph
         .nodes
         .iter_mut()
@@ -30,7 +34,7 @@ fn paths(graph: &mut Graph) -> impl Iterator<Item = &mut PathBuf> {
                 .filter_map(|param| param.default.as_mut()),
         )
         .filter_map(|value| match value {
-            ParamValue::Image(Some(path)) => Some(path),
+            ParamValue::Image(path) => Some(path),
             _ => None,
         })
 }
@@ -118,8 +122,13 @@ pub(in crate::editor::ui::model_viewer::paint) fn load_shader(
     } else {
         read(&read_manifest(path)?)?
     };
+    validate_shader(&graph)?;
+    Ok(graph)
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn validate_shader(graph: &Graph) -> Result<(), String> {
     let library = library();
-    if !material_painter_graph::shading::is_shading(&graph, &library) {
+    if !material_painter_graph::shading::is_shading(graph, &library) {
         return Err("Выберите граф шейдинга Material Painter".into());
     }
     for node in &graph.nodes {
@@ -130,7 +139,7 @@ pub(in crate::editor::ui::model_viewer::paint) fn load_shader(
             return Err(format!("Недопустимый узел в графе шейдинга · {}", def.name));
         }
     }
-    Ok(graph)
+    Ok(())
 }
 
 pub(in crate::editor::ui::model_viewer::paint) fn load(
@@ -182,6 +191,58 @@ pub(in crate::editor::ui::model_viewer::paint) fn check_size(
         return Err("Текстуры графа слишком большие".into());
     }
     Ok(())
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn embed_project_images(
+    graph: &mut Graph,
+    directory: &Path,
+    id: u64,
+    mut reserve: impl FnMut(usize) -> Result<(), String>,
+    warnings: &mut Vec<String>,
+) -> GraphImages {
+    let mut images = GraphImages::new();
+    let mut paths = HashMap::<PathBuf, Option<PathBuf>>::new();
+    let (mut bytes, mut texels) = (0, 0);
+    for value in image_values(graph) {
+        let Some(path) = value.take() else { continue };
+        let portable = paths.entry(path.clone()).or_insert_with(|| {
+            let result = (|| {
+                let source = project_image(directory, &path)?;
+                let bitmap = read_bitmap(&source)?;
+                let (mut next_bytes, mut next_texels) = (bytes, texels);
+                check_size(&mut next_bytes, &mut next_texels, images.len() + 1, &bitmap)?;
+                reserve(bitmap.bytes.len() + bitmap.pixels().as_raw().len())?;
+                (bytes, texels) = (next_bytes, next_texels);
+                let key = format!("graph-images/mpp-{id}/{}.png", images.len() + 1);
+                let portable = PathBuf::from(&key);
+                images.insert(key, Arc::new(bitmap));
+                Ok::<_, String>(portable)
+            })();
+            match result {
+                Ok(portable) => Some(portable),
+                Err(error) => {
+                    warnings.push(format!("Граф {id} · {} · {error}", path.display()));
+                    None
+                }
+            }
+        });
+        *value = portable.clone();
+    }
+    images
+}
+
+fn project_image(directory: &Path, path: &Path) -> Result<PathBuf, String> {
+    if matches!(path.components().next(), Some(Component::Prefix(prefix))
+        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+    {
+        return Err("Допускаются только локальные пути".into());
+    }
+    if !image::ImageFormat::from_path(path).is_ok_and(|format| format.reading_enabled()) {
+        return Err("Неподдерживаемый формат изображения".into());
+    }
+    inside(directory, path)
+        .or_else(|| inside(&directory.join("assets"), path))
+        .map_or_else(|| source_image(directory, path, &Value::Null), Ok)
 }
 
 pub(in crate::editor::ui::model_viewer::paint) fn read_bitmap(path: &Path) -> Result<Bitmap, String> {

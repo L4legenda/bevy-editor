@@ -577,8 +577,9 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
     let front = probe.n.w;
     let origin = probe.geo.xyz;
     let limit = front + probe.geo.w;
-    var hit = trace_hit(origin, direction, limit, vec4<u32>(0u), 4u, -1.0);
-    if (hit.triangle == NONE) {
+    let prefer_front_faces = (probe.ids.w & 2u) != 0u;
+    var hit = trace_hit(origin, direction, limit, vec4<u32>(0u), select(5u, 4u, prefer_front_faces), -1.0);
+    if (prefer_front_faces && hit.triangle == NONE) {
         hit = trace_hit(origin, direction, limit, vec4<u32>(0u), 5u, -1.0);
     }
     var face = NONE;
@@ -589,7 +590,7 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
         face = triangle_at(hit.triangle).ids.y;
         position = origin + direction * hit.distance;
         height = (front - hit.distance) / range;
-    } else if (probe.ids.w != 0u) {
+    } else if ((probe.ids.w & 1u) != 0u) {
         let closest = closest_surface(low, range * 4.0);
         if (closest.triangle != NONE) {
             face = triangle_at(closest.triangle).ids.y;
