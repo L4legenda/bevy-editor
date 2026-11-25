@@ -15,6 +15,11 @@ impl Spatial {
             // A changed texel can affect the opposite edge of a repeated mask.
             FilterKind::Blur if self.params[1] != 0. => size,
             FilterKind::Blur | FilterKind::Outline => self.params[0] as u32,
+            FilterKind::DirectionalBlur => {
+                let [samples, x, y, _] = self.params;
+                (samples * x.abs().max(y.abs())).ceil() as u32 + 1
+            }
+            FilterKind::Pixelate => size.div_ceil(self.params[0] as u32),
             FilterKind::Sharpen => self.params[1] as u32,
             FilterKind::Warp => (self.params[0] * size as f32 * 0.5).ceil() as u32 + 1,
             _ => 0,
@@ -47,6 +52,16 @@ impl Spatial {
                     pass(false, params, weights.clone()),
                     pass(true, params, weights),
                 ]
+            }
+            FilterKind::DirectionalBlur if a > 0. => {
+                // The Painter preset is authored at 256 px. Keep the width relative to the mask.
+                let radius = a * (size as f32 / 256.);
+                let samples = (radius.ceil() as i32).clamp(1, 64);
+                let step = Vec2::from_angle(b.to_radians()) * (radius / samples as f32);
+                vec![pass(false, [samples as f32, step.x, step.y, 0.], Vec::new())]
+            }
+            FilterKind::Pixelate if a >= 1. && a < size as f32 => {
+                vec![pass(false, [a, 0., 0., 0.], Vec::new())]
             }
             FilterKind::Sharpen if a > 0. => vec![pass(
                 false,
@@ -106,6 +121,15 @@ impl Spatial {
             input[p.y as usize * size as usize + p.x as usize]
         };
         let at = |p| f32::from(raw_at(p)) / 255.;
+        let bilinear = |pos: Vec2| {
+            let lo = pos.floor().as_ivec2();
+            let t = pos - lo.as_vec2();
+            mix(
+                mix(at(lo), at(lo + IVec2::X), t.x),
+                mix(at(lo + IVec2::Y), at(lo + IVec2::ONE), t.x),
+                t.y,
+            )
+        };
         let dir = if self.vertical { IVec2::Y } else { IVec2::X };
         for (i, value) in output.iter_mut().enumerate() {
             let p = IVec2::new((i % size) as i32, (i / size) as i32);
@@ -118,6 +142,20 @@ impl Spatial {
                     .enumerate()
                     .map(|(k, weight)| at(p + dir * (k as i32 - a as i32)) * weight)
                     .sum(),
+                FilterKind::DirectionalBlur => {
+                    let step = Vec2::new(b, c);
+                    let samples = a as i32;
+                    let sum: f32 = (-samples..=samples)
+                        .map(|k| bilinear(p.as_vec2() + step * k as f32))
+                        .sum();
+                    sum / (2 * samples + 1) as f32
+                }
+                FilterKind::Pixelate => {
+                    let cells = a as i32;
+                    let size = size as i32;
+                    let cell = ((p * 2 + IVec2::ONE) * cells) / (2 * size);
+                    at(((cell * 2 + IVec2::ONE) * size) / (2 * cells))
+                }
                 FilterKind::Sharpen => {
                     let x = IVec2::X * b as i32;
                     let y = IVec2::Y * b as i32;
@@ -130,13 +168,7 @@ impl Spatial {
                         fbm((q + Vec2::new(5.2, 1.7)).extend(7.1 + c)),
                     );
                     let pos = p.as_vec2() + (offset - Vec2::splat(0.5)) * (a * size as f32);
-                    let lo = pos.floor().as_ivec2();
-                    let t = pos - lo.as_vec2();
-                    mix(
-                        mix(at(lo), at(lo + IVec2::X), t.x),
-                        mix(at(lo + IVec2::Y), at(lo + IVec2::ONE), t.x),
-                        t.y,
-                    )
+                    bilinear(pos)
                 }
                 FilterKind::Noise => {
                     let t = ((fbm(q.extend(c)) - 0.35) / (0.65 - 0.35)).clamp(0., 1.);
@@ -182,6 +214,48 @@ impl Spatial {
             *value = (v.clamp(0., 1.) * 255.).round() as u8;
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn directional_blur_spreads_an_impulse_only_along_its_angle() {
+    let size = 256;
+    let mut input = vec![0; size * size];
+    let center = 100 * size + 100;
+    input[center] = 255;
+    let mut output = input.clone();
+    let mut filter = Filter::new(FilterKind::DirectionalBlur);
+    filter.set_value(0, 4.);
+    for (angle, axis, other) in [(0., 1, size), (90., size, 1)] {
+        filter.set_value(1, angle);
+        let passes = Spatial::passes(filter, size as u32);
+        assert_eq!(passes.len(), 1);
+        passes[0].apply(&input, &mut output, size);
+        assert_eq!(output[center], 28);
+        assert_eq!(output[center - 4 * axis], 28);
+        assert_eq!(output[center + 4 * axis], 28);
+        assert_eq!(output[center + 5 * axis], 0);
+        assert_eq!(output[center + other], 0);
+    }
+    filter.set_value(0, 0.);
+    assert!(Spatial::passes(filter, size as u32).is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn pixelate_reads_the_center_of_each_cell_on_a_nondivisible_map() {
+    let size = 8;
+    let input: Vec<_> = (0..64).collect();
+    let mut output = vec![0; size * size];
+    let mut filter = Filter::new(FilterKind::Pixelate);
+    filter.set_value(0, 3.);
+    let passes = Spatial::passes(filter, size as u32);
+    passes[0].apply(&input, &mut output, size);
+    assert_eq!(&output[..8], &[9, 9, 9, 12, 12, 14, 14, 14]);
+    assert_eq!(&output[7 * size..], &[49, 49, 49, 52, 52, 54, 54, 54]);
+    assert_eq!(passes[0].reach(size as u32), 3);
+    filter.set_value(0, 8.);
+    assert!(Spatial::passes(filter, size as u32).is_empty());
 }
 
 fn mix(a: f32, b: f32, t: f32) -> f32 {

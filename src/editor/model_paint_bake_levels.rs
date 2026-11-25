@@ -105,6 +105,26 @@ pub(super) fn set(slot: &mut MaterialSlot, map: BakeMap, levels: Levels) -> Resu
     Ok(())
 }
 
+pub(in crate::editor) fn import_levels(
+    slot: &mut MaterialSlot,
+    map: BakeMap,
+    [black, white, gamma]: [f64; 3],
+) -> Result<bool, String> {
+    if !supports(map) {
+        return Ok(false);
+    }
+    let in_range = (0. ..=1.).contains(&black)
+        && (0. ..=1.).contains(&white)
+        && (0.1..=4.).contains(&gamma);
+    let percent = |value: f64, min, max| (value.clamp(min, max) * 100.).round() as u16;
+    set(slot, map, Levels {
+        black: percent(black, 0., 1.),
+        white: percent(white, 0., 1.),
+        gamma: percent(gamma, 0.1, 4.),
+    })?;
+    Ok(in_range)
+}
+
 /// The disk cache stays raw. Every preview, graph and export uses this version.
 pub(in crate::editor::ui::model_viewer::paint) struct Maps {
     pub(super) raw: Arc<mesh::Maps>,

@@ -24,7 +24,7 @@ pub(in crate::editor) use engine::surface::{PolygonReplay, Stencil, StencilCache
 pub(in crate::editor) mod export;
 #[path = "model_paint_bake.rs"]
 pub(super) mod bake;
-pub(in crate::editor) use bake::import_generator_inputs;
+pub(in crate::editor) use bake::{import_bake_map_bits, import_generator_inputs, import_levels};
 #[path = "model_paint_pathtrace.rs"]
 pub(super) mod pathtrace;
 #[path = "model_paint_post.rs"]
@@ -35,6 +35,7 @@ mod materials;
 use materials::{MATERIALS, MaterialType};
 #[path = "model_paint_presets.rs"]
 pub(super) mod presets;
+pub(in crate::editor) use presets::{project_fill, project_graph, project_mask};
 #[path = "model_paint_graph.rs"]
 mod material_graph;
 #[path = "model_paint_folder_graph.rs"]
@@ -321,7 +322,7 @@ pub(in crate::editor) enum PaintAction {
     SaveBrushDefaults,
     ResetBrushDefaults,
     ToggleRecovery,
-    ApplyRecoveryLimit(Entity),
+    ApplyHistoryPreference(Entity),
     FollowStroke,
     PressureSize,
     PressureFlow,
@@ -641,7 +642,7 @@ impl PaintAction {
             Self::SaveBrushDefaults => "Сохранить размер, жёсткость, шаг кисти и отступ UV-заливки для следующих запусков.",
             Self::ResetBrushDefaults => "Восстановить стандартные параметры кисти и отступа UV-заливки.",
             Self::ToggleRecovery => "Включить или выключить запись новых автокопий GLB.",
-            Self::ApplyRecoveryLimit(_) => "Сохранить число правок между автокопиями.",
+            Self::ApplyHistoryPreference(_) => "Сохранить настройку истории правок.",
             Self::FollowStroke => "Поворачивать наконечник по направлению движения.",
             Self::PressureSize => "Нажим пера управляет размером отпечатка.",
             Self::PressureFlow => "Нажим пера управляет потоком отдельного отпечатка.",
@@ -727,6 +728,7 @@ struct Session {
     stack: Stack,
     undo: Vec<Stack>,
     redo: Vec<Stack>,
+    history_limit: usize,
     tool: PaintTool,
     panel: Panel,
     view: View,
@@ -852,6 +854,7 @@ impl Default for Session {
             stack: Stack::default(),
             undo: vec![],
             redo: vec![],
+            history_limit: editing::recovery::DEFAULT_UNDO_STEPS,
             tool: PaintTool::Brush,
             panel: Panel::Layers,
             view: View::Split,
@@ -1857,7 +1860,7 @@ impl Session {
             }
             PaintAction::BrushTip(tip) => self.tip = tip,
             PaintAction::ImportBrushTip | PaintAction::SaveBrushDefaults | PaintAction::ResetBrushDefaults => {}
-            PaintAction::ToggleRecovery | PaintAction::ApplyRecoveryLimit(_) => {}
+            PaintAction::ToggleRecovery | PaintAction::ApplyHistoryPreference(_) => {}
             PaintAction::FollowStroke => self.follow_stroke = !self.follow_stroke,
             PaintAction::PressureSize => self.pressure_size = !self.pressure_size,
             PaintAction::PressureFlow => self.pressure_flow = !self.pressure_flow,
@@ -2128,6 +2131,7 @@ impl Session {
             PaintAction::Undo => {
                 if let Some(stack) = self.undo.pop() {
                     self.redo.push(self.stack.clone());
+                    Self::trim_history(&mut self.redo, self.history_limit);
                     self.stack = stack;
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
@@ -2138,6 +2142,7 @@ impl Session {
             PaintAction::Redo => {
                 if let Some(stack) = self.redo.pop() {
                     self.undo.push(self.stack.clone());
+                    Self::trim_history(&mut self.undo, self.history_limit);
                     self.stack = stack;
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
@@ -2583,11 +2588,27 @@ impl Session {
         self.revision += 1;
     }
     fn checkpoint(&mut self) {
-        if self.undo.len() >= 32 {
-            self.undo.remove(0);
-        }
-        self.undo.push(self.stack.clone());
+        self.record_undo(self.stack.clone());
+    }
+
+    fn record_undo(&mut self, previous: Stack) {
+        self.undo.push(previous);
+        Self::trim_history(&mut self.undo, self.history_limit);
         self.redo.clear();
+    }
+
+    fn trim_history(history: &mut Vec<Stack>, limit: usize) {
+        history.drain(..history.len().saturating_sub(limit));
+    }
+
+    fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit;
+        Self::trim_history(&mut self.undo, limit);
+        Self::trim_history(&mut self.redo, limit);
+        for (undo, redo) in self.histories.values_mut() {
+            Self::trim_history(undo, limit);
+            Self::trim_history(redo, limit);
+        }
     }
 
     fn select_layer(&mut self, index: usize) {
@@ -2814,9 +2835,9 @@ impl PaintState {
         None
     }
 
-    fn activate(&mut self, model: usize) {
+    fn activate(&mut self, model: usize, history_limit: usize) {
         self.sessions.entry(model).or_insert_with(|| {
-            let mut session = Session::default();
+            let mut session = Session { history_limit, ..Session::default() };
             self.brush_defaults.settings().apply(&mut session);
             session
         });
@@ -2940,11 +2961,11 @@ pub(super) fn actions(
     queue: Option<Res<bevy::render::renderer::RenderQueue>>,
     graph_labels: Query<(&GraphLabel, &bevy::text::EditableText)>,
     mut layer_names: Query<(&LayerNameField, &mut bevy::text::EditableText),
-        (Without<GraphLabel>, Without<ui::RecoveryLimit>)>,
+        (Without<GraphLabel>, Without<ui::HistoryPreference>)>,
     baked: Res<bake::State>,
     (export_preferences, mut recovery, recovery_fields): (
         Res<export::prefs::Store>, ResMut<editing::recovery::Preferences>,
-        Query<&bevy::text::EditableText, With<ui::RecoveryLimit>>,
+        Query<(&ui::HistoryPreference, &bevy::text::EditableText)>,
     ),
 ) {
     let paint = &mut *paint;
@@ -3147,7 +3168,7 @@ pub(super) fn actions(
     {
         return;
     }
-    paint.activate(index);
+    paint.activate(index, recovery.settings().undo_steps);
     let paint = &mut *paint;
     let session = paint.sessions.get_mut(&index).unwrap();
     let stored_settings = export_preferences.settings();
@@ -3170,6 +3191,7 @@ pub(super) fn actions(
     for (action, deferred) in messages.read().copied().map(|action| (action, false))
         .chain(deferred_drop.map(|action| (action, true)))
     {
+        let session = paint.sessions.get_mut(&index).unwrap();
         if let Action::ModelView(ModelViewAction::Paint(mut action)) = action {
             if let PaintAction::ShaderToGraph { model, definition, library_revision } = action {
                 if model != index || editor.browser_popup || editor.hdri_library_open {
@@ -3348,25 +3370,40 @@ pub(super) fn actions(
                 continue;
             }
             match action {
-                PaintAction::ToggleRecovery | PaintAction::ApplyRecoveryLimit(_) => {
+                PaintAction::ToggleRecovery | PaintAction::ApplyHistoryPreference(_) => {
                     if editor.browser_popup || editor.hdri_library_open {
                         continue;
                     }
                     let mut settings = recovery.settings();
                     match action {
                         PaintAction::ToggleRecovery => settings.enabled = !settings.enabled,
-                        PaintAction::ApplyRecoveryLimit(entity) => {
-                            let Some(limit) = recovery_fields.get(entity).ok().and_then(ui::parse_recovery_limit) else {
-                                editor.status = "Введите целое число от 1 до 500".into();
+                        PaintAction::ApplyHistoryPreference(entity) => {
+                            let Ok((&preference, input)) = recovery_fields.get(entity) else {
                                 continue;
                             };
-                            settings.edits = limit;
+                            let Some(limit) = preference.parse(input) else {
+                                let (min, max) = preference.range();
+                                editor.status = format!("Введите целое число от {min} до {max}");
+                                continue;
+                            };
+                            match preference {
+                                ui::HistoryPreference::Recovery => settings.edits = limit,
+                                ui::HistoryPreference::Undo => settings.undo_steps = usize::from(limit),
+                            }
                         }
                         _ => unreachable!(),
                     }
+                    let history_changed = settings.undo_steps != recovery.settings().undo_steps;
                     editor.status = match recovery.save(settings) {
-                        Ok(()) => "Настройки автокопий сохранены".into(),
-                        Err(error) => format!("Не удалось сохранить настройки автокопий · {error}"),
+                        Ok(()) => {
+                            if history_changed {
+                                for session in paint.sessions.values_mut() {
+                                    session.set_history_limit(settings.undo_steps);
+                                }
+                            }
+                            "Настройки истории правок сохранены".into()
+                        }
+                        Err(error) => format!("Не удалось сохранить настройки истории · {error}"),
                     };
                     continue;
                 }
@@ -3865,6 +3902,7 @@ pub(super) fn actions(
         }
     }
 
+    let session = paint.sessions.get_mut(&index).unwrap();
     if paint.smart_import.is_none()
         && session.available(PaintAction::GraphRebake)
         && let Some(binding) = session.binding

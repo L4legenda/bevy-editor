@@ -671,6 +671,7 @@ fn navigate(
         Res<space_mouse::State>,
         Res<paint::engine::Runtime>,
         MessageWriter<bevy::window::RequestRedraw>,
+        Res<super::image_viewer::paint_input::PointerFrame>,
     ),
     mut grids: Query<(&mut Transform, &mut Visibility), (With<ModelGrid>, Without<ViewCamera>)>,
 ) {
@@ -771,6 +772,12 @@ fn navigate(
         .1
         .get()
         .is_some_and(|entity| runtime.2.contains(entity));
+    let in_paint = editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Paint;
+    let pen = in_paint.then_some(runtime.12.pen_pan).flatten();
+    let pen_blocked = pen.is_some_and(|pan| {
+        runtime.10.stroke_active()
+            || pan.start.is_some_and(|point| runtime.4.covers(point, &window))
+    });
     let blocked = typing
         || runtime.6.dragging()
         || editing.gesture.is_some()
@@ -780,9 +787,8 @@ fn navigate(
         || editing.bisect
         || editor.sidebar.resizing()
         || runtime.4.resizing
-        || window
-            .cursor_position()
-            .is_some_and(|point| runtime.4.covers(point, &window));
+        || (pen.is_none() && window.cursor_position()
+            .is_some_and(|point| runtime.4.covers(point, &window)));
     let gizmo_blocked = runtime.5.as_deref_mut().is_some_and(|gizmo| {
         let mut frame = super::navigation_gizmo::Frame {
             workspace: super::navigation_gizmo::Workspace::Model(editor.viewing_model.unwrap()),
@@ -814,11 +820,12 @@ fn navigate(
         runtime.0.delta_secs(),
         runtime.3.delta,
         rect,
-        blocked || gizmo_blocked,
+        blocked || gizmo_blocked || pen_blocked,
+        pen,
     );
-    let in_paint = editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Paint;
     if !blocked
         && !gizmo_blocked
+        && pen.is_none()
         && !mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
         && !runtime.10.stroke_active()
         && (!in_paint || runtime.7.has_3d_view(editor.viewing_model, runtime.8.shows_model()))

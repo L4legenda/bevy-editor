@@ -10,10 +10,18 @@ pub(in crate::editor) enum Sample {
     Up(Vec2),
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::editor) struct PenPan {
+    pub start: Option<Vec2>,
+    pub point: Vec2,
+}
+
 #[derive(Resource, Default)]
 pub(in crate::editor) struct PointerFrame {
     input: Samples,
     pub samples: Vec<Sample>,
+    pub pen_pan: Option<PenPan>,
+    pub pen_pan_handled: bool,
 }
 
 pub(in crate::editor) struct PointerPlugin;
@@ -44,6 +52,12 @@ pub(in crate::editor) fn collect_frame(
     frame.samples = frame
         .input
         .collect(events.read(), id, window.cursor_position(), &mouse);
+    #[cfg(windows)]
+    {
+        let (pan, handled) = super::pen_barrel::poll(id, window.scale_factor());
+        frame.pen_pan = pan;
+        frame.pen_pan_handled = handled;
+    }
 }
 
 #[derive(Default)]

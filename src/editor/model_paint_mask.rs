@@ -29,10 +29,18 @@ pub(in crate::editor) enum FilterKind {
     Warp = 5,
     Noise = 6,
     Outline = 9,
+    Threshold = 10,
+    HistogramScan = 11,
+    ContrastLuminosity = 12,
+    DirectionalBlur = 13,
+    Clamp = 14,
+    Smoothstep = 15,
+    Posterize = 16,
+    Pixelate = 17,
 }
 
 impl FilterKind {
-    pub(in crate::editor) const ALL: [Self; 8] = [
+    pub(in crate::editor) const ALL: [Self; 16] = [
         Self::Levels,
         Self::Invert,
         Self::Contrast,
@@ -41,6 +49,14 @@ impl FilterKind {
         Self::Warp,
         Self::Noise,
         Self::Outline,
+        Self::Threshold,
+        Self::HistogramScan,
+        Self::ContrastLuminosity,
+        Self::DirectionalBlur,
+        Self::Clamp,
+        Self::Smoothstep,
+        Self::Posterize,
+        Self::Pixelate,
     ];
 
     pub(in crate::editor) fn label(self) -> &'static str {
@@ -53,6 +69,14 @@ impl FilterKind {
             Self::Warp => "Искажение",
             Self::Noise => "Шум",
             Self::Outline => "Контур",
+            Self::Threshold => "Порог",
+            Self::HistogramScan => "Сканирование гистограммы",
+            Self::ContrastLuminosity => "Контраст и яркость",
+            Self::DirectionalBlur => "Направленное размытие",
+            Self::Clamp => "Ограничение диапазона",
+            Self::Smoothstep => "Плавный порог",
+            Self::Posterize => "Постеризация",
+            Self::Pixelate => "Пикселизация",
         }
     }
 
@@ -88,6 +112,20 @@ impl FilterKind {
                 ("Кривая, %", 0., -100., 100.),
                 ("Инверсия", 0., 0., 1.),
             ],
+            Self::Threshold => &[("Порог, %", 1., 0., 100.), ("Сравнение", 0., 0., 3.)],
+            Self::HistogramScan => &[
+                ("Позиция, %", 50., 0., 100.),
+                ("Контраст, %", 0., 0., 100.),
+                ("Инверсия", 0., 0., 1.),
+            ],
+            Self::ContrastLuminosity => &[
+                ("Контраст, %", 0., -100., 100.),
+                ("Яркость, %", 0., -100., 100.),
+            ],
+            Self::DirectionalBlur => &[("Интенсивность", 1., 0., 16.), ("Угол, °", 0., 0., 360.)],
+            Self::Clamp | Self::Smoothstep => &[("Минимум, %", 0., 0., 100.), ("Максимум, %", 100., 0., 100.)],
+            Self::Posterize => &[("Градации", 8., 1., 64.)],
+            Self::Pixelate => &[("Ячеек на сторону", 32., 1., 128.)],
         }
     }
 
@@ -98,14 +136,23 @@ impl FilterKind {
             (Self::Sharpen, _) => 0.5,
             (Self::Outline, 1 | 3) => 0.25,
             (Self::Outline, 2 | 5) => 1.,
+            (Self::Threshold, 1) | (Self::HistogramScan, 2) => 1.,
+            (Self::DirectionalBlur, 0) => 0.25,
+            (Self::Clamp | Self::Smoothstep | Self::Posterize | Self::Pixelate, _) => 1.,
             _ => 5.,
         }
     }
 
-    fn spatial(self) -> bool {
+    pub(in crate::editor) fn spatial(self) -> bool {
         matches!(
             self,
-            Self::Blur | Self::Sharpen | Self::Warp | Self::Noise | Self::Outline
+            Self::Blur | Self::Sharpen | Self::Warp | Self::Noise | Self::Outline | Self::DirectionalBlur | Self::Pixelate
+        )
+    }
+
+    fn discrete(self, slot: usize) -> bool {
+        matches!((self, slot),
+            (Self::Threshold, 1) | (Self::HistogramScan, 2) | (Self::Posterize | Self::Pixelate, 0)
         )
     }
 }
@@ -171,7 +218,11 @@ impl Filter {
                 .controls()
                 .iter()
                 .enumerate()
-                .all(|(slot, &(_, _, min, max))| (min..=max).contains(&self.value(slot)))
+                .all(|(slot, &(_, _, min, max))| {
+                    let value = self.value(slot);
+                    (min..=max).contains(&value)
+                        && (!self.kind.discrete(slot) || value.fract() == 0.)
+                })
     }
 
     pub fn value(&self, slot: usize) -> f32 {
@@ -216,7 +267,7 @@ impl Filter {
                 _ => self.values[slot] = value,
             }
         } else if let Some(target) = self.values.iter_mut().chain(&mut self.output).nth(slot) {
-            *target = value;
+            *target = if self.kind.discrete(slot) { value.round() } else { value };
         }
     }
 
@@ -237,10 +288,69 @@ impl Filter {
                 let t = ((s - (a - w)) / (2. * w)).clamp(0., 1.);
                 t * t * (3. - 2. * t)
             }
+            FilterKind::Threshold => {
+                let passes = match self.values[1] as u32 {
+                    0 => s > a,
+                    1 => s >= a,
+                    2 => s < a,
+                    _ => s <= a,
+                };
+                f32::from(u8::from(passes))
+            }
+            FilterKind::HistogramScan => {
+                let value = if a == 0. || a == 1. {
+                    a
+                } else {
+                    let width = (1. - b).max(0.0001);
+                    ((s - (1. - a)) / width + 0.5).clamp(0., 1.)
+                };
+                if c > 0. { 1. - value } else { value }
+            }
+            FilterKind::ContrastLuminosity => {
+                let slope = if a < 0. { 1. + a } else { 1. / (1. - a).max(0.0001) };
+                ((s - 0.5) * slope + 0.5 + b).clamp(0., 1.)
+            }
+            FilterKind::Clamp => s.clamp(a.min(b), a.max(b)),
+            FilterKind::Smoothstep if a == b => f32::from(u8::from(s >= a)),
+            FilterKind::Smoothstep => spatial::smooth(((s - a) / (b - a)).clamp(0., 1.)),
+            FilterKind::Posterize => {
+                let intervals = self.values[0] - 1.;
+                if intervals > 0. { (s * intervals).round() / intervals } else { 0.5 }
+            }
             _ => unreachable!("spatial filters use a separate pass"),
         };
         (value * 255.).round() as u8
     }
+}
+
+#[cfg(test)]
+#[test]
+fn threshold_modes_preserve_equality_and_direction() {
+    let mut filter = Filter::new(FilterKind::Threshold);
+    filter.set_value(0, 0.);
+    for (mode, equal, higher) in [(0., 0, 255), (1., 255, 255), (2., 0, 0), (3., 255, 0)] {
+        filter.set_value(1, mode);
+        assert_eq!([filter.apply(0), filter.apply(128)], [equal, higher]);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn mask_ranges_clamp_or_remap_and_posterize_has_discrete_steps() {
+    let mut clamp = Filter::new(FilterKind::Clamp);
+    clamp.set_value(0, 25.);
+    clamp.set_value(1, 75.);
+    assert_eq!([clamp.apply(0), clamp.apply(100), clamp.apply(255)], [64, 100, 191]);
+    let mut smooth = Filter::new(FilterKind::Smoothstep);
+    smooth.set_value(0, 25.);
+    smooth.set_value(1, 75.);
+    assert_eq!([smooth.apply(60), smooth.apply(128), smooth.apply(200)], [0, 129, 255]);
+    smooth.set_value(1, 25.);
+    assert_eq!([smooth.apply(63), smooth.apply(64)], [0, 255]);
+    let mut posterize = Filter::new(FilterKind::Posterize);
+    posterize.set_value(0, 3.7);
+    assert_eq!(posterize.value(0), 4.);
+    assert_eq!([0, 70, 130, 255].map(|gray| posterize.apply(gray)), [0, 85, 170, 255]);
 }
 
 pub(in crate::editor) enum MaskPass {

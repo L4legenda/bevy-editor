@@ -347,13 +347,7 @@ impl Geometry {
             }) {
                 return Err("Повреждённая топология или UV".into());
             }
-            let edge_scale = face
-                .edges()
-                .map(|(a, b)| self.positions[a].distance_squared(self.positions[b]))
-                .fold(0.0_f32, f32::max);
-            if edge_scale == 0.0
-                || self.normal(face).length_squared() <= edge_scale * edge_scale * 1.0e-14
-            {
+            if !self.has_face_area(face) {
                 return Err("Вырожденная грань: операция отменена".into());
             }
             if self.triangles(face).len() != face.corners.len() - 2 {
@@ -361,6 +355,12 @@ impl Geometry {
             }
         }
         Ok(())
+    }
+    pub(super) fn has_face_area(&self, face: &Face) -> bool {
+        let edge_scale = face.edges()
+            .map(|(a, b)| self.positions[a].distance_squared(self.positions[b]))
+            .fold(0.0_f32, f32::max);
+        edge_scale != 0.0 && self.normal(face).length_squared() > edge_scale * edge_scale * 1.0e-14
     }
     pub fn normal(&self, face: &Face) -> Vec3 {
         face.corners

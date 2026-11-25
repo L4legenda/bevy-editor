@@ -1,5 +1,6 @@
 //! The model workspace uses the same fly/orbit/pan gestures as the scene view.
 use super::*;
+use super::super::image_viewer::paint_input::PenPan;
 
 pub(super) fn background(
     shading: Res<shading::Shading>,
@@ -32,6 +33,7 @@ pub(super) fn background(
 pub(super) enum Navigation {
     Fly,
     Pan,
+    PenPan,
     Orbit,
 }
 
@@ -45,6 +47,7 @@ pub(super) fn drive(
     motion: Vec2,
     rect: Rect,
     blocked: bool,
+    pen: Option<PenPan>,
 ) {
     let command = keys.any_pressed([
         KeyCode::ControlLeft,
@@ -56,14 +59,20 @@ pub(super) fn drive(
         viewer.gesture = None;
         return;
     }
-    let cursor = window
-        .cursor_position()
+    let cursor = pen.map(|pan| pan.point)
+        .or_else(|| window.cursor_position())
         .or_else(|| viewer.gesture.map(|(_, point)| point));
     let Some(cursor) = cursor else {
         return;
     };
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
-    if rect.contains(cursor) {
+    if let Some(pan) = pen {
+        if let Some(start) = pan.start.filter(|point| rect.contains(*point)) {
+            viewer.gesture = Some((Navigation::PenPan, start));
+        } else if !viewer.gesture.is_some_and(|(nav, _)| matches!(nav, Navigation::PenPan)) {
+            viewer.gesture = None;
+        }
+    } else if rect.contains(cursor) {
         let nav = if mouse.just_pressed(MouseButton::Right) {
             Some(Navigation::Fly)
         } else if mouse.just_pressed(MouseButton::Middle) {
@@ -81,10 +90,13 @@ pub(super) fn drive(
         let held = match nav {
             Navigation::Fly => mouse.pressed(MouseButton::Right),
             Navigation::Pan => mouse.pressed(MouseButton::Middle),
+            Navigation::PenPan => pen.is_some(),
             Navigation::Orbit => mouse.pressed(MouseButton::Left),
         };
         if held {
-            let delta = if motion != Vec2::ZERO {
+            let delta = if matches!(nav, Navigation::PenPan) {
+                cursor - previous
+            } else if motion != Vec2::ZERO {
                 motion
             } else {
                 cursor - previous
@@ -114,7 +126,7 @@ pub(super) fn drive(
                         + movement.normalize_or_zero() * speed * dt.min(0.05)
                         + *pose.forward() * viewer.distance;
                 }
-                Navigation::Pan => {
+                Navigation::Pan | Navigation::PenPan => {
                     let pose = view_pose(viewer);
                     viewer.center += (*pose.right() * -delta.x + *pose.up() * delta.y)
                         * viewer.distance
@@ -133,7 +145,7 @@ pub(super) fn drive(
             viewer.gesture = None;
         }
     }
-    if rect.contains(cursor) && scroll.delta.y != 0.0 {
+    if pen.is_none() && rect.contains(cursor) && scroll.delta.y != 0.0 {
         let factor = if scroll.unit == MouseScrollUnit::Line {
             0.13
         } else {

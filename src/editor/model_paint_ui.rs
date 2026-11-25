@@ -223,8 +223,29 @@ fn hide_paint_drop(
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct Value(Parameter);
 
-#[derive(Component)]
-pub(in crate::editor::ui::model_viewer) struct RecoveryLimit;
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(in crate::editor::ui::model_viewer) enum HistoryPreference {
+    Recovery,
+    Undo,
+}
+
+impl HistoryPreference {
+    pub(super) fn range(self) -> (u16, u16) {
+        match self {
+            Self::Recovery => (1, editing::recovery::MAX_EDITS),
+            Self::Undo => (
+                editing::recovery::MIN_UNDO_STEPS as u16,
+                editing::recovery::MAX_UNDO_STEPS as u16,
+            ),
+        }
+    }
+
+    pub(super) fn parse(self, input: &EditableText) -> Option<u16> {
+        let (min, max) = self.range();
+        input.value().to_string().trim().parse::<u16>().ok()
+            .filter(|number| (min..=max).contains(number))
+    }
+}
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct CustomMapName(pub u64);
 #[derive(Resource)]
@@ -257,7 +278,6 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     requested_swatches: std::collections::HashSet<ShelfMaterial>,
     shelf_preview_job: Option<(ShelfMaterial, Task<Result<image::RgbaImage, String>>)>,
     layer_name: Entity,
-    recovery_limit: Entity,
     brush_name: Entity,
     fill_options: Entity,
     fill_angle: Entity,
@@ -1942,27 +1962,12 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     );
     button(&mut commands, defaults, font, "Сохранить стартовые", PaintAction::SaveBrushDefaults);
     button(&mut commands, defaults, font, "Вернуть стандартные", PaintAction::ResetBrushDefaults);
-    text(&mut commands, body, font, "ВОССТАНОВЛЕНИЕ", 11., MUTED);
+    text(&mut commands, body, font, "ИСТОРИЯ И ВОССТАНОВЛЕНИЕ", 11., MUTED);
+    history_number(&mut commands, body, font, "Шагов отмены на набор", HistoryPreference::Undo,
+        "Введите число от 8 до 512 и нажмите Enter. Меньше шагов занимают меньше памяти.");
     button(&mut commands, body, font, "Автокопии", PaintAction::ToggleRecovery);
-    let recovery_limit = number_line(
-        &mut commands, body, font, "Правок между автокопиями",
-        Number::integer(1, editing::recovery::MAX_EDITS.into()), false,
-    );
-    commands.entity(recovery_limit).insert(RecoveryLimit).observe(
-        |mut event: On<FocusedInput<KeyboardInput>>, mut actions: MessageWriter<Action>| {
-            if event.input.state == ButtonState::Pressed && !event.input.repeat
-                && matches!(event.input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
-            {
-                actions.write(Action::ModelView(ModelViewAction::Paint(
-                    PaintAction::ApplyRecoveryLimit(event.focused_entity),
-                )));
-                event.propagate(false);
-            }
-        },
-    );
-    control_hints::attach(&mut commands, recovery_limit,
+    history_number(&mut commands, body, font, "Правок между автокопиями", HistoryPreference::Recovery,
         "Введите число от 1 до 500 и нажмите Enter. После паузы редактор сохраняет накопленные правки.");
-    commands.entity(recovery_limit).insert(Pickable::default());
     text(&mut commands, body, font, "МАТЕРИАЛ", 11., MUTED);
     let palette = node(
         &mut commands,
@@ -2158,7 +2163,6 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         requested_swatches: Default::default(),
         shelf_preview_job: None,
         layer_name,
-        recovery_limit,
         brush_name,
         fill_options,
         fill_angle,
@@ -2232,7 +2236,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         Query<(Entity, &Value, &mut EditableText, &mut BorderColor)>,
         Query<&mut EditableText, With<ShelfSearch>>,
         Query<&LayerNameField>,
-        Query<(&mut EditableText, &mut BorderColor), With<RecoveryLimit>>,
+        Query<(Entity, &HistoryPreference, &mut EditableText, &mut BorderColor)>,
     )>,
     buttons: Query<
         (
@@ -2242,7 +2246,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             &BorderColor,
             Option<&bevy::ui::InteractionDisabled>,
         ),
-        (Without<Value>, Without<RecoveryLimit>),
+        (Without<Value>, Without<HistoryPreference>),
     >,
     mut images: ResMut<Assets<Image>>,
     rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>),
@@ -2395,7 +2399,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let index = editor.viewing_model.unwrap();
     let doc = doc.unwrap();
     let paint = &mut *paint;
-    paint.activate(index);
+    paint.activate(index, recovery_preferences.settings().undo_steps);
     let session = paint.sessions.get_mut(&index).unwrap();
     session.refresh_folder_view();
     if let Ok(mut label) = labels.get_mut(ui.three_label) {
@@ -2510,12 +2514,15 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     let recovery = recovery_preferences.settings();
-    if let Ok((mut input, mut border)) = fields.p3().get_mut(ui.recovery_limit) {
-        if focus.get() == Some(ui.recovery_limit) {
-            let valid = parse_recovery_limit(&input).is_some();
+    for (entity, &preference, mut input, mut border) in &mut fields.p3() {
+        if focus.get() == Some(entity) {
+            let valid = preference.parse(&input).is_some();
             border.set_if_neq(BorderColor::all(if valid { FOCUS } else { ERROR }));
         } else {
-            let saved = recovery.edits.to_string();
+            let saved = match preference {
+                HistoryPreference::Recovery => recovery.edits.to_string(),
+                HistoryPreference::Undo => recovery.undo_steps.to_string(),
+            };
             if input.value().to_string() != saved {
                 input.editor_mut().set_text(&saved);
             }
@@ -3220,7 +3227,14 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                                     _ => "С обеих сторон",
                                 }
                                 .to_owned(),
-                                (FilterKind::Outline, 5) => {
+                                (FilterKind::Threshold, 1) => match value as u32 {
+                                    0 => "Больше",
+                                    1 => "Больше или равно",
+                                    2 => "Меньше",
+                                    _ => "Меньше или равно",
+                                }
+                                .to_owned(),
+                                (FilterKind::Outline, 5) | (FilterKind::HistogramScan, 2) => {
                                     if value != 0. { "Вкл." } else { "Выкл." }.to_owned()
                                 }
                                 _ => value.to_string(),
@@ -4076,7 +4090,27 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     }
 }
 
-pub(super) fn parse_recovery_limit(input: &EditableText) -> Option<u16> {
-    input.value().to_string().trim().parse::<u16>().ok()
-        .filter(|number| (1..=editing::recovery::MAX_EDITS).contains(number))
+fn history_number(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    label: &str,
+    preference: HistoryPreference,
+    hint: &str,
+) {
+    let (min, max) = preference.range();
+    let field = number_line(commands, parent, font, label, Number::integer(min.into(), max.into()), false);
+    control_hints::attach(commands, field, hint);
+    commands.entity(field).insert((preference, Pickable::default())).observe(
+        |mut event: On<FocusedInput<KeyboardInput>>, mut actions: MessageWriter<Action>| {
+            if event.input.state == ButtonState::Pressed && !event.input.repeat
+                && matches!(event.input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
+            {
+                actions.write(Action::ModelView(ModelViewAction::Paint(
+                    PaintAction::ApplyHistoryPreference(event.focused_entity),
+                )));
+                event.propagate(false);
+            }
+        },
+    );
 }

@@ -155,7 +155,14 @@ impl Summary {
 }
 
 pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, ImportDetails)> {
-    use bevy_scene_format::{Revision, atomic_write};
+    let name = project_name(source);
+    let (model, summary) = import(source, &name)?;
+    let bytes = Glb::new_asset(&[model]).map_err(io::Error::other)?;
+    let file = publish_project(target, &name, "SPP", &bytes)?;
+    Ok((file, summary.details()))
+}
+
+pub(super) fn project_name(source: &Path) -> String {
     let name = source
         .file_stem()
         .and_then(|name| name.to_str())
@@ -172,21 +179,23 @@ pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, Impo
         })
         .collect();
     let name = name.trim();
-    let name = if name.is_empty() { "Painter" } else { name };
-    let (model, summary) = import(source, name)?;
-    let bytes = Glb::new_asset(&[model]).map_err(io::Error::other)?;
+    if name.is_empty() { "Painter" } else { name }.to_owned()
+}
+
+pub(super) fn publish_project(target: &Path, name: &str, format: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    use bevy_scene_format::{Revision, atomic_write};
     for number in 1.. {
         let file = if number == 1 {
-            format!("{name}_SPP.glb")
+            format!("{name}_{format}.glb")
         } else {
-            format!("{name}_SPP_{number}.glb")
+            format!("{name}_{format}_{number}.glb")
         };
         let path = target.join(&file);
         if path.exists() {
             continue;
         }
-        match atomic_write(&path, &bytes, Revision::Missing) {
-            Ok(_) => return Ok((PathBuf::from(file), summary.details())),
+        match atomic_write(&path, bytes, Revision::Missing) {
+            Ok(_) => return Ok(PathBuf::from(file)),
             Err(_) if path.exists() => continue,
             Err(error) => return Err(error),
         }
@@ -1035,7 +1044,7 @@ mod tests {
         );
         assert_eq!(report.errors.len(), 1, "{}", report.status());
         assert!(!assets.join("Broken_SPP.glb").exists());
-        let details = report.spp_details().unwrap();
+        let details = report.paint_project_details().unwrap();
         assert!(details.contains("Old_SPP.glb"), "{details}");
         assert!(
             details.contains("карта «цвет» отсутствует в кэше"),
@@ -1247,6 +1256,45 @@ mod tests {
             std::array::from_fn::<_, 6, _>(|slot| outline.value(slot)),
             [75., 2.5, 1., 1., -25., 1.]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_preserves_tonal_mask_filters_in_glb() {
+        use crate::editor::model_paint_data::mask::FilterKind;
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-tonal-mask-{}", bevy::asset::uuid::Uuid::new_v4(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Tonal.spp");
+        fs::write(&source, fixture::hdf5_file(&[
+            ("paint/scene.assbin", fixture::assbin_quad()),
+            ("paint/document.bin", fixture::document_with_tonal_mask_filters()),
+        ])).unwrap();
+        let (filename, report) = convert(&source, &root).unwrap();
+        assert!(report.overview.contains("слоёв частично: 1"));
+        assert!(report.warnings.iter().any(|note| note.contains("Rust")));
+        let glb = Glb::load(&root.join(filename)).unwrap();
+        let surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0])
+            .unwrap().unwrap();
+        let mask = surface.stack.layers.iter().find(|layer| layer.name == "Rust")
+            .unwrap().mask.as_deref().unwrap();
+        assert_eq!(mask.filters.iter().map(|f| (f.kind, f.values)).collect::<Vec<_>>(), [
+            (FilterKind::ContrastLuminosity, [50., 37.5, 0.]),
+            (FilterKind::HistogramScan, [62.5, 50., 1.]),
+            (FilterKind::Threshold, [37.5, 1., 0.]),
+            (FilterKind::DirectionalBlur, [4., 45., 0.]),
+            (FilterKind::Clamp, [12.5, 56.25, 0.]),
+            (FilterKind::Smoothstep, [25., 75., 0.]),
+            (FilterKind::Posterize, [4., 0., 0.]),
+            (FilterKind::Pixelate, [24., 0., 0.]),
+        ]);
+        assert_eq!(mask.effective()[0], 170);
+        for (count, expected) in [(5, 143), (4, 255), (2, 128), (1, 96)] {
+            let mut prefix = mask.clone();
+            prefix.filters.truncate(count);
+            assert!(prefix.effective()[0].abs_diff(expected) <= 2);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

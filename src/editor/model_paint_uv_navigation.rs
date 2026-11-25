@@ -28,7 +28,7 @@ impl UvView {
 
 pub(in crate::editor::ui::model_viewer) struct Drag {
     model: usize,
-    button: MouseButton,
+    button: Option<MouseButton>,
     start: Vec2,
     previous: Vec2,
     moved: bool,
@@ -50,6 +50,7 @@ pub(in crate::editor::ui::model_viewer) fn navigate(
     mut image: Query<&mut Node, With<TextureCanvas>>,
     mut actions: MessageReader<Action>,
     mut drag: Local<Option<Drag>>,
+    pointer: Res<PointerFrame>,
 ) {
     runtime.uv_panning = false;
     let mut fit = false;
@@ -96,25 +97,39 @@ pub(in crate::editor::ui::model_viewer) fn navigate(
             KeyCode::SuperRight,
         ]);
     let alt = keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]);
+    let pen = pointer.pen_pan;
     if blocked
         || drag.as_ref().is_some_and(|drag| {
             drag.model != index
-                || !mouse.pressed(drag.button)
-                || (drag.button == MouseButton::Left && !alt)
+                || match drag.button {
+                    None => pen.is_none_or(|pan| pan.start.is_some()),
+                    Some(button) => pen.is_some() || !mouse.pressed(button)
+                        || (button == MouseButton::Left && !alt),
+                }
         })
     {
         *drag = None;
     }
-    if !blocked && let Some(point) = window.cursor_position() {
+    if !blocked && let Some(point) = pen.map(|pan| pan.point).or_else(|| window.cursor_position()) {
         let over = rect.contains(point) && !drawer.covers(point, &window);
-        if drag.is_none() && over {
+        if let Some(start) = pen.and_then(|pan| pan.start)
+            .filter(|point| rect.contains(*point) && !drawer.covers(*point, &window))
+        {
+            *drag = Some(Drag {
+                model: index,
+                button: None,
+                start,
+                previous: start,
+                moved: true,
+            });
+        } else if pen.is_none() && drag.is_none() && over {
             let button = [MouseButton::Middle, MouseButton::Right, MouseButton::Left]
                 .into_iter()
                 .find(|&button| mouse.just_pressed(button) && (button != MouseButton::Left || alt));
             if let Some(button) = button {
                 *drag = Some(Drag {
                     model: index,
-                    button,
+                    button: Some(button),
                     start: point,
                     previous: point,
                     moved: false,
@@ -122,14 +137,14 @@ pub(in crate::editor::ui::model_viewer) fn navigate(
             }
         }
         if let Some(drag) = drag.as_mut() {
-            drag.moved |= drag.button != MouseButton::Right
+            drag.moved |= drag.button != Some(MouseButton::Right)
                 || crate::editor::area_selection::dragged(drag.start, point);
             if drag.moved {
                 session.uv_view.pan += (point - drag.previous) / size;
                 drag.previous = point;
                 runtime.uv_panning = true;
             }
-        } else if over
+        } else if pen.is_none() && over
             && !mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right])
         {
             let rate = if scroll.unit == MouseScrollUnit::Line {

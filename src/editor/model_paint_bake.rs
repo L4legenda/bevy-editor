@@ -33,6 +33,7 @@ pub(in crate::editor::ui::model_viewer) mod view3d;
 mod mesh;
 #[path = "model_paint_bake_levels.rs"]
 pub(super) mod levels;
+pub(in crate::editor) use levels::import_levels;
 pub(super) use levels::Maps;
 
 pub(in crate::editor) use crate::editor::model_paint_data::map_fixes::BakeMap;
@@ -210,6 +211,10 @@ pub(in crate::editor) fn import_generator_inputs(
         return Err("В наборе нет поверхности с UV-развёрткой".into());
     }
     Ok(maps.generator_inputs().clone())
+}
+
+pub(in crate::editor) fn import_bake_map_bits(maps: impl Iterator<Item = BakeMap>) -> u8 {
+    maps.fold(0, |bits, map| bits | MapSelection::bit(map))
 }
 
 pub(in crate::editor) use crate::editor::model_bake_settings::Quality;

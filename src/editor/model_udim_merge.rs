@@ -1,6 +1,6 @@
 //! Copy texture data at unchanged local UVs when two UDIM sets can share a stack.
 use super::{MaterialSlot, Object};
-use crate::editor::model_paint_data::{DEFAULT_SIZE, Layer, Surface, mask::FilterKind};
+use crate::editor::model_paint_data::{DEFAULT_SIZE, Layer, Surface};
 use std::{ops::Range, sync::Arc};
 
 const GUTTER: usize = 2;
@@ -123,12 +123,7 @@ fn compatible_layers(a: &Layer, b: &Layer) -> bool {
             !a.uses_geometry()
                 && a.graph.is_none()
                 && a.geometry_coverage().is_none()
-                && a.filters.iter().all(|f| {
-                    matches!(
-                        f.kind,
-                        FilterKind::Levels | FilterKind::Contrast | FilterKind::Invert
-                    )
-                })
+                && a.filters.iter().all(|f| !f.kind.spatial())
                 && a.same_settings(b)
         }
         _ => false,

@@ -10,6 +10,109 @@ use bevy::input::{
 };
 
 #[test]
+#[ignore = "requires GPU; checks the Windows Ink pan input in both paint views"]
+fn gpu_pen_barrel_pans_paint_views_without_painting() {
+    use crate::editor::ui::image_viewer::paint_input::{PenPan, PointerFrame, Sample, collect_frame};
+
+    #[derive(Resource, Default)]
+    struct Pen(Option<PenPan>);
+
+    fn inject(pen: Res<Pen>, mut pointer: ResMut<PointerFrame>) {
+        if let Some(pan) = pen.0 {
+            pointer.pen_pan = Some(pan);
+            pointer.pen_pan_handled = true;
+            if let Some(start) = pan.start {
+                pointer.samples.push(Sample::Down(start));
+            }
+            pointer.samples.push(Sample::Move(pan.point));
+        } else {
+            pointer.pen_pan = None;
+            pointer.pen_pan_handled = false;
+        }
+    }
+
+    fn center<T: Component>(app: &mut App) -> Vec2 {
+        let world = app.world_mut();
+        let (node, transform) = world.query_filtered::<
+            (&ComputedNode, &UiGlobalTransform), With<T>,
+        >().single(world).unwrap();
+        transform.affine().translation * node.inverse_scale_factor()
+    }
+
+    let (mut app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.init_resource::<Pen>().add_systems(PreUpdate, inject.after(collect_frame));
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) {
+            break;
+        }
+    }
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Paint))));
+    warm(&mut app, 6);
+    paint_ready(&mut app);
+
+    for view in [View::Three, View::Two] {
+        paint_message(&mut app, PaintAction::View(view));
+        let canvas = if view == View::Three { center::<Canvas>(&mut app) }
+            else { center::<engine::TextureCanvas>(&mut app) };
+        let camera = app.world().resource::<Viewer>().center;
+        let undo = app.world().resource::<PaintState>().sessions[&0].undo.len();
+        app.world_mut().resource_mut::<Pen>().0 = Some(PenPan { start: Some(canvas), point: canvas });
+        frame(&mut app);
+        app.world_mut().resource_mut::<Pen>().0 = Some(PenPan { start: None, point: canvas + Vec2::new(30., 15.) });
+        frame(&mut app);
+        app.world_mut().resource_mut::<Pen>().0 = None;
+        warm(&mut app, 8);
+        assert_eq!(app.world().resource::<PaintState>().sessions[&0].undo.len(), undo);
+        if view == View::Three {
+            assert_ne!(app.world().resource::<Viewer>().center, camera);
+        } else {
+            assert_eq!(app.world().resource::<Viewer>().center, camera);
+            assert!(center::<engine::TextureCanvas>(&mut app).distance(canvas + Vec2::new(30., 15.)) < 2.);
+        }
+    }
+}
+
+#[test]
+fn paint_history_limit_keeps_latest_edits_in_active_and_parked_sets() {
+    let mut paint = PaintState::default();
+    paint.activate(0, 24);
+    let session = paint.sessions.get_mut(&0).unwrap();
+    let initial_layers = session.stack.layers.len();
+    for _ in 0..20 {
+        session.edit(PaintAction::Add(LayerKind::Paint));
+    }
+    for _ in 0..10 {
+        session.edit(PaintAction::Undo);
+    }
+    session.histories.insert((1, 2), (session.undo.clone(), session.redo.clone()));
+    session.set_history_limit(8);
+    let (parked_undo, parked_redo) = &session.histories[&(1, 2)];
+    assert_eq!(parked_undo.len(), 8);
+    assert_eq!(parked_undo[0].layers.len(), initial_layers + 2);
+    assert_eq!(parked_redo.len(), 8);
+    assert_eq!(parked_redo[0].layers.len(), initial_layers + 18);
+
+    for _ in 0..9 {
+        session.edit(PaintAction::Undo);
+    }
+    assert!(session.undo.is_empty());
+    assert_eq!(session.stack.layers.len(), initial_layers + 2);
+    for _ in 0..8 {
+        session.edit(PaintAction::Redo);
+    }
+    assert_eq!(session.stack.layers.len(), initial_layers + 10);
+
+    let previous = session.stack.clone();
+    session.record_undo(previous);
+    assert_eq!(session.undo.len(), 8);
+    assert_eq!(session.undo.last().unwrap().layers.len(), initial_layers + 10);
+    assert!(session.redo.is_empty());
+}
+
+#[test]
 fn shader_insertion_keeps_the_open_graph_target_and_rejects_incompatible_nodes() {
     let library = material_graph::library();
     let texture = library.defs.iter().position(|node| node.id == "color").unwrap();
@@ -1530,7 +1633,9 @@ fn gpu_paint_sets_recovery_preferences_from_properties() {
 
     let field = {
         let world = app.world_mut();
-        world.query_filtered::<Entity, With<ui::RecoveryLimit>>().single(world).unwrap()
+        world.query::<(Entity, &ui::HistoryPreference)>().iter(world)
+            .find_map(|(entity, preference)| (*preference == ui::HistoryPreference::Recovery).then_some(entity))
+            .unwrap()
     };
     scroll_to_paint_entity(&mut app, field);
     let point = labelled(&mut app, "Рисование: Правок между автокопиями").center();
@@ -1553,6 +1658,26 @@ fn gpu_paint_sets_recovery_preferences_from_properties() {
     let settings = app.world().resource::<editing::recovery::Preferences>().settings();
     assert!(settings.enabled);
     assert_eq!(settings.edits, 37);
+    let field = {
+        let world = app.world_mut();
+        world.query::<(Entity, &ui::HistoryPreference)>().iter(world)
+            .find_map(|(entity, preference)| (*preference == ui::HistoryPreference::Undo).then_some(entity))
+            .unwrap()
+    };
+    scroll_to_paint_entity(&mut app, field);
+    let point = labelled(&mut app, "Рисование: Шагов отмены на набор").center();
+    move_pointer(&mut app, window, point);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    for (typed, expected) in [("7", 32), ("12", 12)] {
+        app.world_mut().get_mut::<bevy::text::EditableText>(field).unwrap()
+            .editor_mut().set_text(typed);
+        fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Pressed);
+        fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Released);
+        assert_eq!(app.world().resource::<editing::recovery::Preferences>().settings().undo_steps, expected);
+        assert_eq!(app.world().resource::<PaintState>().sessions[&0].history_limit, expected);
+    }
     assert!(!app.world().resource::<editing::State>().documents[&0].dirty());
     let edits = app.world().resource::<editing::State>().documents[&0].recovery_edits;
     let add = PaintAction::Add(LayerKind::Paint);

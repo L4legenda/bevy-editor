@@ -3,6 +3,68 @@ use super::*;
 use std::time::Instant;
 
 #[test]
+#[ignore = "requires GPU; compares directional blur and pixelation mask passes with the CPU"]
+fn gpu_directional_blur_and_pixelate_match_cpu_mask() {
+    use data::mask::{Filter, FilterKind, Mask};
+
+    let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+    let render = app.sub_app(RenderApp).world();
+    let device = render.resource::<RenderDevice>();
+    let queue = render.resource::<RenderQueue>();
+    let pipelines = Pipelines::new(device);
+    let size = 256u32;
+    let bytes = u64::from(size).pow(2) * 4;
+    let tiles = empty(device, "unused sparse tiles", 16, BufferUsages::STORAGE);
+    let output = empty(device, "mask filter output", bytes,
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+    let readback = empty(device, "mask filter readback", bytes,
+        BufferUsages::COPY_DST | BufferUsages::MAP_READ);
+    let pixels: Arc<Vec<_>> = Arc::new((0..size).flat_map(|y| {
+        (0..size).flat_map(move |x| {
+            let gray = if x < y / 2 || (70..112).contains(&x) && y < 40 { 255 } else { 0 };
+            [gray, gray, gray, 255]
+        })
+    }).collect());
+    let bounds: Vec<_> = [size; 4].into_iter().flat_map(u32::to_le_bytes).collect();
+    for (kind, params) in [
+        (FilterKind::DirectionalBlur, [8.5, 0.]),
+        (FilterKind::DirectionalBlur, [8.5, 37.]),
+        (FilterKind::DirectionalBlur, [8.5, 90.]),
+        (FilterKind::Pixelate, [32., 0.]),
+        (FilterKind::Pixelate, [37., 0.]),
+    ] {
+        let mut filter = Filter::new(kind);
+        for (slot, value) in params.into_iter().enumerate() {
+            filter.set_value(slot, value);
+        }
+        let mask = Mask::new(pixels.clone(), vec![filter]);
+        let filters = MaskFilters::new(device, &pipelines, &mask, size, &output, &tiles).unwrap();
+        queue.write_buffer(filters.bounds.as_ref().unwrap(), 0, &bounds);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        for group in &filters.passes {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipelines.mask_filter);
+            pass.set_bind_group(0, &**group, &[]);
+            pass.dispatch_workgroups(size.div_ceil(8), size.div_ceil(8), 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, bytes);
+        let submission = queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(MapMode::Read, |result| result.unwrap());
+        device.poll(PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(std::time::Duration::from_secs(30)),
+        }).unwrap();
+        let gpu = readback.slice(..).get_mapped_range().unwrap();
+        let max_error = gpu.iter().zip(mask.effective()).map(|(a, b)| a.abs_diff(*b)).max();
+        let tolerance = u8::from(kind == FilterKind::DirectionalBlur);
+        assert!(max_error.is_some_and(|error| error <= tolerance), "{kind:?} {params:?}, max error {max_error:?}");
+        assert_ne!(&gpu[..], &pixels[..]);
+        drop(gpu);
+        readback.unmap();
+    }
+}
+
+#[test]
 #[ignore = "requires GPU and tools/paint-perf/prepare.py; measures actual completed paint work"]
 fn gpu_compare_complex_paint() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/paint-perf");

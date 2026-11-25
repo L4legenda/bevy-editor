@@ -190,16 +190,16 @@ pub(super) struct ImportReport {
     pub(super) mesh_unwrapped_sets: usize,
     pub skipped: usize,
     pub errors: Vec<String>,
-    pub(super) spp: Vec<(PathBuf, super::model_paint_spp::ImportDetails)>,
+    pub(super) paint_projects: Vec<(PathBuf, super::model_paint_spp::ImportDetails)>,
 }
 
 impl ImportReport {
-    pub(super) fn spp_details(&self) -> Option<String> {
-        if self.spp.is_empty() {
+    pub(super) fn paint_project_details(&self) -> Option<String> {
+        if self.paint_projects.is_empty() {
             return None;
         }
         let mut sections = Vec::new();
-        for (path, report) in &self.spp {
+        for (path, report) in &self.paint_projects {
             let mut lines = vec![path.display().to_string(), report.overview.clone()];
             lines.extend(report.warnings.iter().map(|warning| format!("• {warning}")));
             sections.push(lines.join("\n"));
@@ -222,10 +222,10 @@ impl ImportReport {
         if self.mesh_unwrapped_sets > 0 {
             status.push_str(&format!(" · Построена UV-развёртка · наборов: {}", self.mesh_unwrapped_sets));
         }
-        if let Some((_, summary)) = self.spp.first() {
+        if let Some((_, summary)) = self.paint_projects.first() {
             status.push_str(&format!(" · {}", summary.label));
-            if self.spp.len() > 1 {
-                status.push_str(&format!(" (SPP-проектов: {})", self.spp.len()));
+            if self.paint_projects.len() > 1 {
+                status.push_str(&format!(" (проектов рисования: {})", self.paint_projects.len()));
             }
         }
         if self.skipped != 0 {
@@ -304,16 +304,20 @@ fn import(
             }
             continue;
         }
-        if source.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("spp")) {
+        if let Some(ext) = source.extension().and_then(|ext| ext.to_str())
+            && ["spp", "mpp"].iter().any(|format| ext.eq_ignore_ascii_case(format))
+        {
+            let mpp = ext.eq_ignore_ascii_case("mpp");
             let result = source.canonicalize().and_then(|source| {
                 if !seen.insert(source.clone()) { return Ok(None); }
-                super::model_paint_spp::convert(&source, &target).map(Some)
+                let convert = if mpp { super::model_paint_mpp::convert } else { super::model_paint_spp::convert };
+                convert(&source, &target).map(Some)
             });
             match result {
                 Ok(Some((name, summary))) => {
                     let path = parent.join(name);
                     report.imported.push(path.clone());
-                    report.spp.push((path, summary));
+                    report.paint_projects.push((path, summary));
                 }
                 Ok(None) => report.skipped += 1,
                 Err(error) => report.errors.push(format!("{label}: {error}")),

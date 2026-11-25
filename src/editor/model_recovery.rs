@@ -16,6 +16,9 @@ use std::{
 
 const DEFAULT_EDITS: u16 = 10;
 pub(in crate::editor) const MAX_EDITS: u16 = 500;
+pub(in crate::editor) const DEFAULT_UNDO_STEPS: usize = 32;
+pub(in crate::editor) const MIN_UNDO_STEPS: usize = 8;
+pub(in crate::editor) const MAX_UNDO_STEPS: usize = 512;
 const INTERVAL: Duration = Duration::from_secs(15);
 const MAX_GLB: usize = 512 * 1024 * 1024;
 
@@ -24,6 +27,7 @@ const MAX_GLB: usize = 512 * 1024 * 1024;
 pub(in crate::editor) struct Settings {
     pub enabled: bool,
     pub edits: u16,
+    pub undo_steps: usize,
 }
 
 impl Default for Settings {
@@ -31,6 +35,7 @@ impl Default for Settings {
         Self {
             enabled: true,
             edits: DEFAULT_EDITS,
+            undo_steps: DEFAULT_UNDO_STEPS,
         }
     }
 }
@@ -70,6 +75,7 @@ impl Preferences {
             }
         }
         settings.edits = settings.edits.clamp(1, MAX_EDITS);
+        settings.undo_steps = settings.undo_steps.clamp(MIN_UNDO_STEPS, MAX_UNDO_STEPS);
         Self {
             path,
             settings,
@@ -83,6 +89,7 @@ impl Preferences {
 
     pub(in crate::editor) fn save(&mut self, mut settings: Settings) -> io::Result<()> {
         settings.edits = settings.edits.clamp(1, MAX_EDITS);
+        settings.undo_steps = settings.undo_steps.clamp(MIN_UNDO_STEPS, MAX_UNDO_STEPS);
         if settings == self.settings {
             return Ok(());
         }
@@ -647,6 +654,7 @@ mod tests {
             .save(Settings {
                 enabled: false,
                 edits: DEFAULT_EDITS - 1,
+                undo_steps: 48,
             })
             .unwrap();
         store.next_poll = None;
@@ -713,6 +721,7 @@ mod tests {
             .save(Settings {
                 enabled: true,
                 edits: MAX_EDITS,
+                ..preferences.settings()
             })
             .unwrap();
         live.update(&root, &preferences, std::iter::once(&doc));

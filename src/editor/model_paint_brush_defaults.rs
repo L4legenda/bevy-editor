@@ -128,10 +128,10 @@ mod tests {
             brush_defaults: Store::open(Some(path.clone())),
             ..Default::default()
         };
-        restarted.activate(0);
+        restarted.activate(0, 32);
         assert_eq!(Settings::capture(&restarted.sessions[&0]), saved);
         restarted.sessions.get_mut(&0).unwrap().size = 32.;
-        restarted.activate(1);
+        restarted.activate(1, 32);
         assert_eq!(restarted.sessions[&1].size, 32.);
         assert_eq!(restarted.sessions[&1].fill_padding, saved.fill_padding);
 

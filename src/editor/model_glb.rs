@@ -33,6 +33,15 @@ impl Glb {
     }
 
     pub(in crate::editor) fn new_asset_with_pngs(objects: &[Object], pngs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+        Self::new_asset_configured(objects, pngs, |_| Ok(()), None)
+    }
+
+    pub(in crate::editor) fn new_asset_configured(
+        objects: &[Object],
+        pngs: &[Vec<u8>],
+        configure: impl FnOnce(&mut Value) -> Result<(), String>,
+        cage: Option<&crate::editor::model_cage_data::Edits>,
+    ) -> Result<Vec<u8>, String> {
         let mut source = Self {
             path: PathBuf::new(),
             json: json!({
@@ -69,7 +78,8 @@ impl Glb {
             source.json["textures"] = json!((0..images.len()).map(|i| json!({"source":i})).collect::<Vec<_>>());
             source.json["images"] = json!(images);
         }
-        source.encode(objects, &[])
+        configure(&mut source.json)?;
+        source.encode_with_cage(objects, &[], cage)
     }
 
     pub fn data(&self) -> &[u8] {

@@ -24,6 +24,7 @@ mod model_cage_data;
 mod model_import_mesh;
 mod model_mesh;
 mod model_paint_data;
+mod model_paint_mpp;
 mod model_paint_spp;
 mod model_primitives;
 mod model_source;

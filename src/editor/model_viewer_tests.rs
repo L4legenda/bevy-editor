@@ -750,6 +750,7 @@ fn navigation_gizmo_model_pan_and_zoom_keep_orthographic_but_orbit_restores_pers
         Vec2::new(12.0, 2.0),
         rect,
         false,
+        None,
     );
     assert!(viewer.orthographic);
     mouse.release(MouseButton::Middle);
@@ -767,6 +768,7 @@ fn navigation_gizmo_model_pan_and_zoom_keep_orthographic_but_orbit_restores_pers
         Vec2::ZERO,
         rect,
         false,
+        None,
     );
     assert!(viewer.orthographic);
     mouse.press(MouseButton::Left);
@@ -781,8 +783,48 @@ fn navigation_gizmo_model_pan_and_zoom_keep_orthographic_but_orbit_restores_pers
         Vec2::new(12.0, 2.0),
         rect,
         false,
+        None,
     );
     assert!(!viewer.orthographic);
+}
+
+#[test]
+fn pen_pan_stays_in_the_view_where_it_started() {
+    use super::super::image_viewer::paint_input::PenPan;
+
+    let mut viewer = Viewer {
+        distance: 8.0,
+        radius: 1.0,
+        orthographic: true,
+        ..default()
+    };
+    let window = Window { focused: true, ..default() };
+    let rect = Rect::from_corners(Vec2::ZERO, Vec2::splat(600.0));
+    let mouse = ButtonInput::default();
+    let keys = ButtonInput::default();
+    let scroll = AccumulatedMouseScroll::default();
+    let original = viewer.center;
+    let drive = |viewer: &mut Viewer, pen, blocked| {
+        navigation::drive(viewer, &window, &mouse, &keys, &scroll, 0.016,
+            Vec2::splat(100.0), rect, blocked, pen);
+    };
+    drive(&mut viewer, Some(PenPan {
+        start: Some(Vec2::splat(650.0)), point: Vec2::splat(550.0),
+    }), false);
+    assert_eq!(viewer.center, original);
+    drive(&mut viewer, Some(PenPan {
+        start: Some(Vec2::splat(550.0)), point: Vec2::splat(550.0),
+    }), false);
+    assert_eq!(viewer.center, original, "raw mouse motion is ignored");
+    drive(&mut viewer, Some(PenPan { start: None, point: Vec2::splat(650.0) }), false);
+    assert_ne!(viewer.center, original);
+    assert!(viewer.orthographic);
+    let panned = viewer.center;
+    drive(&mut viewer, Some(PenPan { start: None, point: Vec2::splat(670.0) }), true);
+    drive(&mut viewer, Some(PenPan { start: None, point: Vec2::splat(690.0) }), false);
+    assert_eq!(viewer.center, panned, "closing an overlay does not restart the gesture");
+    drive(&mut viewer, None, false);
+    assert!(viewer.gesture.is_none());
 }
 
 #[test]

@@ -19,6 +19,7 @@ use std::{
 
 #[path = "model_paint_mpsmart.rs"]
 mod mpsmart;
+pub(in crate::editor) use mpsmart::{project_fill, project_graph, project_mask};
 
 const EXTENSION: &str = "bevypaint";
 const MAX_FILE: u64 = 194 * 1024 * 1024;

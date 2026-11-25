@@ -256,7 +256,7 @@ pub(super) fn decode_bytes(
             .as_ref()
             .map(|mask| {
                 let graph = lookup_graph(&graphs, &mask["graph"], &layer.name)?;
-                read_mask(mask, &mut omitted, graph.map(|graph| graph.mask.clone()))
+                read_mask(mask, &mut omitted, graph.map(|graph| graph.mask.clone()), &[])
             })
             .transpose()?;
         layers.push(LayerPreset {
@@ -439,15 +439,74 @@ fn read_fill(
     ))
 }
 
+pub(in crate::editor) fn project_graph(value: &Value) -> Result<Arc<Value>, String> {
+    let graph = material_graph::read(value)?;
+    graph.validate_texture_graph(material_graph::library().as_ref())?;
+    if material_graph::file::image_paths(&graph).next().is_some() {
+        return Err("Граф ссылается на внешнее изображение".into());
+    }
+    Ok(Arc::new(value.clone()))
+}
+
+pub(in crate::editor) fn project_fill(
+    layer: &mut Layer,
+    value: &Value,
+    images: [Option<Arc<texture_fill::Bitmap>>; CHANNEL_COUNT],
+    opacity_source: OpacitySource,
+    graph: Option<Arc<Value>>,
+    mut plane: impl FnMut([u8; 4]) -> Result<Arc<Vec<u8>>, String>,
+) -> Result<(), String> {
+    let graph = graph.map(|payload| {
+        let parsed = material_graph::read(&payload)?;
+        let outputs = material_painter_graph::channel_outputs(&parsed.outputs(material_graph::library().as_ref()));
+        Ok::<_, String>(ArchiveGraph { mask: project_graph_preset(payload), outputs })
+    }).transpose()?;
+    // The common fill reader uses image presence to pick the correct factors and channels.
+    let references = std::array::from_fn(|channel| {
+        images[channel].as_ref().map(|image| ImageRef { file: String::new(), name: image.name.clone() })
+    });
+    let (channels, fill) = read_fill(value, references, opacity_source, graph.as_ref())?;
+    for (target, source) in layer.channels.iter_mut().zip(channels) {
+        *target = source.map(&mut plane).transpose()?;
+    }
+    if let Some(payload) = fill {
+        let mut fill = texture_fill::Fill::default();
+        fill.settings = payload.settings;
+        fill.graph = payload.graph;
+        fill.images = std::array::from_fn(|i| payload.images[i].as_ref().and(images[i].clone()));
+        layer.texture_fill = Some(Arc::new(fill));
+    }
+    Ok(())
+}
+
+fn project_graph_preset(payload: Arc<Value>) -> MaskGraphPreset {
+    MaskGraphPreset { payload, images: BTreeMap::new(), output: None }
+}
+
+pub(in crate::editor) fn project_mask(
+    value: &Value,
+    pixels: Arc<Vec<u8>>,
+    graph: Option<Arc<Value>>,
+    maps: &[crate::editor::model_paint_data::custom::Recipe],
+    omitted: &mut usize,
+) -> Result<Arc<Mask>, String> {
+    let preset = read_mask(value, omitted, graph.map(project_graph_preset), maps)?;
+    if !preset.valid() {
+        return Err("Параметры маски Material Painter вне поддерживаемого диапазона".into());
+    }
+    preset.load(pixels, &mut |_| Err("Граф ссылается на внешнее изображение".into()))
+}
+
 fn read_mask(
     value: &Value,
     omitted: &mut usize,
     graph: Option<MaskGraphPreset>,
+    maps: &[crate::editor::model_paint_data::custom::Recipe],
 ) -> Result<MaskPreset, String> {
     let generator = value
         .get("generator")
         .filter(|value| !value.is_null())
-        .map(|value| read_generator(value, omitted))
+        .map(|value| read_generator(value, omitted, maps))
         .transpose()?;
     let filters = value["filters"]
         .as_array()
@@ -479,7 +538,7 @@ fn read_mask(
             let source = &row["source"];
             let generator = source
                 .get("generator")
-                .map(|generator| read_generator(generator, omitted))
+                .map(|generator| read_generator(generator, omitted, maps))
                 .transpose()?;
             let blend = match row["blend"].as_str().unwrap_or("multiply") {
                 "normal" => MaskBlend::Normal,
@@ -512,6 +571,12 @@ fn read_mask(
 }
 
 fn read_filter(row: &Value) -> Result<Filter, String> {
+    if let Some(saved) = row.get("bevy_filter") {
+        let filter: Filter = serde_json::from_value(saved.clone())
+            .map_err(|error| format!("Повреждённый фильтр маски: {error}"))?;
+        return filter.valid().then_some(filter)
+            .ok_or_else(|| "Недопустимые параметры фильтра маски".into());
+    }
     if let Some(outline) = row.get("bevy_outline") {
         let filter: Filter = serde_json::from_value(outline.clone())
             .map_err(|error| format!("Повреждённый контур маски: {error}"))?;
@@ -595,7 +660,33 @@ fn mpsmart_mask_outline_survives_through_an_editor_extension() {
     assert_eq!(read_filter(&data["filters"][0]).unwrap(), filter);
 }
 
-fn read_generator(value: &Value, omitted: &mut usize) -> Result<Generator, String> {
+#[cfg(test)]
+#[test]
+fn mpsmart_native_filters_round_trip_and_report_external_limit() {
+    let filters = [FilterKind::Threshold, FilterKind::HistogramScan, FilterKind::ContrastLuminosity,
+        FilterKind::DirectionalBlur, FilterKind::Clamp, FilterKind::Smoothstep,
+        FilterKind::Posterize, FilterKind::Pixelate]
+        .map(|kind| {
+            let mut filter = Filter::new(kind);
+            filter.set_value(0, 43.);
+            filter
+        });
+    let mask = Mask::new(solid(16, [255; 4]), filters.to_vec());
+    let (preset, _, _) = MaskPreset::capture(&mask, &mut Vec::new());
+    let mut adjusted = 0;
+    let data = write_mask(&preset, LayerKind::Fill, &mut adjusted);
+    assert_eq!(adjusted, filters.len());
+    for (row, filter) in data["filters"].as_array().unwrap().iter().zip(filters) {
+        assert_eq!(row["enabled"], false);
+        assert_eq!(read_filter(row).unwrap(), filter);
+    }
+}
+
+fn read_generator(
+    value: &Value,
+    omitted: &mut usize,
+    maps: &[crate::editor::model_paint_data::custom::Recipe],
+) -> Result<Generator, String> {
     let name = value["kind"].as_str().unwrap_or("");
     let &(kind, _) = GENERATORS
         .iter()
@@ -611,6 +702,7 @@ fn read_generator(value: &Value, omitted: &mut usize) -> Result<Generator, Strin
     generator.edge_width = (number(value, "edge_width", 0.04) * 1000.).round() as u16;
     generator.id_color = Some(vector(value, "id_color", [1., 0., 0.]).map(pack));
     generator.id_tolerance = percent(number(value, "id_tolerance", 0.15));
+    let mut legacy_custom = &[][..];
     if let Some(weights) = value["weights"].as_array() {
         let mut converted = generator.weights().map(|_| 0);
         let legacy = value.get("custom").is_none() && weights.len() > 19;
@@ -619,19 +711,31 @@ fn read_generator(value: &Value, omitted: &mut usize) -> Result<Generator, Strin
             *target = (source.as_f64().unwrap_or(0.) * 100.).round() as i16;
         }
         if legacy {
-            *omitted += weights[built_in..]
-                .iter()
-                .filter(|weight| weight.as_f64().is_some_and(|value| value != 0.))
-                .count();
+            legacy_custom = &weights[built_in..];
         }
         generator.weights = Some(converted);
     }
-    *omitted += value["custom"]
+    let explicit = value["custom"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|slot| slot["id"].as_u64().unwrap_or(0) != 0)
-        .count();
+        .filter_map(|slot| Some((slot["id"].as_u64()?, slot["weight"].as_f64().unwrap_or(0.))));
+    let legacy = legacy_custom.iter().enumerate()
+        .filter_map(|(i, weight)| Some((i as u64 + 1, weight.as_f64()?)))
+        .filter(|&(_, weight)| weight != 0.);
+    for (id, weight) in explicit.chain(legacy).filter(|&(id, _)| id != 0) {
+        if maps.iter().any(|map| map.id == id)
+            && !generator.custom.iter().any(|entry| entry.id == id)
+            && let Some(slot) = generator.custom.iter_mut().find(|entry| entry.id == 0)
+        {
+            let weight = (weight * 100.).round();
+            *omitted += usize::from(!(-200. ..=200.).contains(&weight));
+            slot.id = id;
+            slot.weight = weight.clamp(-200., 200.) as i16;
+        } else {
+            *omitted += 1;
+        }
+    }
     Ok(generator)
 }
 
@@ -988,15 +1092,18 @@ fn write_mask(mask: &MaskPreset, kind: LayerKind, adjusted: &mut usize) -> Value
                 *adjusted += usize::from(filter.enabled && kind != LayerKind::Folder);
                 return json!({"kind": "invert", "enabled": false, "bevy_outline": filter});
             }
-            let (_, kind, units) = FILTERS
+            let Some((_, key, units)) = FILTERS
                 .iter()
                 .find(|(kind, _, _)| *kind == filter.kind)
-                .unwrap();
+            else {
+                *adjusted += usize::from(filter.enabled && kind != LayerKind::Folder);
+                return json!({"kind": "invert", "enabled": false, "bevy_filter": filter});
+            };
             let [a, b, mut c] = std::array::from_fn(|i| filter.values[i] / units[i]);
             if filter.kind == FilterKind::Warp {
                 c = 0.;
             }
-            let mut row = json!({"kind": kind, "enabled": filter.enabled, "a": a, "b": b, "c": c});
+            let mut row = json!({"kind": key, "enabled": filter.enabled, "a": a, "b": b, "c": c});
             if filter.kind == FilterKind::Levels && filter.output != [0., 100.] {
                 row["bevy_output_min"] = json!(filter.output[0] / 100.);
                 row["bevy_output_max"] = json!(filter.output[1] / 100.);

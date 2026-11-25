@@ -28,6 +28,9 @@ mod gradient;
 pub(in crate::editor) use canvas_material::{CanvasMaterial, ImageCanvasPlugin};
 #[path = "image_paint_input.rs"]
 pub(super) mod paint_input;
+#[cfg(windows)]
+#[path = "image_pen_barrel.rs"]
+mod pen_barrel;
 #[path = "image_panel_resize.rs"]
 mod panel_resize;
 #[cfg(target_os = "windows")]

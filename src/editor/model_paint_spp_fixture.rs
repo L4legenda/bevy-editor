@@ -391,6 +391,10 @@ pub fn document_with_ordered_mask_filters() -> Vec<u8> {
     document_options(0, None, TestMask::OrderedFilters)
 }
 
+pub fn document_with_tonal_mask_filters() -> Vec<u8> {
+    document_options(0, None, TestMask::TonalFilters)
+}
+
 pub fn document_with_anchors() -> Vec<u8> {
     document_options(0, None, TestMask::Anchors)
 }
@@ -475,6 +479,7 @@ enum TestMask<'a> {
     PaintFill,
     Effects(&'a str, bool),
     OrderedFilters,
+    TonalFilters,
     Anchors,
     Udim,
     Stencil(&'a str, bool, Option<bool>, Option<u32>),
@@ -607,6 +612,34 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         write_strokes(&mut w, 0x400, true, None, None, false, false);
     } else if let Some(url) = mask_image {
         write_mask_effects(&mut w, url, matches!(mask, TestMask::Effects(_, true)));
+    } else if matches!(mask, TestMask::TonalFilters) {
+        w.u32(0x600);
+        w.class("DataStackActions", &[("items", 19)]);
+        w.u32(9);
+        write_uniform(&mut w, 0x601, 0.25);
+        for (id, name, tweaks) in [
+            (0x610, "contrast_luminosity", &[("Contrast", 0.5), ("Luminosity", 0.375)][..]),
+            (0x620, "histogram_scan", &[("Position", 0.625), ("Contrast", 0.5), ("Invert_Position", 1.)][..]),
+            (0x630, "threshold", &[("threshold", 0.375), ("mode", 1.)][..]),
+            (0x640, "blur_directional", &[("intensity", 4.), ("mblurangle", 0.125)][..]),
+            (0x650, "clamp", &[("min", 0.125), ("max", 0.5625)][..]),
+            (0x660, "smoothstep", &[("min", 0.25), ("max", 0.75)][..]),
+            (0x670, "posterize", &[("colors_amount", 4.)][..]),
+            (0x680, "pixelate", &[("pixel_amount", 24.)][..]),
+        ] {
+            w.u32(id);
+            w.class("DataActionFilterProcedural", &[("procedural", 18)]);
+            w.u32(id + 1);
+            w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
+            w.string(&format!("starter/{name}/{name}"));
+            w.u32(tweaks.len() as u32);
+            for (i, &(key, value)) in tweaks.iter().enumerate() {
+                w.u32(id + 2 + i as u32);
+                w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
+                w.string(key);
+                w.u32(f32::to_bits(value));
+            }
+        }
     } else if matches!(mask, TestMask::OrderedFilters) {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);

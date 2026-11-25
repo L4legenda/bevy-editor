@@ -180,6 +180,21 @@ fn filter_mask(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocatio
             effective[index] = value * 0x00010101u | 0xff000000u;
             return;
         }
+        case 13u: {
+            let n = i32(a);
+            let step = u.params.yz;
+            v = 0.0;
+            for (var k = -n; k <= n; k++) {
+                v += bilinear(vec2<f32>(p) + step * f32(k));
+            }
+            v /= f32(2 * n + 1);
+        }
+        case 17u: {
+            let cells = i32(a);
+            let size = i32(u.size);
+            let cell = ((c * 2 + 1) * cells) / (2 * size);
+            v = at(((cell * 2 + 1) * size) / (2 * cells));
+        }
         default: {
             effective[index] = table[raw] * 0x00010101u | 0xff000000u;
             return;

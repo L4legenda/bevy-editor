@@ -83,7 +83,7 @@ path = "src/bin/bevy-editor-mcp.rs"
 required-features = ["mcp"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_Pointer", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dependencies]
 hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native", "linux-native-basic-udev", "macos-shared-device"] }

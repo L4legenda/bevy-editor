@@ -1284,9 +1284,43 @@ fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {
                 }
                 "mask_outline" => FilterKind::Outline,
                 "invert" | "invert_grayscale" => FilterKind::Invert,
+                "threshold" => FilterKind::Threshold,
+                "histogram_scan" => FilterKind::HistogramScan,
+                "contrast_luminosity" => FilterKind::ContrastLuminosity,
+                "blur_directional" => FilterKind::DirectionalBlur,
+                "clamp" => FilterKind::Clamp,
+                "smoothstep" => FilterKind::Smoothstep,
+                "posterize" => FilterKind::Posterize,
+                "pixelate" => FilterKind::Pixelate,
                 _ => return None,
             };
             let mut filter = Filter::new(kind);
+            let controls: &[(&str, f32, f32)] = match kind {
+                FilterKind::Threshold => &[("threshold", 0.01, 100.), ("mode", 0., 1.)],
+                FilterKind::HistogramScan => &[
+                    ("position", 0.5, 100.), ("contrast", 0., 100.), ("invert_position", 0., 1.),
+                ],
+                FilterKind::ContrastLuminosity => &[("contrast", 0., 100.), ("luminosity", 0., 100.)],
+                FilterKind::DirectionalBlur => &[("intensity", 1., 1.), ("mblurangle", 0., 360.)],
+                FilterKind::Clamp | FilterKind::Smoothstep => &[("min", 0., 100.), ("max", 1., 100.)],
+                FilterKind::Posterize => &[("colors_amount", 8., 1.)],
+                FilterKind::Pixelate => &[("pixel_amount", 32., 1.)],
+                _ => &[],
+            };
+            if !controls.is_empty() {
+                let mut partial = !matches!(kind, FilterKind::Threshold | FilterKind::Clamp | FilterKind::Smoothstep);
+                for (slot, &(key, default, scale)) in controls.iter().enumerate() {
+                    let value = graph.value(key).unwrap_or(default) * scale;
+                    filter.set_value(slot, value);
+                    partial |= filter.value(slot) != value;
+                }
+                if matches!(kind, FilterKind::Clamp | FilterKind::Smoothstep)
+                    && filter.value(0) >= filter.value(1)
+                {
+                    partial = true;
+                }
+                return Some((filter, partial));
+            }
             let intensity = graph.value("intensity").filter(|v| v.is_finite());
             if kind == FilterKind::Outline {
                 for (slot, key, units, default) in [

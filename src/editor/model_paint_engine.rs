@@ -885,6 +885,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     mut uploads: ResMut<crate::editor::image_texture::TextureUploads>,
     mut gpu_queue: ResMut<gpu::Queue>,
     mut baked: ResMut<bake::State>,
+    recovery: Res<editing::recovery::Preferences>,
     mut messages: ParamSet<(MessageReader<Action>, MessageWriter<Action>)>,
 ) {
     let replies = std::mem::take(&mut *gpu_queue.replies.lock().unwrap());
@@ -936,7 +937,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             .get(&index)
             .filter(|d| d.mode == Mode::Paint)
         {
-            paint.activate(index);
+            paint.activate(index, recovery.settings().undo_steps);
             let session = paint.sessions.get_mut(&index).unwrap();
             session.set_appearance.count(doc);
             let target = doc
@@ -1060,11 +1061,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             doc.recovery_edits += result.history.len() as u64 + u64::from(resized);
             if bound {
                 for history in result.history {
-                    if session.undo.len() >= 32 {
-                        session.undo.remove(0);
-                    }
-                    session.undo.push(history);
-                    session.redo.clear();
+                    session.record_undo(history);
                 }
                 if finished {
                     session.stack = result.work.surface.stack.clone();
@@ -1481,7 +1478,8 @@ pub(in crate::editor::ui::model_viewer) fn input(
             KeyCode::SuperLeft,
             KeyCode::SuperRight,
         ])
-        || mouse.pressed(MouseButton::Middle);
+        || mouse.pressed(MouseButton::Middle)
+        || pointer.pen_pan_handled;
     let brush_tool = matches!(tool, Some(PaintTool::Brush | PaintTool::Eraser));
     let bake_read_only = session.is_some_and(Session::paint_blocked_by_bake);
     let cursor = window.cursor_position();
@@ -2006,6 +2004,7 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
             || drawer.covers(point, &window)
             || (adjustment.is_none() && mouse.pressed(MouseButton::Right))
             || mouse.pressed(MouseButton::Middle)
+            || pointer.pen_pan_handled
             || keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
         {
             return None;

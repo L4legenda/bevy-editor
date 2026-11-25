@@ -178,7 +178,7 @@ impl Work {
             }
             Self::ImportModel(auto_unwrap) => match crate::editor::asset_monitor::choose_file_path(&root) {
                 Ok(Some(path)) if path.extension().is_some_and(|ext| {
-                    ["obj", "fbx", "spp"].iter().any(|kind| ext.eq_ignore_ascii_case(kind))
+                    ["obj", "fbx", "spp", "mpp"].iter().any(|kind| ext.eq_ignore_ascii_case(kind))
                 }) => {
                     let report = browser_files::import_editable_files(&root, &parent, vec![path], auto_unwrap);
                     let status = report.status();
@@ -186,7 +186,7 @@ impl Work {
                 }
                 Ok(None) => Outcome { report: Default::default(), status: "Импорт модели отменён".into() },
                 result => {
-                    let error = result.err().map_or_else(|| "Выберите файл OBJ, FBX или SPP".into(), |error| error.to_string());
+                    let error = result.err().map_or_else(|| "Выберите файл OBJ, FBX, SPP или MPP".into(), |error| error.to_string());
                     Outcome { report: Default::default(), status: format!("Не удалось импортировать модель · {error}") }
                 }
             },
@@ -748,7 +748,7 @@ pub(super) fn setup(commands: &mut Commands, root: Entity, font_handle: &Handle<
         PANEL,
     );
     commands.entity(report).insert(AccessibleLabel("Отчёт об импорте SPP".into()));
-    text(commands, report, font_handle, "Импорт Substance Painter", 21.0, TEXT);
+    text(commands, report, font_handle, "Импорт проектов рисования", 21.0, TEXT);
     text(
         commands,
         report,
@@ -1751,7 +1751,7 @@ pub(in crate::editor) fn update(
                 editor.open_model_tab(model);
             }
         }
-        if let Some(details) = completed.report.spp_details() {
+        if let Some(details) = completed.report.paint_project_details() {
             context.previous_focus = focus.get();
             context.import_report = details;
             context.phase = Phase::Report;
