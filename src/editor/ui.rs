@@ -198,7 +198,6 @@ pub(super) struct Interface {
     rotation_scope: Entity,
     scale_scope: Entity,
     camera_scope: Entity,
-    object_scope: Entity,
     space_label: Entity,
     field_error: Entity,
     navigation_hint: Entity,
@@ -741,33 +740,6 @@ pub(super) fn setup(
 
     let hierarchy_info =
         scene_hierarchy_ui::setup_inspector(&mut commands, scene_properties, &font);
-    let object_scope = node(&mut commands, scene_properties, column(0.0));
-    let actions = inspector::section(
-        &mut commands,
-        object_scope,
-        &font,
-        "Действия",
-        "объект actions duplicate delete",
-        false,
-    )
-    .body;
-    let actions = node(
-        &mut commands,
-        actions,
-        Node {
-            flex_wrap: FlexWrap::Wrap,
-            row_gap: px(3),
-            ..row(3.0)
-        },
-    );
-    for (label, action) in [
-        ("Дублировать", Action::Duplicate),
-        ("Удалить", Action::Delete),
-    ] {
-        let item = node(&mut commands, actions, row(0.0));
-        inspector::searchable(&mut commands, item, label);
-        button(&mut commands, item, &font, label, action, Look::Regular);
-    }
     let field_error = text(&mut commands, scene_properties, &font, "", 11.0, ERROR);
     commands.entity(field_error).insert((
         TextLayout::default(),
@@ -843,7 +815,6 @@ pub(super) fn setup(
         rotation_scope: transform_ui.rotation_scope,
         scale_scope: transform_ui.scale_scope,
         camera_scope: transform_ui.camera_scope,
-        object_scope,
         space_label: transform_ui.space_label,
         field_error,
         navigation_hint,
@@ -2194,8 +2165,6 @@ pub(super) fn refresh(
         (interface.transforms, inspecting_scene
             && editor.selection.is_some_and(|target| editor.pose(target).is_some())),
         (interface.camera_scope, camera),
-        (interface.object_scope, editor.has_scene() && !editor.asset_viewer_open()
-            && (editor.batch_editable() || editor.deletable_targets())),
         (interface.field_error, numeric.error_message().is_some()),
         (interface.rotation_scope, editor.inspector_targets(Field::Rotation(0)).all(|target| !matches!(target,
             Selection::Light(id) if editor.light(id).is_some_and(|light| light.kind == crate::lighting::LightKind::Point)))),

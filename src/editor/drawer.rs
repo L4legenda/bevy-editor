@@ -804,6 +804,7 @@ fn caption(
         Node {
             width: percent(100),
             height: px(32),
+            flex_shrink: 0.0,
             overflow: Overflow::clip(),
             ..default()
         },
@@ -1212,6 +1213,7 @@ pub(crate) fn refresh(
             }
             Entry::Image(index) | Entry::File(index) => {
                 let file = &browser.files[index];
+                let title = file.environment_label.as_deref().unwrap_or(&file.filename);
                 let is_image = matches!(entry, Entry::Image(_));
                 let narrative = file.extension.eq_ignore_ascii_case("dialog")
                     || file.extension.eq_ignore_ascii_case("dcharacter");
@@ -1232,7 +1234,7 @@ pub(crate) fn refresh(
                         } else {
                             "Выбрать файл"
                         },
-                        file.filename
+                        title
                     )),
                 ));
                 let well = preview_well(&mut commands, card);
@@ -1299,6 +1301,9 @@ pub(crate) fn refresh(
                         icons::themed(&mut commands, edit, icons::Glyph::Pencil, 15.0);
                     }
                     format!("{} · Загрузка…", file.extension.to_uppercase())
+                } else if file.environment_label.is_some() {
+                    icons::themed(&mut commands, well, icons::Glyph::Globe, 40.0);
+                    format!("Окружение · {}", file_size(file.bytes))
                 } else {
                     let placeholder =
                         file_icon(&mut commands, well, &interface.font, &file.extension);
@@ -1327,7 +1332,7 @@ pub(crate) fn refresh(
                     &mut commands,
                     card,
                     &interface.font,
-                    &file.filename,
+                    title,
                     &kind,
                     if matches!(entry, Entry::Image(_)) {
                         GREEN

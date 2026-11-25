@@ -13,6 +13,7 @@ pub(in crate::editor) enum ObjectAction {
     Rename(Selection),
     EditName,
     Hierarchy(HierarchyAction),
+    Duplicate,
     Remove,
     Confirm,
     Cancel,
@@ -62,6 +63,7 @@ pub(super) fn available(editor: &Editor, action: ObjectAction) -> bool {
                     && !editor.multiple_selected()
                     && scene_hierarchy::available(editor, action)
             }
+            ObjectAction::Duplicate => editor.scene_object_popup && editor.batch_editable(),
             _ => editor.scene_object_popup,
         }
 }
@@ -168,6 +170,11 @@ fn setup(mut commands: Commands, interface: Res<Interface>) {
             "Переименовать · F2",
             icons::Glyph::Pencil,
             ObjectAction::EditName,
+        ),
+        (
+            "Дублировать",
+            icons::Glyph::Copy,
+            ObjectAction::Duplicate,
         ),
         (
             "Удалить · Delete",
@@ -340,7 +347,7 @@ fn input(
                     menu.left = px(cursor.x.clamp(4.0, (window.width() - 224.0).max(4.0)));
                     menu.top = px((cursor.y - TOP).clamp(
                         4.0,
-                        (window.height() - TOP - FOOT - 82.0 - hierarchy_height).max(4.0),
+                        (window.height() - TOP - FOOT - 114.0 - hierarchy_height).max(4.0),
                     ));
                 }
             }
@@ -372,18 +379,25 @@ fn input(
                 ui.suppress_click = true;
                 focus.clear();
             }
-            Action::SceneObject(ObjectAction::Remove) => {
+            Action::SceneObject(command @ (ObjectAction::Duplicate | ObjectAction::Remove)) => {
+                let duplicate = matches!(command, ObjectAction::Duplicate);
                 if let Some(bound) = ui.bound.filter(|bound| {
                     bound.room == editor.room && editor.object_editable(bound.target)
                 }) {
                     if !editor.is_selected(bound.target) {
                         editor.select(Some(bound.target));
                     }
-                    editor.finish_camera_navigation();
-                    let before = editor.edits.clone();
-                    editor.delete_targets();
-                    editor.finish_edit(before);
-                    editor.status = "Объект удалён · Ctrl+Z — восстановить".into();
+                    if !duplicate || editor.batch_editable() {
+                        editor.finish_camera_navigation();
+                        let before = editor.edits.clone();
+                        if duplicate {
+                            editor.duplicate_targets();
+                        } else {
+                            editor.delete_targets();
+                            editor.status = "Объект удалён · Ctrl+Z — восстановить".into();
+                        }
+                        editor.finish_edit(before);
+                    }
                 }
                 ui.bound = None;
                 ui.suppress_click = true;

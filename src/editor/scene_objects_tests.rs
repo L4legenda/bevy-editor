@@ -340,6 +340,24 @@ mod gpu {
             click(&mut app, window, point, MouseButton::Right);
             assert!(app.world().resource::<Editor>().scene_object_popup);
             assert_eq!(app.world().resource::<Editor>().selection, Some(target));
+            let duplicate = control_point(&mut app, |action| {
+                matches!(action, Action::SceneObject(ObjectAction::Duplicate))
+            });
+            click(&mut app, window, duplicate, MouseButton::Left);
+            {
+                let editor = app.world().resource::<Editor>();
+                assert_eq!(editor.edits.models.len(), original.models.len() + 1);
+                assert!(editor.pose(target).is_some());
+                assert_ne!(editor.selection, Some(target));
+            }
+            app.world_mut().write_message(Action::Undo);
+            warm(&mut app, 5);
+            assert_eq!(app.world().resource::<Editor>().edits, original);
+            let point = control_point(
+                &mut app,
+                |action| matches!(action, Action::Select(t) if t == target),
+            );
+            click(&mut app, window, point, MouseButton::Right);
             capture_when(
                 &mut app,
                 &target_image,

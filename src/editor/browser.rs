@@ -51,6 +51,7 @@ pub(super) struct BrowserFile {
     /// Relative to the asset root, preserving the actual filesystem spelling.
     pub path: PathBuf,
     pub filename: String,
+    pub environment_label: Option<String>,
     /// Original case, without the dot. Empty for extensionless files.
     pub extension: String,
     pub bytes: u64,
@@ -275,6 +276,10 @@ impl Browser {
                                 .unwrap_or_default();
                             browser.files.push(BrowserFile {
                                 folder,
+                                environment_label: super::ui::environment_library::asset_label(
+                                    &project.asset_root,
+                                    &path,
+                                ),
                                 path,
                                 filename: name,
                                 kind: if links.is_some() {
@@ -573,6 +578,9 @@ impl Browser {
                 } else {
                     self.folders[file.folder].path.starts_with(&current.path)
                         && (file.path.to_string_lossy().to_lowercase().contains(&query)
+                            || file.environment_label.as_ref().is_some_and(|label| {
+                                label.to_lowercase().contains(&query)
+                            })
                             || file
                                 .scenes
                                 .iter()
@@ -580,7 +588,12 @@ impl Browser {
                 }
             })
             .collect();
-        files.sort_by_key(|(_, file)| file.filename.to_lowercase());
+        files.sort_by_key(|(_, file)| {
+            file.environment_label
+                .as_deref()
+                .unwrap_or(&file.filename)
+                .to_lowercase()
+        });
         for (index, file) in files {
             match file.kind {
                 FileKind::Scene => {
@@ -679,6 +692,33 @@ mod tests {
             initial_selection: None,
             play: None,
         }
+    }
+
+    #[test]
+    fn environment_assets_are_searchable_by_title_and_keep_their_path() {
+        let files = Fixture::new();
+        let path = "environments/scene-0123456789.env.json";
+        files.file(path);
+        let mut project = files.project();
+        fs::write(
+            project.asset_root.join(path),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "name": "Ночная мастерская",
+                "lighting": crate::SceneLighting::editor_default(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut browser = Browser::new(&mut project);
+        browser.search = "мастерская".into();
+        let entries = browser.entries(&project.catalog);
+        let [Entry::File(index)] = entries.as_slice() else {
+            panic!("Expected the matching environment file, got {entries:?}");
+        };
+        let file = &browser.files[*index];
+        assert_eq!(file.environment_label.as_deref(), Some("Ночная мастерская"));
+        assert_eq!(file.path, Path::new(path));
     }
 
     #[test]

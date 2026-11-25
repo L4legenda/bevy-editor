@@ -102,6 +102,31 @@ pub(in crate::editor) fn save_scene(editor: &Editor) -> io::Result<()> {
     )
 }
 
+fn read_preset(path: &Path) -> Option<Preset> {
+    let bytes = read_limited(path, MAX_BYTES).ok()?;
+    let mut preset: Preset = serde_json::from_slice(&bytes).ok()?;
+    if preset.version != 1
+        || preset.name.chars().count() > 160
+        || preset.name.chars().any(char::is_control)
+        || preset.lighting.validate().is_err()
+    {
+        return None;
+    }
+    if preset.name.trim().is_empty() {
+        preset.name = "Без названия".into();
+    }
+    Some(preset)
+}
+
+pub(in crate::editor) fn asset_label(root: &Path, path: &Path) -> Option<String> {
+    if path.parent()? != Path::new(DIRECTORY)
+        || !path.file_name()?.to_str()?.ends_with(".env.json")
+    {
+        return None;
+    }
+    read_preset(&root.join(path)).map(|preset| preset.name)
+}
+
 impl Library {
     fn scan(&mut self, root: &Path) {
         let mut entries = Vec::new();
@@ -113,18 +138,7 @@ impl Library {
                 {
                     continue;
                 }
-                let preset = read_limited(&file.path(), MAX_BYTES)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Preset>(&bytes).ok());
-                if let Some(mut preset) = preset.filter(|p| {
-                    p.version == 1
-                        && p.name.chars().count() <= 160
-                        && !p.name.chars().any(char::is_control)
-                        && p.lighting.validate().is_ok()
-                }) {
-                    if preset.name.trim().is_empty() {
-                        preset.name = "Без названия".into();
-                    }
+                if let Some(preset) = read_preset(&file.path()) {
                     entries.push((name, preset));
                 } else {
                     warn!("Не удалось прочитать окружение: {}", file.path().display());

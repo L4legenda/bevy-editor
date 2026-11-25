@@ -120,14 +120,12 @@ impl BrushLibraryUi {
         let Some(group) = library.groups.get(category) else {
             return;
         };
-        for index in std::iter::once(None).chain(group.iter().copied().map(Some)) {
-            let name = index.map_or("Стандартная кисть", |i| {
-                library.presets[i].name.as_str()
-            });
+        for &index in group {
+            let name = library.presets[index].name.as_str();
             let card = control(
                 commands,
                 self.brushes,
-                Action::ImageEdit(EditAction::BrushPreset(index)),
+                Action::ImageEdit(EditAction::BrushPreset(Some(index))),
                 Look::Asset,
                 Node {
                     width: percent(100),
@@ -140,7 +138,7 @@ impl BrushLibraryUi {
             );
             commands.entity(card).insert(AccessibleLabel(name.into()));
             text(commands, card, &self.font, name, 12.0, TEXT);
-            if let Some(preview) = index.and_then(brush_library::preview) {
+            if let Some(preview) = brush_library::preview(index) {
                 commands.spawn((
                     ImageNode {
                         image_mode: bevy::ui::widget::NodeImageMode::Stretch,
