@@ -87,6 +87,7 @@ fn upload(
 
 struct Request {
     graph: Graph,
+    thumbnail_nodes: Option<Vec<u64>>,
     images: Arc<GraphImages>,
     paths: Vec<PathBuf>,
     maps: Option<Arc<bake::Maps>>,
@@ -109,7 +110,8 @@ impl Request {
 
 impl PartialEq for Request {
     fn eq(&self, other: &Self) -> bool {
-        self.graph == other.graph && self.images == other.images && self.same_inputs(other)
+        self.graph == other.graph && self.thumbnail_nodes == other.thumbnail_nodes
+            && self.images == other.images && self.same_inputs(other)
     }
 }
 
@@ -143,6 +145,22 @@ impl Previews {
         maps: Option<&Arc<bake::Maps>>,
         surface: Option<&Arc<surface::Source>>,
     ) {
+        self.set_request(graph, images, maps, surface, None);
+    }
+
+    /// Evaluate independent preset branches once, keeping only their card images.
+    pub(in crate::editor::ui::model_viewer::paint) fn set_gallery(&mut self, graph: &Graph, thumbnail_nodes: Vec<u64>) {
+        self.set_request(graph, &Arc::default(), None, None, Some(thumbnail_nodes));
+    }
+
+    fn set_request(
+        &mut self,
+        graph: &Graph,
+        images: &Arc<GraphImages>,
+        maps: Option<&Arc<bake::Maps>>,
+        surface: Option<&Arc<surface::Source>>,
+        thumbnail_nodes: Option<Vec<u64>>,
+    ) {
         let mut graph = Graph::clone(graph);
         graph.name.clear();
         graph.next_id = 1;
@@ -170,6 +188,7 @@ impl Previews {
             .cloned();
         let request = Request {
             graph,
+            thumbnail_nodes,
             images: images.clone(),
             paths,
             maps,
@@ -283,15 +302,18 @@ impl Previews {
                         false,
                     );
                     for node in &graph.nodes {
-                        if let Some(texture) = runtime.thumb(node.id) {
+                        if request.thumbnail_nodes.as_ref().is_none_or(|nodes| nodes.contains(&node.id))
+                            && let Some(texture) = runtime.thumb(node.id)
+                        {
                             thumbs.insert(node.id, texture.clone());
                         }
                     }
                 }
+                let keep_runtime = request.thumbnail_nodes.is_none();
                 Reply {
                     generation,
                     request,
-                    runtime: runtime.map(Mutex::new),
+                    runtime: if keep_runtime { runtime.map(Mutex::new) } else { None },
                     surface,
                     thumbs,
                 }

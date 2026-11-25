@@ -624,6 +624,15 @@ fn set_shelf_query(app: &mut App, value: &str) {
     warm(app, 4);
 }
 
+fn search_graph_palette(app: &mut App, value: &str) -> Entity {
+    let world = app.world_mut();
+    let mut fields = world.query::<(Entity, &AccessibleLabel, &mut bevy::text::EditableText)>();
+    let (entity, _, mut field) = fields.iter_mut(world)
+        .find(|(_, label, _)| label.0 == "Поиск узлов").unwrap();
+    field.editor_mut().set_text(value);
+    entity
+}
+
 fn paint_button_rect(app: &mut App, action: PaintAction) -> Rect {
     let world = app.world_mut();
     let mut query = world.query::<(&Control, &ComputedNode, &UiGlobalTransform)>();
@@ -3170,6 +3179,608 @@ fn gpu_graph_canvas_exports_output_pngs_with_native_height_precision() {
 }
 
 #[test]
+#[ignore = "requires a GPU with 4K material graph support"]
+fn gpu_graph_resolution_canvas_saves_4k_and_follows_the_texture_set() {
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use crate::editor::model_document::glb::Glb;
+    use material_graph::Edit;
+    use material_painter_graph::{Graph, Value};
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    paint_message(&mut app, PaintAction::Resolution(512));
+    let mut graph = Graph::new("Graph resolution");
+    graph.res = 256;
+    graph.match_set = false;
+    let color = graph.add("color", [0., 0.]);
+    graph.node_mut(color).unwrap().params.insert("color".into(), Value::Color([0.125, 0.375, 0.8125]));
+    // Each channel at 4K fills one 128 MiB readback batch.
+    for usage in [0, 3] {
+        let output = graph.add("output", [220., usage as f32 * 80.]);
+        graph.node_mut(output).unwrap().params.insert("usage".into(), Value::Enum(usage));
+        assert!(graph.connect(color, output, "input"));
+    }
+    let device = app.world().resource::<RenderDevice>();
+    let queue = app.world().resource::<RenderQueue>();
+    assert_eq!(material_graph::render_limit(device), 4096);
+    let layer = material_graph::prepare_graph(graph, &Default::default(), 512, Default::default(), device, queue).unwrap();
+    {
+        let mut state = app.world_mut().resource_mut::<PaintState>();
+        let session = state.sessions.get_mut(&0).unwrap();
+        assert_eq!(session.texture_size, 512);
+        session.insert_layer(layer);
+        session.revision += 1;
+    }
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    let choose = |app: &mut App, size| {
+        for action in [PaintAction::GraphResolutionMenu, PaintAction::GraphEdit(Edit::Resolution(size))] {
+            scroll_to_paint_control(app, action);
+            paint_click(app, window, action);
+        }
+    };
+    let wait_for_size = |app: &mut App, graph_size, set_size| {
+        let start = std::time::Instant::now();
+        loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            let fill = session.stack.layers[session.stack.selected].texture_fill.as_ref().unwrap();
+            if !session.smart_loading && session.texture_size == set_size
+                && [0, 3].into_iter().all(|channel| {
+                    fill.images[channel].as_ref().unwrap().pixels().dimensions() == (graph_size, graph_size)
+                })
+            {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 180, "{}", app.world().resource::<Editor>().status);
+        }
+        paint_ready(app);
+    };
+    choose(&mut app, Some(4096));
+    wait_for_size(&mut app, 4096, 512);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("resolution.glb");
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    std::fs::write(&path, doc.source.encode(&doc.objects, &doc.original).unwrap()).unwrap();
+    let saved = Glb::load(&path).unwrap();
+    let surface = saved.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .find_map(|primitive| saved.paint_surface(primitive).unwrap()).unwrap();
+    let fill = surface.stack.layers.iter().find_map(|layer| layer.texture_fill.as_deref()).unwrap();
+    let saved_graph = material_graph::read(fill.graph.as_ref().unwrap()).unwrap();
+    assert_eq!(saved_graph.res, 4096);
+    assert!(!saved_graph.match_set);
+    for channel in [0, 3] {
+        let pixels = fill.images[channel].as_ref().unwrap().pixels();
+        assert_eq!(pixels.dimensions(), (4096, 4096));
+        assert_eq!(pixels.get_pixel(4095, 4095)[0], 32);
+    }
+    drop(surface);
+    drop(saved);
+
+    choose(&mut app, None);
+    wait_for_size(&mut app, 512, 512);
+    let session = &app.world().resource::<PaintState>().sessions[&0];
+    assert!(material_graph::read(session.graph().unwrap()).unwrap().match_set);
+    paint_message(&mut app, PaintAction::Resolution(1024));
+    wait_for_size(&mut app, 1024, 1024);
+}
+
+#[test]
+#[ignore = "requires GPU; exercises contextual search, linked placement and one-step undo"]
+fn gpu_graph_canvas_palette_places_and_connects_nodes() {
+    use bevy::{input_focus::InputFocus, picking::pointer::{PointerAction, PointerButton},
+        render::renderer::{RenderDevice, RenderQueue}};
+    use material_painter_graph::Graph;
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    let mut original = Graph::new("Palette test");
+    original.res = 64;
+    let color = original.add("color", [0., 0.]);
+    let output = original.add("output", [220., 0.]);
+    assert!(original.connect(color, output, "input"));
+    let layer = material_graph::prepare_graph(original.clone(), &Default::default(), 512, Default::default(),
+        app.world().resource::<RenderDevice>(), app.world().resource::<RenderQueue>()).unwrap();
+    {
+        let mut state = app.world_mut().resource_mut::<PaintState>();
+        let session = state.sessions.get_mut(&0).unwrap();
+        session.insert_layer(layer);
+        session.revision += 1;
+    }
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    warm(&mut app, 8);
+    let graph = |app: &App| material_graph::read(app.world().resource::<PaintState>()
+        .sessions[&0].graph().unwrap()).unwrap();
+    let tap = |app: &mut App, code, key: Key| {
+        fill_modifier(app, window, code, key.clone(), ButtonState::Pressed);
+        fill_modifier(app, window, code, key, ButtonState::Released);
+        warm(app, 4);
+    };
+    let empty = |app: &mut App| labelled(app, "Холст графа материала").max - Vec2::splat(15.);
+    let cursor = empty(&mut app);
+    move_pointer(&mut app, window, cursor);
+    tap(&mut app, KeyCode::Space, Key::Space);
+    let field = search_graph_palette(&mut app, "Checker");
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    warm(&mut app, 4);
+    tap(&mut app, KeyCode::Enter, Key::Enter);
+    let added = graph(&app);
+    assert_eq!(added.nodes.len(), 3);
+    let checker = added.nodes.last().unwrap();
+    assert_eq!(checker.def, "checker");
+    assert!(checker.pos[0] > 220. && checker.pos[1] > 70., "{:?}", checker.pos);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph(&app), original);
+
+    let cursor = empty(&mut app);
+    move_pointer(&mut app, window, cursor);
+    tap(&mut app, KeyCode::Tab, Key::Tab);
+    assert_eq!(app.world().resource::<editing::State>().documents[&0].mode, Mode::Paint);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    tap(&mut app, KeyCode::Escape, Key::Escape);
+    assert_ne!(app.world().resource::<InputFocus>().get(), Some(field));
+    for action in [PointerAction::Press(PointerButton::Secondary), PointerAction::Release(PointerButton::Secondary)] {
+        crate::editor::tests::lighting_ui_render::pointer(&mut app, window, cursor, action);
+        warm(&mut app, 2);
+    }
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    tap(&mut app, KeyCode::Escape, Key::Escape);
+
+    let drag_wire = |app: &mut App, origin, drop| {
+        move_pointer(app, window, origin);
+        mouse(app, window, ButtonState::Pressed);
+        move_pointer(app, window, drop - Vec2::splat(10.));
+        move_pointer(app, window, drop);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 5);
+    };
+    let from_color = |app: &mut App| {
+        let origin = labelled(app, "Uniform Color · выход").center();
+        let drop = empty(app);
+        drag_wire(app, origin, drop);
+    };
+    from_color(&mut app);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    tap(&mut app, KeyCode::Escape, Key::Escape);
+    assert_eq!(graph(&app), original);
+    from_color(&mut app);
+    search_graph_palette(&mut app, "Checker");
+    warm(&mut app, 4);
+    tap(&mut app, KeyCode::Enter, Key::Enter);
+    assert_eq!(graph(&app), original);
+    search_graph_palette(&mut app, "Invert");
+    warm(&mut app, 4);
+    tap(&mut app, KeyCode::Enter, Key::Enter);
+    let settle = |app: &mut App| {
+        let start = std::time::Instant::now();
+        while app.world().resource::<PaintState>().sessions[&0].smart_loading {
+            frame(app);
+            assert!(start.elapsed().as_secs() < 60, "{}", app.world().resource::<Editor>().status);
+        }
+        paint_ready(app);
+    };
+    settle(&mut app);
+    let linked = graph(&app);
+    assert_eq!(linked.nodes.len(), 3);
+    let invert = linked.nodes.last().unwrap();
+    assert_eq!(invert.def, "invert");
+    assert_eq!(invert.links["input"], color);
+    assert_eq!(linked.node(output).unwrap().links["input"], color);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph(&app), original);
+    paint_message(&mut app, PaintAction::Redo);
+    assert_eq!(graph(&app), linked);
+
+    let canvas = labelled(&mut app, "Холст графа материала");
+    move_pointer(&mut app, window, canvas.center());
+    paint_message(&mut app, PaintAction::GraphClearSelection);
+    tap(&mut app, KeyCode::KeyF, Key::Character("f".into()));
+    let input = |app: &mut App| labelled(app, "Output · input").center();
+    let history = |app: &App| app.world().resource::<PaintState>().sessions[&0].undo.len();
+    let undo_steps = history(&app);
+    let port = input(&mut app);
+    drag_wire(&mut app, port, port);
+    assert_eq!(graph(&app), linked);
+    assert_eq!(history(&app), undo_steps);
+
+    let port = input(&mut app);
+    let blank = empty(&mut app);
+    move_pointer(&mut app, window, port);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, blank - Vec2::splat(10.));
+    assert_eq!(app.world().resource::<ui::PaintUi>().pending_graph_source(), Some(color));
+    tap(&mut app, KeyCode::Escape, Key::Escape);
+    move_pointer(&mut app, window, blank);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(graph(&app), linked);
+    assert_eq!(history(&app), undo_steps);
+    assert_ne!(app.world().resource::<InputFocus>().get(), Some(field));
+
+    let port = input(&mut app);
+    let blank = empty(&mut app);
+    drag_wire(&mut app, port, blank);
+    assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
+    assert_eq!(graph(&app), linked);
+    tap(&mut app, KeyCode::Escape, Key::Escape);
+    assert_eq!(graph(&app), linked);
+
+    let port = input(&mut app);
+    let target = labelled(&mut app, "Invert · input").center();
+    drag_wire(&mut app, port, target);
+    settle(&mut app);
+    let moved = graph(&app);
+    assert!(!moved.node(output).unwrap().links.contains_key("input"));
+    assert_eq!(moved.node(invert.id).unwrap().links["input"], color);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph(&app), linked);
+
+    let port = input(&mut app);
+    let blank = empty(&mut app);
+    drag_wire(&mut app, port, blank);
+    search_graph_palette(&mut app, "Invert");
+    warm(&mut app, 4);
+    tap(&mut app, KeyCode::Enter, Key::Enter);
+    settle(&mut app);
+    let extended = graph(&app);
+    assert_eq!(extended.nodes.len(), 4);
+    assert!(!extended.node(output).unwrap().links.contains_key("input"));
+    assert_eq!(extended.nodes.last().unwrap().links["input"], color);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph(&app), linked);
+}
+
+#[test]
+#[ignore = "requires GPU; drives group selection, dragging and clipboard on the graph canvas"]
+fn gpu_graph_canvas_groups_move_copy_paste_and_delete() {
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use material_painter_graph::Graph;
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    let mut graph = Graph::new("Graph selection");
+    graph.res = 64;
+    graph.match_set = false;
+    let color = graph.add("color", [0., 0.]);
+    let invert = graph.add("invert", [220., 0.]);
+    let output = graph.add("output", [440., 0.]);
+    assert!(graph.connect(color, invert, "input"));
+    assert!(graph.connect(invert, output, "input"));
+    let layer = material_graph::prepare_graph(
+        graph.clone(), &Default::default(), 512, Default::default(),
+        app.world().resource::<RenderDevice>(), app.world().resource::<RenderQueue>(),
+    ).unwrap();
+    {
+        let mut state = app.world_mut().resource_mut::<PaintState>();
+        let session = state.sessions.get_mut(&0).unwrap();
+        session.insert_layer(layer);
+        session.revision += 1;
+    }
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    warm(&mut app, 8);
+
+    let stage = |app: &mut App| labelled(app, "Холст графа материала");
+    let title_on_canvas = |app: &mut App, name: &str| {
+        let bounds = stage(app);
+        let world = app.world_mut();
+        world.query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>().iter(world)
+            .filter(|(label, node, _)| label.0 == name && node.size().min_element() > 0.)
+            .map(|(_, node, transform)| transform.affine().translation * node.inverse_scale_factor())
+            .find(|point| bounds.contains(*point))
+            .unwrap_or_else(|| panic!("No title {name} on the graph canvas"))
+    };
+    let graph_of = |app: &App| {
+        material_graph::read(app.world().resource::<PaintState>().sessions[&0].graph().unwrap()).unwrap()
+    };
+    let drag = |app: &mut App, from, to| {
+        move_pointer(app, window, from);
+        mouse(app, window, ButtonState::Pressed);
+        move_pointer(app, window, to);
+        mouse(app, window, ButtonState::Released);
+        warm(app, 8);
+    };
+    let key = |app: &mut App, code, key: Key, ctrl| {
+        if ctrl { fill_modifier(app, window, KeyCode::ControlLeft, Key::Control, ButtonState::Pressed); }
+        fill_modifier(app, window, code, key.clone(), ButtonState::Pressed);
+        fill_modifier(app, window, code, key, ButtonState::Released);
+        if ctrl { fill_modifier(app, window, KeyCode::ControlLeft, Key::Control, ButtonState::Released); }
+        warm(app, 4);
+    };
+    let settle = |app: &mut App| {
+        let start = std::time::Instant::now();
+        while app.world().resource::<PaintState>().sessions[&0].smart_loading {
+            frame(app);
+            assert!(start.elapsed().as_secs() < 60, "{}", app.world().resource::<Editor>().status);
+        }
+        warm(app, 8);
+        paint_ready(app);
+    };
+    let box_select = |app: &mut App| {
+        let rect = stage(app);
+        drag(app, rect.min + Vec2::splat(6.), rect.max - Vec2::splat(6.));
+    };
+    box_select(&mut app);
+    assert_eq!(app.world().resource::<ui::PaintUi>().graph_selection(), &[color, invert, output]);
+    let title = format!("Output #{output}");
+    let output_center = title_on_canvas(&mut app, &title);
+    fill_modifier(&mut app, window, KeyCode::ShiftLeft, Key::Shift, ButtonState::Pressed);
+    move_pointer(&mut app, window, output_center);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    fill_modifier(&mut app, window, KeyCode::ShiftLeft, Key::Shift, ButtonState::Released);
+    warm(&mut app, 4);
+    assert_eq!(app.world().resource::<ui::PaintUi>().graph_selection(), &[color, invert]);
+    let from = title_on_canvas(&mut app, &format!("Uniform Color #{color}"));
+    drag(&mut app, from, from + Vec2::new(30., 20.));
+    let moved = graph_of(&app);
+    let delta = |id| Vec2::from_array(moved.node(id).unwrap().pos) - Vec2::from_array(graph.node(id).unwrap().pos);
+    assert!(delta(color).length() > 5.);
+    assert!(delta(color).distance(delta(invert)) < 0.001);
+    assert_eq!(delta(output), Vec2::ZERO);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph_of(&app), graph);
+
+    key(&mut app, KeyCode::KeyD, Key::Character("d".into()), true);
+    settle(&mut app);
+    let duplicated = graph_of(&app);
+    let end = duplicated.next_id - 1;
+    assert_eq!(duplicated.nodes.len(), 5);
+    assert_eq!(duplicated.node(end).unwrap().links["input"], end - 1);
+    assert_eq!(app.world().resource::<ui::PaintUi>().graph_selection(), &[end - 1, end]);
+    key(&mut app, KeyCode::KeyC, Key::Character("c".into()), true);
+    let pointer = stage(&mut app).center();
+    move_pointer(&mut app, window, pointer);
+    key(&mut app, KeyCode::KeyV, Key::Character("v".into()), true);
+    settle(&mut app);
+    let pasted = graph_of(&app);
+    let end = pasted.next_id - 1;
+    assert_eq!(pasted.nodes.len(), 7);
+    assert_eq!(pasted.node(end).unwrap().links["input"], end - 1);
+    key(&mut app, KeyCode::Delete, Key::Delete, false);
+    settle(&mut app);
+    assert_eq!(graph_of(&app).nodes, duplicated.nodes);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph_of(&app), pasted);
+
+    paint_message(&mut app, PaintAction::Panel(Panel::Preview));
+    let preset = shader_preview::presets().iter().position(|graph| graph.name == "Unlit").unwrap();
+    paint_message(&mut app, PaintAction::PreviewShader(Some(preset)));
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    warm(&mut app, 8);
+    let shader = graph_of(&app);
+    box_select(&mut app);
+    assert_eq!(app.world().resource::<ui::PaintUi>().graph_selection().len(), shader.nodes.len());
+    key(&mut app, KeyCode::KeyD, Key::Character("d".into()), true);
+    settle(&mut app);
+    assert_eq!(graph_of(&app).nodes.len(), 2 * shader.nodes.len());
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(graph_of(&app), shader);
+}
+
+#[test]
+#[ignore = "requires GPU; opens model graphs, templates and saved materials from the catalogue"]
+fn gpu_graph_catalogue_opens_layers_across_sets_and_starts_materials() {
+    use crate::editor::{model_document::{MaterialSlot, Object, glb::Glb}, model_primitives::Primitive};
+    use crate::editor::model_paint_data::solid;
+    use material_painter_graph::{Graph, MASK_USAGE, Value};
+    use serde_json::json;
+
+    let files = tempfile::tempdir().unwrap();
+    let mut project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let assets = files.path().join("assets");
+    copy_tree(&project.asset_root, &assets);
+    project.asset_root = assets.clone();
+    let graph = |name: &str, usage| {
+        let mut graph = Graph::new(name);
+        graph.res = 64;
+        let color = graph.add("color", [0., 0.]);
+        let output = graph.add("output", [220., 0.]);
+        graph.node_mut(output).unwrap().params.insert("usage".into(), Value::Enum(usage));
+        assert!(graph.connect(color, output, "input"));
+        material_graph::encode(&graph)
+    };
+    let bitmap = Arc::new(texture_fill::Bitmap::from_rgba("Preview.png".into(),
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([70, 120, 190, 255]))).unwrap());
+    let fill = |name: &str| {
+        let mut layer = Layer::new(name.into(), LayerKind::Fill);
+        layer.edit_texture_fill(|fill| {
+            fill.graph = Some(Arc::new(graph(name, 0)));
+            fill.images[0] = Some(bitmap.clone());
+        });
+        layer.channels[0] = Some(solid(64, [70, 120, 190, 255]));
+        layer
+    };
+    let mut child = fill("Nested material");
+    child.depth = 1;
+    let mut mask = Mask::new(solid(64, [255; 4]), Vec::new());
+    mask.set_graph(Arc::new(crate::editor::model_paint_data::mask::GraphMask::new(
+        Arc::new(graph("Nested mask", MASK_USAGE)), Arc::default(), Some(bitmap.clone()),
+    )));
+    child.mask = Some(Arc::new(mask));
+    let mut folder = Layer::new("Folder".into(), LayerKind::Folder);
+    folder.collapsed = true;
+    let material = |layers, selected| MaterialSlot {
+        material: Default::default(), source: json!({"material": 0}), authored: None,
+        bake_fixes: Default::default(),
+        paint: Some(Arc::new(Surface {
+            size: 64, base: std::array::from_fn(|_| solid(64, [255; 4])),
+            stack: Stack { layers, selected }, material: json!(null), baked: None,
+        })),
+    };
+    let mut mesh = Primitive::Cube.geometry(&Primitive::Cube.defaults()).unwrap();
+    for (index, face) in mesh.faces.iter_mut().enumerate() { face.material = index % 2; }
+    let object = Object {
+        id: 0, source_node: None, name: "Два набора".into(), geometry: mesh.into(),
+        transform: Transform::IDENTITY, hidden: false,
+        materials: vec![material(vec![child, folder], 1), material(vec![fill("Second set")], 0)],
+    };
+    std::fs::write(assets.join("models/block.glb"), Glb::new_asset(&[object]).unwrap()).unwrap();
+    let library = files.path().join("library");
+    material_graph::file::package::export_shelf(&library.join("graphs"),
+        &graph("Saved gallery material", 0), &Default::default(), Some(&bitmap.bytes)).unwrap();
+
+    let (mut app, window, render_target) = fixture_project(project);
+    app.world_mut().resource_mut::<PaintState>().library.root = Some(library);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    paint_ready(&mut app);
+    let object = app.world().resource::<editing::State>().documents[&0].objects[0].id;
+    let open = |slot, layer, kind| PaintAction::OpenProjectGraph {
+        model: 0, target: ProjectGraphTarget { binding: (object, slot), layer, kind },
+    };
+    let catalogue_click = |app: &mut App, action| {
+        scroll_to_paint_control(app, action);
+        paint_click(app, window, action);
+    };
+    let wait_for_graph = |app: &mut App, name: &str| {
+        let start = std::time::Instant::now();
+        loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            if session.graph_canvas_open() && session.graph_catalogue().is_none() && !session.smart_loading
+                && session.graph().is_some_and(|payload| payload["name"].as_str() == Some(name))
+            { break; }
+            assert!(start.elapsed().as_secs() < 60, "{name} · {}", app.world().resource::<Editor>().status);
+        }
+        paint_ready(app);
+    };
+    let before_gallery = {
+        let paint = app.world().resource::<PaintState>();
+        let session = &paint.sessions[&0];
+        (session.binding, session.set, session.stack.clone(), session.undo.len())
+    };
+    paint_click(&mut app, window, PaintAction::GraphPage(GraphPage::Home));
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].graph_catalogue(), Some(GraphPage::Home));
+    let swatches = |app: &mut App| {
+        let world = app.world_mut();
+        let mut images = world.query::<(&ui::PresetSwatch, &ImageNode, &ComputedNode, &UiGlobalTransform)>();
+        let mut visible: Vec<_> = images.iter(world).filter(|(_, _, node, _)| node.size().min_element() > 0.)
+            .map(|(swatch, image, node, transform)| {
+                let scale = node.inverse_scale_factor();
+                (swatch.0, image.image.id(), Rect::from_center_size(transform.affine().translation * scale, node.size() * scale))
+            }).collect();
+        visible.sort_unstable_by_key(|(index, _, _)| *index);
+        visible
+    };
+    let start = std::time::Instant::now();
+    let first_visit = loop {
+        frame(&mut app);
+        let ready = swatches(&mut app);
+        if ready.len() == material_graph::PRESETS.len() { break ready; }
+        assert!(start.elapsed().as_secs() < 30, "Preset previews did not render");
+    };
+    let brick = first_visit[0].2;
+    capture_when(&mut app, &render_target, &files.path().join("preset-preview.png"), |image| {
+        let sample = |u, v| {
+            let p = (brick.min + brick.size() * Vec2::new(u, v)).as_uvec2();
+            image.get_pixel(p.x, p.y).0
+        };
+        let reference = sample(0.2, 0.25);
+        [0.35, 0.55, 0.75].into_iter().any(|v| [0.2, 0.4, 0.6, 0.8].into_iter().any(|u| {
+            sample(u, v)[0].abs_diff(reference[0]) > 12
+        }))
+    });
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    paint_message(&mut app, PaintAction::GraphPage(GraphPage::Home));
+    let reopened = swatches(&mut app);
+    let asset_ids = |swatches: &[(usize, _, Rect)]| swatches.iter().map(|(index, id, _)| (*index, *id)).collect::<Vec<_>>();
+    assert_eq!(asset_ids(&first_visit), asset_ids(&reopened));
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!((session.binding, session.set, session.undo.len()), (before_gallery.0, before_gallery.1, before_gallery.3));
+        assert!(crate::editor::model_paint_data::same_stack(&session.stack, &before_gallery.2));
+    }
+    catalogue_click(&mut app, open(0, 0, ProjectGraphKind::Mask));
+    wait_for_graph(&mut app, "Nested mask");
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert!(session.editing_mask && session.stack.listed(0));
+        assert_eq!(session.stack.layers.len(), 2);
+        assert!(session.undo.is_empty());
+    }
+    paint_message(&mut app, PaintAction::GraphEdit(material_graph::Edit::Move(2, IVec2::new(410, 100))));
+    paint_click(&mut app, window, PaintAction::GraphPage(GraphPage::Project));
+    catalogue_click(&mut app, open(1, 0, ProjectGraphKind::Fill));
+    wait_for_graph(&mut app, "Second set");
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!(session.binding, Some((object, 1)));
+        assert_eq!(session.stack.layers.len(), 1);
+        assert!(!session.editing_mask && session.undo.is_empty());
+    }
+    paint_click(&mut app, window, PaintAction::GraphPage(GraphPage::Project));
+    catalogue_click(&mut app, open(0, 0, ProjectGraphKind::Mask));
+    wait_for_graph(&mut app, "Nested mask");
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!(session.undo.len(), 1);
+        let restored = material_graph::read(session.graph().unwrap()).unwrap();
+        assert_eq!(restored.node(2).unwrap().pos, [410., 100.]);
+    }
+
+    paint_click(&mut app, window, PaintAction::GraphPage(GraphPage::Project));
+    catalogue_click(&mut app, open(0, 1, ProjectGraphKind::Folder));
+    wait_for_graph(&mut app, "Folder");
+    assert!(app.world().resource::<PaintState>().sessions[&0].active_folder_view().is_some());
+    paint_click(&mut app, window, PaintAction::GraphPage(GraphPage::Project));
+    catalogue_click(&mut app, open(0, 0, ProjectGraphKind::Fill));
+    wait_for_graph(&mut app, "Nested material");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.len(), 2);
+    paint_message(&mut app, PaintAction::GraphPage(GraphPage::Home));
+    let blank = material_graph::PRESETS.iter().position(|preset| preset.name == "Blank").unwrap();
+    catalogue_click(&mut app, PaintAction::AddGraphMaterial(blank));
+    wait_for_graph(&mut app, "Blank");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.len(), 3);
+    paint_message(&mut app, PaintAction::GraphPage(GraphPage::Home));
+    catalogue_click(&mut app, PaintAction::OpenSavedGraph(0));
+    wait_for_graph(&mut app, "Saved gallery material");
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.len(), 4);
+    paint_message(&mut app, PaintAction::GraphPage(GraphPage::Home));
+    catalogue_click(&mut app, PaintAction::AddGraphMask);
+    wait_for_graph(&mut app, "Граф маски");
+    let session = &app.world().resource::<PaintState>().sessions[&0];
+    assert!(session.editing_mask);
+    assert_eq!(session.stack.layers.len(), 4);
+}
+
+#[test]
 #[ignore = "requires GPU; saves, reloads, drags, shares and opens a local graph without network access"]
 fn gpu_community_graph_from_installed_package_applies_as_a_fill() {
     let project = crate::EditorProject::load(
@@ -3771,6 +4382,8 @@ fn gpu_model_paint_graph_presets_and_node_edit_survive_glb() {
 
     settle(&mut app);
     click_label(&mut app, "Добавить узел");
+    search_graph_palette(&mut app, "Checker");
+    warm(&mut app, 4);
     click_label(&mut app, "Checker");
     settle(&mut app);
     let checker = current_graph(&app).nodes.into_iter().find(|node| node.def == "checker").unwrap();
@@ -3800,7 +4413,7 @@ fn gpu_model_paint_graph_presets_and_node_edit_survive_glb() {
     settle(&mut app);
     assert!(!current_graph(&app).node(ramp.id).unwrap().links.contains_key("input"));
     click_label(&mut app, &format!("Checker #{}", checker.id));
-    click_label(&mut app, "Удалить узел");
+    click_label(&mut app, "Удалить выбранные узлы");
     settle(&mut app);
     assert!(current_graph(&app).node(checker.id).is_none());
     paint_message(&mut app, PaintAction::Undo);
@@ -5770,7 +6383,9 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         "bevy-udim-export-{}", bevy::asset::uuid::Uuid::new_v4()
     ));
     std::fs::create_dir(&directory).unwrap();
-    paint_click(&mut app, window, PaintAction::ExportPadding(export::Padding::Transparent));
+    let padding = PaintAction::ExportPadding(export::Padding::Transparent);
+    scroll_to_paint_control(&mut app, padding);
+    paint_click(&mut app, window, padding);
     scroll_to_paint_control(&mut app, PaintAction::ExportTemplateMenu);
     paint_click(&mut app, window, PaintAction::ExportTemplateMenu);
     let godot = PaintAction::ExportTemplate(export::Template::Godot);
@@ -6193,7 +6808,9 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
     warm(&mut app, 3);
     let center = labelled(&mut app, "3D-вид модели").center().as_uvec2();
     let base = capture_when(&mut app, &target, &output.join("12-cage-disabled.png"), |_| true);
+    scroll_to_paint_control(&mut app, PaintAction::BakeInspectCage);
     paint_click(&mut app, window, PaintAction::BakeInspectCage);
+    assert!(app.world().resource::<PaintState>().sessions[&0].bake_inspect_cage);
     let started = std::time::Instant::now();
     loop {
         frame(&mut app);
@@ -6219,11 +6836,13 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
             (center.x - 20..center.x + 20).filter(|&x| changed(x, y)).count()
         }).sum::<usize>() > 500
     });
+    scroll_to_paint_control(&mut app, PaintAction::BakeInspectCage);
     paint_click(&mut app, window, PaintAction::BakeInspectCage);
     {
         let world = app.world_mut();
         assert_eq!(world.query_filtered::<Entity, With<bake::cage_preview::Shell>>().iter(world).count(), 0);
     }
+    scroll_to_paint_control(&mut app, PaintAction::BakeStart);
     paint_click(&mut app, window, PaintAction::BakeStart);
     let started = std::time::Instant::now();
     loop {
@@ -6273,7 +6892,9 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
     }
     paint_message(&mut app, PaintAction::BakeClearCage);
     assert!(app.world().resource::<PaintState>().sessions[&0].bake_projection.cage.is_none());
+    scroll_to_paint_control(&mut app, PaintAction::BakePaintCage);
     paint_click(&mut app, window, PaintAction::BakePaintCage);
+    assert!(app.world().resource::<PaintState>().sessions[&0].bake_paint_cage);
     let shell_height = |app: &mut App| {
         let world = app.world_mut();
         let handle = world.query_filtered::<&Mesh3d, With<bake::cage_preview::Shell>>()
@@ -6441,16 +7062,20 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         }
         assert!(started.elapsed().as_secs() < 60, "{}", world.resource::<Editor>().status);
     }
-    paint_click(&mut app, window, PaintAction::BakeQuality(bake::Quality::Standard));
+    let click_bake_control = |app: &mut App, action| {
+        scroll_to_paint_control(app, action);
+        paint_click(app, window, action);
+    };
+    click_bake_control(&mut app, PaintAction::BakeQuality(bake::Quality::Standard));
     {
         let world = app.world();
         let doc = &world.resource::<editing::State>().documents[&0];
         assert_eq!(world.resource::<PaintState>().sessions[&0].bake_projection.quality, bake::Quality::Standard);
         assert!(world.resource::<bake::State>().maps(0, doc, (object, 0), 512).is_none());
     }
-    paint_click(&mut app, window, PaintAction::BakeMapOptions);
-    paint_click(&mut app, window, PaintAction::BakeSelectAllMaps(false));
-    paint_click(&mut app, window, PaintAction::BakeStart);
+    click_bake_control(&mut app, PaintAction::BakeMapOptions);
+    click_bake_control(&mut app, PaintAction::BakeSelectAllMaps(false));
+    click_bake_control(&mut app, PaintAction::BakeStart);
     let started = std::time::Instant::now();
     loop {
         frame(&mut app);
@@ -6478,7 +7103,7 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
     ));
     let cache_dir = directory.join("bake-cache");
     assert!(std::fs::read_dir(&cache_dir).unwrap().next().is_some());
-    paint_click(&mut app, window, PaintAction::BakeClearDiskCache);
+    click_bake_control(&mut app, PaintAction::BakeClearDiskCache);
     let started = std::time::Instant::now();
     loop {
         frame(&mut app);
@@ -6491,7 +7116,7 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         }
         assert!(started.elapsed().as_secs() < 10, "{status}");
     }
-    paint_click(&mut app, window, PaintAction::BakeStart);
+    click_bake_control(&mut app, PaintAction::BakeStart);
     let started = std::time::Instant::now();
     loop {
         frame(&mut app);

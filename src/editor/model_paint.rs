@@ -10,6 +10,9 @@ use crate::editor::model_paint_data::mask::{
 use crate::editor::model_paint_data::{Blend, Layer, MAX_LAYER_DEPTH, MAX_LAYERS, Stack, Surface, texture_fill};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+#[derive(Component)]
+pub(in crate::editor) struct GraphCanvasStage;
 #[path = "model_paint_brush_defaults.rs"]
 mod brush_defaults;
 #[path = "model_paint_mesh_tools.rs"]
@@ -617,11 +620,14 @@ pub(in crate::editor) enum PaintAction {
     ExportGraphPackage,
     ExportGraphOutputs,
     GraphSelectNode(u64),
+    GraphClearSelection,
     GraphAdjust(u64, usize, usize, i8),
     GraphBitmapPick(material_graph::ParameterTarget),
     GraphMapMenu(material_graph::ParameterTarget),
     GraphRebake,
     GraphCanvas,
+    GraphPage(GraphPage),
+    OpenProjectGraph { model: usize, target: ProjectGraphTarget },
     GraphResolutionMenu,
     GraphEdit(material_graph::Edit),
     ShaderToGraph { model: usize, definition: usize, library_revision: usize },
@@ -894,11 +900,14 @@ impl PaintAction {
             Self::ExportGraphPackage => "Сохранить граф, узлы WGSL и изображения в ZIP-пакет.",
             Self::ExportGraphOutputs => "Рассчитать и сохранить выходы графа в отдельные карты PNG.",
             Self::GraphSelectNode(_) => "Показать параметры узла.",
+            Self::GraphClearSelection => "Снять выделение узлов.",
             Self::GraphAdjust(..) => "Изменить параметр и пересчитать граф.",
             Self::GraphBitmapPick(_) => "Выбрать изображение для узла графа.",
             Self::GraphMapMenu(_) => "Выбрать запечённую карту модели.",
             Self::GraphRebake => "Обновить графы по запечённым картам.",
             Self::GraphCanvas => "Открыть или закрыть холст графа.",
+            Self::GraphPage(_) => "Переключить страницу редактора графов.",
+            Self::OpenProjectGraph { .. } => "Открыть существующий граф слоя.",
             Self::GraphResolutionMenu => "Выбрать размер расчёта графа или привязать его к набору текстур.",
             Self::GraphEdit(_) => "Изменить схему материала.",
             Self::ShaderToGraph { .. } => "Добавить узел WGSL в открытый граф.",
@@ -927,6 +936,39 @@ struct ShaderGraphReturn {
     payload: Arc<serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::editor) enum GraphPage {
+    #[default]
+    Canvas,
+    Home,
+    Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) enum ProjectGraphKind {
+    Fill,
+    Mask,
+    Folder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) struct ProjectGraphTarget {
+    binding: (usize, usize),
+    layer: usize,
+    kind: ProjectGraphKind,
+}
+
+impl ProjectGraphTarget {
+    fn exists(self, stack: &Stack) -> bool {
+        let Some(layer) = stack.layers.get(self.layer) else { return false; };
+        match self.kind {
+            ProjectGraphKind::Fill => layer.texture_fill.as_ref().is_some_and(|fill| fill.graph.is_some()),
+            ProjectGraphKind::Mask => layer.mask.as_ref().is_some_and(|mask| mask.graph.is_some()),
+            ProjectGraphKind::Folder => folder_graph::can_open_at(stack, self.layer),
+        }
+    }
+}
+
 struct Session {
     stack: Stack,
     undo: Vec<history::Snapshot>,
@@ -938,7 +980,10 @@ struct Session {
     view: View,
     category: Category,
     graph_node: Option<u64>,
+    graph_pasted: Option<(u64, u64)>,
     graph_canvas: bool,
+    graph_page: GraphPage,
+    pending_project_graph: Option<ProjectGraphTarget>,
     shader_graph_return: Option<ShaderGraphReturn>,
     folder_view: Option<folder_graph::View>,
     preview_shader: Option<usize>,
@@ -1074,7 +1119,10 @@ impl Default for Session {
             view: View::Split,
             category: Category::Materials,
             graph_node: None,
+            graph_pasted: None,
             graph_canvas: false,
+            graph_page: GraphPage::Canvas,
+            pending_project_graph: None,
             shader_graph_return: None,
             folder_view: None,
             preview_shader: None,
@@ -1407,9 +1455,15 @@ impl Session {
                 return self.binding.is_some() && !self.smart_loading && self.panel != Panel::Preview
                     && self.graph().is_some() && self.active_folder_view().is_none();
             }
-            PaintAction::GraphCanvas => return self.graph().is_some()
+            PaintAction::GraphCanvas => return self.graph_canvas_open() || self.graph().is_some()
                 || (self.panel == Panel::Layers && !self.editing_mask
                     && folder_graph::can_open(&self.stack)),
+            PaintAction::GraphPage(page) => return page != GraphPage::Canvas
+                || (self.pending_project_graph.is_none() && (self.graph().is_some()
+                    || (self.panel == Panel::Layers && !self.editing_mask && folder_graph::can_open(&self.stack)))),
+            PaintAction::OpenProjectGraph { .. } => return self.graph_catalogue().is_some()
+                && !self.busy && !self.smart_loading && self.resize_request.is_none()
+                && self.pending_project_graph.is_none(),
             PaintAction::GraphResolutionMenu => return self.panel != Panel::Preview
                 && self.graph().is_some() && self.active_folder_view().is_none(),
             PaintAction::PreviewShader(value) => return value.is_none_or(|id| {
@@ -2119,7 +2173,14 @@ impl Session {
                 }
             }
             PaintAction::Category(value) => self.category = value,
-            PaintAction::GraphSelectNode(node) => self.graph_node = Some(node),
+            PaintAction::GraphSelectNode(node) => {
+                self.graph_pasted = None;
+                self.graph_node = Some(node);
+            }
+            PaintAction::GraphClearSelection => {
+                self.graph_pasted = None;
+                self.graph_node = None;
+            }
             PaintAction::GraphMapMenu(target) => {
                 self.graph_map_menu = (self.graph_map_menu != Some(target)).then_some(target);
             }
@@ -2130,8 +2191,22 @@ impl Session {
                     self.shader_canvas = !self.shader_canvas;
                 } else {
                     self.graph_canvas = !self.graph_canvas;
+                    self.graph_page = GraphPage::Canvas;
+                    self.pending_project_graph = None;
                 }
                 self.graph_map_menu = None;
+                self.refresh_folder_view();
+            }
+            PaintAction::GraphPage(page) => {
+                if self.panel != Panel::Layers {
+                    self.graph_node = None;
+                    self.graph_pasted = None;
+                }
+                self.panel = Panel::Layers;
+                self.graph_canvas = true;
+                self.graph_page = page;
+                self.graph_map_menu = None;
+                self.graph_resolution_menu = false;
                 self.refresh_folder_view();
             }
             PaintAction::BrushTip(tip) => self.tip = tip,
@@ -2525,7 +2600,7 @@ impl Session {
             PaintAction::AddSmartMaterial(_) | PaintAction::AddSmartGraph(_) | PaintAction::AddGraphMaterial(_) | PaintAction::AddGraphMask
             | PaintAction::ImportGraphFile | PaintAction::ImportShaderGraph | PaintAction::ExportGraphFile | PaintAction::ExportGraphPackage | PaintAction::ExportGraphOutputs
             | PaintAction::GraphAdjust(..) | PaintAction::GraphEdit(_) | PaintAction::GraphBitmapPick(_) | PaintAction::GraphRebake
-            | PaintAction::ShaderToGraph { .. }
+            | PaintAction::ShaderToGraph { .. } | PaintAction::OpenProjectGraph { .. }
             | PaintAction::AddShelfTexture(_)
             | PaintAction::DropMaterial(ShelfMaterial::Smart(_) | ShelfMaterial::User(_) | ShelfMaterial::Downloaded(_) | ShelfMaterial::Texture(_) | ShelfMaterial::Graph(_) | ShelfMaterial::CommunityGraph(_), _)
             | PaintAction::DropMaterialOnSet(..)
@@ -2725,6 +2800,9 @@ impl Session {
         {
             return;
         }
+        if self.graph_catalogue().is_some() {
+            return;
+        }
         if self.panel != Panel::Layers || !self.graph_canvas || self.editing_mask
             || !folder_graph::is_group(&self.stack)
         {
@@ -2783,7 +2861,36 @@ impl Session {
             }
             _ => return Ok(None),
         };
-        if graph == view.graph { return Ok(None); }
+        Ok(self.finish_folder_graph(next, graph, node))
+    }
+
+    fn edit_folder_batch(
+        &mut self, batch: material_graph::Batch, kind: material_graph::BatchKind,
+    ) -> Result<Option<(Stack, folder_graph::Masks)>, String> {
+        let Some(view) = self.active_folder_view() else { return Ok(None) };
+        let mut graph = view.graph.clone();
+        let mut next = self.stack.clone();
+        let mut images = view.images.clone();
+        let node = batch.apply(&mut graph, &mut images, false, true)?;
+        if !Arc::ptr_eq(&images, &view.images) {
+            Arc::make_mut(&mut next.layers[next.selected].folder_images).extend(
+                images.iter().filter(|(key, _)| !view.images.contains_key(*key))
+                    .map(|(key, image)| (key.clone(), image.clone())),
+            );
+        }
+        let changed = graph != view.graph;
+        let pending = self.finish_folder_graph(next, graph, node);
+        if changed && pending.is_none() {
+            self.select_graph_batch(kind, node);
+        }
+        Ok(pending)
+    }
+
+    fn finish_folder_graph(
+        &mut self, mut next: Stack, graph: material_painter_graph::Graph, node: Option<u64>,
+    ) -> Option<(Stack, folder_graph::Masks)> {
+        let view = self.active_folder_view()?;
+        if graph == view.graph { return None; }
         let masks = folder_graph::changed_masks(&self.stack, &view.graph, &graph);
         folder_graph::store(&mut next.layers[next.selected], &graph);
         if masks.iter().all(|(_, graph)| graph.is_none()) {
@@ -2793,9 +2900,24 @@ impl Session {
                 }
             }
             self.commit_folder_view(next, node);
-            Ok(None)
+            None
         } else {
-            Ok(Some((next, masks)))
+            Some((next, masks))
+        }
+    }
+
+    fn select_graph_batch(&mut self, kind: material_graph::BatchKind, last: Option<u64>) {
+        use material_graph::BatchKind;
+        match kind {
+            BatchKind::Move => {}
+            BatchKind::Remove => {
+                self.graph_node = None;
+                self.graph_pasted = None;
+            }
+            BatchKind::Paste(first) => {
+                self.graph_node = last;
+                self.graph_pasted = last.map(|last| (first, last));
+            }
         }
     }
 
@@ -2812,8 +2934,31 @@ impl Session {
         match self.panel {
             Panel::Preview => self.shader_canvas && self.editing_shader().is_some(),
             Panel::Shader => false,
-            _ => self.graph_canvas && self.graph().is_some(),
+            _ => self.graph_canvas && (self.graph_page != GraphPage::Canvas || self.graph().is_some()),
         }
+    }
+
+    fn graph_catalogue(&self) -> Option<GraphPage> {
+        (self.graph_canvas && !matches!(self.panel, Panel::Preview | Panel::Shader)
+            && self.graph_page != GraphPage::Canvas).then_some(self.graph_page)
+    }
+
+    fn open_project_graph(&mut self, target: ProjectGraphTarget) -> bool {
+        if self.binding != Some(target.binding) || !target.exists(&self.stack) {
+            return false;
+        }
+        self.select_layer(target.layer);
+        self.stack.reveal_selection();
+        self.editing_mask = target.kind == ProjectGraphKind::Mask;
+        self.show_mask = false;
+        self.graph_pasted = None;
+        self.panel = Panel::Layers;
+        self.graph_canvas = true;
+        self.graph_page = GraphPage::Canvas;
+        self.graph_resolution_menu = false;
+        self.revision += 1;
+        self.refresh_folder_view();
+        true
     }
 
     fn editing_shader(&self) -> Option<&shader_preview::Document> {
@@ -2994,6 +3139,7 @@ impl Session {
                 && (value != Preview3d::Material || !self.diagnostic_3d()),
             PaintAction::Category(value) => self.category == value,
             PaintAction::GraphCanvas => self.graph_canvas_open(),
+            PaintAction::GraphPage(page) => self.graph_canvas_open() && self.graph_page == page,
             PaintAction::GraphSelectNode(node) => self.graph_node == Some(node),
             PaintAction::ExportPadding(padding) => self.export_settings.padding == padding,
             PaintAction::ExportFileMenu => self.export_file_menu,
@@ -3194,6 +3340,12 @@ impl PaintState {
         None
     }
 
+    pub(in crate::editor) fn graph_shortcuts_active(&self, index: Option<usize>) -> bool {
+        index.and_then(|index| self.sessions.get(&index)).is_some_and(|session| {
+            session.graph_canvas_open() && session.graph_catalogue().is_none()
+        })
+    }
+
     fn activate(&mut self, model: usize, history_limit: usize) {
         self.sessions.entry(model).or_insert_with(|| {
             let mut session = Session { history_limit, ..Session::default() };
@@ -3210,12 +3362,14 @@ impl PaintState {
 
     pub(super) fn blocks_view_navigation(&self, model: Option<usize>, draft_preview: bool) -> bool {
         model.and_then(|model| self.sessions.get(&model))
-            .is_some_and(|session| session.panel == Panel::Shader && !draft_preview)
+            .is_some_and(|session| session.graph_catalogue().is_some()
+                || (session.panel == Panel::Shader && !draft_preview))
     }
 
     pub(super) fn has_3d_view(&self, model: Option<usize>, draft_preview: bool) -> bool {
         model.and_then(|model| self.sessions.get(&model))
-            .is_none_or(|session| session.graph_canvas_open() || session.viewport_layout(draft_preview) != View::Two)
+            .is_none_or(|session| session.graph_catalogue().is_none()
+                && (session.graph_canvas_open() || session.viewport_layout(draft_preview) != View::Two))
     }
 }
 
@@ -3327,6 +3481,7 @@ pub(super) fn actions(
     mut layer_names: Query<(&LayerNameField, &mut bevy::text::EditableText),
         (Without<GraphLabel>, Without<ui::HistoryPreference>)>,
     baked: Res<bake::State>,
+    mut graph_ui: Option<ResMut<ui::PaintUi>>,
     (export_preferences, mut recovery, recovery_fields): (
         Res<export::prefs::Store>, ResMut<editing::recovery::Preferences>,
         Query<(&ui::HistoryPreference, &bevy::text::EditableText)>,
@@ -3497,6 +3652,10 @@ pub(super) fn actions(
                             _ => None,
                         };
                         session.commit_folder_view(stack, node);
+                        if let PaintAction::GraphEdit(material_graph::Edit::Batch(_, kind)) = job.action {
+                            let last = session.active_folder_view().and_then(|view| view.graph.nodes.last().map(|node| node.id));
+                            session.select_graph_batch(kind, last);
+                        }
                     }
                     Ok(layers) if job.action == PaintAction::GraphRebake => {
                         session.stack.layers = layers;
@@ -3530,6 +3689,7 @@ pub(super) fn actions(
                                     session.mask_value = 0;
                                 }
                                 session.graph_canvas = true;
+                                session.graph_page = GraphPage::Canvas;
                                 session.graph_node = None;
                                 session.graph_map_menu = None;
                             }
@@ -3545,9 +3705,14 @@ pub(super) fn actions(
                         {
                             session.graph_node = None;
                         }
-                        if let PaintAction::GraphEdit(material_graph::Edit::Add(..)) = job.action {
+                        if let PaintAction::GraphEdit(material_graph::Edit::Add(..) | material_graph::Edit::AddConnected(..)) = job.action {
                             session.graph_node = session.graph()
                                 .and_then(|graph| graph["nodes"].as_array()?.last()?.get("id")?.as_u64());
+                        }
+                        if let PaintAction::GraphEdit(material_graph::Edit::Batch(_, kind)) = job.action {
+                            let last = session.graph()
+                                .and_then(|graph| graph["nodes"].as_array()?.last()?.get("id")?.as_u64());
+                            session.select_graph_batch(kind, last);
                         }
                     }
                     Ok(layers) if !layers.is_empty()
@@ -3555,9 +3720,14 @@ pub(super) fn actions(
                         && layers.iter().all(|layer| layer.depth + job.insertion.1 <= MAX_LAYER_DEPTH) =>
                     {
                         session.insert_smart_material(layers, job.insertion);
-                        if matches!(job.action, PaintAction::OpenSavedGraph(_)) {
+                        if matches!(job.action, PaintAction::OpenSavedGraph(_))
+                            || (session.graph_catalogue().is_some()
+                                && matches!(job.action, PaintAction::AddGraphMaterial(_) | PaintAction::ImportGraphFile))
+                        {
                             session.graph_canvas = true;
+                            session.graph_page = GraphPage::Canvas;
                             session.graph_node = None;
+                            session.graph_pasted = None;
                             session.graph_map_menu = None;
                         }
                     }
@@ -3645,6 +3815,17 @@ pub(super) fn actions(
     }
     if let Some(doc) = editing.documents.get(&index) {
         session.set_appearance.count(doc);
+        if let Some(target) = session.pending_project_graph {
+            let same_set = doc.paint_target(session.set).is_some_and(|(object, slot)| (object.id, slot) == target.binding);
+            if !same_set || session.graph_catalogue().is_none() {
+                session.pending_project_graph = None;
+            } else if session.binding == Some(target.binding) && !session.busy && !session.smart_loading {
+                session.pending_project_graph = None;
+                if !session.open_project_graph(target) {
+                    editor.status = "Граф слоя больше недоступен".into();
+                }
+            }
+        }
     }
     let deferred_drop = pending_drop.filter(|(model, _, _)| *model == index)
         .map(|(_, (object, slot), material)| Action::ModelView(ModelViewAction::Paint(
@@ -3655,6 +3836,14 @@ pub(super) fn actions(
     {
         let session = paint.sessions.get_mut(&index).unwrap();
         if let Action::ModelView(ModelViewAction::Paint(mut action)) = action {
+            let mut batch = if let PaintAction::GraphEdit(material_graph::Edit::Batch(id, _)) = action {
+                let Some(batch) = graph_ui.as_deref_mut().and_then(|ui| ui.take_graph_batch(id, index, session))
+                    .filter(|_| session.graph_canvas_open() && !editor.browser_popup && !editor.hdri_library_open)
+                else { continue };
+                Some(batch)
+            } else {
+                None
+            };
             if matches!(action, PaintAction::MeshReplacement(_) | PaintAction::SaveCopy) {
                 continue;
             }
@@ -3773,7 +3962,12 @@ pub(super) fn actions(
                 let (mut stack, mut masks) = if bitmap.is_some() {
                     (session.stack.clone(), Vec::new())
                 } else {
-                    match session.edit_folder_view(action) {
+                    let edit = if let PaintAction::GraphEdit(material_graph::Edit::Batch(_, kind)) = action {
+                        session.edit_folder_batch(batch.take().unwrap(), kind)
+                    } else {
+                        session.edit_folder_view(action)
+                    };
+                    match edit {
                         Ok(Some(edit)) => edit,
                         Ok(None) => continue,
                         Err(error) => {
@@ -3794,6 +3988,10 @@ pub(super) fn actions(
                 let surface = editing.documents.get(&index)
                     .and_then(|doc| material_graph::surface::Source::capture(doc, binding)).map(Arc::new);
                 let mut images = session.active_folder_view().unwrap().images.clone();
+                if matches!(action, PaintAction::GraphEdit(material_graph::Edit::Batch(..))) {
+                    Arc::make_mut(&mut images).extend(stack.layers[stack.selected].folder_images.iter()
+                        .map(|(key, image)| (key.clone(), image.clone())));
+                }
                 let directory = editor.project.asset_root.clone();
                 #[cfg(test)]
                 let test_path = bitmap.as_ref().and_then(|_| paint.graph_bitmap_test_path.take());
@@ -3844,6 +4042,7 @@ pub(super) fn actions(
                 }
                 let id = session.preview_shader.unwrap();
                 let shader = session.shader_graphs.get_mut(&id).unwrap();
+                let mut batch_selection = None;
                 match action {
                     PaintAction::Undo | PaintAction::Redo => {
                         shader.restore(action == PaintAction::Redo);
@@ -3867,7 +4066,13 @@ pub(super) fn actions(
                                     } else {
                                         None
                                     };
-                                    edit.apply_for(&mut graph, label.as_deref(), true)?
+                                    if let material_graph::Edit::Batch(_, kind) = edit {
+                                        let node = batch.take().unwrap().apply(&mut graph, &mut Arc::default(), true, false)?;
+                                        batch_selection = Some((kind, node));
+                                        node
+                                    } else {
+                                        edit.apply_for(&mut graph, label.as_deref(), true)?
+                                    }
                                 }
                                 _ => unreachable!(),
                             };
@@ -3889,10 +4094,41 @@ pub(super) fn actions(
                     doc.recovery_edits += 1;
                     doc.ui_revision += 1;
                 }
+                if let Some((kind, last)) = batch_selection {
+                    session.select_graph_batch(kind, last);
+                }
                 session.revision += 1;
                 continue;
             }
             match action {
+                PaintAction::OpenProjectGraph { model, target } => {
+                    if model != index || !session.available(action) || editor.browser_popup || editor.hdri_library_open {
+                        continue;
+                    }
+                    if session.binding == Some(target.binding) {
+                        if !session.open_project_graph(target) {
+                            editor.status = "Граф слоя больше недоступен".into();
+                        }
+                    } else if let Some(doc) = editing.documents.get_mut(&index) {
+                        let set = doc.objects.iter()
+                            .flat_map(|object| (0..object.materials.len()).map(move |slot| (object, slot)))
+                            .enumerate().find_map(|(set, (object, slot))| {
+                                ((object.id, slot) == target.binding
+                                    && object.materials[slot].paint.as_ref().is_some_and(|paint| target.exists(&paint.stack)))
+                                    .then_some(set)
+                            });
+                        if set.is_some_and(|set| session.choose_set(doc, set, time.elapsed_secs_f64())) {
+                            session.pending_project_graph = Some(target);
+                        } else {
+                            editor.status = "Граф слоя больше недоступен".into();
+                        }
+                    }
+                    continue;
+                }
+                PaintAction::GraphPage(GraphPage::Home) => {
+                    paint.library.ensure();
+                    paint.graph_shelf.ensure(paint.library.root.as_deref());
+                }
                 PaintAction::ToggleRecovery | PaintAction::ApplyHistoryPreference(_) => {
                     if editor.browser_popup || editor.hdri_library_open {
                         continue;
@@ -4445,7 +4681,7 @@ pub(super) fn actions(
                                 session.revision += 1;
                             }
                             let (previous_payload, previous_images) = session.graph_data().unwrap();
-                            let previous_images = previous_images.clone();
+                            let mut previous_images = previous_images.clone();
                             let mut graph = match material_graph::read(previous_payload) {
                                 Ok(graph) => graph,
                                 Err(error) => {
@@ -4467,7 +4703,12 @@ pub(super) fn actions(
                                     } else {
                                         None
                                     };
-                                    match edit.apply(&mut graph, label.as_deref()) {
+                                    let result = if let Some(batch) = batch.take() {
+                                        batch.apply(&mut graph, &mut previous_images, false, false)
+                                    } else {
+                                        edit.apply(&mut graph, label.as_deref())
+                                    };
+                                    match result {
                                         Ok(node) => {
                                             let rebuilds = edit.rebuilds();
                                             let payload = if rebuilds {
@@ -4484,7 +4725,7 @@ pub(super) fn actions(
                                                 if mask {
                                                     let mask = Arc::make_mut(layer.mask.as_mut().unwrap());
                                                     Arc::make_mut(mask.graph.as_mut().unwrap()).payload = Arc::new(payload);
-                                                    if !matches!(edit, material_graph::Edit::Move(..)) {
+                                                    if !matches!(edit, material_graph::Edit::Move(..) | material_graph::Edit::Batch(_, material_graph::BatchKind::Move)) {
                                                         let selected = session.stack.selected;
                                                         folder_graph::sync_standalone_mask(&mut session.stack, selected);
                                                     }

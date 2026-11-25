@@ -15,6 +15,8 @@ pub(in crate::editor::ui::model_viewer) use shader_code::decorate as decorate_sh
 pub(in crate::editor::ui::model_viewer) use shader_maker::Maker as ShaderMaker;
 #[cfg(test)]
 pub(super) use graph_canvas::NodePreview;
+#[cfg(test)]
+pub(super) use graph_canvas::PresetSwatch;
 pub(super) use graph_canvas::position_next_to_graph;
 pub(in crate::editor::ui::model_viewer) use graph_canvas::refresh as refresh_graph;
 use bevy::{
@@ -335,6 +337,18 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     smart_swatches: Vec<Handle<Image>>,
     generator_swatches: Vec<Handle<Image>>,
     showing: bool,
+}
+
+impl PaintUi {
+    pub(super) fn take_graph_batch(&mut self, id: u64, model: usize, session: &Session) -> Option<material_graph::Batch> {
+        self.graph.take_batch(id, model, session)
+    }
+
+    #[cfg(test)]
+    pub(super) fn graph_selection(&self) -> &[u64] {
+        self.graph.selection()
+    }
+
 }
 
 struct ShelfLayout {
@@ -1187,29 +1201,17 @@ fn graph_fields(
             }
         }
     }
-    let nodes = node(
-        commands,
-        parent,
-        Node {
-            display: if session.graph_canvas_open() {
-                Display::None
-            } else {
-                Display::Flex
-            },
+    if !editing {
+        let nodes = node(commands, parent, Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3.),
             ..row(4.)
-        },
-    );
-    for item in &graph.nodes {
-        if let Some(definition) = library.find(&item.def) {
-            button(
-                commands,
-                nodes,
-                font,
-                &format!("{} #{}", definition.name, item.id),
-                PaintAction::GraphSelectNode(item.id),
-            );
+        });
+        for item in &graph.nodes {
+            if let Some(definition) = library.find(&item.def) {
+                button(commands, nodes, font, &format!("{} #{}", definition.name, item.id),
+                    PaintAction::GraphSelectNode(item.id));
+            }
         }
     }
     let Some(selected) = session
@@ -1702,6 +1704,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         Look::Primary,
     );
     button(&mut commands, toolbar, font, "Сохранить как…", PaintAction::SaveCopy);
+    button(&mut commands, toolbar, font, "Редактор графов", PaintAction::GraphPage(GraphPage::Home));
     button(
         &mut commands, toolbar, font, "Экспорт карт…", PaintAction::ExportMaps(true),
     );
@@ -2876,7 +2879,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let shelf_content_stamp = stamp_for(session.panel);
     let panel_stamps = sidebar::PANELS.map(stamp_for);
     let inspector_stamp = (index, session.revision, doc.revision);
-    if graph_workspace {
+    if graph_workspace && session.graph_catalogue().is_none() {
         if ui.graph_settings_stamp != Some(inspector_stamp)
             && !focus.get().is_some_and(|field| graph_labels.get(field).is_ok())
             && let Some(graph) = session.graph()

@@ -77,12 +77,16 @@ pub(super) fn rekey(layers: &mut [Layer]) {
 }
 
 pub(super) fn can_open(stack: &Stack) -> bool {
-    if !is_group(stack) {
+    can_open_at(stack, stack.selected)
+}
+
+pub(super) fn can_open_at(stack: &Stack, folder: usize) -> bool {
+    if !stack.layers.get(folder).is_some_and(|layer| layer.kind == LayerKind::Folder) {
         return false;
     }
     let mut total = 0;
     let mut outputs = [false; CHANNELS.len()];
-    for index in fills(stack, stack.selected) {
+    for index in fills(stack, folder) {
         let layer = &stack.layers[index];
         total += usize::from(layer.mask.as_ref().is_some_and(|mask| {
             mask.generator.is_some() || has_mapped_pattern(mask)
@@ -98,7 +102,7 @@ pub(super) fn can_open(stack: &Stack) -> bool {
         }
     }
     let outputs = outputs.into_iter().filter(|&enabled| enabled).count();
-    let custom = stack.layers[stack.selected]
+    let custom = stack.layers[folder]
         .folder_graph
         .as_deref()
         .and_then(|payload| payload["nodes"].as_array().zip(payload["tags"].as_array()))
@@ -692,25 +696,31 @@ pub(super) fn can_edit(stack: &Stack, graph: &Graph, edit: material_graph::Edit)
         managed(graph, id)
             .is_some_and(|tag| matches!(tag.role, Role::Channel(_)) && input(id, index))
     };
+    let can_connect = |from, to, index| custom(graph, from) && (custom(graph, to) || mask(to, index));
+    let can_disconnect = |id, index| {
+        custom(graph, id) || (mask(id, index)
+            && managed(graph, id).is_some_and(|tag| graph.tagged(tag.layer, Role::Source(0)).is_some()))
+    };
     match edit {
+        Edit::Batch(..) => true,
         Edit::Move(id, _) => graph.node(id).is_some(),
-        Edit::Add(index, _) => {
+        Edit::Add(index, _) | Edit::AddConnected(index, _, _) => {
             graph.nodes.len() < 256
                 && material_graph::library()
                     .defs
                     .get(index)
                     .is_some_and(|def| !def.shading && def.id != material_painter_graph::OUTPUT_DEF)
+                && match edit {
+                    Edit::AddConnected(_, _, source) => custom(graph, source.node)
+                        && source.input.is_none_or(|old| can_disconnect(old.node, old.index)),
+                    _ => true,
+                }
         }
         Edit::Remove(id) => custom(graph, id),
-        Edit::Connect(from, to, index) => {
-            custom(graph, from) && (custom(graph, to) || mask(to, index))
-        }
-        Edit::Disconnect(id, index) => {
-            custom(graph, id)
-                || (mask(id, index)
-                    && managed(graph, id)
-                        .is_some_and(|tag| graph.tagged(tag.layer, Role::Source(0)).is_some()))
-        }
+        Edit::Connect(from, to, index) => can_connect(from, to, index),
+        Edit::Reconnect(source, target) => can_connect(source.node, target.node, target.index)
+            && source.input.is_none_or(|old| can_disconnect(old.node, old.index)),
+        Edit::Disconnect(id, index) => can_disconnect(id, index),
         Edit::SetMeshMap(ParameterTarget::Node(id, _), _) => custom(graph, id),
         Edit::SetMeshMap(ParameterTarget::Published(index), _)
         | Edit::AdjustParameter(index, ..)
@@ -726,11 +736,23 @@ pub(super) fn edit_graph(
     edit: material_graph::Edit,
 ) -> Result<Option<u64>, String> {
     use material_graph::Edit;
-    let target = match edit {
-        Edit::Connect(_, to, _) | Edit::Disconnect(to, _) => managed(graph, to),
-        _ => None,
+    let (old, new) = match edit {
+        Edit::Connect(from, to, _) => (None, managed(graph, to).map(|tag| (tag, from))),
+        Edit::Disconnect(to, _) => (managed(graph, to), None),
+        Edit::Reconnect(source, target) => (
+            source.input.and_then(|port| managed(graph, port.node)),
+            managed(graph, target.node).map(|tag| (tag, source.node)),
+        ),
+        Edit::AddConnected(_, _, source) => (source.input.and_then(|port| managed(graph, port.node)), None),
+        _ => (None, None),
     };
-    if let (Some(tag), Edit::Connect(_, _, _)) = (target, edit)
+    // Layer channel nodes can expose the same mask as several graph inputs.
+    if let Edit::Reconnect(_, target) = edit
+        && old.zip(new).is_some_and(|(old, (new, _))| old.layer == new.layer)
+    {
+        return Ok(Some(target.node));
+    }
+    if let Some((tag, _)) = new
         && graph.tagged(tag.layer, Role::Source(0)).is_none()
         && stack.layers.iter().any(|layer| {
             layer.graph_id == Some(tag.layer)
@@ -740,17 +762,11 @@ pub(super) fn edit_graph(
         return Err("У слоя уже есть отдельный граф маски".into());
     }
     let selection = edit.apply(graph, None)?;
-    if let Some(tag) = target {
-        graph
-            .tags
-            .retain(|t| t.layer != tag.layer || !matches!(t.role, Role::Source(_)));
-        if let Edit::Connect(from, _, _) = edit {
-            graph.tags.push(Tag {
-                node: from,
-                layer: tag.layer,
-                role: Role::Source(0),
-            });
-        }
+    for tag in old.into_iter().chain(new.map(|(tag, _)| tag)) {
+        graph.tags.retain(|t| t.layer != tag.layer || !matches!(t.role, Role::Source(_)));
+    }
+    if let Some((tag, from)) = new {
+        graph.tags.push(Tag { node: from, layer: tag.layer, role: Role::Source(0) });
     }
     graph
         .tags
@@ -1591,6 +1607,45 @@ mod tests {
         assert_eq!(current(&session).weight(GeneratorInput::Front), -220);
         session.edit(PaintAction::Undo);
         assert_eq!(current(&session).weight(GeneratorInput::Scratches), -220);
+    }
+
+    #[test]
+    fn rerouting_folder_mask_wire_updates_the_layer_sources() {
+        use material_graph::{Edit, GraphInput, WireSource};
+        let mut session = Session::default();
+        session.texture_size = 16;
+        session.edit(PaintAction::Add(LayerKind::Folder));
+        session.edit(PaintAction::Add(LayerKind::Fill));
+        let first = session.stack.selected;
+        session.stack.layers[first].channels[1] = Some(solid(16, [128; 4]));
+        session.edit(PaintAction::Add(LayerKind::Fill));
+        let second = session.stack.selected;
+        let folder = session.stack.parents(second).next().unwrap();
+        session.edit(PaintAction::Select(folder));
+        let view = start(&mut session.stack, 16, 0, None);
+        let mut graph = view.graph;
+        let first_id = session.stack.layers[first].graph_id.unwrap();
+        let second_id = session.stack.layers[second].graph_id.unwrap();
+        let source = graph.add("color", [0., 0.]);
+        let library = material_graph::library();
+        let index = library.find("layer").unwrap().inputs.iter().position(|input| input.name == "mask").unwrap();
+        let old = GraphInput { node: graph.tagged(first_id, Role::Channel(0)).unwrap(), index };
+        let alias = GraphInput { node: graph.tagged(first_id, Role::Channel(1)).unwrap(), index };
+        let target = GraphInput { node: graph.tagged(second_id, Role::Channel(0)).unwrap(), index };
+        edit_graph(&session.stack, &mut graph, Edit::Connect(source, old.node, old.index)).unwrap();
+        wire_mask(&mut graph, first_id, source);
+        let original = graph.clone();
+        let dragged = WireSource { node: source, input: Some(old) };
+        edit_graph(&session.stack, &mut graph, Edit::Reconnect(dragged, alias)).unwrap();
+        assert_eq!(graph, original);
+        let edit = Edit::Reconnect(dragged, target);
+        assert!(can_edit(&session.stack, &graph, edit));
+        edit_graph(&session.stack, &mut graph, edit).unwrap();
+        assert_eq!(graph.tagged(first_id, Role::Source(0)), None);
+        assert_eq!(graph.tagged(second_id, Role::Source(0)), Some(source));
+        let masks = changed_masks(&session.stack, &original, &graph);
+        assert!(masks.iter().any(|(index, value)| *index == first && value.is_none()));
+        assert!(masks.iter().any(|(index, value)| *index == second && value.is_some()));
     }
 
     #[test]

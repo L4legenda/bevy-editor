@@ -1349,9 +1349,11 @@ pub(super) fn shortcuts(
     lighting: Option<Res<LightingUi>>,
     browser_context: Option<Res<BrowserContext>>,
     image_viewer: Option<Res<ImageViewer>>,
-    (model_edit, model_paint): (
+    (model_edit, model_paint, graph_stage, windows): (
         Option<Res<model_viewer::editing::State>>,
         Option<Res<model_viewer::paint::PaintState>>,
+        Query<(&ComputedNode, &UiGlobalTransform), With<model_viewer::paint::GraphCanvasStage>>,
+        Query<&Window, With<PrimaryWindow>>,
     ),
     sliders: Query<(), With<bevy::ui_widgets::Slider>>,
     (pointer, scrub, tree_drag): (
@@ -1438,6 +1440,19 @@ pub(super) fn shortcuts(
             KeyCode::SuperRight,
         ]);
         if focus.get().is_some_and(|entity| inputs.contains(entity)) {
+            return;
+        }
+        if keys.just_pressed(KeyCode::Tab)
+            && model_edit.as_ref().is_some_and(|state| {
+                state.mode(editor.viewing_model) == crate::editor::model_document::Mode::Paint
+            })
+            && model_paint.as_ref().is_some_and(|state| state.graph_shortcuts_active(editor.viewing_model))
+            && let (Ok((stage, transform)), Ok(window)) = (graph_stage.single(), windows.single())
+            && let Some(cursor) = window.cursor_position()
+            && stage.size().min_element() > 0.
+            && Rect::from_center_size(transform.affine().translation * stage.inverse_scale_factor(),
+                stage.size() * stage.inverse_scale_factor()).contains(cursor)
+        {
             return;
         }
         if model_viewer::editing::shortcuts(

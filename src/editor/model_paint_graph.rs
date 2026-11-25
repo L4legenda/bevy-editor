@@ -1,7 +1,7 @@
 //! Bevy paint-layer bridge for the procedural material graph runtime.
 use super::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
-use material_painter_graph::{Graph, Library, ParamKind, Runtime, Value, channel_outputs};
+use material_painter_graph::{CHANNEL_USAGE, Graph, Library, ParamKind, Runtime, Value};
 pub(super) use node_library::encode;
 pub(super) use node_library::library;
 use std::path::PathBuf;
@@ -74,9 +74,11 @@ impl ParameterTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum Edit {
     Add(usize, IVec2),
+    AddConnected(usize, IVec2, WireSource),
     Move(u64, IVec2),
     Remove(u64),
     Connect(u64, u64, usize),
+    Reconnect(WireSource, GraphInput),
     Disconnect(u64, usize),
     Publish(u64, usize),
     Bind(u64, usize, usize),
@@ -89,16 +91,133 @@ pub(in crate::editor) enum Edit {
     ClearBitmap(ParameterTarget),
     SetMeshMap(ParameterTarget, usize),
     Resolution(Option<u32>),
+    Batch(u64, BatchKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) struct GraphInput {
+    pub(super) node: u64,
+    pub(super) index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) struct WireSource {
+    pub(super) node: u64,
+    pub(super) input: Option<GraphInput>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::editor) enum BatchKind {
+    Move,
+    Remove,
+    Paste(u64),
+}
+
+pub(super) enum Batch {
+    Move(Vec<u64>, Vec2),
+    Remove(Vec<u64>),
+    Paste {
+        nodes: Vec<material_painter_graph::Node>,
+        offset: Vec2,
+        keep_links: bool,
+        images: Arc<texture_fill::GraphImages>,
+    },
+}
+
+impl Batch {
+    pub(super) fn apply(
+        self,
+        graph: &mut Graph,
+        images: &mut Arc<texture_fill::GraphImages>,
+        shading: bool,
+        folder: bool,
+    ) -> Result<Option<u64>, String> {
+        match self {
+            Self::Move(ids, offset) => {
+                for id in &ids {
+                    if let Some(node) = graph.node_mut(*id) {
+                        node.pos = (Vec2::from_array(node.pos) + offset).to_array();
+                    }
+                }
+                Ok(ids.last().copied())
+            }
+            Self::Remove(ids) => {
+                for id in ids {
+                    if !folder || folder_graph::managed(graph, id).is_none() {
+                        graph.remove(id);
+                        if folder {
+                            graph.tags.retain(|tag| tag.node != id);
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Self::Paste { nodes, offset, keep_links, images: copied_images } => {
+                let library = library();
+                if nodes.iter().any(|node| !library.find(&node.def).is_some_and(|def| {
+                    def.shading == shading && (!folder || def.id != material_painter_graph::OUTPUT_DEF)
+                })) {
+                    return Err("Узлы не подходят для этого графа".into());
+                }
+                let first = graph.next_id;
+                if graph.nodes.len() + nodes.len() > 256 || first.checked_add(nodes.len() as u64).is_none() {
+                    return Err("Достигнут предел числа узлов графа".into());
+                }
+                let ids: HashMap<_, _> = nodes.iter().map(|node| {
+                    let position = (Vec2::from_array(node.pos) + offset).to_array();
+                    (node.id, graph.add(&node.def, position))
+                }).collect();
+                let last = nodes.last().map(|node| ids[&node.id]);
+                let mut relocated = HashMap::<PathBuf, PathBuf>::new();
+                for mut node in nodes {
+                    let id = ids[&node.id];
+                    for value in node.params.values_mut() {
+                        if let Value::Image(Some(path)) = value
+                            && let Some(key) = path.to_str()
+                            && let Some(bitmap) = copied_images.get(key)
+                        {
+                            if let Some(destination) = relocated.get(path) {
+                                *path = destination.clone();
+                            } else if let Some(existing) = images.get(key) {
+                                if !Arc::ptr_eq(existing, bitmap) {
+                                    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+                                    let destination = (1..).map(|number| format!("graph-images/copy-{number}-{filename}"))
+                                        .find(|candidate| !images.contains_key(candidate)).unwrap();
+                                    Arc::make_mut(images).insert(destination.clone(), bitmap.clone());
+                                    relocated.insert(path.clone(), destination.clone().into());
+                                    *path = destination.into();
+                                }
+                            } else {
+                                Arc::make_mut(images).insert(key.to_owned(), bitmap.clone());
+                            }
+                        }
+                    }
+                    graph.node_mut(id).unwrap().params = node.params;
+                    for (input, from) in node.links {
+                        if let Some(source) = ids.get(&from).copied().or_else(|| {
+                            (keep_links && from < first && (!folder || folder_graph::managed(graph, from).is_none()))
+                                .then_some(from)
+                        }) {
+                            graph.connect(source, id, &input);
+                        }
+                    }
+                }
+                Ok(last)
+            }
+        }
+    }
 }
 
 impl Edit {
     pub(super) fn rebuilds(self) -> bool {
         match self {
-            Self::Add(index, _) => library()
+            Self::AddConnected(_, _, WireSource { input: Some(_), .. }) => true,
+            Self::Add(index, _) | Self::AddConnected(index, _, _) => library()
                 .defs
                 .get(index)
                 .is_some_and(|def| def.id == material_painter_graph::OUTPUT_DEF),
             Self::Move(..)
+            | Self::Batch(_, BatchKind::Move)
             | Self::Publish(..)
             | Self::Unbind(..)
             | Self::RemoveParameter(_)
@@ -132,7 +251,18 @@ impl Edit {
                 .map(|input| input.name.as_str())
                 .ok_or("Вход узла не найден")
         };
+        let original_input = |graph: &Graph, source: WireSource| -> Result<Option<(u64, &str)>, String> {
+            graph.node(source.node).ok_or("Исходный узел не найден")?;
+            source.input.map(|input| {
+                let name = port(graph, input.node, input.index)?;
+                if graph.node(input.node).and_then(|node| node.links.get(name)) != Some(&source.node) {
+                    return Err("Исходная связь уже изменилась".into());
+                }
+                Ok((input.node, name))
+            }).transpose()
+        };
         match self {
+            Self::Batch(..) => Err("Пакет правок графа недоступен".into()),
             Self::Resolution(size) => {
                 if shading || size.is_some_and(|size| !RESOLUTIONS.contains(&size)) {
                     return Err("Неподдерживаемое разрешение графа".into());
@@ -143,7 +273,7 @@ impl Edit {
                 }
                 Ok(None)
             }
-            Self::Add(index, pos) => {
+            Self::Add(index, pos) | Self::AddConnected(index, pos, _) => {
                 let def = lib
                     .defs
                     .get(index)
@@ -152,7 +282,21 @@ impl Edit {
                 if graph.nodes.len() >= 256 || graph.next_id == u64::MAX {
                     return Err("Достигнут предел числа узлов графа".into());
                 }
-                Ok(Some(graph.add(&def.id, pos.as_vec2().to_array())))
+                let connection = if let Self::AddConnected(_, _, source) = self {
+                    let old = original_input(graph, source)?;
+                    let input = def.inputs.first().ok_or("У узла нет входов")?.name.as_str();
+                    Some((source.node, input, old))
+                } else {
+                    None
+                };
+                let id = graph.add(&def.id, pos.as_vec2().to_array());
+                if let Some((source, input, old)) = connection {
+                    graph.connect(source, id, input);
+                    if let Some((node, name)) = old {
+                        graph.node_mut(node).unwrap().links.remove(name);
+                    }
+                }
+                Ok(Some(id))
             }
             Self::Move(id, pos) => {
                 graph.node_mut(id).ok_or("Узел не найден")?.pos = pos.as_vec2().to_array();
@@ -171,6 +315,20 @@ impl Edit {
                     return Err("Связь замыкает цикл или один из узлов отсутствует".into());
                 }
                 Ok(Some(to))
+            }
+            Self::Reconnect(source, target) => {
+                let old = original_input(graph, source)?;
+                if source.input == Some(target) {
+                    return Ok(Some(target.node));
+                }
+                let input = port(graph, target.node, target.index)?;
+                if !graph.connect(source.node, target.node, input) {
+                    return Err("Связь замыкает цикл или один из узлов отсутствует".into());
+                }
+                if let Some((node, name)) = old {
+                    graph.node_mut(node).unwrap().links.remove(name);
+                }
+                Ok(Some(target.node))
             }
             Self::Disconnect(id, index) => {
                 let input = port(graph, id, index)?;
@@ -512,8 +670,9 @@ pub(super) fn prepare_graph(
     device: &RenderDevice,
     queue: &RenderQueue,
 ) -> Result<Layer, String> {
-    let (graph, images, outputs) = render(graph, images, set_size, inputs, device, queue)?;
-    graph_layer(graph, images, channel_outputs(&outputs))
+    let (graph, images, mut outputs) = render(graph, images, set_size, inputs, device, queue)?;
+    let channels = CHANNEL_USAGE.map(|usage| outputs[usage].take());
+    graph_layer(graph, images, channels)
 }
 
 pub(super) fn mask_starter() -> Graph {
@@ -745,6 +904,88 @@ fn graph_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_validates_both_ends_before_moving_an_existing_wire() {
+        let mut graph = Graph::new("Reroute");
+        let color = graph.add("color", [0., 0.]);
+        let source = graph.add("invert", [200., 0.]);
+        let old = graph.add("output", [400., 0.]);
+        let target = graph.add("invert", [400., 160.]);
+        assert!(graph.connect(color, source, "input"));
+        assert!(graph.connect(source, old, "input"));
+        assert!(graph.connect(color, target, "input"));
+        let old_port = GraphInput { node: old, index: 0 };
+        let dragged = WireSource { node: source, input: Some(old_port) };
+        let original = graph.clone();
+        let cycle = Edit::Reconnect(dragged, GraphInput { node: source, index: 0 });
+        assert!(cycle.apply(&mut graph, None).is_err());
+        Edit::Reconnect(dragged, old_port).apply(&mut graph, None).unwrap();
+        assert_eq!(graph, original);
+        let reroute = Edit::Reconnect(dragged, GraphInput { node: target, index: 0 });
+        assert_eq!(reroute.apply(&mut graph, None).unwrap(), Some(target));
+        assert!(!graph.node(old).unwrap().links.contains_key("input"));
+        assert_eq!(graph.node(target).unwrap().links["input"], source);
+        let changed = graph.clone();
+        assert!(reroute.apply(&mut graph, None).is_err());
+        assert_eq!(graph, changed);
+    }
+
+    #[test]
+    fn batch_paste_remaps_internal_links_and_only_keeps_local_inputs() {
+        let mut graph = Graph::new("Batch");
+        let input = graph.add("color", [0., 0.]);
+        let first = graph.add("invert", [220., 0.]);
+        let last = graph.add("invert", [440., 0.]);
+        assert!(graph.connect(input, first, "input"));
+        assert!(graph.connect(first, last, "input"));
+        let copied = vec![graph.node(first).unwrap().clone(), graph.node(last).unwrap().clone()];
+        let mut images = Arc::default();
+        let pasted = Batch::Paste {
+            nodes: copied.clone(), offset: Vec2::splat(40.), keep_links: true, images: Arc::default(),
+        }.apply(&mut graph, &mut images, false, false).unwrap().unwrap();
+        assert_eq!(graph.node(pasted).unwrap().links["input"], pasted - 1);
+        assert_eq!(graph.node(pasted - 1).unwrap().links["input"], input);
+        assert_eq!(graph.node(pasted - 1).unwrap().pos, [260., 40.]);
+
+        let mut another = Graph::new("Another graph");
+        assert_eq!(another.add("color", [0., 0.]), input);
+        let pasted = Batch::Paste {
+            nodes: copied, offset: Vec2::ZERO, keep_links: false, images: Arc::default(),
+        }.apply(&mut another, &mut images, false, false).unwrap().unwrap();
+        assert_eq!(another.node(pasted).unwrap().links["input"], pasted - 1);
+        assert!(another.node(pasted - 1).unwrap().links.is_empty());
+
+        Batch::Move(vec![pasted - 1, pasted], Vec2::new(20., 4.))
+            .apply(&mut another, &mut images, false, false).unwrap();
+        assert_eq!(another.node(pasted - 1).unwrap().pos, [240., 4.]);
+        assert_eq!(another.node(pasted).unwrap().pos, [460., 4.]);
+        Batch::Remove(vec![pasted - 1, pasted]).apply(&mut another, &mut images, false, false).unwrap();
+        assert_eq!(another.nodes.len(), 1);
+    }
+
+    #[test]
+    fn batch_paste_keeps_both_bitmaps_when_graph_paths_collide() {
+        let path = "graph-images/input.png";
+        let red = Arc::new(texture_fill::Bitmap::from_rgba("red.png".into(),
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))).unwrap());
+        let blue = Arc::new(texture_fill::Bitmap::from_rgba("blue.png".into(),
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]))).unwrap());
+        let mut images = Arc::new(texture_fill::GraphImages::from([(path.into(), red.clone())]));
+        let mut graph = Graph::new("Images");
+        let id = Batch::Paste {
+            nodes: vec![material_painter_graph::Node {
+                id: 1, def: "bitmap".into(), pos: [0., 0.], params: HashMap::from([
+                    ("image".into(), Value::Image(Some(PathBuf::from(path)))),
+                ]), links: HashMap::new(),
+            }],
+            offset: Vec2::ZERO, keep_links: false,
+            images: Arc::new(texture_fill::GraphImages::from([(path.into(), blue.clone())])),
+        }.apply(&mut graph, &mut images, false, false).unwrap().unwrap();
+        let Value::Image(Some(copied)) = &graph.node(id).unwrap().params["image"] else { panic!() };
+        assert!(Arc::ptr_eq(&images[path], &red));
+        assert!(Arc::ptr_eq(&images[copied.to_str().unwrap()], &blue));
+    }
 
     #[test]
     fn rebind_published_parameter_after_earlier_entry_is_removed() {

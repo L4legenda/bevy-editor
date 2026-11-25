@@ -164,7 +164,8 @@ pub(in crate::editor) struct Bitmap {
     has_alpha: bool,
 }
 
-const MAX_BYTES: usize = 64 * 1024 * 1024;
+// A 4096² RGBA raster can take 64 MiB plus PNG filter and container bytes.
+const MAX_BYTES: usize = 65 * 1024 * 1024;
 
 impl Bitmap {
     pub(in crate::editor) fn has_alpha(&self) -> bool {
@@ -173,6 +174,11 @@ impl Bitmap {
 
     pub(in crate::editor) fn pixels(&self) -> &RgbaImage {
         &self.mips[0]
+    }
+
+    pub(in crate::editor) fn preview_pixels(&self) -> &RgbaImage {
+        self.mips.iter().find(|image| image.width().max(image.height()) <= 144)
+            .unwrap_or_else(|| self.pixels())
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -191,7 +197,7 @@ impl Bitmap {
 
     pub fn decode(name: String, bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > MAX_BYTES {
-            return Err("Размер изображения превышает 64 МиБ".into());
+            return Err("Размер изображения превышает 65 МиБ".into());
         }
         let mut reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
@@ -211,7 +217,7 @@ impl Bitmap {
     pub(in crate::editor) fn from_rgba(name: String, pixels: RgbaImage) -> Result<Self, String> {
         let bytes = encode_png(&pixels)?;
         if bytes.len() > MAX_BYTES {
-            return Err("Размер изображения превышает 64 МиБ".into());
+            return Err("Размер изображения превышает 65 МиБ".into());
         }
         Ok(Self::with_pixels(name, bytes, pixels))
     }

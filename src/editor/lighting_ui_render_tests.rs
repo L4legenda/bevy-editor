@@ -1151,7 +1151,7 @@ pub(in crate::editor) fn mouse(app: &mut App, window: Entity, state: ButtonState
     warm(app, 2);
 }
 
-fn pointer(app: &mut App, window: Entity, position: Vec2, action: PointerAction) {
+pub(in crate::editor) fn pointer(app: &mut App, window: Entity, position: Vec2, action: PointerAction) {
     let target = {
         let world = app.world_mut();
         let mut cameras = world.query_filtered::<&RenderTarget, With<IsDefaultUiCamera>>();
