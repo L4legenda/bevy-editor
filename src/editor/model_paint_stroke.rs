@@ -162,6 +162,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scatter_can_move_a_stamp_two_brush_radii_on_each_axis() {
+        use super::super::{Parameter, Session};
+        let mut session = Session::default();
+        let (_, maximum) = Parameter::BrushScatter.bounds();
+        assert_eq!(maximum, 200.);
+        session.set_value(Parameter::BrushScatter, maximum as f32);
+        let stamp = Stamp::from(Vec2::new(12., 25.));
+        let radius = 10.;
+        let mut largest = 0f32;
+        for seed in 0..256 {
+            let (scattered, _) = Noise::new(seed).vary(stamp, radius, Variation {
+                scatter: session.value(Parameter::BrushScatter) / 100.,
+                ..Default::default()
+            });
+            largest = largest.max((scattered.point - stamp.point).abs().max_element());
+        }
+        assert!(largest > radius * 1.9 && largest <= radius * 2.);
+    }
+
+    #[test]
     fn stabilizer_keeps_spacing_and_interpolates_stamp_pressure() {
         let mut path = Path::new(Vec2::ZERO, 0.25, 4., 10., true, true);
         assert_eq!(path.first().radius, 0.25);

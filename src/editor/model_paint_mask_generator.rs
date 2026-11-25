@@ -11,6 +11,9 @@ use super::spatial::{fbm, noise, smooth};
 
 #[path = "model_paint_mask_patterns.rs"]
 mod patterns;
+#[path = "model_paint_mask_gradient.rs"]
+mod gradient;
+pub(in crate::editor) use gradient::{GradientMapping, GradientProjection, GradientVolume};
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,10 +188,13 @@ pub(in crate::editor) enum GeneratorKind {
     PartRandom,
     IdMask,
     CustomMap,
+    GradientLinear,
+    GradientMirror,
+    GradientPeak,
 }
 
 impl GeneratorKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::Clouds,
         Self::Height,
         Self::EdgeWear,
@@ -203,6 +209,9 @@ impl GeneratorKind {
         Self::PartRandom,
         Self::IdMask,
         Self::CustomMap,
+        Self::GradientLinear,
+        Self::GradientMirror,
+        Self::GradientPeak,
     ];
 
     pub fn label(self) -> &'static str {
@@ -221,6 +230,9 @@ impl GeneratorKind {
             Self::PartRandom => "Случайно по деталям",
             Self::IdMask => "Маска по ID",
             Self::CustomMap => "По запечённой карте",
+            Self::GradientLinear => "Линейный градиент",
+            Self::GradientMirror => "Закруглённый градиент",
+            Self::GradientPeak => "Треугольный градиент",
         }
     }
 
@@ -245,13 +257,17 @@ impl GeneratorKind {
             Self::PartGradient => &[(I::PartGradient, 100)],
             Self::PartRandom => &[(I::PartRandom, 100)],
             Self::IdMask => &[(I::Id, 100)],
-            Self::CustomMap => &[],
+            Self::CustomMap | Self::GradientLinear | Self::GradientMirror | Self::GradientPeak => &[],
         };
         let mut weights = [0; GENERATOR_INPUT_COUNT];
         for &(input, weight) in inputs {
             weights[input as usize] = weight;
         }
         weights
+    }
+
+    pub fn is_gradient(self) -> bool {
+        matches!(self, Self::GradientLinear | Self::GradientMirror | Self::GradientPeak)
     }
 }
 
@@ -335,11 +351,15 @@ pub(in crate::editor) struct Generator {
     pub edge_width: u16,
     #[serde(default, skip_serializing_if = "empty_custom_inputs")]
     pub custom: [custom::Input; custom::MAX_MIX_INPUTS],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gradient_mapping: Option<GradientMapping>,
 }
 
 fn empty_custom_inputs(inputs: &[custom::Input; custom::MAX_MIX_INPUTS]) -> bool {
     inputs.iter().all(|input| input.id == 0)
 }
+
+type Control = (&'static str, f32, f32, f32);
 
 const fn default_id_tolerance() -> u8 {
     15
@@ -352,13 +372,29 @@ const fn default_edge_width() -> u16 {
 impl Generator {
     pub const WEIGHT_LIMIT: i16 = 250;
 
-    pub const CONTROLS: [(&'static str, f32, f32, f32); 5] = [
+    const CONTROLS: [Control; 5] = [
         ("Уровень, %", -100., 200., 5.),
         ("Переход, %", 0.1, 100., 5.),
         ("Масштаб", 0.1, 64., 0.5),
         ("Шум края, %", 0., 200., 5.),
         ("Зерно", 0., 100., 1.),
     ];
+
+    const GRADIENT_CONTROLS: [Control; 5] = [
+        ("Баланс, %", 0., 100., 5.),
+        ("Контраст, %", 0., 100., 5.),
+        ("Повторы", 1., 16., 1.),
+        ("Угол, °", -360., 360., 15.),
+        ("Вершина, %", 0., 100., 5.),
+    ];
+
+    pub fn controls(self) -> &'static [Control] {
+        match self.kind {
+            GeneratorKind::GradientPeak => &Self::GRADIENT_CONTROLS,
+            GeneratorKind::GradientLinear | GeneratorKind::GradientMirror => &Self::GRADIENT_CONTROLS[..4],
+            _ => &Self::CONTROLS,
+        }
+    }
 
     pub fn new(kind: GeneratorKind) -> Self {
         let values = match kind {
@@ -376,6 +412,9 @@ impl Generator {
             GeneratorKind::PartRandom => [50., 1., 3., 0., 0.],
             GeneratorKind::IdMask => [50., 5., 3., 0., 0.],
             GeneratorKind::CustomMap => [35., 15., 3., 30., 0.],
+            GeneratorKind::GradientLinear | GeneratorKind::GradientMirror | GeneratorKind::GradientPeak => {
+                [50., 0., 1., 0., 50.]
+            }
         };
         Self {
             kind,
@@ -386,11 +425,13 @@ impl Generator {
             weights: None,
             edge_width: default_edge_width(),
             custom: Default::default(),
+            gradient_mapping: None,
         }
     }
 
     pub fn valid(self) -> bool {
         (1..=100).contains(&self.id_tolerance)
+            && self.gradient_mapping.is_none_or(|mapping| self.kind.is_gradient() && mapping.valid())
             && (2..=500).contains(&self.edge_width)
             && self.custom.iter().enumerate().all(|(i, input)| {
                 if input.id == 0 {
@@ -406,8 +447,8 @@ impl Generator {
             && self
                 .values
                 .into_iter()
-                .zip(Self::CONTROLS)
-                .all(|(v, (_, min, max, _))| (min..=max).contains(&v))
+                .zip(self.controls())
+                .all(|(v, &(_, min, max, _))| (min..=max).contains(&v))
     }
 
     pub fn weights(self) -> [i16; GENERATOR_INPUT_COUNT] {
@@ -442,6 +483,14 @@ impl Generator {
 
     /// A lit preview sphere with synthetic bake inputs. The actual mask uses the model's maps.
     pub fn shelf_preview(self, size: u32) -> image::RgbaImage {
+        if self.kind.is_gradient() {
+            let sample = gradient::Sampler::new(self);
+            return image::RgbaImage::from_fn(size, size, |x, y| {
+                let uv = (Vec2::new(x as f32 + 0.5, size as f32 - y as f32 - 0.5)) / size as f32;
+                let [value, alpha] = sample.uv(uv);
+                image::Rgba([value, value, value, alpha])
+            });
+        }
         let point = |x, y| {
             let half = size as f32 * 0.45;
             let x = (x as f32 + 0.5 - size as f32 * 0.5) / half;
@@ -652,7 +701,13 @@ pub(in crate::editor) struct GeneratorSurface {
     live: Option<Arc<custom::LivePlane>>,
     geometry: OnceLock<Coordinates>,
     normals: OnceLock<Vec<[i8; 3]>>,
-    maps: Mutex<Vec<(Generator, Arc<Vec<u8>>)>>,
+    maps: Mutex<Vec<(Generator, GeneratorMap)>>,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::editor) struct GeneratorMap {
+    pub values: Arc<Vec<u8>>,
+    pub coverage: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -725,7 +780,7 @@ impl GeneratorSurface {
             }
     }
 
-    pub fn map(&self, generator: Generator) -> Arc<Vec<u8>> {
+    pub fn map(&self, generator: Generator) -> GeneratorMap {
         let mut cache = self.maps.lock().unwrap();
         if let Some(i) = cache.iter().position(|(cached, _)| *cached == generator) {
             let entry = cache.remove(i);
@@ -733,6 +788,52 @@ impl GeneratorSurface {
             cache.push(entry);
             return pixels;
         }
+        let pixels = if generator.kind.is_gradient() {
+            self.gradient_map(generator)
+        } else {
+            GeneratorMap { values: self.geometry_map(generator), coverage: None }
+        };
+        // Recent settings are reused during strokes and undo.
+        if cache.len() == 8 {
+            cache.remove(0);
+        }
+        cache.push((generator, pixels.clone()));
+        pixels
+    }
+
+    fn gradient_map(&self, generator: Generator) -> GeneratorMap {
+        use crate::editor::model_paint_data::texture_fill::{pad_texels, raster};
+        let size = self.size as usize;
+        let sampler = gradient::Sampler::new(generator);
+        let mapping = generator.gradient_mapping.unwrap_or_default();
+        if mapping.full_coverage() {
+            let values = (0..size * size).map(|i| {
+                let uv = Vec2::new((i % size) as f32 + 0.5, size as f32 - (i / size) as f32 - 0.5);
+                sampler.uv(uv / size as f32)[0]
+            }).collect();
+            return GeneratorMap { values: Arc::new(values), coverage: None };
+        }
+        let mut samples = vec![[0; 2]; size * size];
+        if mapping.volume.is_some() {
+            let mut covered = vec![0; samples.len()];
+            raster(
+                &self.mesh, self.slot, self.size, self.uv_offset, Transform::IDENTITY,
+                &self.mesh.positions, &mut covered, |index, _, point, normal, _, _| {
+                    samples[index] = sampler.projected(point, normal);
+                },
+            );
+            pad_texels(size, &mut covered, |to, from| samples[to] = samples[from]);
+        } else {
+            for (i, pixel) in samples.iter_mut().enumerate() {
+                let uv = Vec2::new((i % size) as f32 + 0.5, size as f32 - (i / size) as f32 - 0.5);
+                *pixel = sampler.uv(uv / size as f32);
+            }
+        }
+        let (values, coverage) = samples.into_iter().map(|[v, a]| (v, a)).unzip();
+        GeneratorMap { values: Arc::new(values), coverage: Some(Arc::new(coverage)) }
+    }
+
+    fn geometry_map(&self, generator: Generator) -> Arc<Vec<u8>> {
         let weights: Vec<_> = GeneratorInput::ALL
             .into_iter()
             .zip(generator.weights())
@@ -786,7 +887,7 @@ impl GeneratorSurface {
             }
         };
         let use_footprint = generator.weight(GeneratorInput::Scratches) != 0;
-        let pixels: Arc<Vec<u8>> = Arc::new(
+        Arc::new(
             coordinates
                 .points
                 .iter()
@@ -838,14 +939,7 @@ impl GeneratorSurface {
                     )
                 })
                 .collect(),
-        );
-        // Recent settings are reused during strokes and undo. Cap CPU memory
-        // independently of the number of history entries.
-        if cache.len() == 8 {
-            cache.remove(0);
-        }
-        cache.push((generator, pixels.clone()));
-        pixels
+        )
     }
 
     fn coordinates(&self) -> Coordinates {

@@ -697,6 +697,26 @@ fn mpsmart_warp_seed_uses_the_editor_extension() {
 
 #[cfg(test)]
 #[test]
+fn mpsmart_gradient_keeps_native_parameters_and_reports_external_limit() {
+    use crate::editor::model_paint_data::mask::GradientMapping;
+
+    let mut generator = Generator::new(GeneratorKind::GradientPeak);
+    generator.values[4] = 35.;
+    generator.gradient_mapping = Some(GradientMapping {
+        offset: [0.125, -0.25],
+        repeat: [false, true],
+        ..Default::default()
+    });
+    let mut adjusted = 0;
+    let data = write_generator(generator, &mut adjusted);
+    assert_eq!(adjusted, 1);
+    assert_eq!(data["kind"], "Clouds");
+    assert_eq!(read_generator(&data, &mut adjusted, &[]).unwrap(), generator);
+    assert_eq!(adjusted, 1);
+}
+
+#[cfg(test)]
+#[test]
 fn mpsmart_mask_outline_survives_through_an_editor_extension() {
     let mut filter = Filter::new(FilterKind::Outline);
     filter.set_value(2, 1.);
@@ -739,6 +759,13 @@ fn read_generator(
     omitted: &mut usize,
     maps: &[crate::editor::model_paint_data::custom::Recipe],
 ) -> Result<Generator, String> {
+    if let Some(data) = value.get("bevy_gradient") {
+        let generator: Generator = serde_json::from_value(data.clone())
+            .map_err(|error| format!("Повреждён градиент маски: {error}"))?;
+        return (generator.kind.is_gradient() && generator.valid())
+            .then_some(generator)
+            .ok_or_else(|| "Недопустимые параметры градиента маски".into());
+    }
     let name = value["kind"].as_str().unwrap_or("");
     let &(kind, _) = GENERATORS
         .iter()
@@ -1192,6 +1219,14 @@ fn write_mask(mask: &MaskPreset, kind: LayerKind, adjusted: &mut usize) -> Value
 }
 
 fn write_generator(generator: Generator, adjusted: &mut usize) -> Value {
+    if generator.kind.is_gradient() {
+        let mut fallback = Generator::new(GeneratorKind::Clouds);
+        fallback.values[0] = -100.;
+        *adjusted += 1;
+        let mut stored = write_generator(fallback, adjusted);
+        stored["bevy_gradient"] = json!(generator);
+        return stored;
+    }
     let (_, kind) = GENERATORS
         .iter()
         .find(|(kind, _)| *kind == generator.kind)

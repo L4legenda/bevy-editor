@@ -138,7 +138,9 @@ fn filter_mask(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocatio
             v = s * (1.0 - a * (1.0 - n));
         }
         case 7u: {
-            let l = f32(table[index]) / 255.0;
+            let sample = table[index];
+            let l = f32(sample & 255u) / 255.0;
+            let coverage = f32((sample >> 8u) & 255u) / 255.0;
             var mixed = l;
             switch u32(a) {
                 case 1u: { mixed = s * l; }
@@ -148,7 +150,7 @@ fn filter_mask(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocatio
                 case 5u: { mixed = min(s, l); }
                 default: {}
             }
-            v = mix(s, mixed, b);
+            v = mix(s, mixed, b * coverage);
         }
         case 8u: {
             var multiplier = 255u;

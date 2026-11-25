@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-const PREVIEW_SIZE: u32 = 128;
+pub(in crate::editor::ui::model_viewer::paint) const PREVIEW_SIZE: u32 = 128;
 
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct Uploads(HashMap<AssetId<Image>, Arc<Tex>>);

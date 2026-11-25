@@ -4,8 +4,9 @@ use crate::editor::model_document::MeshData;
 use crate::editor::model_paint_data::{
     Blend, Layer, LayerKind, MAX_LAYER_DEPTH, MAX_LAYERS,
     mask::{
-        BakedInputs, Filter, FilterKind, Generator, GeneratorInput, GeneratorKind, GeneratorSurface, MAX_FILTERS,
-        MAX_MASK_LAYERS, Mask, MaskBlend, MaskLayer,
+        BakedInputs, Filter, FilterKind, Generator, GeneratorInput, GeneratorKind, GeneratorSurface,
+        GradientMapping, GradientProjection, GradientVolume, MAX_FILTERS, MAX_MASK_LAYERS, Mask,
+        MaskBlend, MaskLayer,
     },
     over, solid,
     texture_fill::{Bitmap, Fill, Projection, pad_texels, raster, triplanar_coordinates},
@@ -722,7 +723,8 @@ impl Rebuild<'_> {
             let (mode, opacity) = mask_blend(action);
             mode == MaskBlend::Normal && mask_blend_code(action) == 25 && opacity == 1.
                 && matches!(&action.kind, ActionKind::Fill { sources, .. } if sources.len() == 1
-                    && matches!(&sources[0], SourceInfo::Procedural { graph, .. } if generator(graph).is_some()))
+                    && matches!(&sources[0], SourceInfo::Procedural { graph, .. }
+                        if generator(graph, action).is_some_and(|g| g.gradient_mapping.is_none_or(GradientMapping::full_coverage))))
         });
         let leading_generator = covering
             .filter(|&index| {
@@ -738,7 +740,7 @@ impl Rebuild<'_> {
                 let SourceInfo::Procedural { graph, .. } = &sources[0] else {
                     return None;
                 };
-                let generator = generator(graph);
+                let generator = generator(graph, steps[index]);
                 steps.drain(..=index);
                 generator
             });
@@ -1074,7 +1076,7 @@ impl Rebuild<'_> {
                 SourceInfo::Procedural { graph, .. }
                     if mask.layers.len() < MAX_MASK_LAYERS || !filters.is_empty() =>
                 {
-                    if let Some(generator) = generator(graph) {
+                    if let Some(generator) = generator(graph, action) {
                         if !self.bake_mask_filters(mask, before_paint, filters) {
                             partial = true;
                             continue;
@@ -1292,7 +1294,7 @@ pub(super) fn mask_generators(layers: &[LayerInfo], generators: &mut Vec<Generat
             for action in layer.mask.iter().filter(|action| action.enabled) {
                 if let ActionKind::Fill { sources, .. } = &action.kind {
                     generators.extend(sources.iter().filter_map(|source| match source {
-                        SourceInfo::Procedural { graph, .. } => generator(graph),
+                        SourceInfo::Procedural { graph, .. } => generator(graph, action),
                         _ => None,
                     }));
                 }
@@ -1302,9 +1304,57 @@ pub(super) fn mask_generators(layers: &[LayerInfo], generators: &mut Vec<Generat
     }
 }
 
-fn generator(graph: &GraphRef) -> Option<Generator> {
+fn gradient_generator(kind: GeneratorKind, graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
+    let ActionKind::Fill { projection, .. } = action.kind else { return None };
+    let volume = match projection {
+        0 => None,
+        1 | 2 => {
+            let source = action.projection_3d?;
+            let projection = if projection == 1 {
+                GradientProjection::Planar { depth: source.depth }
+            } else {
+                GradientProjection::Triplanar { hardness: source.triplanar_hardness }
+            };
+            Some(GradientVolume {
+                center: source.center, size: source.size, rotation: source.rotation,
+                crop: source.crop, projection, backface: source.backface,
+            })
+        }
+        _ => return None,
+    };
+    let mut mapping = GradientMapping { volume, repeat: if projection == 2 { [true; 2] } else { action.uv_wrap }, ..Default::default() };
+    if let Some(uv) = action.uv {
+        mapping.scale = uv.scale;
+        mapping.rotation = uv.rotation;
+        mapping.offset = uv.offset;
+    }
+    // Linear 3 exposes both "Position" (balance) and "position" (peak).
+    let value = |key, default: f32, min: f32, max: f32| {
+        graph.tweaks.iter().find(|(name, _)| name == key)
+            .and_then(|(_, values)| values.first().copied())
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+            .clamp(min, max)
+    };
+    let mut generator = Generator::new(kind);
+    generator.values = [
+        value("Position", 0.5, 0., 1.) * 100.,
+        value("Contrast", 0., 0., 1.) * 100.,
+        value("Tiling", 1., 1., 16.).round(),
+        value("rotation", 0., 0., 3.).round() * 90.,
+        value("position", 0.5, 0., 1.) * 100.,
+    ];
+    generator.invert = value("invert", 0., 0., 1.) > 0.5;
+    generator.gradient_mapping = (mapping != GradientMapping::default()).then_some(mapping);
+    generator.valid().then_some(generator)
+}
+
+fn generator(graph: &GraphRef, action: &ActionInfo) -> Option<Generator> {
     let name = graph.name().to_ascii_lowercase();
     let kind = match name.as_str() {
+        "gradient_linear_1" => return gradient_generator(GeneratorKind::GradientLinear, graph, action),
+        "gradient_linear_2" => return gradient_generator(GeneratorKind::GradientMirror, graph, action),
+        "gradient_linear_3" => return gradient_generator(GeneratorKind::GradientPeak, graph, action),
         "mg_dirt" | "mg_ambient_occlusion" | "mg_mask_editor" | "mg_mask_builder" => {
             GeneratorKind::Dirt
         }

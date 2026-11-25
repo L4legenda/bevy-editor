@@ -293,6 +293,8 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     shelf_preview_job: Option<(ShelfMaterial, Task<Result<image::RgbaImage, String>>)>,
     layer_name: Entity,
     brush_name: Entity,
+    diagnostic_label: Entity,
+    diagnostic_meter: diagnostics::Meter,
     fill_options: Entity,
     fill_angle: Entity,
     path_options: Entity,
@@ -455,7 +457,7 @@ fn generator_controls(
         button(commands, line, font, "−", action(GeneratorEdit::EdgeWidth(-1)));
         button(commands, line, font, "+", action(GeneratorEdit::EdgeWidth(1)));
     }
-    for (i, &(label, ..)) in Generator::CONTROLS.iter().enumerate() {
+    for (i, &(label, ..)) in generator.controls().iter().enumerate() {
         let line = node(commands, parent, row(4.));
         text(
             commands,
@@ -479,6 +481,9 @@ fn generator_controls(
             "+",
             action(GeneratorEdit::Adjust(i, 1)),
         );
+    }
+    if generator.kind.is_gradient() {
+        return;
     }
     button(commands, parent, font, "Входы генератора", PaintAction::GeneratorInputs(index));
     if let Some(picker) = mix {
@@ -1674,6 +1679,23 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         PANEL,
     );
     commands.entity(workspace).insert(AccessibleLabel("Рабочая область рисования".into()));
+    let diagnostics_panel = surface(
+        &mut commands,
+        workspace,
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(8.),
+            bottom: px(5.),
+            max_width: percent(100),
+            padding: UiRect::axes(px(6.), px(3.)),
+            border_radius: BorderRadius::all(px(4.)),
+            ..row(0.)
+        },
+        CHROME,
+    );
+    commands.entity(diagnostics_panel).insert((Pickable::IGNORE, ZIndex(5)));
+    let diagnostic_label = text(&mut commands, diagnostics_panel, font, "", 11., MUTED);
+    commands.entity(diagnostic_label).insert((Pickable::IGNORE, AccessibleLabel("Статистика рисования".into())));
     let model_pane = node(&mut commands, workspace, pane());
     let three_title = surface(
         &mut commands,
@@ -2240,6 +2262,8 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         shelf_preview_job: None,
         layer_name,
         brush_name,
+        diagnostic_label,
+        diagnostic_meter: diagnostics::Meter::default(),
         fill_options,
         fill_angle,
         path_options,
@@ -2288,11 +2312,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         (Without<Value>, Without<HistoryPreference>, Without<PreviewValue>),
     >,
     mut images: ResMut<Assets<Image>>,
-    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>),
+    rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>, Res<engine::gpu::Queue>, Res<Time<bevy::time::Real>>),
     (baked, mut preview_edits): (Res<bake::State>, MessageWriter<Action>),
     mut texture_nodes: Query<&mut ImageNode, Or<(With<engine::TextureCanvas>, With<UvWire>, With<UvSeams2d>)>>,
 ) {
-    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys) = rendering;
+    let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys, gpu_queue, time) = rendering;
     let doc = editor
         .viewing_model
         .and_then(|index| editing.documents.get(&index));
@@ -2425,6 +2449,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     if !showing {
+        ui.diagnostic_meter = diagnostics::Meter::default();
         ui.stamps = [None; 5];
         ui.stack_context = [None; 5];
         ui.graph_settings_stamp = None;
@@ -2444,6 +2469,15 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     paint.activate(index, recovery_preferences.settings().undo_steps);
     let session = paint.sessions.get_mut(&index).unwrap();
     session.refresh_folder_view();
+    if let Some(ms) = ui.diagnostic_meter.sample((index, session.set, session.texture_size), time.delta_secs_f64())
+        && let Ok(mut label) = labels.get_mut(ui.diagnostic_label)
+    {
+        let triangles = ui.diagnostic_meter.triangles(index, doc);
+        let value = diagnostics::label(index, session, &runtime, &gpu_queue, &images, ms, triangles);
+        if label.0 != value {
+            label.0 = value;
+        }
+    }
     if let Ok(mut label) = labels.get_mut(ui.three_label) {
         let current = if let Some(channel) = session.diagnostic_channel() {
             CHANNELS[channel]

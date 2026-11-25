@@ -3,6 +3,7 @@ use super::*;
 use material_painter_graph::{CHANNEL_USAGE, Graph, Role, Tag, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Weak;
 
 const CHANNELS: [usize; 5] = [0, 1, 2, 3, 5];
 const MASK_SLOTS: usize = 4;
@@ -14,6 +15,7 @@ pub(super) struct View {
     pub payload: Arc<serde_json::Value>,
     pub images: Arc<texture_fill::GraphImages>,
     pub labels: Arc<std::collections::HashMap<u64, String>>,
+    preview_masks: HashMap<u64, Weak<Mask>>,
 }
 
 pub(super) fn is_group(stack: &Stack) -> bool {
@@ -82,12 +84,9 @@ pub(super) fn can_open(stack: &Stack) -> bool {
     let mut outputs = [false; CHANNELS.len()];
     for index in fills(stack, stack.selected) {
         let layer = &stack.layers[index];
-        total += usize::from(
-            layer
-                .mask
-                .as_ref()
-                .is_some_and(|mask| mask.generator.is_some()),
-        );
+        total += usize::from(layer.mask.as_ref().is_some_and(|mask| {
+            mask.generator.is_some() || has_gradient(mask)
+        }));
         for (output, channel) in outputs.iter_mut().zip(CHANNELS) {
             if layer
                 .channel(channel)
@@ -127,7 +126,7 @@ fn fills(stack: &Stack, folder: usize) -> Vec<usize> {
         .collect()
 }
 
-pub(super) fn start(stack: &mut Stack, size: u32, revision: u64) -> View {
+pub(super) fn start(stack: &mut Stack, size: u32, revision: u64, previous: Option<&View>) -> View {
     let folder = stack.selected;
     let children = fills(stack, folder);
     let mut seen = std::collections::HashSet::new();
@@ -180,23 +179,41 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64) -> View {
         .filter(|id| !managed.contains(id))
         .collect();
     let mut images = layer.folder_images.as_ref().clone();
+    let mut preview_masks = HashMap::new();
     let mut top = [None; CHANNELS.len()];
     let end = children.len() as f32 * 260.;
     for (column, &index) in children.iter().enumerate() {
         let layer = &stack.layers[index];
         let layer_id = layer.graph_id.unwrap();
         let x = column as f32 * 260.;
-        let mask = layer
-            .mask
-            .as_ref()
-            .and_then(|mask| mask.generator)
-            .map(|generator| {
-                let node = ensure(&mut graph, layer_id, Role::Mask, "smart_mask", [x, -220.]);
-                used.insert(node);
+        let position = [x, -220.];
+        let mask = layer.mask.as_ref().and_then(|mask| {
+            if has_gradient(mask) {
+                let path = format!("graph-images/folder-mask-{layer_id}.png");
+                let source = Arc::downgrade(mask);
+                let image = previous
+                    .filter(|view| {
+                        view.preview_masks.get(&layer_id).is_some_and(|old| old.ptr_eq(&source))
+                    })
+                    .and_then(|view| view.images.get(&path).cloned())
+                    .or_else(|| gradient_mask_bitmap(mask, &path))?;
+                preview_masks.insert(layer_id, source);
+                images.insert(path.clone(), image);
+                let node = ensure(&mut graph, layer_id, Role::Mask, "bitmap", position);
+                let entry = graph.node_mut(node).unwrap();
+                entry.params.clear();
+                entry.params.insert("image".into(), Value::Image(Some(PathBuf::from(path))));
+                return Some(node);
+            }
+            mask.generator.map(|generator| {
+                let node = ensure(&mut graph, layer_id, Role::Mask, "smart_mask", position);
                 write_mask(graph.node_mut(node).unwrap(), generator);
                 node
-            });
-        let mask = graph.tagged(layer_id, Role::Source(0)).or(mask);
+            })
+        });
+        used.extend(mask);
+        let source = graph.tagged(layer_id, Role::Source(0));
+        let mask = if preview_masks.contains_key(&layer_id) { mask } else { source.or(mask) };
         for (channel_index, channel) in CHANNELS.into_iter().enumerate() {
             if !layer
                 .channel(channel)
@@ -314,7 +331,9 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64) -> View {
         if let Some(source) =
             restore_mask(&mut graph, &mut restored_images, layer_id, position, mask)
         {
-            wire_mask(&mut graph, layer_id, source);
+            if !preview_masks.contains_key(&layer_id) {
+                wire_mask(&mut graph, layer_id, source);
+            }
             restored = true;
         }
     }
@@ -338,6 +357,7 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64) -> View {
                 .find(|layer| layer.graph_id == Some(tag.layer))?;
             let role = match tag.role {
                 Role::Channel(index) => super::CHANNELS[*CHANNELS.get(index)?],
+                Role::Mask if preview_masks.contains_key(&tag.layer) => "Итоговая маска",
                 Role::Mask => "Маска",
                 Role::Output(usage) => {
                     let channel = CHANNEL_USAGE.iter().position(|&value| value == usage)?;
@@ -355,7 +375,30 @@ pub(super) fn start(stack: &mut Stack, size: u32, revision: u64) -> View {
         graph,
         images: Arc::new(images),
         labels: Arc::new(labels),
+        preview_masks,
     }
+}
+
+fn has_gradient(mask: &Mask) -> bool {
+    mask.generator.is_some_and(|generator| generator.kind.is_gradient())
+        || mask.layers.iter().any(|layer| {
+            layer.enabled && layer.opacity != 0
+                && layer.generator.is_some_and(|generator| generator.kind.is_gradient())
+        })
+}
+
+fn gradient_mask_bitmap(mask: &Mask, path: &str) -> Option<Arc<texture_fill::Bitmap>> {
+    let pixels = mask.effective();
+    let edge = (pixels.len() / 4).isqrt() as u32;
+    let pixels = if edge > material_graph::previews::PREVIEW_SIZE {
+        let source = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(edge, edge, pixels)?;
+        let edge = material_graph::previews::PREVIEW_SIZE;
+        image::imageops::resize(&source, edge, edge, image::imageops::FilterType::Triangle)
+    } else {
+        image::RgbaImage::from_raw(edge, edge, pixels.to_vec())?
+    };
+    let name = path.rsplit('/').next().unwrap();
+    texture_fill::Bitmap::from_rgba(name.into(), pixels).ok().map(Arc::new)
 }
 
 fn wire_mask(graph: &mut Graph, layer: u64, source: u64) {
@@ -519,7 +562,21 @@ fn retain_images(images: &mut Arc<texture_fill::GraphImages>, graph: &Graph) {
 
 pub(super) fn store(layer: &mut Layer, graph: &Graph) {
     retain_images(&mut layer.folder_images, graph);
-    layer.folder_graph = Some(Arc::new(material_graph::encode(graph)));
+    let mut payload = material_graph::encode(graph);
+    // The preview is rebuilt from the mask on open. Keep the node position, but
+    // avoid saving a reference to a generated image in the editable folder.
+    let generated: HashSet<_> = graph.tags.iter()
+        .filter(|tag| tag.role == Role::Mask)
+        .filter_map(|tag| graph.node(tag.node).filter(|node| node.def == "bitmap").map(|node| node.id))
+        .collect();
+    if let Some(nodes) = payload["nodes"].as_array_mut() {
+        for node in nodes.iter_mut().filter(|node| node["id"].as_u64().is_some_and(|id| generated.contains(&id))) {
+            if let Some(params) = node["params"].as_object_mut() {
+                params.remove("image");
+            }
+        }
+    }
+    layer.folder_graph = Some(Arc::new(payload));
 }
 
 pub(super) fn replace_bitmap(
@@ -1176,7 +1233,9 @@ pub(super) fn adjust(
                         return false;
                     };
                     let scale = if matches!(index, 0 | 1 | 3) { 100. } else { 1. };
-                    let (_, min, max, _) = Generator::CONTROLS[index];
+                    let Some(&(_, min, max, _)) = generator.controls().get(index) else {
+                        return false;
+                    };
                     generator.values[index] = (value * scale).clamp(min, max);
                 }
                 _ => return false,
@@ -1245,6 +1304,97 @@ fn adjust_layer(layer: &mut Layer, channel: usize, key: &str, value: Value, size
 mod tests {
     use super::*;
     use crate::editor::model_paint_data::{mask::GraphMask, solid};
+
+    #[test]
+    fn folder_graph_previews_projected_gradient_stack_and_keeps_the_authored_branch() {
+        use crate::editor::{
+            model_mesh::{Corner, Face, Geometry},
+            model_paint_data::mask::{GeneratorSurface, GradientMapping, GradientProjection, GradientVolume, MaskBlend},
+        };
+
+        let size = 16;
+        let mut session = Session::default();
+        session.texture_size = size;
+        session.edit(PaintAction::Add(LayerKind::Folder));
+        session.edit(PaintAction::Add(LayerKind::Fill));
+        let child = session.stack.selected;
+        let folder = session.stack.parents(child).next().unwrap();
+        let mut mask = Mask::new(solid(size, [64; 4]), Vec::new());
+        let mut generator = Generator::new(GeneratorKind::GradientLinear);
+        generator.gradient_mapping = Some(GradientMapping {
+            volume: Some(GradientVolume {
+                center: [0.5, 0.5, 0.],
+                size: [0.5, 1., 1.],
+                rotation: [0.; 3],
+                crop: true,
+                projection: GradientProjection::Planar { depth: None },
+                backface: None,
+            }),
+            ..Default::default()
+        });
+        mask.edit_layers().push(MaskLayer {
+            generator: Some(generator),
+            blend: MaskBlend::Normal,
+            ..Default::default()
+        });
+        let mesh = Geometry {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+            faces: vec![Face {
+                corners: [Vec2::Y, Vec2::ONE, Vec2::X, Vec2::ZERO]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, uv)| {
+                        let mut corner = Corner::new(index);
+                        corner.uv = uv;
+                        corner
+                    })
+                    .collect(),
+                material: 0,
+                smooth: false,
+            }],
+            ..default()
+        };
+        mask.bind(Arc::new(GeneratorSurface::new(
+            mesh.into(), 0, size, Vec2::ZERO, Transform::IDENTITY, None,
+        )));
+        let mut authored = Graph::new("Отдельная маска");
+        let root = authored.add("color", [0., 0.]);
+        let authored = mask_subgraph(&authored, root, "Отдельная маска");
+        mask.set_graph(Arc::new(GraphMask::new(
+            Arc::new(material_graph::encode(&authored)), Arc::default(), None,
+        )));
+        session.stack.layers[child].mask = Some(Arc::new(mask));
+        session.stack.selected = folder;
+
+        let preview_image = |view: &View, layer_id| {
+            let id = view.graph.tagged(layer_id, Role::Mask).unwrap();
+            let node = view.graph.node(id).unwrap();
+            assert_eq!(node.def, "bitmap");
+            let Value::Image(Some(path)) = &node.params["image"] else { panic!("Missing mask bitmap") };
+            let channel = view.graph.tagged(layer_id, Role::Channel(0)).unwrap();
+            assert_eq!(view.graph.node(channel).unwrap().links["mask"], id);
+            view.images[path.to_str().unwrap()].clone()
+        };
+        let first = start(&mut session.stack, size, 0, None);
+        let id = session.stack.layers[child].graph_id.unwrap();
+        let pixels = preview_image(&first, id);
+        assert!(first.graph.tagged(id, Role::Source(0)).is_some());
+        assert_eq!(pixels.pixels().get_pixel(0, 0)[0], 64);
+        assert!(pixels.pixels().get_pixel(8, 0)[0] > 220);
+        let saved = material_graph::read(session.stack.layers[folder].folder_graph.as_deref().unwrap()).unwrap();
+        let node = saved.node(saved.tagged(id, Role::Mask).unwrap()).unwrap();
+        assert!(!node.params.contains_key("image"));
+        assert!(session.stack.layers[folder].folder_images.is_empty());
+
+        let cached = start(&mut session.stack, size, 1, Some(&first));
+        assert!(Arc::ptr_eq(&pixels, &preview_image(&cached, id)));
+        let mask = session.stack.layers[child].mask.as_mut().unwrap();
+        Arc::make_mut(mask).edit_layers()[0].generator.as_mut().unwrap().invert = true;
+        let updated = start(&mut session.stack, size, 2, Some(&cached));
+        let updated = preview_image(&updated, id);
+        assert_eq!(updated.pixels().get_pixel(0, 0)[0], 64);
+        assert!(updated.pixels().get_pixel(8, 0)[0] < 35);
+    }
 
     #[test]
     fn folder_graph_survives_native_preset_and_duplicates_with_independent_ids() {
@@ -1418,7 +1568,7 @@ mod tests {
         session.stack.layers[first].mask = Some(mask(0.2));
         session.stack.layers[second].mask = Some(mask(0.2));
         session.edit(PaintAction::Select(folder));
-        let mut view = start(&mut session.stack, 16, 0);
+        let mut view = start(&mut session.stack, 16, 0, None);
         let first_id = session.stack.layers[first].graph_id.unwrap();
         let second_id = session.stack.layers[second].graph_id.unwrap();
         let shared = view.graph.tagged(first_id, Role::Source(0)).unwrap();
@@ -1435,7 +1585,7 @@ mod tests {
 
         session.stack.layers[first].mask = Some(mask(0.8));
         sync_standalone_mask(&mut session.stack, first);
-        let view = start(&mut session.stack, 16, 1);
+        let view = start(&mut session.stack, 16, 1, None);
         let updated = view.graph.tagged(first_id, Role::Source(0)).unwrap();
         assert_ne!(updated, shared);
         assert_eq!(

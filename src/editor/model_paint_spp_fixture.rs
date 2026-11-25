@@ -397,7 +397,11 @@ pub enum GeneratorTweak {
 }
 
 pub fn document_with_generator_tweaks(url: &str, tweaks: &[GeneratorTweak]) -> Vec<u8> {
-    document_options(0, None, TestMask::TunedGenerator(url, tweaks))
+    document_options(0, None, TestMask::TunedGenerator(url, tweaks, None))
+}
+
+pub fn document_with_projected_gradient(url: &str, tweaks: &[GeneratorTweak], projection: u32) -> Vec<u8> {
+    document_options(0, None, TestMask::TunedGenerator(url, tweaks, Some(projection)))
 }
 
 pub fn document_with_mask_outline(url: &str) -> Vec<u8> {
@@ -496,7 +500,7 @@ enum TestMask<'a> {
     PaintFill,
     Effects(&'a str, bool),
     BitmapProjection(&'a str, u32),
-    TunedGenerator(&'a str, &'a [GeneratorTweak]),
+    TunedGenerator(&'a str, &'a [GeneratorTweak], Option<u32>),
     OrderedFilters,
     TonalFilters,
     Anchors,
@@ -645,11 +649,14 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         w.u32(0x603);
         w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
         w.string(url);
-    } else if let TestMask::TunedGenerator(url, tweaks) = mask {
+    } else if let TestMask::TunedGenerator(url, tweaks, projection) = mask {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);
-        w.u32(1);
-        write_generator_fill(&mut w, url, tweaks);
+        w.u32(if projection.is_some() { 2 } else { 1 });
+        if projection.is_some() {
+            write_uniform(&mut w, 0x601, 0.25);
+        }
+        write_generator_fill(&mut w, url, tweaks, projection);
     } else if matches!(mask, TestMask::TonalFilters) {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);
@@ -971,12 +978,29 @@ fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
 
 fn write_generator(w: &mut DocWriter) {
     w.u32(1);
-    write_generator_fill(w, "starter/mg_dirt/mg_dirt", &[]);
+    write_generator_fill(w, "starter/mg_dirt/mg_dirt", &[], None);
 }
 
-fn write_generator_fill(w: &mut DocWriter, url: &str, tweaks: &[GeneratorTweak]) {
+fn write_generator_fill(w: &mut DocWriter, url: &str, tweaks: &[GeneratorTweak], projection: Option<u32>) {
     w.u32(0x610);
-    w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
+    if let Some(projection) = projection {
+        w.define_class("DataActionFill", &[
+            ("projection", 9), ("uvSamplingWrap", 9), ("uvTransformation", 18),
+            ("dddPosition", 3), ("dddSize", 3), ("dddEulerAngles", 3),
+            ("dddWrap", 9), ("depthCulling", 10), ("channelTypes", 12), ("sources", 19),
+        ]);
+        w.u32(projection);
+        w.u32(2);
+        w.u32(0x609);
+        w.class("Data2DTransformation", &[("scaleFactors", 2), ("translation", 2), ("rotation", 1)]);
+        for value in [1., 1., 0., 0., 0f32, 0.5, 0.5, 0., 0.5, 1., 0.4, 0., 0., 0.] {
+            w.u32(value.to_bits());
+        }
+        w.u32(0);
+        w.out.push(1);
+    } else {
+        w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
+    }
     w.out.extend(u64::MAX.to_le_bytes());
     w.u32(1);
     w.u32(0x611);
@@ -1029,7 +1053,7 @@ fn write_polygon_mask(w: &mut DocWriter, generator: Option<&str>) {
         w.u32(0x604);
         w.class("DataStackActions", &[("items", 19)]);
         w.u32(1);
-        write_generator_fill(w, url, &[]);
+        write_generator_fill(w, url, &[], None);
     }
     w.u32(0x321);
     w.class("DataActionDecal", &[("hits", 19)]);

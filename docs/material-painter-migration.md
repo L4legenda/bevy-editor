@@ -248,11 +248,13 @@ remains available for comparison.
 `tools/paint-perf/README.md` describes the shared 262,144-triangle comparison with
 upstream, including measurement boundaries and reproducible commands.
 
-## Remaining functional migration
+## Initial migration outline
+
+The [port plan](material-paint-port-plan.md) tracks the current implementation and verification.
 
 | Feature | Source modules | Integration boundary |
 |---|---|---|
-| Remaining generator presets, generator input mixing, GPU-resident history | `engine.rs`, `engine/`, `textures.rs`, `undo.rs`, `shaders/` | Add mesh-map inputs to the current generator support and extend the GPU path |
+| Generator presets, generator input mixing, compressed stroke history | `engine.rs`, `engine/`, `textures.rs`, `undo.rs`, `shaders/` | Add mesh-map inputs and pack stroke snapshots after GPU readback |
 | Moving UDIM islands between sets and additional mesh formats | `app/texture_sets.rs`, `mesh.rs`, `import.rs`, `unwrap.rs` | Update set assignment on cross-tile edits |
 | Additional mesh maps, high-poly/cage baking, GPU jobs and persistent cache | `bake.rs`, `bake_cache.rs`, `cage.rs`, `app/cage_paint.rs` | Add missing map passes, projection, user settings, and disk reuse |
 | Smart materials, masks, generators, shelf and online libraries | `presets.rs`, `library.rs`, `app/library_ui.rs` | Asset catalog, thumbnails and downloads |

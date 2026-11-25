@@ -15,7 +15,7 @@ use bevy::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -27,6 +27,7 @@ pub(super) struct Statistics {
     pub batches: AtomicU64,
     pub stamps: AtomicU64,
     pub readbacks: AtomicU64,
+    contexts: Mutex<HashMap<u64, u64>>,
 }
 #[derive(Clone)]
 pub(super) struct Scene {
@@ -135,6 +136,11 @@ pub(in crate::editor::ui::model_viewer) struct Queue {
     next: u64,
 }
 impl Queue {
+    pub fn context_bytes(&self, ids: impl Iterator<Item = u64>) -> u64 {
+        let contexts = self.stats.contexts.lock().unwrap();
+        ids.filter_map(|id| contexts.get(&id)).sum()
+    }
+
     #[cfg(test)]
     pub(in crate::editor::ui::model_viewer) fn statistics(&self) -> (u64, u64, u64) {
         (
@@ -218,6 +224,27 @@ fn command_id(command: &Command) -> u64 {
 struct Target {
     texture: Texture,
     view: TextureView,
+}
+impl Target {
+    fn bytes(&self) -> u64 {
+        texture_bytes(self.texture.size(), self.texture.format())
+    }
+}
+
+pub(super) fn texture_bytes(size: Extent3d, format: TextureFormat) -> u64 {
+    let (width, height) = format.block_dimensions();
+    u64::from(size.width.div_ceil(width))
+        * u64::from(size.height.div_ceil(height))
+        * u64::from(size.depth_or_array_layers)
+        * u64::from(format.block_copy_size(None).unwrap_or(0))
+}
+
+#[cfg(test)]
+#[test]
+fn paint_texture_memory_counts_depth_and_partial_blocks() {
+    let size = Extent3d { width: 7, height: 5, depth_or_array_layers: 2 };
+    assert_eq!(texture_bytes(size, TextureFormat::Depth32Float), 280);
+    assert_eq!(texture_bytes(size, TextureFormat::Bc3RgbaUnorm), 128);
 }
 fn target(
     device: &RenderDevice,
@@ -726,6 +753,7 @@ struct MaskFilters {
     raw: Buffer,
     passes: Vec<BindGroup>,
     bounds: Option<Buffer>,
+    pass_bytes: u64,
 }
 
 impl MaskFilters {
@@ -776,6 +804,7 @@ impl MaskFilters {
             })
             .collect();
         let last = operations.len() - 1;
+        let mut pass_bytes = scratch.iter().map(|buffer| buffer.size()).sum::<u64>();
         let passes = operations
             .into_iter()
             .enumerate()
@@ -823,7 +852,10 @@ impl MaskFilters {
                             0.,
                             0.,
                         ],
-                        map.iter().flat_map(|&v| [v, 0, 0, 0]).collect(),
+                        map.values.iter().enumerate().flat_map(|(i, &value)| {
+                            let coverage = map.coverage.as_ref().map_or(255, |coverage| coverage[i]);
+                            [value, coverage, 0, 0]
+                        }).collect(),
                     ),
                 };
                 let region = if dense { 2 } else { u32::from(size > 1024) };
@@ -851,6 +883,7 @@ impl MaskFilters {
                     &table,
                     BufferUsages::STORAGE,
                 );
+                pass_bytes += uniform.size() + table.size();
                 let src = if i == 0 { &raw } else { &scratch[(i - 1) % 2] };
                 let dst = if i == last { output } else { &scratch[i % 2] };
                 let entries: Vec<_> =
@@ -873,7 +906,53 @@ impl MaskFilters {
             raw,
             passes,
             bounds,
+            pass_bytes,
         })
+    }
+}
+
+impl Context {
+    fn texture_bytes(&self) -> u64 {
+        self.outputs.iter()
+            .chain([&self.mask, &self.depth, &self.scene_ids])
+            .chain(self.grain.as_ref().map(|(_, target)| target))
+            .chain(self.uv_occupancy.as_ref())
+            .map(Target::bytes).sum()
+    }
+
+    fn bytes(&self) -> u64 {
+        let mut bytes = self.texture_bytes();
+        let mut seen = HashSet::new();
+        let mut count = |buffer: &Buffer| {
+            if seen.insert(buffer.id()) {
+                bytes += buffer.size();
+            }
+        };
+        for buffer in [&self.vertices, &self.auxiliary, &self.baked_normal, &self.snapshot, &self.dirty, &self.tiles, &self.grid]
+            .into_iter().chain(self.additional.iter().map(|channel| &channel.snapshot))
+        {
+            count(buffer);
+        }
+        for composition in std::iter::once(&self.composition)
+            .chain(self.additional.iter().map(|channel| &channel.composition))
+            .chain(&self.mask_compositions)
+        {
+            for buffer in [&composition.base, &composition.result, &composition.below]
+                .into_iter()
+                .chain(&composition.saved)
+                .chain(composition.layers.iter().flat_map(|layer| std::iter::once(&layer.buffer).chain(&layer.mask)))
+            {
+                count(buffer);
+            }
+        }
+        if let Some(filters) = &self.mask_filter {
+            count(&filters.raw);
+            if let Some(bounds) = &filters.bounds {
+                count(bounds);
+            }
+            bytes += filters.pass_bytes;
+        }
+        bytes
     }
 }
 fn composition_for_channel(
@@ -2275,9 +2354,7 @@ fn execute(
                 baked_preview,
                 fix,
             } => {
-                contexts.insert(
-                    id,
-                    Context::new(
+                let context = Context::new(
                         &device,
                         pipelines,
                         &mut encoder,
@@ -2291,8 +2368,9 @@ fn execute(
                         relief_factor,
                         baked_preview.as_ref().and_then(|bake| bake.normal.as_deref()),
                         fix,
-                    ),
                 );
+                pending.stats.contexts.lock().unwrap().insert(id, context.bytes());
+                contexts.insert(id, context);
             }
             Command::Begin {
                 id,
@@ -2302,6 +2380,7 @@ fn execute(
                 trace,
             } => {
                 if let Some(context) = contexts.get_mut(&id) {
+                    let before = context.texture_bytes();
                     context.begin(
                         &device,
                         pipelines,
@@ -2312,6 +2391,12 @@ fn execute(
                         &images,
                         trace,
                     );
+                    let after = context.texture_bytes();
+                    if before != after
+                        && let Some(bytes) = pending.stats.contexts.lock().unwrap().get_mut(&id)
+                    {
+                        *bytes = *bytes - before + after;
+                    }
                 }
             }
             Command::Points { id, points, ranges } => {
@@ -2364,6 +2449,7 @@ fn execute(
             }
             Command::Drop(id) => {
                 contexts.remove(&id);
+                pending.stats.contexts.lock().unwrap().remove(&id);
             }
         }
         queue.submit([encoder.finish()]);

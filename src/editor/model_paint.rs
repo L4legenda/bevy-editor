@@ -16,6 +16,10 @@ mod brush_defaults;
 pub(super) mod mesh_tools;
 #[path = "model_paint_save_copy.rs"]
 pub(super) mod save_copy;
+#[path = "model_paint_history.rs"]
+mod history;
+#[path = "model_paint_diagnostics.rs"]
+mod diagnostics;
 #[path = "model_paint_dock.rs"]
 pub(super) mod dock;
 #[path = "model_paint_sidebar.rs"]
@@ -279,7 +283,8 @@ impl Parameter {
             Self::Size => (1., 800.),
             Self::Spacing => (1., 300.),
             Self::Stabilizer => (0., 200.),
-            Self::BrushScatter | Self::BrushSizeJitter | Self::BrushAngleJitter => (0., 100.),
+            Self::BrushScatter => (0., 200.),
+            Self::BrushSizeJitter | Self::BrushAngleJitter => (0., 100.),
             Self::TipAngle | Self::GrainAngle => (-180., 180.),
             Self::GrainScale => (0.25, 64.),
             Self::BrushAngleLimit => (10., 90.),
@@ -782,7 +787,7 @@ impl PaintAction {
             Self::PathApply => "Enter · Провести кистью вдоль контура.",
             Self::PathClear => "Esc · Убрать все точки контура.",
             Self::Color(_) => "Выбрать цвет кисти.",
-            Self::Preset(_) => "Использовать материал для кисти.",
+            Self::Preset(_) => "Взять цвет, шероховатость и металличность материала для кисти.",
             Self::ShelfClearSearch => "Очистить поиск ресурсов.",
             Self::ShelfTypeMenu => "Фильтровать по типу материала.",
             Self::ShelfType(_) => "Показать материалы выбранного типа.",
@@ -829,8 +834,9 @@ struct ShaderGraphReturn {
 
 struct Session {
     stack: Stack,
-    undo: Vec<Stack>,
-    redo: Vec<Stack>,
+    undo: Vec<history::Snapshot>,
+    redo: Vec<history::Snapshot>,
+    history_cache: history::Cache,
     history_limit: usize,
     tool: PaintTool,
     panel: Panel,
@@ -918,7 +924,7 @@ struct Session {
     graph_surfaces: HashMap<(usize, usize), Arc<material_graph::surface::Source>>,
     mesh_graph_refresh: std::collections::HashSet<(usize, usize)>,
     graph_map_menu: Option<material_graph::ParameterTarget>,
-    histories: HashMap<(usize, usize), (Vec<Stack>, Vec<Stack>)>,
+    histories: HashMap<(usize, usize), (Vec<history::Snapshot>, Vec<history::Snapshot>)>,
     busy: bool,
     export_settings: export::prefs::Settings,
     export_template_menu: bool,
@@ -961,6 +967,7 @@ impl Default for Session {
             stack: Stack::default(),
             undo: vec![],
             redo: vec![],
+            history_cache: history::Cache::default(),
             history_limit: editing::recovery::DEFAULT_UNDO_STEPS,
             tool: PaintTool::Brush,
             panel: Panel::Layers,
@@ -1447,7 +1454,7 @@ impl Session {
                             && if direction > 0 { g.edge_width < 500 } else { g.edge_width > 2 }
                     }),
                     GeneratorEdit::Adjust(i, direction) => generator.is_some_and(|g| {
-                        Generator::CONTROLS.get(i).is_some_and(|&(_, min, max, _)| {
+                        g.controls().get(i).is_some_and(|&(_, min, max, _)| {
                             if direction > 0 {
                                 g.values[i] < max
                             } else {
@@ -1700,7 +1707,7 @@ impl Session {
             }
             GeneratorEdit::Adjust(i, direction) => {
                 let generator = generator.as_mut().unwrap();
-                let (_, min, max, step) = Generator::CONTROLS[i];
+                let (_, min, max, step) = generator.controls()[i];
                 generator.values[i] =
                     (generator.values[i] + direction.signum() as f32 * step).clamp(min, max);
             }
@@ -2247,10 +2254,11 @@ impl Session {
                 return;
             }
             PaintAction::Undo => {
-                if let Some(stack) = self.undo.pop() {
-                    self.redo.push(self.stack.clone());
+                if let Some(previous) = self.undo.pop() {
+                    let stack = self.history_cache.restore(previous);
+                    let current = std::mem::replace(&mut self.stack, stack);
+                    self.redo.push(self.history_cache.capture(current));
                     Self::trim_history(&mut self.redo, self.history_limit);
-                    self.stack = stack;
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
                         self.graph_surfaces.remove(&binding);
@@ -2258,10 +2266,11 @@ impl Session {
                 }
             }
             PaintAction::Redo => {
-                if let Some(stack) = self.redo.pop() {
-                    self.undo.push(self.stack.clone());
+                if let Some(next) = self.redo.pop() {
+                    let stack = self.history_cache.restore(next);
+                    let current = std::mem::replace(&mut self.stack, stack);
+                    self.undo.push(self.history_cache.capture(current));
                     Self::trim_history(&mut self.undo, self.history_limit);
-                    self.stack = stack;
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
                         self.graph_surfaces.remove(&binding);
@@ -2353,6 +2362,8 @@ impl Session {
                 self.roughness = material.roughness * 100.;
                 self.metallic = material.metallic * 100.;
                 self.picked = Some(material.rgb());
+                self.multi_channel_brush = true;
+                self.brush_channels |= 0b0000_0111;
                 self.tool = PaintTool::Brush;
                 self.editing_mask = false;
                 self.show_mask = false;
@@ -2550,7 +2561,9 @@ impl Session {
             self.folder_view = None;
             return;
         }
-        let mut view = folder_graph::start(&mut self.stack, self.texture_size, self.revision);
+        let mut view = folder_graph::start(
+            &mut self.stack, self.texture_size, self.revision, self.folder_view.as_ref(),
+        );
         if let Some(previous) = &self.folder_view {
             if previous.payload == view.payload { view.payload = previous.payload.clone(); }
             if previous.images == view.images { view.images = previous.images.clone(); }
@@ -2733,12 +2746,12 @@ impl Session {
     }
 
     fn record_undo(&mut self, previous: Stack) {
-        self.undo.push(previous);
+        self.undo.push(self.history_cache.capture(previous));
         Self::trim_history(&mut self.undo, self.history_limit);
         self.redo.clear();
     }
 
-    fn trim_history(history: &mut Vec<Stack>, limit: usize) {
+    fn trim_history(history: &mut Vec<history::Snapshot>, limit: usize) {
         history.drain(..history.len().saturating_sub(limit));
     }
 

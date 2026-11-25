@@ -22,6 +22,10 @@ struct StrokeRecord {
     selected: usize,
 }
 impl Controller {
+    pub fn context_id(&self) -> u64 {
+        self.id
+    }
+
     pub fn owns(&self, id: u64) -> bool {
         self.id == id
     }

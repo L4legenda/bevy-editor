@@ -11,9 +11,10 @@ pub(in crate::editor) use spatial::fbm;
 #[path = "model_paint_mask_generator.rs"]
 mod generator;
 pub(in crate::editor) use generator::{
-    BakedInputs, Generator, GeneratorInput, GeneratorKind, GeneratorSurface, INPUT_CHANNELS,
-    PartIds,
+    BakedInputs, Generator, GeneratorInput, GeneratorKind, GeneratorSurface, GradientMapping,
+    GradientProjection, GradientVolume, INPUT_CHANNELS, PartIds,
 };
+use generator::GeneratorMap;
 
 pub(in crate::editor) const MAX_FILTERS: usize = 16;
 pub(in crate::editor) const MAX_MASK_LAYERS: usize = 16;
@@ -357,7 +358,7 @@ pub(in crate::editor) enum MaskPass {
     Lookup(Box<[u32; 256]>),
     Spatial(Spatial),
     Affine(Option<Arc<Vec<u8>>>),
-    GeneratorLayer(MaskLayer, Arc<Vec<u8>>),
+    GeneratorLayer(MaskLayer, GeneratorMap),
 }
 
 #[repr(u32)]
@@ -422,8 +423,12 @@ impl MaskLayer {
         self.value <= 100 && self.opacity <= 100 && self.generator.is_none_or(Generator::valid)
     }
     fn apply(self, base: u8, l: f32) -> u8 {
+        self.apply_covered(base, l, 255)
+    }
+
+    fn apply_covered(self, base: u8, l: f32, coverage: u8) -> u8 {
         let s = base as f32 / 255.;
-        let w = self.opacity as f32 / 100.;
+        let w = self.opacity as f32 / 100. * (coverage as f32 / 255.);
         let mixed = match self.blend {
             MaskBlend::Normal => l,
             MaskBlend::Multiply => s * l,
@@ -668,7 +673,7 @@ impl Mask {
             let generator = self
                 .generator
                 .zip(self.context.as_ref())
-                .map(|(g, c)| c.map(g));
+                .map(|(g, c)| c.map(g).values);
             let graph = self.graph.as_ref().and_then(|graph| graph.plane(size));
             let map = match (graph, generator) {
                 (Some(graph), Some(generator)) => Some(Arc::new(
@@ -734,7 +739,7 @@ impl Mask {
                     blend: MaskBlend::Multiply,
                     ..MaskLayer::default()
                 },
-                coverage.clone(),
+                GeneratorMap { values: coverage.clone(), coverage: None },
             ));
         }
         passes
@@ -770,8 +775,9 @@ impl Mask {
                         }
                     }
                     MaskPass::GeneratorLayer(layer, map) => {
-                        for (value, &sample) in gray.iter_mut().zip(map.iter()) {
-                            *value = layer.apply(*value, sample as f32 / 255.);
+                        for (i, (value, &sample)) in gray.iter_mut().zip(map.values.iter()).enumerate() {
+                            let coverage = map.coverage.as_ref().map_or(255, |coverage| coverage[i]);
+                            *value = layer.apply_covered(*value, sample as f32 / 255., coverage);
                         }
                     }
                 }

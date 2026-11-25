@@ -1927,6 +1927,25 @@ pub(in crate::editor::ui::model_viewer) fn input(
     }
 }
 impl Runtime {
+    pub(super) fn paint_gpu_bytes(&self, model: usize, queue: &gpu::Queue, images: &Assets<Image>) -> u64 {
+        let lives = self.lives.iter().filter(|&(&(index, _, _), _)| index == model).map(|(_, live)| live);
+        let mut textures = std::collections::HashSet::new();
+        let image_bytes: u64 = lives.clone()
+            .filter_map(|live| live.gpu.as_ref())
+            .flat_map(|gpu| &gpu.images)
+            .filter(|image| textures.insert(image.id()))
+            .filter_map(|image| images.get(image))
+            .map(|image| {
+                let descriptor = &image.texture_descriptor;
+                (0..descriptor.mip_level_count)
+                    .filter_map(|level| descriptor.mip_level_size(level))
+                    .map(|size| gpu::texture_bytes(size, descriptor.format))
+                    .sum::<u64>() * u64::from(descriptor.sample_count)
+            })
+            .sum();
+        image_bytes + queue.context_bytes(lives.map(|live| live.controller.context_id()))
+    }
+
     pub(super) fn discard_mesh(&mut self, model: usize, queue: &mut gpu::Queue) {
         self.lives.retain(|(index, _, _), live| {
             if *index == model {

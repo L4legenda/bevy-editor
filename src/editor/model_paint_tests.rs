@@ -10,6 +10,35 @@ use bevy::input::{
 };
 
 #[test]
+fn shelf_material_activates_pbr_brush_without_changing_the_layer() {
+    let mut session = Session::default();
+    session.edit(PaintAction::Add(LayerKind::Paint));
+    session.edit(PaintAction::AddMask(true));
+    session.edit(PaintAction::Tool(PaintTool::Eraser));
+    session.multi_channel_brush = false;
+    session.brush_channels = (1 << 3) | (1 << 5);
+    session.brush_height = 62.;
+    session.brush_alpha = 83.;
+    session.brush_emission = [11., 22., 33.];
+    let stack = session.stack.clone();
+    let history = session.undo.len();
+    let material = &MATERIALS[0];
+
+    session.edit(PaintAction::Preset(0));
+
+    assert_eq!(session.tool, PaintTool::Brush);
+    assert_eq!(session.stroke_channels(), 0b0010_1111);
+    assert_eq!(session.brush_color(), material.rgb());
+    assert_eq!(session.roughness, material.roughness * 100.);
+    assert_eq!(session.metallic, material.metallic * 100.);
+    assert_eq!(session.brush_height, 62.);
+    assert_eq!(session.brush_alpha, 83.);
+    assert_eq!(session.brush_emission, [11., 22., 33.]);
+    assert_eq!(session.stack, stack);
+    assert_eq!(session.undo.len(), history);
+}
+
+#[test]
 #[ignore = "requires GPU; checks the Windows Ink pan input in both paint views"]
 fn gpu_pen_barrel_pans_paint_views_without_painting() {
     use crate::editor::ui::image_viewer::paint_input::{PenPan, PointerFrame, Sample, collect_frame};
@@ -91,9 +120,9 @@ fn paint_history_limit_keeps_latest_edits_in_active_and_parked_sets() {
     session.set_history_limit(8);
     let (parked_undo, parked_redo) = &session.histories[&(1, 2)];
     assert_eq!(parked_undo.len(), 8);
-    assert_eq!(parked_undo[0].layers.len(), initial_layers + 2);
+    assert_eq!(parked_undo[0].layer_count(), initial_layers + 2);
     assert_eq!(parked_redo.len(), 8);
-    assert_eq!(parked_redo[0].layers.len(), initial_layers + 18);
+    assert_eq!(parked_redo[0].layer_count(), initial_layers + 18);
 
     for _ in 0..9 {
         session.edit(PaintAction::Undo);
@@ -108,7 +137,7 @@ fn paint_history_limit_keeps_latest_edits_in_active_and_parked_sets() {
     let previous = session.stack.clone();
     session.record_undo(previous);
     assert_eq!(session.undo.len(), 8);
-    assert_eq!(session.undo.last().unwrap().layers.len(), initial_layers + 10);
+    assert_eq!(session.undo.last().unwrap().layer_count(), initial_layers + 10);
     assert!(session.redo.is_empty());
 }
 
@@ -487,10 +516,10 @@ fn paint_workspace_generators_use_surface_height_and_keep_paint_overrides() {
     let context = Arc::new(GeneratorSurface::new(mesh, 0, 16, Vec2::ZERO, Transform::IDENTITY, None));
     let mut height = Generator::new(GeneratorKind::Height);
     height.values[3] = 0.;
-    let map = context.map(height);
+    let map = context.map(height).values;
     assert_eq!((map[8], map[15 * 16 + 8]), (0, 255));
-    assert!(Arc::ptr_eq(&map, &context.map(height)));
-    let cloud = context.map(Generator::new(GeneratorKind::Clouds));
+    assert!(Arc::ptr_eq(&map, &context.map(height).values));
+    let cloud = context.map(Generator::new(GeneratorKind::Clouds)).values;
     assert!(cloud.windows(2).any(|p| p[0] != p[1]));
 
     let mut raw = [255, 255, 255, 255].repeat(16 * 16);
@@ -977,7 +1006,7 @@ fn gpu_paint_folder_graph_opens_from_the_renamed_layer_group() {
         .unwrap().pixels().get_pixel(0, 0).0, color);
     let mut reopened = surface.stack.clone();
     reopened.selected = folder;
-    let graph = folder_graph::start(&mut reopened, surface.size, 0);
+    let graph = folder_graph::start(&mut reopened, surface.size, 0, None);
     assert_eq!(graph.graph.node(invert).unwrap().links["input"], bitmap);
     assert_eq!(graph.images.len(), 2);
     std::fs::remove_file(saved).unwrap();
@@ -6480,6 +6509,54 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         material.normal_map_texture.clone().unwrap()
     };
     assert_eq!(read(&mut app, normal, 0), [128, 128, 255, 255]);
+
+    paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
+    for channel in [0, 1, 2, 3, 4, 6, 7] {
+        paint_message(&mut app, PaintAction::BrushChannel(channel));
+    }
+    paint_message(&mut app, PaintAction::MultiChannelBrush);
+    paint_message(&mut app, PaintAction::Preset(0));
+    let history = undo_len(&app);
+    stroke(&mut app, point);
+    assert_eq!(undo_len(&app), history + 1);
+    let surface = current(&app).unwrap();
+    let painted = &surface.stack.layers[surface.stack.selected];
+    let preset = &MATERIALS[0];
+    let gray = |value: f32| [(value * 100. * 2.55).round() as u8; 3];
+    for (channel, expected) in [
+        (0, preset.rgb()),
+        (1, gray(preset.roughness)),
+        (2, gray(preset.metallic)),
+        (5, [51, 153, 255]),
+    ] {
+        let pixels = painted.channels[channel].as_ref().unwrap();
+        assert_eq!(&pixels[side..side + 3], &expected);
+        assert_eq!(pixels[side + 3], 255);
+    }
+    assert!([3, 4, 6, 7].into_iter().all(|channel| painted.channels[channel].is_none()));
+
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let mut labels = world.query::<(&AccessibleLabel, &Text)>();
+        if labels.iter(world).any(|(label, text)| {
+            label.0 == "Статистика рисования"
+                && text.0.contains("GPU рисования")
+                && text.0.contains("История")
+                && text.0.contains("512²")
+                && text.0.contains("2 треуг.")
+        }) {
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 5, "No paint workspace diagnostics");
+    }
+    let world = app.world();
+    let session = &world.resource::<PaintState>().sessions[&0];
+    assert!(session.history_cache.bytes() > 0);
+    assert!(world.resource::<engine::Runtime>().paint_gpu_bytes(
+        0, world.resource::<engine::gpu::Queue>(), world.resource::<Assets<Image>>(),
+    ) > 0);
 }
 
 #[test]

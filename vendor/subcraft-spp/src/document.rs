@@ -555,8 +555,21 @@ pub struct ActionInfo {
     pub group: usize,
     /// The action's own blending (mask effects keep theirs here); empty = the default.
     pub own_blends: Vec<(u64, i32, f32)>,
-    /// A fill's UV transformation: tiling scale, rotation (degrees as stored), offset.
+    /// A fill's UV transformation: tiling scale, rotation in radians, offset.
     pub uv: Option<UvTransform>,
+    pub uv_wrap: [bool; 2],
+    pub projection_3d: Option<Projection3d>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Projection3d {
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub rotation: [f32; 3],
+    pub crop: bool,
+    pub depth: Option<f32>,
+    pub backface: Option<[f32; 2]>,
+    pub triplanar_hardness: f32,
 }
 
 /// `Data2DTransformation` of a fill.
@@ -852,6 +865,23 @@ fn uv_of(a: &Obj) -> Option<UvTransform> {
     Some(UvTransform { scale: pair("scaleFactors", 1.0), rotation: t.float("rotation").unwrap_or(0.0), offset: pair("translation", 0.0), tiling: a.int("uvSamplingWrap").unwrap_or(3) != 0 })
 }
 
+fn projection_3d_of(a: &Obj) -> Option<Projection3d> {
+    let triple = |key| -> Option<[f32; 3]> { a.floats(key)?.try_into().ok() };
+    Some(Projection3d {
+        center: triple("dddPosition")?,
+        size: triple("dddSize")?,
+        rotation: triple("dddEulerAngles")?,
+        crop: a.int("dddWrap") == Some(0),
+        depth: a.bool("depthCulling").unwrap_or(false)
+            .then(|| a.float("depthCullingHardness").unwrap_or(0.75)),
+        backface: a.bool("backfaceCulling").unwrap_or(false).then(|| [
+            a.float("backfaceCullingAngle").unwrap_or(0.5),
+            a.float("backfaceCullingHardness").unwrap_or(0.5),
+        ]),
+        triplanar_hardness: a.float("sideHardness").unwrap_or(0.5),
+    })
+}
+
 fn action_of(a: &Obj, blends: Vec<(u64, i32, f32)>, group: usize) -> ActionInfo {
     let kind = match a.class.as_str() {
         "DataActionFill" => ActionKind::Fill { sources: a.list("sources").iter().filter_map(source_of).collect(), projection: a.int("projection").unwrap_or(0) },
@@ -869,7 +899,13 @@ fn action_of(a: &Obj, blends: Vec<(u64, i32, f32)>, group: usize) -> ActionInfo 
         "DataActionAnchor" => ActionKind::Anchor { uid: a.int("uid").unwrap_or(0) },
         other => ActionKind::Other(other.to_string()),
     };
-    ActionInfo { kind, enabled: a.bool("enabled").unwrap_or(true), label: a.str("label").unwrap_or("").to_string(), channels: a.int("channelTypes").unwrap_or(-1) as u64, blends, group, own_blends: blends_of(a), uv: uv_of(a) }
+    let wrap = a.int("uvSamplingWrap").unwrap_or(3);
+    ActionInfo {
+        kind, enabled: a.bool("enabled").unwrap_or(true), label: a.str("label").unwrap_or("").to_string(),
+        channels: a.int("channelTypes").unwrap_or(-1) as u64, blends, group,
+        own_blends: blends_of(a), uv: uv_of(a), uv_wrap: [wrap & 1 != 0, wrap & 2 != 0],
+        projection_3d: projection_3d_of(a),
+    }
 }
 
 fn layer_of(l: &Obj) -> LayerInfo {

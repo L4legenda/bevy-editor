@@ -63,6 +63,7 @@ struct Summary {
     mask_effects: usize,
     triplanar_mask_bitmaps: usize,
     tuned_mask_generators: usize,
+    gradient_masks: usize,
     baked_mask_filters: usize,
     baked_mask_generators: usize,
     baked_generator_sets: usize,
@@ -82,6 +83,7 @@ pub(super) struct ImportDetails {
 impl Summary {
     fn mask_generator(&mut self, generator: Generator) {
         self.tuned_mask_generators += usize::from(generator != Generator::new(generator.kind));
+        self.gradient_masks += usize::from(generator.kind.is_gradient());
     }
 
     fn overview(&self) -> String {
@@ -119,6 +121,9 @@ impl Summary {
         if self.tuned_mask_generators > 0 {
             summary.push_str(&format!(" · генераторов с параметрами: {}", self.tuned_mask_generators));
         }
+        if self.gradient_masks > 0 {
+            summary.push_str(&format!(" · градиентных масок: {}", self.gradient_masks));
+        }
         if self.baked_mask_filters > 0 {
             summary.push_str(&format!(
                 " · фильтров сведено в основу маски: {}",
@@ -152,6 +157,9 @@ impl Summary {
     fn details(mut self) -> ImportDetails {
         if self.triplanar_mask_bitmaps > 0 {
             self.notes.push("Положение трипланарной проекции масок приближённо восстановлено по сетке".into());
+        }
+        if self.gradient_masks > 0 {
+            self.notes.push("Кривые градиентных масок и затухание объёмной проекции восстановлены приближённо".into());
         }
         let overview = self.overview();
         let mut label = overview.clone();
@@ -1368,6 +1376,72 @@ mod tests {
     }
 
     #[test]
+    fn spp_import_reopens_editable_gradients_with_uv_and_planar_coverage() {
+        use crate::editor::model_paint_data::mask::{GeneratorKind, GeneratorSurface};
+        use fixture::GeneratorTweak::{Bool, Float, Int};
+
+        let root = std::env::temp_dir().join(format!("bevy-spp-gradient-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for (name, kind, projection, tweaks) in [
+            ("gradient_linear_1", GeneratorKind::GradientLinear, 1, vec![Float("Position", 0.5)]),
+            ("gradient_linear_2", GeneratorKind::GradientMirror, 0, vec![Int("Tiling", 2), Int("rotation", 1)]),
+            ("gradient_linear_3", GeneratorKind::GradientPeak, 0, vec![Float("Position", 0.49), Float("position", 0.25), Bool("invert", true)]),
+        ] {
+            let source = root.join(format!("{name}.spp"));
+            let document = if kind == GeneratorKind::GradientLinear {
+                fixture::document_with_projected_gradient(&format!("starter/{name}/{name}"), &tweaks, projection)
+            } else {
+                fixture::document_with_generator_tweaks(&format!("starter/{name}/{name}"), &tweaks)
+            };
+            let geometry = fixture::assbin_quad();
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", geometry),
+                ("paint/document.bin", document),
+            ])).unwrap();
+            let (filename, report) = convert(&source, &root).unwrap();
+            assert!(report.overview.contains("градиентных масок: 1"), "{}", report.overview);
+            let model = Glb::load(&root.join(filename)).unwrap();
+            let primitive = &model.json["meshes"][0]["primitives"][0];
+            let surface = model.paint_surface(primitive).unwrap().unwrap();
+            let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
+            let mut mask = (**layer.mask.as_ref().unwrap()).clone();
+            let generator = mask.generator.or_else(|| mask.layers.last()?.generator).unwrap();
+            assert_eq!(generator.kind, kind);
+            let (object, _) = import(&source, name).unwrap();
+            mask.bind(Arc::new(GeneratorSurface::new(
+                object.geometry, 0, surface.size, Vec2::ZERO, Transform::IDENTITY, None,
+            )));
+            let size = surface.size as usize;
+            let value = |x, y| mask.effective()[(y * size + x) * 4];
+            match kind {
+                GeneratorKind::GradientLinear => {
+                    assert_eq!(mask.layers.len(), 2);
+                    let mapping = generator.gradient_mapping.unwrap();
+                    assert_eq!(mapping.repeat, [false, true]);
+                    assert_eq!(mapping.volume.unwrap().size, [0.5, 1., 0.4]);
+                    assert_eq!(value(size / 8, size / 4), 64);
+                    assert!(value(size / 2, size / 4).abs_diff(191) <= 2);
+                    assert!(value(size / 2, 3 * size / 4).abs_diff(64) <= 2);
+                }
+                GeneratorKind::GradientMirror => {
+                    assert_eq!(&generator.values[2..4], &[2., 90.]);
+                    assert!(value(size / 4, size / 3) > 250);
+                    assert!(value(3 * size / 4, size / 3) > 250);
+                    assert!(value(size / 2, size / 3) < 8);
+                }
+                GeneratorKind::GradientPeak => {
+                    assert_eq!(generator.values[4], 25.);
+                    assert_eq!(generator.values[0], 49.);
+                    assert!(value(size / 2, 3 * size / 4) < 8);
+                    assert!(value(size / 2, 0) > 250);
+                }
+                _ => unreachable!(),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn spp_import_preserves_tonal_mask_filters_in_glb() {
         use crate::editor::model_paint_data::mask::FilterKind;
         let root = std::env::temp_dir().join(format!(
@@ -2172,6 +2246,9 @@ mod tests {
             println!("{name}: {status}");
             if name == "JadeToad" {
                 assert!(status.contains("действий кисти и ластика:"), "{status}");
+            }
+            if name == "FrenchRestaurantTable" {
+                assert!(status.contains("градиентных масок:"), "{status}");
             }
             let path = root.join(output);
             let glb = Glb::load(&path).unwrap();
