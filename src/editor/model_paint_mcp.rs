@@ -903,7 +903,7 @@ pub(in crate::editor) fn catalog(paint: &PaintState) -> Value {
         "channels": CHANNEL_KEYS,
         "materials": MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "smart_materials": SMART_MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
-        "local_presets": paint.library.entries.iter().enumerate().map(|(index, entry)| json!({"index": index, "name": entry.name})).collect::<Vec<_>>(),
+        "local_presets": paint.library.entries().map(|(index, entry)| json!({"index": index, "name": entry.name})).collect::<Vec<_>>(),
         "generators": GeneratorKind::ALL.map(|kind| json!({"id": kind, "label": kind.label()})),
         "generator_inputs": GeneratorInput::ALL.map(|input| json!({"id": input as usize, "label": input.label()})),
         "blend_modes": Blend::ALL.map(|blend| json!({"id": blend, "label": blend.label()})),

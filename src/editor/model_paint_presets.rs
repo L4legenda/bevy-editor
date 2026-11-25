@@ -827,6 +827,16 @@ pub(super) fn export_community_package(directory: &Path, capture: Capture) -> Re
     export_material_as(directory, capture, ExportFormat::Community)
 }
 
+pub(super) fn export_saved_community_package(
+    directory: &Path,
+    entry: Entry,
+) -> Result<Export, String> {
+    // Presets only store uniform channel and mask defaults. Source bitmaps retain their size.
+    let layers = load_material(&entry.path, 16)?;
+    let capture = Capture::Material { name: entry.name, layers };
+    export_captured(directory, self::capture(capture, false)?, ExportFormat::Community, entry.thumbnail.as_deref())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportFormat {
     Material,
@@ -835,16 +845,26 @@ enum ExportFormat {
 }
 
 fn export_material_as(directory: &Path, capture: Capture, format: ExportFormat) -> Result<Export, String> {
+    export_captured(directory, self::capture(capture, false)?, format, None)
+}
+
+fn export_captured(
+    directory: &Path,
+    captured: Captured,
+    format: ExportFormat,
+    saved_thumbnail: Option<&image::RgbaImage>,
+) -> Result<Export, String> {
     let package = format != ExportFormat::Material;
     let Captured {
         manifest,
         images,
         skipped,
-    } = self::capture(capture, false)?;
-    let thumbnail = render_thumbnail(&manifest, &images)
-        .as_ref()
-        .map(texture_fill::encode_png)
-        .transpose()?;
+    } = captured;
+    let thumbnail = if let Some(saved) = saved_thumbnail {
+        Some(texture_fill::encode_png(saved)?)
+    } else {
+        render_thumbnail(&manifest, &images).as_ref().map(texture_fill::encode_png).transpose()?
+    };
     let images = mpsmart::prepare_images(&images)?;
     let (mut contents, adjusted) = mpsmart::encode(&manifest, &images)?;
     let mut sources = BTreeMap::new();
@@ -1063,15 +1083,29 @@ pub(super) fn publish_named(
 #[derive(Default)]
 pub(super) struct Library {
     pub root: Option<PathBuf>,
-    pub entries: Vec<Entry>,
+    entries: Vec<Option<Entry>>,
     pub revision: u64,
     initialized: bool,
     scan: Option<bevy::tasks::Task<Result<Vec<Entry>, String>>>,
     write: Option<bevy::tasks::Task<Result<Option<(Entry, usize)>, String>>>,
     export: Option<bevy::tasks::Task<Result<Option<Export>, String>>>,
+    delete: Option<(usize, bevy::tasks::Task<Result<(), String>>)>,
 }
 
 impl Library {
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = (usize, &Entry)> {
+        self.entries.iter().enumerate().filter_map(|(index, entry)| {
+            entry.as_ref().map(|entry| (index, entry))
+        })
+    }
+
+    pub fn entry(&self, index: usize) -> Option<&Entry> {
+        if self.delete.as_ref().is_some_and(|(pending, _)| *pending == index) {
+            return None;
+        }
+        self.entries.get(index)?.as_ref()
+    }
+
     pub fn ensure(&mut self) {
         if self.initialized {
             return;
@@ -1147,6 +1181,39 @@ impl Library {
         result.transpose()
     }
 
+    pub fn start_delete(&mut self, index: usize) -> Result<(), String> {
+        if self.delete.is_some() || self.scan.is_some() || self.write.is_some() || self.export.is_some() {
+            return Err("Дождитесь завершения операции с библиотекой".into());
+        }
+        let entry = self.entry(index).ok_or("Пресет не найден")?;
+        if entry.path.parent() != self.root.as_deref() {
+            return Err("Файл пресета находится вне библиотеки".into());
+        }
+        let path = entry.path.clone();
+        let task = bevy::tasks::IoTaskPool::get().spawn(async move {
+            let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() {
+                return Err("Файл пресета недоступен".into());
+            }
+            fs::remove_file(path).map_err(|error| error.to_string())
+        });
+        self.delete = Some((index, task));
+        Ok(())
+    }
+
+    pub fn poll_delete(&mut self) -> Option<Result<usize, String>> {
+        use bevy::tasks::{block_on, poll_once};
+        let (index, job) = self.delete.as_mut()?;
+        let index = *index;
+        let result = block_on(poll_once(job))?;
+        self.delete = None;
+        if result.is_ok() {
+            self.entries[index] = None;
+            self.revision += 1;
+        }
+        Some(result.map(|()| index))
+    }
+
     pub fn poll(&mut self) -> Option<Result<(Entry, usize), String>> {
         use bevy::tasks::{block_on, poll_once};
         if let Some(result) = self.scan.as_mut().and_then(|job| block_on(poll_once(job))) {
@@ -1154,7 +1221,7 @@ impl Library {
             match result {
                 Ok(entries) => {
                     for entry in entries {
-                        if !self.entries.iter().any(|known| known.path == entry.path) {
+                        if !self.entries().any(|(_, known)| known.path == entry.path) {
                             self.upsert(entry);
                         }
                     }
@@ -1179,10 +1246,10 @@ impl Library {
 
     pub(super) fn upsert(&mut self, entry: Entry) {
         // Keep indices stable for controls and drag payloads during asynchronous refresh.
-        if let Some(old) = self.entries.iter_mut().find(|old| old.path == entry.path) {
+        if let Some(old) = self.entries.iter_mut().filter_map(Option::as_mut).find(|old| old.path == entry.path) {
             *old = entry;
         } else {
-            self.entries.push(entry);
+            self.entries.push(Some(entry));
         }
         self.revision += 1;
     }

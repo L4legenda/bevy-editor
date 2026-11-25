@@ -3084,6 +3084,13 @@ pub(super) const SMART_MATERIALS: &[SmartMaterial] = &[
 ];
 
 impl SmartMaterial {
+    pub fn graph(&self, size: u32) -> Result<(material_painter_graph::Graph, Arc<texture_fill::GraphImages>), String> {
+        // The graph builder reads only the authored values of the recipe's uniform planes.
+        let layers = self.prepare(1)?;
+        let selected = layers.len() - 1;
+        super::folder_graph::standalone(super::Stack { layers, selected }, size)
+    }
+
     pub fn kind(&self) -> super::MaterialType {
         use super::MaterialType;
         match MaterialType::of(self.name, None) {
@@ -3289,6 +3296,35 @@ fn pack(value: f32) -> u8 {
 mod tests {
     use super::super::{PaintAction, Session};
     use super::*;
+
+    #[test]
+    fn smart_recipe_graphs_keep_masks_parameters_and_scan_inputs() {
+        use material_painter_graph::Value;
+
+        let library = super::super::material_graph::library();
+        let mut scanned = 0;
+        for recipe in SMART_MATERIALS {
+            let (graph, images) = recipe.graph(256).unwrap_or_else(|error| panic!("{} · {error}", recipe.name));
+            graph.validate_texture_graph(&library).unwrap_or_else(|error| panic!("{} · {error}", recipe.name));
+            assert_eq!(graph.name, recipe.name);
+            assert!(graph.match_set && graph.tags.is_empty());
+            assert!(graph.nodes.iter().any(|node| node.def == "smart_mask"));
+            assert!(graph.params.iter().any(|param| param.name == "Непрозрачность" && param.binds.len() > 1));
+            assert!(graph.params.iter().all(|param| !param.group.is_empty()));
+            for path in graph.nodes.iter().flat_map(|node| node.params.values()).filter_map(|value| {
+                let Value::Image(Some(path)) = value else { return None; };
+                path.to_str()
+            }) {
+                assert!(images.contains_key(path), "{} · {path}", recipe.name);
+            }
+            if recipe.layers.iter().any(|layer| layer.scan.is_some()) {
+                scanned += 1;
+                assert!(!images.is_empty());
+                assert!(graph.params.iter().any(|param| param.name == "Повтор текстуры"));
+            }
+        }
+        assert_eq!(scanned, 19);
+    }
     use crate::editor::model_paint_data::{Stack, Surface};
 
     #[test]

@@ -3089,7 +3089,88 @@ fn gpu_graph_mask_keeps_painted_alpha_filters_and_graph_on_save() {
 }
 
 #[test]
-#[ignore = "requires GPU; applies an installed community graph through the shelf without network access"]
+#[ignore = "requires GPU; exports the material graph's native output textures through the canvas"]
+fn gpu_graph_canvas_exports_output_pngs_with_native_height_precision() {
+    use bevy::render::renderer::{RenderDevice, RenderQueue};
+    use material_painter_graph::{Graph, USAGES, Value};
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    let mut graph = Graph::new("Sample Graph");
+    graph.res = 48;
+    graph.match_set = false;
+    let uniform = graph.add("color", [0., 0.]);
+    // Exactly representable in RGBA16Float, including after a second render pass.
+    let channels = [0.125, 0.375, 0.8125];
+    graph.node_mut(uniform).unwrap().params.insert("color".into(), Value::Color(channels));
+    for usage in 0..USAGES.len() {
+        let output = graph.add("output", [220., usage as f32 * 140.]);
+        graph.node_mut(output).unwrap().params.insert("usage".into(), Value::Enum(usage));
+        assert!(graph.connect(uniform, output, "input"));
+    }
+    let device = app.world().resource::<RenderDevice>().clone();
+    let queue = app.world().resource::<RenderQueue>().clone();
+    let layer = material_graph::prepare_graph(graph, &Default::default(), 256, Default::default(), &device, &queue).unwrap();
+    {
+        let mut state = app.world_mut().resource_mut::<PaintState>();
+        let session = state.sessions.get_mut(&0).unwrap();
+        session.insert_layer(layer);
+        session.revision += 1;
+    }
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    let before = app.world().resource::<PaintState>().sessions[&0].stack.clone();
+
+    let folder = tempfile::tempdir().unwrap();
+    let existing = folder.path().join("Sample_Graph_outputs");
+    std::fs::create_dir(&existing).unwrap();
+    let existing_map = existing.join("Sample_Graph_Height.png");
+    std::fs::write(&existing_map, b"previous export").unwrap();
+    app.world_mut().resource_mut::<PaintState>().graph_outputs_test_folder = Some(Some(folder.path().into()));
+    paint_click(&mut app, window, PaintAction::ExportGraphOutputs);
+    let start = std::time::Instant::now();
+    while app.world().resource::<PaintState>().graph_output_export.is_some() {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 60, "Graph output export did not finish");
+    }
+    let directory = folder.path().join("Sample_Graph_outputs_2");
+    assert!(directory.is_dir(), "{}", app.world().resource::<Editor>().status);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), USAGES.len());
+    assert_eq!(std::fs::read(existing_map).unwrap(), b"previous export");
+    let quantized = channels.map(|sample| half::f16::from_f32(sample).to_f32());
+    let open = |usage: &str| image::open(directory.join(format!("Sample_Graph_{usage}.png"))).unwrap();
+    let height = open("Height");
+    assert_eq!(height.color(), image::ColorType::L16);
+    let pixel = height.into_luma16().get_pixel(47, 47).0[0];
+    assert!((i32::from(pixel) - (quantized[0] * 65535.).round() as i32).abs() <= 1);
+    assert_ne!(pixel % 257, 0);
+    let rgb = quantized.map(|sample| (sample * 255.).round() as u8);
+    for usage in ["BaseColor", "Emission", "Normal"] {
+        let output = open(usage);
+        assert_eq!(output.color(), image::ColorType::Rgb8);
+        assert_eq!(output.into_rgb8().get_pixel(47, 47).0, rgb);
+    }
+    for usage in ["Mask", "Opacity", "Roughness", "Metallic", "Specular"] {
+        let output = open(usage);
+        assert_eq!(output.color(), image::ColorType::L8);
+        assert_eq!(output.into_luma8().get_pixel(47, 47).0, [rgb[0]]);
+    }
+    let after = &app.world().resource::<PaintState>().sessions[&0].stack;
+    assert!(crate::editor::model_paint_data::same_stack(&before, after));
+}
+
+#[test]
+#[ignore = "requires GPU; saves, reloads, drags, shares and opens a local graph without network access"]
 fn gpu_community_graph_from_installed_package_applies_as_a_fill() {
     let project = crate::EditorProject::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
@@ -3142,7 +3223,47 @@ fn gpu_community_graph_from_installed_package_applies_as_a_fill() {
         }
         assert!(started.elapsed().as_secs() < 60, "{}", app.world().resource::<Editor>().status);
     }
-    paint_message(&mut app, PaintAction::ShareCommunityGraph);
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    paint_click(&mut app, window, PaintAction::SaveGraphShelf);
+    let started = std::time::Instant::now();
+    while app.world().resource::<PaintState>().graph_shelf.entries.is_empty() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    let entry = &app.world().resource::<PaintState>().graph_shelf.entries[0];
+    assert_eq!(entry.name, "Community blue");
+    assert_eq!(entry.path.parent(), Some(root.join("graphs").as_path()));
+    assert!(entry.thumbnail.as_ref().unwrap().pixels().get_pixel(0, 0)[2] > 128);
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    paint_message(&mut app, PaintAction::Undo);
+    assert!(!app.world().resource::<PaintState>().sessions[&0].stack.layers.iter()
+        .any(|layer| layer.name == "Community blue"));
+
+    app.world_mut().resource_mut::<PaintState>().graph_shelf = graph_shelf::Library::default();
+    paint_click(&mut app, window, PaintAction::Category(Category::Graphs));
+    let started = std::time::Instant::now();
+    while app.world().resource::<PaintState>().graph_shelf.entries.is_empty() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "Local graph did not reload");
+    }
+    warm(&mut app, 4);
+    let target = labelled(&mut app, "3D-вид модели").center();
+    drag_shelf_item(&mut app, window, PaintAction::ApplySavedGraph(0), target);
+    let wait_for_count = |app: &mut App, count| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            if !session.smart_loading && session.stack.layers.iter().filter(|layer| layer.name == "Community blue").count() == count {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 60, "{}", app.world().resource::<Editor>().status);
+        }
+        paint_ready(app);
+    };
+    wait_for_count(&mut app, 1);
+    paint_click(&mut app, window, PaintAction::SavedGraphMenu(Some(0)));
+    paint_click(&mut app, window, PaintAction::ShareSavedGraph(0));
     let started = std::time::Instant::now();
     while app.world().resource::<PaintState>().community_submission.is_some() {
         frame(&mut app);
@@ -3155,10 +3276,301 @@ fn gpu_community_graph_from_installed_package_applies_as_a_fill() {
         .unwrap_or_else(|| panic!("{}", app.world().resource::<Editor>().status));
     let (shared, _) = material_graph::file::load(&output.path()).unwrap();
     assert_eq!(shared.name, "Community blue");
+    assert_eq!(material_graph::library().find(&shared.node(1).unwrap().def).unwrap().source, shader);
+    paint_click(&mut app, window, PaintAction::OpenSavedGraph(0));
+    wait_for_count(&mut app, 2);
+    assert!(app.world().resource::<PaintState>().sessions[&0].graph_canvas_open());
+    paint_message(&mut app, PaintAction::GraphCanvas);
+    paint_message(&mut app, PaintAction::Undo);
     paint_message(&mut app, PaintAction::Undo);
     assert!(!app.world().resource::<PaintState>().sessions[&0].stack.layers.iter().any(|layer| layer.name == "Community blue"));
     drop(app);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "requires GPU; adds one graph from the smart-material shelf and verifies published edits"]
+fn gpu_smart_recipe_graph_shelf_adds_one_layer_with_editable_parameters() {
+    use material_graph::Edit;
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    paint_message(&mut app, PaintAction::Resolution(256));
+    paint_ready(&mut app);
+    let before = app.world().resource::<PaintState>().sessions[&0].stack.layers.len();
+    let recipe = 0;
+    let name = SMART_MATERIALS[recipe].name;
+    paint_click(&mut app, window, PaintAction::Category(Category::Smart));
+    set_shelf_query(&mut app, name);
+    paint_click(&mut app, window, PaintAction::SmartRecipeMenu(Some(recipe)));
+    assert!(paint_button_rect(&mut app, PaintAction::AddSmartMaterial(recipe)).width() > 0.);
+    paint_click(&mut app, window, PaintAction::AddSmartGraph(recipe));
+
+    let wait_for_graph = |app: &mut App| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            if !session.smart_loading
+                && let Some(fill) = session.active_texture_fill()
+                && let Some(payload) = &fill.graph
+                && let Some(image) = &fill.images[0]
+            {
+                let graph = material_graph::read(payload).unwrap();
+                let bytes = image.bytes.clone();
+                paint_ready(app);
+                return (graph, bytes);
+            }
+            assert!(started.elapsed().as_secs() < 90, "{}", app.world().resource::<Editor>().status);
+        }
+    };
+
+    let (initial, color) = wait_for_graph(&mut app);
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!(session.stack.layers.len(), before + 1);
+        assert_eq!(session.stack.layers[session.stack.selected].kind, LayerKind::Fill);
+        assert_eq!(session.stack.layers[session.stack.selected].name, name);
+    }
+    let base_color = initial.params.iter().position(|param| param.group == "Oak" && param.name == "Цвет").unwrap();
+    paint_message(&mut app, PaintAction::GraphEdit(Edit::AdjustParameter(base_color, 0, 1)));
+    let (edited, edited_color) = wait_for_graph(&mut app);
+    let library = material_graph::library();
+    assert_ne!(initial.param_value(base_color, &library).unwrap().1, edited.param_value(base_color, &library).unwrap().1);
+    assert_ne!(color, edited_color);
+
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    let bytes = doc.source.encode(&doc.objects, &doc.original).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("smart-graph.glb");
+    std::fs::write(&path, bytes).unwrap();
+    let glb = crate::editor::model_document::glb::Glb::load(&path).unwrap();
+    let restored = glb.json["meshes"].as_array().unwrap().iter().flat_map(|mesh| {
+        mesh["primitives"].as_array().into_iter().flatten()
+    }).find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
+    let fill = restored.stack.layers.iter().find(|layer| layer.name == name)
+        .unwrap().texture_fill.as_ref().unwrap();
+    assert_eq!(fill.images[0].as_ref().unwrap().bytes, edited_color);
+    let reopened = material_graph::read(fill.graph.as_ref().unwrap()).unwrap();
+    assert_eq!(reopened.params[base_color], edited.params[base_color]);
+
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(wait_for_graph(&mut app).1, color);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.len(), before);
+}
+
+#[test]
+#[ignore = "requires GPU; uses shelf drag and the channel picker, then reopens the GLB"]
+fn gpu_shelf_textures_drop_pick_and_restore_fill_channels() {
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    paint_click(&mut app, window, PaintAction::Add(LayerKind::Fill));
+    paint_message(&mut app, PaintAction::Channel(4));
+    paint_click(&mut app, window, PaintAction::Category(Category::Textures));
+    set_shelf_query(&mut app, "tiles");
+
+    let wait_for_map = |app: &mut App, channel: usize, texture: usize| {
+        let started = std::time::Instant::now();
+        let name = format!("{}.png", tips::texture_name(texture));
+        let bitmap = loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            if let Some(bitmap) = session.active_texture_fill()
+                .and_then(|fill| fill.images[channel].as_ref())
+                .filter(|bitmap| bitmap.name == name) {
+                break bitmap.clone();
+            }
+            assert!(started.elapsed().as_secs() < 45, "{}", app.world().resource::<Editor>().status);
+        };
+        paint_ready(app);
+        bitmap
+    };
+
+    paint_click(&mut app, window, PaintAction::Grain(Some(0)));
+    let roughness = PaintAction::FillTexturePicker(Some(1));
+    scroll_to_paint_control(&mut app, roughness);
+    let target = paint_button_rect(&mut app, roughness).center();
+    drag_shelf_item(&mut app, window, PaintAction::Grain(Some(0)), target);
+    let original = wait_for_map(&mut app, 1, 0);
+    assert_eq!(original.pixels().dimensions(), (1024, 1024));
+
+    scroll_to_paint_control(&mut app, roughness);
+    paint_click(&mut app, window, roughness);
+    let replacement = PaintAction::TextureToChannel(2, 1);
+    scroll_to_paint_control(&mut app, replacement);
+    paint_click(&mut app, window, replacement);
+    let brick = wait_for_map(&mut app, 1, 2);
+    assert_ne!(original.bytes, brick.bytes);
+    {
+        let session = &app.world().resource::<PaintState>().sessions[&0];
+        assert_eq!(session.channel, 4);
+        assert_eq!(session.grain, Some(0));
+        assert!(session.active_texture_fill().unwrap().images[4].is_none());
+    }
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(wait_for_map(&mut app, 1, 0).bytes, original.bytes);
+    paint_message(&mut app, PaintAction::Redo);
+    assert_eq!(wait_for_map(&mut app, 1, 2).bytes, brick.bytes);
+    let remove = PaintAction::FillTextureRemove(1);
+    scroll_to_paint_control(&mut app, remove);
+    paint_click(&mut app, window, remove);
+    assert!(app.world().resource::<PaintState>().sessions[&0].active_texture_fill().is_none());
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(wait_for_map(&mut app, 1, 2).bytes, brick.bytes);
+
+    paint_click(&mut app, window, PaintAction::AddShelfTexture(0));
+    let height = wait_for_map(&mut app, 3, 0);
+    let fill = app.world().resource::<PaintState>().sessions[&0].active_texture_fill().unwrap();
+    assert_eq!(fill.settings.projection, texture_fill::Projection::Triplanar);
+    assert_eq!(fill.settings.tiling, 2.);
+    assert_eq!(height.bytes, original.bytes);
+
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    let bytes = doc.source.encode(&doc.objects, &doc.original).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shelf-texture.glb");
+    std::fs::write(&path, bytes).unwrap();
+    let glb = crate::editor::model_document::glb::Glb::load(&path).unwrap();
+    let restored = glb.json["meshes"].as_array().unwrap().iter().flat_map(|mesh| {
+        mesh["primitives"].as_array().into_iter().flatten()
+    }).find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
+    for (channel, expected) in [(1, brick), (3, height)] {
+        let restored_map = restored.stack.layers.iter().filter_map(|layer| {
+            layer.texture_fill.as_ref()?.images[channel].as_ref()
+        }).next().unwrap();
+        assert_eq!(restored_map.bytes, expected.bytes);
+    }
+}
+
+#[test]
+#[ignore = "requires GPU; opens, searches, clicks and drags the offline material shelf"]
+fn gpu_downloaded_material_shelf_inserts_editable_layers_without_network() {
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = online::cache_in(temp.path());
+    online::downloaded::fixture(&root, online::Provider::PolyHaven, "red-rock", "Red Rock");
+    online::downloaded::fixture(&root, online::Provider::AmbientCg, "unrelated", "Other Rock");
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<PaintState>().library.root = Some(temp.path().to_path_buf());
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) { break; }
+    }
+    app.world_mut().resource_mut::<editing::State>().documents.get_mut(&0).unwrap().mode = Mode::Paint;
+    warm(&mut app, 15);
+    paint_click(&mut app, window, PaintAction::Category(Category::Downloaded));
+    set_shelf_query(&mut app, "red terrain");
+    let started = std::time::Instant::now();
+    let action = loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let mut cards = world.query::<(&Control, &Children)>();
+        let mut matching = cards.iter(world).filter_map(|(control, children)| {
+            let Action::ModelView(ModelViewAction::Paint(action @ PaintAction::ApplyDownloaded(_))) =
+                control.action else { return None };
+            let ready = children.iter().any(|child| {
+                world.get::<ImageNode>(child)
+                    .and_then(|node| world.resource::<Assets<Image>>().get(&node.image))
+                    .is_some_and(|image| image.width() == 128)
+            });
+            Some((action, ready))
+        });
+        if let Some((action, true)) = matching.next() {
+            assert!(matching.next().is_none(), "Search left unrelated materials visible");
+            break action;
+        }
+        assert!(started.elapsed().as_secs() < 30, "Offline material preview did not load");
+    };
+    assert!(app.world().resource::<PaintState>().online.entries.is_empty());
+    let wait_for_layers = |app: &mut App, count| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            let session = &app.world().resource::<PaintState>().sessions[&0];
+            if !session.smart_loading
+                && session.stack.layers.iter().filter(|layer| layer.name == "Red Rock").count() == count
+            {
+                break;
+            }
+            assert!(started.elapsed().as_secs() < 45, "{}", app.world().resource::<Editor>().status);
+        }
+        paint_ready(app);
+    };
+
+    paint_click(&mut app, window, action);
+    wait_for_layers(&mut app, 1);
+    let texture = {
+        let stack = &app.world().resource::<PaintState>().sessions[&0].stack;
+        let layer = &stack.layers[stack.selected];
+        assert_eq!(layer.name, "Red Rock");
+        let fill = layer.texture_fill.as_ref().unwrap();
+        assert_eq!(fill.settings.projection, texture_fill::Projection::Triplanar);
+        fill.images[0].as_ref().unwrap().bytes.clone()
+    };
+    paint_message(&mut app, PaintAction::Add(LayerKind::Folder));
+    let folder = app.world().resource::<PaintState>().sessions[&0].stack.selected;
+    scroll_to_paint_control(&mut app, PaintAction::Select(folder));
+    let destination = paint_button_rect(&mut app, PaintAction::Select(folder)).center();
+    drag_shelf_item(&mut app, window, action, destination);
+    wait_for_layers(&mut app, 2);
+    let stack = &app.world().resource::<PaintState>().sessions[&0].stack;
+    assert_eq!(stack.layers[stack.selected].name, "Red Rock");
+    assert_eq!(stack.layers[stack.selected].depth, 1);
+    assert!(stack.valid_hierarchy());
+
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    let bytes = doc.source.encode(&doc.objects, &doc.original).unwrap();
+    let path = temp.path().join("offline-fill.glb");
+    std::fs::write(&path, bytes).unwrap();
+    let glb = crate::editor::model_document::glb::Glb::load(&path).unwrap();
+    let restored = glb.json["meshes"].as_array().unwrap().iter().flat_map(|mesh| {
+        mesh["primitives"].as_array().into_iter().flatten()
+    }).find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
+    let layer = restored.stack.layers.iter().find(|layer| layer.name == "Red Rock" && layer.depth == 1).unwrap();
+    assert_eq!(layer.texture_fill.as_ref().unwrap().images[0].as_ref().unwrap().bytes, texture);
+    paint_message(&mut app, PaintAction::Undo);
+    let stack = &app.world().resource::<PaintState>().sessions[&0].stack;
+    assert_eq!(stack.layers.iter().filter(|layer| layer.name == "Red Rock").count(), 1);
+
+    let PaintAction::ApplyDownloaded(id) = action else { unreachable!() };
+    paint_click(&mut app, window, PaintAction::DownloadedMenu(Some(id)));
+    paint_button_rect(&mut app, PaintAction::OpenDownloadedSource(id));
+    paint_button_rect(&mut app, PaintAction::ShowDownloadedFiles(id));
+    paint_click(&mut app, window, PaintAction::DeleteDownload(id));
+    let started = std::time::Instant::now();
+    while app.world().resource::<PaintState>().downloaded.record(id).is_some() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    assert!(!root.join("polyhaven-red-rock-1k").exists());
+    assert!(root.join("ambientcg-unrelated-1k").is_dir());
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.iter()
+        .filter(|layer| layer.name == "Red Rock").count(), 1);
 }
 
 #[test]
@@ -4214,8 +4626,7 @@ fn gpu_mpsmart_graphs_apply_to_target_geometry() {
     app.world_mut()
         .resource_mut::<PaintState>()
         .library
-        .entries
-        .push(entry);
+        .upsert(entry);
     paint_message(&mut app, PaintAction::ApplyShelfMaterial(0));
 
     let wait_for_mask = |app: &mut App, expected| {
@@ -8277,7 +8688,8 @@ fn gpu_model_paint_user_presets_save_and_apply() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     ).unwrap();
     let (mut app, window, _) = fixture_project(project);
-    let directory = std::env::temp_dir().join(format!("bevy-paint-shelf-ui-{}", std::process::id()));
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().to_path_buf();
     app.world_mut().resource_mut::<PaintState>().library.root = Some(directory.clone());
     app.world_mut().resource_mut::<Editor>().drawer = false;
     app.world_mut().write_message(Action::ViewModel(0));
@@ -8299,7 +8711,7 @@ fn gpu_model_paint_user_presets_save_and_apply() {
     };
     let wait_library = |app: &mut App, count| {
         let start = std::time::Instant::now();
-        while app.world().resource::<PaintState>().library.entries.len() < count {
+        while app.world().resource::<PaintState>().library.entries().count() < count {
             frame(app);
             assert!(start.elapsed() < std::time::Duration::from_secs(12),
                 "expected {count} presets · {}", app.world().resource::<Editor>().status);
@@ -8315,9 +8727,8 @@ fn gpu_model_paint_user_presets_save_and_apply() {
     wait_library(&mut app, 2);
     let (material, mask) = {
         let resource = app.world().resource::<PaintState>();
-        let entries = &resource.library.entries;
-        let material = entries.iter().position(|entry| matches!(entry.kind, presets::Kind::Material { .. })).unwrap();
-        let mask = entries.iter().position(|entry| matches!(entry.kind, presets::Kind::Mask(_))).unwrap();
+        let material = resource.library.entries().find(|(_, entry)| matches!(entry.kind, presets::Kind::Material { .. })).unwrap().0;
+        let mask = resource.library.entries().find(|(_, entry)| matches!(entry.kind, presets::Kind::Mask(_))).unwrap().0;
         (material, mask)
     };
     assert_eq!(presets::list(&directory).unwrap().len(), 2);
@@ -8367,8 +8778,8 @@ fn gpu_model_paint_user_presets_save_and_apply() {
             move || Ok(Some(path))
         }).unwrap();
     wait_library(&mut app, 3);
-    let imported = app.world().resource::<PaintState>().library.entries.iter()
-        .position(|entry| entry.name == "MP Patinated brass").unwrap();
+    let imported = app.world().resource::<PaintState>().library.entries()
+        .find(|(_, entry)| entry.name == "MP Patinated brass").unwrap().0;
     paint_click(&mut app, window, PaintAction::ApplyShelfMaterial(imported));
     let start = std::time::Instant::now();
     loop {
@@ -8388,12 +8799,39 @@ fn gpu_model_paint_user_presets_save_and_apply() {
         assert!(start.elapsed() < std::time::Duration::from_secs(90),
             "{}", app.world().resource::<Editor>().status);
     }
+    let before = app.world().resource::<PaintState>().sessions[&0].stack.clone();
+    paint_click(&mut app, window, PaintAction::SavedMaterialMenu(Some(imported)));
+    assert!(paint_button_rect(&mut app, PaintAction::ShowSavedMaterial(imported)).width() > 0.);
+    paint_click(&mut app, window, PaintAction::ShareSavedMaterial(imported));
+    let start = std::time::Instant::now();
+    while app.world().resource::<PaintState>().community_submission.is_some() {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 60, "Community package did not finish");
+    }
+    let package = std::fs::read_dir(directory.join("online/community/submissions")).unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "zip"))
+        .unwrap_or_else(|| panic!("{}", app.world().resource::<Editor>().status));
+    let (reopened, _) = presets::import_material(&source_dir, &package).unwrap();
+    let layers = presets::load_material(&reopened.path, 32).unwrap();
+    assert_eq!(layers.len(), 3);
+    assert_eq!(layers[0].name, "Brass coating");
+    assert_eq!(layers[0].mask.as_ref().unwrap().filters.len(), 1);
+
+    let deleted = app.world().resource::<PaintState>().library.entry(material).unwrap().path.clone();
+    paint_click(&mut app, window, PaintAction::SavedMaterialMenu(Some(material)));
+    paint_click(&mut app, window, PaintAction::DeleteSavedMaterial(material));
+    let start = std::time::Instant::now();
+    while app.world().resource::<PaintState>().library.entries().any(|(index, _)| index == material) {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    assert!(!deleted.exists());
+    let state = app.world().resource::<PaintState>();
+    assert_eq!(state.library.entry(imported).unwrap().name, "MP Patinated brass");
+    assert!(state.library.entry(mask).is_some());
+    assert!(crate::editor::model_paint_data::same_stack(&state.sessions[&0].stack, &before));
     paint_click(&mut app, window, PaintAction::Undo);
     assert_eq!(app.world().resource::<PaintState>().sessions[&0].stack.layers.len(), 3);
-    for entry in presets::list(&directory).unwrap() {
-        std::fs::remove_file(entry.path).unwrap();
-    }
-    std::fs::remove_file(path).unwrap();
-    std::fs::remove_dir(source_dir).unwrap();
-    std::fs::remove_dir(directory).unwrap();
 }

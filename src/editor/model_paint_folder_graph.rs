@@ -126,6 +126,61 @@ fn fills(stack: &Stack, folder: usize) -> Vec<usize> {
         .collect()
 }
 
+pub(super) fn standalone(
+    mut stack: Stack,
+    size: u32,
+) -> Result<(Graph, Arc<texture_fill::GraphImages>), String> {
+    if !can_open(&stack) {
+        return Err("Материал не помещается в один граф заливки".into());
+    }
+    let View { mut graph, images, .. } = start(&mut stack, size, 0, None);
+    let library = material_graph::library();
+    let mut groups = HashSet::new();
+    for index in fills(&stack, stack.selected) {
+        let layer = &stack.layers[index];
+        let id = layer.graph_id.unwrap();
+        let mut group = layer.name.clone();
+        let mut suffix = 2;
+        while !groups.insert(group.clone()) {
+            group = format!("{} {suffix}", layer.name);
+            suffix += 1;
+        }
+        let nodes: [Option<u64>; CHANNELS.len()] =
+            std::array::from_fn(|channel| graph.tagged(id, Role::Channel(channel)));
+        let mask = graph.tagged(id, Role::Mask).filter(|id| {
+            graph.node(*id).is_some_and(|node| node.def == "smart_mask")
+        });
+        let mut expose = |nodes: &[u64], parameter: &str, label: &str| {
+            let Some((&first, rest)) = nodes.split_first() else { return; };
+            let index = graph.expose(first, parameter, &library);
+            for &node in rest {
+                graph.bind(index, node, parameter, &library);
+            }
+            graph.params[index].name = label.into();
+            graph.params[index].group.clone_from(&group);
+        };
+        let all: Vec<_> = nodes.into_iter().flatten().collect();
+        let scanned = layer.texture_fill.as_ref().is_some_and(|fill| fill.images.iter().any(Option::is_some));
+        expose(&all, "opacity", "Непрозрачность");
+        if scanned {
+            expose(&all, "tiling", "Повтор текстуры");
+        } else {
+            for (channel, key, label) in [
+                (0, "color", "Цвет"),
+                (1, "value", "Шероховатость"),
+                (2, "value", "Металличность"),
+            ] {
+                expose(nodes[channel].as_slice(), key, label);
+            }
+        }
+        expose(nodes[3].as_slice(), "value", "Высота");
+        expose(mask.as_slice(), "level", "Уровень маски");
+        expose(mask.as_slice(), "scale", "Масштаб маски");
+    }
+    graph.tags.clear();
+    Ok((graph, images))
+}
+
 pub(super) fn start(stack: &mut Stack, size: u32, revision: u64, previous: Option<&View>) -> View {
     let folder = stack.selected;
     let children = fills(stack, folder);

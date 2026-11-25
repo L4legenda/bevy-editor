@@ -22,7 +22,7 @@ use bevy::{
     ecs::system::SystemParam,
     input::{ButtonState, keyboard::KeyboardInput},
     input_focus::{FocusedInput, InputFocus},
-    picking::{events::{PointerDragDrop, PointerDragLeave, PointerDragOver}, pointer::PointerButton},
+    picking::{events::{PointerClick, PointerDragDrop, PointerDragLeave, PointerDragOver}, pointer::PointerButton},
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
     text::EditableText,
     ui::ScrollPosition,
@@ -40,19 +40,20 @@ enum PaintDropZone {
     View3d,
     ViewUv,
     Layer { index: usize, folder_open: Option<bool> },
+    FillChannel(usize),
 }
 
 impl PaintDropZone {
     fn layer(self) -> Option<usize> {
         match self {
-            Self::View3d | Self::ViewUv => None,
+            Self::View3d | Self::ViewUv | Self::FillChannel(_) => None,
             Self::Layer { index, .. } => Some(index),
         }
     }
 
     fn placement(self, y: f32, moving_layer: bool) -> ShelfPlacement {
         match self {
-            Self::View3d | Self::ViewUv => ShelfPlacement::Top,
+            Self::View3d | Self::ViewUv | Self::FillChannel(_) => ShelfPlacement::Top,
             Self::Layer { index, folder_open: Some(open) }
                 if y >= 0.25 && (y <= 0.75 || (moving_layer && open)) => {
                 ShelfPlacement::Inside(index)
@@ -63,6 +64,14 @@ impl PaintDropZone {
     }
 
     fn action(self, source: PaintAction, y: f32) -> Option<PaintAction> {
+        if let Self::FillChannel(channel) = self {
+            return match source {
+                PaintAction::Grain(Some(texture)) | PaintAction::AddShelfTexture(texture) => {
+                    Some(PaintAction::TextureToChannel(texture, channel))
+                }
+                _ => None,
+            };
+        }
         let material = match source {
             PaintAction::Select(from) if matches!(self, Self::Layer { .. }) => {
                 return Some(PaintAction::MoveLayer(from, self.placement(y, true)));
@@ -74,8 +83,12 @@ impl PaintDropZone {
                 return Some(PaintAction::ApplyShelfMask(index, self.layer()));
             }
             PaintAction::ApplyShelfMaterial(index) => ShelfMaterial::User(index),
+            PaintAction::ApplyDownloaded(index) => ShelfMaterial::Downloaded(index),
+            PaintAction::ApplySavedGraph(index) => ShelfMaterial::Graph(index),
+            PaintAction::CommunityGraph(index) => ShelfMaterial::CommunityGraph(index),
             PaintAction::Preset(index) | PaintAction::AddMaterial(index) => ShelfMaterial::Basic(index),
             PaintAction::AddSmartMaterial(index) => ShelfMaterial::Smart(index),
+            PaintAction::Grain(Some(index)) | PaintAction::AddShelfTexture(index) => ShelfMaterial::Texture(index),
             _ => return None,
         };
         Some(PaintAction::DropMaterial(material, self.placement(y, false)))
@@ -299,6 +312,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     shelf_type_label: Entity,
     shelf_stamp: Option<((usize, u64, u64, usize, usize), Category, u64, u64)>,
     user_swatches: HashMap<usize, Handle<Image>>,
+    graph_swatches: HashMap<usize, Handle<Image>>,
     requested_swatches: std::collections::HashSet<ShelfMaterial>,
     shelf_preview_job: Option<(ShelfMaterial, Task<Result<image::RgbaImage, String>>)>,
     layer_name: Entity,
@@ -864,7 +878,7 @@ fn alpha_card(
     font: &Handle<Font>,
     tip: &tips::Tip,
     action: PaintAction,
-) {
+) -> Entity {
     let card = button(commands, parent, font, "", action);
     commands.entity(card).insert((
         AccessibleLabel(tip.name.clone()),
@@ -890,6 +904,62 @@ fn alpha_card(
         ChildOf(card),
     ));
     text(commands, card, font, &tip.name, 11., TEXT);
+    card
+}
+
+fn fill_channel_slots(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    session: &Session,
+    textures: &[tips::Tip],
+) {
+    for (channel, label) in CHANNELS.into_iter().enumerate() {
+        let slot = node(commands, parent, row(3.));
+        let picker = PaintAction::FillTexturePicker(Some(channel));
+        let target = button(commands, slot, font, "", picker);
+        commands.entity(target).entry::<Node>().and_modify(|mut node| {
+            node.width = px(0.);
+            node.flex_grow = 1.;
+            node.min_width = px(0.);
+            node.overflow = Overflow::clip();
+        });
+        let bitmap = session.active_texture_fill().and_then(|fill| fill.images[channel].as_ref());
+        let title = bitmap.map_or_else(|| label.to_owned(), |bitmap| format!("{label} · {}", bitmap.name));
+        commands.entity(target).insert(AccessibleLabel(title.clone()));
+        text(commands, target, font, &title, 11., TEXT);
+        register_paint_drop(commands, target, PaintDropZone::FillChannel(channel));
+        icon(
+            commands, slot, icons::Glyph::FolderOpen, &format!("Загрузить файл · {label}"),
+            PaintAction::FillTextureImport(channel),
+        );
+        if bitmap.is_some() {
+            icon(
+                commands, slot, icons::Glyph::Close, &format!("Убрать карту · {label}"),
+                PaintAction::FillTextureRemove(channel),
+            );
+        }
+        if session.fill_texture_picker != Some(channel) {
+            continue;
+        }
+        let choices = node(commands, parent, Node {
+            flex_wrap: FlexWrap::Wrap, row_gap: px(4.), ..row(4.)
+        });
+        for (index, texture) in textures.iter().enumerate() {
+            let choice = button(commands, choices, font, "", PaintAction::TextureToChannel(index, channel));
+            commands.entity(choice).insert((
+                AccessibleLabel(format!("{} · {label}", texture.name)),
+                Node { width: px(42), height: px(42), padding: UiRect::all(px(3.)), ..default() },
+            ));
+            control_hints::attach(commands, choice, &texture.name);
+            commands.spawn((
+                ImageNode::new(texture.image.clone()),
+                Node { width: percent(100), height: percent(100), ..default() },
+                Pickable::IGNORE,
+                ChildOf(choice),
+            ));
+        }
+    }
 }
 
 fn material_results<T>(
@@ -990,6 +1060,21 @@ fn graph_fields(
         text(commands, parent, font, "Пересчёт графа…", 11., MUTED);
     }
     let editing = session.graph_canvas_open();
+    if editing && session.panel != Panel::Preview && folder.is_none() {
+        let current = if graph.match_set {
+            format!("По набору · {} × {}", session.texture_size, session.texture_size)
+        } else {
+            format!("{} × {}", graph.res, graph.res)
+        };
+        button(commands, parent, font, &current, PaintAction::GraphResolutionMenu);
+        if session.graph_resolution_menu {
+            let sizes = node(commands, parent, Node { flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(3.) });
+            for size in std::iter::once(None).chain(material_graph::RESOLUTIONS.into_iter().map(Some)) {
+                let label = size.map_or_else(|| "По набору".into(), |size| size.to_string());
+                button(commands, sizes, font, &label, PaintAction::GraphEdit(Edit::Resolution(size)));
+            }
+        }
+    }
     if !graph.params.is_empty() {
         let title = if session.panel == Panel::Preview { "Параметры шейдера" } else { "Параметры материала" };
         text(commands, parent, font, title, 12., TEXT);
@@ -1938,6 +2023,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     for (name, category) in [
         ("Материалы", Category::Materials),
         ("Онлайн", Category::Online),
+        ("Скачанные", Category::Downloaded),
         ("Умные материалы", Category::Smart),
         ("Кисти", Category::Brushes),
         ("Текстуры", Category::Textures),
@@ -1953,7 +2039,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         );
         commands.entity(e).entry::<Node>().and_modify(|mut n| {
             n.width = percent(100);
-            n.height = px(23);
+            n.height = px(21);
         });
         category_buttons.push(e);
     }
@@ -2270,6 +2356,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         shelf_type_label,
         shelf_stamp: None,
         user_swatches: HashMap::new(),
+        graph_swatches: HashMap::new(),
         requested_swatches: Default::default(),
         shelf_preview_job: None,
         layer_name,
@@ -3045,20 +3132,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
                 if session.stack.layers.get(session.stack.selected).is_some_and(|layer| layer.kind == LayerKind::Fill) {
                     text(&mut commands, stack, font, "Текстуры заливки", 12., TEXT);
-                    let channels = node(&mut commands, stack, Node {
-                        flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
-                    });
-                    for (index, label) in CHANNELS.iter().enumerate() {
-                        button(&mut commands, channels, font, label, PaintAction::Channel(index));
-                    }
-                    let images = node(&mut commands, stack, row(4.));
-                    button(&mut commands, images, font, "Выбрать изображение…", PaintAction::FillTextureImport);
+                    fill_channel_slots(&mut commands, stack, font, session, &paint.tips.grains);
                     if let Some(fill) = session.active_texture_fill().filter(|fill| fill.images.iter().any(Option::is_some)) {
-                        if let Some(bitmap) = &fill.images[session.channel] {
-                            button(&mut commands, images, font, "Убрать", PaintAction::FillTextureRemove);
-                            text(&mut commands, stack, font, &bitmap.name, 11., MUTED);
-                        }
-                        if session.channel == 4 && fill.images[4].is_some() {
+                        if fill.images[4].is_some() {
                             let sources = node(&mut commands, stack, Node {
                                 flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
                             });
@@ -3966,7 +4042,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         let handle = match material {
             ShelfMaterial::User(i) => ui.user_swatches.get(&i),
             ShelfMaterial::Smart(i) => ui.smart_swatches.get(i),
-            ShelfMaterial::Basic(_) => None,
+            ShelfMaterial::Basic(_) | ShelfMaterial::Downloaded(_) | ShelfMaterial::Texture(_)
+            | ShelfMaterial::Graph(_) | ShelfMaterial::CommunityGraph(_) => None,
         };
         if let Ok(preview) = result
             && let Some(mut target) = handle.and_then(|handle| images.get_mut(handle))
@@ -3975,7 +4052,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     let shelf_stamp = (shelf_content_stamp, session.category, shelf_filter.revision,
-        paint.library.revision.wrapping_add(paint.online.revision).wrapping_add(paint.community.revision));
+        paint.library.revision.wrapping_add(paint.online.revision)
+            .wrapping_add(paint.community.revision).wrapping_add(paint.downloaded.revision)
+            .wrapping_add(paint.graph_shelf.revision));
     if ui.shelf_stamp != Some(shelf_stamp) {
         if ui.shelf_stamp.is_none_or(|(previous, category, revision, _)| {
             previous.0 != index || category != session.category || revision != shelf_filter.revision
@@ -3986,10 +4065,26 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         let font = &interface.font;
         let mut shown = 0;
         let shelf = ui.shelf;
-        if session.category != Category::Online {
+        ui.user_swatches.retain(|index, _| paint.library.entry(*index).is_some());
+        ui.requested_swatches.retain(|material| match material {
+            ShelfMaterial::User(index) => paint.library.entry(*index).is_some(),
+            _ => true,
+        });
+        if !matches!(session.category, Category::Online | Category::Downloaded) {
             ui.online_previews.clear();
         }
-        for (i, entry) in paint.library.entries.iter().enumerate().rev() {
+        if session.category == Category::Smart
+            && let Some(index) = shelf_filter.saved_material_menu
+            && let Some(entry) = paint.library.entry(index)
+        {
+            let menu = node(&mut commands, shelf, column(4.));
+            text(&mut commands, menu, font, &entry.name, 11., TEXT);
+            button(&mut commands, menu, font, "Пакет CC0…", PaintAction::ShareSavedMaterial(index));
+            button(&mut commands, menu, font, "Показать файл", PaintAction::ShowSavedMaterial(index));
+            button(&mut commands, menu, font, "Удалить пресет", PaintAction::DeleteSavedMaterial(index));
+            button(&mut commands, menu, font, "Закрыть", PaintAction::SavedMaterialMenu(None));
+        }
+        for (i, entry) in paint.library.entries().rev() {
             if !shelf_filter.matches(&entry.name) {
                 continue;
             }
@@ -4027,9 +4122,33 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 };
                 images.add(preview)
             }).clone();
-            let card = material_card(&mut commands, shelf, font, &entry.name, swatch, action);
+            let saved_material = matches!(action, PaintAction::ApplyShelfMaterial(_));
+            let parent = if saved_material {
+                node(&mut commands, shelf, Node {
+                    width: px(112), height: px(140), flex_shrink: 0., ..default()
+                })
+            } else {
+                shelf
+            };
+            let card = material_card(&mut commands, parent, font, &entry.name, swatch, action);
             text(&mut commands, card, font, "Мой пресет", 10., MUTED);
             commands.entity(card).insert(AccessibleLabel(format!("{label} · {}", entry.name)));
+            if saved_material {
+                let action = PaintAction::SavedMaterialMenu(Some(i));
+                let menu = button(&mut commands, parent, font, "⋯", action);
+                commands.entity(menu).insert(AccessibleLabel(format!("Действия · {}", entry.name)));
+                commands.entity(menu).entry::<Node>().and_modify(|mut node| {
+                    node.position_type = PositionType::Absolute;
+                    node.right = px(5);
+                    node.top = px(5);
+                });
+                commands.entity(card).observe(move |mut event: On<PointerClick>, mut actions: MessageWriter<Action>| {
+                    if event.button == PointerButton::Secondary {
+                        event.propagate(false);
+                        actions.write(Action::ModelView(ModelViewAction::Paint(action)));
+                    }
+                });
+            }
             shown += 1;
         }
         match session.category {
@@ -4070,6 +4189,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 if session.smart_loading {
                     text(&mut commands, controls, font, "Загрузка текстур…", 12., MUTED);
                 }
+                if matches!(paint.downloaded.operation(), Some(online::downloaded::Operation::Download)) {
+                    text(&mut commands, controls, font, "Сохранение материала на диск…", 12., MUTED);
+                }
                 if online.provider == online::Provider::Community && paint.community.busy() {
                     text(&mut commands, controls, font, "Установка пакета…", 12., MUTED);
                 }
@@ -4101,10 +4223,85 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         let label = if installed { "Пакет установлен" } else { "Установить пакет сообщества" };
                         commands.entity(card).insert(AccessibleLabel(format!("{label} · {}", entry.name)));
                     } else {
-                        let card = material_card(&mut commands, results, font, &entry.name, preview,
+                        let tile = node(&mut commands, results, Node {
+                            width: px(112), flex_shrink: 0., ..column(3.)
+                        });
+                        let card = material_card(&mut commands, tile, font, &entry.name, preview,
                             PaintAction::OnlineMaterial(online.provider, index));
                         commands.entity(card).insert(AccessibleLabel(format!("Добавить сетевой материал · {}", entry.name)));
+                        button(&mut commands, tile, font, "Скачать",
+                            PaintAction::DownloadOnlineMaterial(online.provider, index));
                     }
+                }
+                shown += 1;
+            }
+            Category::Downloaded => {
+                let library = &paint.downloaded;
+                let controls = node(&mut commands, shelf, column(4.));
+                button(&mut commands, controls, font, "Импорт папки…", PaintAction::ImportDownloaded);
+                let mut matching: Vec<_> = library.records()
+                    .filter(|(_, record)| record.asset.matches(&shelf_filter.query)).collect();
+                matching.sort_by_cached_key(|(_, record)| (record.asset.name.to_lowercase(), record.key()));
+                let page_count = matching.len().div_ceil(online::PAGE);
+                let page = library.page.min(page_count.saturating_sub(1));
+                if let Some(error) = &library.error {
+                    text(&mut commands, controls, font, error, 12., MUTED);
+                } else if matching.is_empty() {
+                    let message = if library.scan.is_some() {
+                        "Чтение скачанных материалов…"
+                    } else if library.root.is_none() {
+                        "Папка скачанных материалов недоступна"
+                    } else if library.records().next().is_none() {
+                        "Скачайте материалы на вкладке «Онлайн»"
+                    } else {
+                        "Материалы не найдены"
+                    };
+                    text(&mut commands, controls, font, message, 12., MUTED);
+                }
+                if page_count > 1 {
+                    if page > 0 {
+                        button(&mut commands, controls, font, "Предыдущая", PaintAction::DownloadedPage(page - 1));
+                    }
+                    text(&mut commands, controls, font, &format!("{} / {page_count}", page + 1), 11., MUTED);
+                    if page + 1 < page_count {
+                        button(&mut commands, controls, font, "Следующая", PaintAction::DownloadedPage(page + 1));
+                    }
+                }
+                if let Some(id) = library.menu
+                    && let Some(record) = library.record(id)
+                {
+                    text(&mut commands, controls, font, &record.asset.name, 11., TEXT);
+                    button(&mut commands, controls, font, "Открыть на сайте", PaintAction::OpenDownloadedSource(id));
+                    button(&mut commands, controls, font, "Показать файлы", PaintAction::ShowDownloadedFiles(id));
+                    button(&mut commands, controls, font, "Удалить загрузку", PaintAction::DeleteDownload(id));
+                    button(&mut commands, controls, font, "Закрыть", PaintAction::DownloadedMenu(None));
+                }
+                let results = node(&mut commands, shelf, if shelf_docked { column(4.) } else { row(4.) });
+                let records = matching.into_iter().skip(page * online::PAGE).take(online::PAGE);
+                let placeholder = ui.layer_thumbs.checker.clone();
+                if let Some(root) = library.root.as_deref() {
+                    ui.online_previews.local_page(root, records.clone().map(|(_, record)| record), &mut images, &placeholder);
+                } else {
+                    ui.online_previews.clear();
+                }
+                for (index, record) in records {
+                    let preview = ui.online_previews.local_image(record).unwrap_or_else(|| placeholder.clone());
+                    let tile = node(&mut commands, results, Node {
+                        width: px(112), flex_shrink: 0., ..column(3.)
+                    });
+                    let card = material_card(&mut commands, tile, font, &record.asset.name, preview,
+                        PaintAction::ApplyDownloaded(index));
+                    let label = format!("{} · {}K", record.provider.name(), record.resolution);
+                    text(&mut commands, card, font, &label, 10., MUTED);
+                    let menu_action = PaintAction::DownloadedMenu(Some(index));
+                    let menu = button(&mut commands, tile, font, "⋯", menu_action);
+                    commands.entity(menu).insert(AccessibleLabel(format!("Действия · {}", record.asset.name)));
+                    commands.entity(card).observe(move |mut event: On<PointerClick>, mut actions: MessageWriter<Action>| {
+                        if event.button == PointerButton::Secondary {
+                            event.propagate(false);
+                            actions.write(Action::ModelView(ModelViewAction::Paint(menu_action)));
+                        }
+                    });
                 }
                 shown += 1;
             }
@@ -4150,18 +4347,44 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 if session.smart_loading {
                     text(&mut commands, ui.shelf, font, "Загрузка материала…", 12., MUTED);
                 }
+                if let Some(index) = shelf_filter.smart_recipe_menu
+                    && let Some(preset) = SMART_MATERIALS.get(index)
+                {
+                    let menu = node(&mut commands, ui.shelf, column(4.));
+                    text(&mut commands, menu, font, preset.name, 11., TEXT);
+                    button(&mut commands, menu, font, "Добавить группой", PaintAction::AddSmartMaterial(index));
+                    button(&mut commands, menu, font, "Добавить одним графом", PaintAction::AddSmartGraph(index));
+                    button(&mut commands, menu, font, "Закрыть", PaintAction::SmartRecipeMenu(None));
+                }
                 let mut group = None;
                 for (i, kind) in material_results(SMART_MATERIALS, shelf_filter, |preset| (preset.name, preset.kind())) {
                     shown += 1;
                     let preset = &SMART_MATERIALS[i];
                     let parent = material_group(&mut commands, ui.shelf, font, shelf_filter, &mut group, kind);
+                    let tile = node(&mut commands, parent, Node {
+                        width: px(112), height: px(140), flex_shrink: 0., ..default()
+                    });
                     let card = material_card(
-                        &mut commands, parent, font, preset.name,
+                        &mut commands, tile, font, preset.name,
                         ui.smart_swatches[i].clone(), PaintAction::AddSmartMaterial(i),
                     );
                     commands.entity(card).insert(AccessibleLabel(format!(
                         "Добавить умный материал · {}", preset.name
                     )));
+                    let action = PaintAction::SmartRecipeMenu(Some(i));
+                    let menu = button(&mut commands, tile, font, "⋯", action);
+                    commands.entity(menu).insert(AccessibleLabel(format!("Действия · {}", preset.name)));
+                    commands.entity(menu).entry::<Node>().and_modify(|mut node| {
+                        node.position_type = PositionType::Absolute;
+                        node.right = px(5);
+                        node.top = px(5);
+                    });
+                    commands.entity(card).observe(move |mut event: On<PointerClick>, mut actions: MessageWriter<Action>| {
+                        if event.button == PointerButton::Secondary {
+                            event.propagate(false);
+                            actions.write(Action::ModelView(ModelViewAction::Paint(action)));
+                        }
+                    });
                 }
             }
             Category::Generators => {
@@ -4229,30 +4452,103 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 ] {
                     button(&mut commands, tools, font, label, action);
                 }
+                if let Some(texture) = shelf_filter.texture_menu
+                    && let Some(grain) = paint.tips.grains.get(texture)
+                {
+                    let menu = node(&mut commands, shelf, column(3.));
+                    text(&mut commands, menu, font, &grain.name, 11., TEXT);
+                    button(&mut commands, menu, font, "Заливка высоты", PaintAction::AddShelfTexture(texture));
+                    let channels = node(&mut commands, menu, Node {
+                        max_width: px(200.), flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(3.)
+                    });
+                    for channel in [3, 0, 1, 2] {
+                        button(&mut commands, channels, font, CHANNELS[channel], PaintAction::TextureToChannel(texture, channel));
+                    }
+                    button(&mut commands, menu, font, "Закрыть", PaintAction::ShelfTextureMenu(None));
+                }
                 for (i, grain) in paint.tips.grains.iter().enumerate() {
-                    if !shelf_filter.matches(&grain.name) {
+                    if !tips::texture_matches(i, &shelf_filter.query) {
                         continue;
                     }
                     shown += 1;
-                    alpha_card(
+                    let tile = node(&mut commands, shelf, Node {
+                        width: px(106), height: px(138), flex_shrink: 0., ..default()
+                    });
+                    let card = alpha_card(
                         &mut commands,
-                        ui.shelf,
+                        tile,
                         font,
                         grain,
                         PaintAction::Grain(Some(i)),
                     );
+                    let add = icon(
+                        &mut commands, tile, icons::Glyph::Plus,
+                        &format!("Добавить заливку высоты · {}", grain.name),
+                        PaintAction::AddShelfTexture(i),
+                    );
+                    commands.entity(add).entry::<Node>().and_modify(|mut node| {
+                        node.position_type = PositionType::Absolute;
+                        node.right = px(5);
+                        node.top = px(5);
+                    });
+                    commands.entity(card).observe(move |mut event: On<PointerClick>, mut actions: MessageWriter<Action>| {
+                        let action = match event.button {
+                            PointerButton::Primary if event.count == 2 => PaintAction::AddShelfTexture(i),
+                            PointerButton::Secondary => PaintAction::ShelfTextureMenu(Some(i)),
+                            _ => return,
+                        };
+                        event.propagate(false);
+                        actions.write(Action::ModelView(ModelViewAction::Paint(action)));
+                    });
                 }
             }
             Category::Graphs => {
-                let tools = node(&mut commands, ui.shelf, Node { align_self: AlignSelf::Start, ..row(5.) });
+                let tools = node(&mut commands, ui.shelf, column(4.));
                 button(&mut commands, tools, font, "Импорт .mpgraph или ZIP…", PaintAction::ImportGraphFile);
                 if session.smart_loading {
                     text(&mut commands, tools, font, "Расчёт материала…", 12., MUTED);
                 }
+                if let Some(index) = shelf_filter.saved_graph_menu
+                    && let Some(entry) = paint.graph_shelf.entries.get(index)
+                {
+                    text(&mut commands, tools, font, &entry.name, 11., TEXT);
+                    button(&mut commands, tools, font, "Открыть на холсте", PaintAction::OpenSavedGraph(index));
+                    button(&mut commands, tools, font, "Пакет CC0…", PaintAction::ShareSavedGraph(index));
+                    button(&mut commands, tools, font, "Закрыть", PaintAction::SavedGraphMenu(None));
+                }
+                let placeholder = ui.layer_thumbs.checker.clone();
+                for (index, entry) in paint.graph_shelf.entries.iter().enumerate() {
+                    if !shelf_filter.matches(&entry.name) {
+                        continue;
+                    }
+                    shown += 1;
+                    let swatch = entry.thumbnail.as_ref().map_or_else(|| placeholder.clone(), |bitmap| {
+                        ui.graph_swatches.entry(index)
+                            .or_insert_with(|| images.add(shelf_image(bitmap.pixels().clone()))).clone()
+                    });
+                    let tile = node(&mut commands, shelf, Node {
+                        width: px(112), height: px(140), flex_shrink: 0., ..default()
+                    });
+                    let card = material_card(&mut commands, tile, font, &entry.name, swatch, PaintAction::ApplySavedGraph(index));
+                    let action = PaintAction::SavedGraphMenu(Some(index));
+                    let menu = button(&mut commands, tile, font, "⋯", action);
+                    commands.entity(menu).insert(AccessibleLabel(format!("Действия · {}", entry.name)));
+                    commands.entity(menu).entry::<Node>().and_modify(|mut node| {
+                        node.position_type = PositionType::Absolute;
+                        node.right = px(5);
+                        node.top = px(5);
+                    });
+                    commands.entity(card).observe(move |mut event: On<PointerClick>, mut actions: MessageWriter<Action>| {
+                        if event.button == PointerButton::Secondary {
+                            event.propagate(false);
+                            actions.write(Action::ModelView(ModelViewAction::Paint(action)));
+                        }
+                    });
+                }
                 for (i, record) in paint.community.records.iter().enumerate() {
                     if record.kind == online::community::Kind::Graph && shelf_filter.matches(&record.name) {
                         shown += 1;
-                        button(&mut commands, tools, font, &record.name, PaintAction::CommunityGraph(i));
+                        material_card(&mut commands, ui.shelf, font, &record.name, placeholder.clone(), PaintAction::CommunityGraph(i));
                     }
                 }
                 for (i, recipe) in material_graph::PRESETS.iter().enumerate() {
@@ -4275,11 +4571,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
         ui.shelf_stamp = Some(shelf_stamp);
     }
-    ui.online_previews.update(session.category == Category::Online
+    ui.online_previews.update(matches!(session.category, Category::Online | Category::Downloaded)
         && (!shelf_docked || sidebar.shelf_tab_visible())
         && !editor.browser_popup && !editor.hdri_library_open, &mut images);
     if session.category == Category::Smart && ui.shelf_preview_job.is_none() {
-        let user = paint.library.entries.iter().enumerate().rev().find(|(i, entry)| {
+        let user = paint.library.entries().rev().find(|(i, entry)| {
             entry.thumbnail.is_none()
                 && !ui.requested_swatches.contains(&ShelfMaterial::User(*i))
                 && ui.user_swatches.contains_key(i)

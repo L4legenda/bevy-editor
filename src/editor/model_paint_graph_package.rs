@@ -3,7 +3,7 @@ use super::*;
 use crate::editor::ui::model_viewer::paint::node_library::{EMBEDDED_SOURCES, SOURCE_LIMIT};
 use std::{
     collections::{BTreeMap, HashSet},
-    io::Seek,
+    io::{Cursor, Seek},
 };
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
@@ -78,6 +78,8 @@ pub(in crate::editor::ui::model_viewer::paint) struct Package {
     entries: HashSet<String>,
     files: Vec<String>,
     pub main: String,
+    title: String,
+    thumb: Option<String>,
 }
 
 impl Package {
@@ -142,12 +144,16 @@ impl Package {
             return Err(format!("В ZIP-пакете несколько файлов .{extension}"));
         }
         let (root, main) = (root.to_owned(), main.clone());
+        let title = crate::editor::hdri_catalog::clean_name(info.get("name"), "Граф материала");
+        let thumb = info["thumb"].as_str().filter(|path| relative(path)).map(str::to_owned);
         Ok(Self {
             archive,
             root,
             entries,
             files,
             main,
+            title,
+            thumb,
         })
     }
 
@@ -188,6 +194,24 @@ impl Package {
         }
         Ok(sources)
     }
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn shelf_metadata(
+    path: &Path,
+) -> Result<(String, Option<Arc<Bitmap>>), String> {
+    let mut package = Package::open(path, "graph", "mpgraph")?;
+    let thumbnail = package.thumb.as_ref().and_then(|name| {
+        let bytes = read_entry(&mut package.archive, &format!("{}{name}", package.root), 1024 * 1024).ok()?;
+        let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Png);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(512);
+        limits.max_image_height = Some(512);
+        limits.max_alloc = Some(2 * 1024 * 1024);
+        reader.limits(limits);
+        let decoded = reader.decode().ok()?.into_rgba8();
+        Bitmap::from_rgba("thumb.png".into(), decoded).ok().map(Arc::new)
+    });
+    Ok((package.title, thumbnail))
 }
 
 pub(in crate::editor::ui::model_viewer::paint) fn attach_sources(
@@ -321,7 +345,16 @@ pub(in crate::editor::ui::model_viewer::paint) fn export(
     payload: &Value,
     images: &GraphImages,
 ) -> Result<PathBuf, String> {
-    export_as(directory, payload, images, GraphPackage::Local)
+    export_as(directory, payload, images, GraphPackage::Local(None))
+}
+
+pub(in crate::editor::ui::model_viewer::paint) fn export_shelf(
+    directory: &Path,
+    payload: &Value,
+    images: &GraphImages,
+    thumbnail: Option<&[u8]>,
+) -> Result<PathBuf, String> {
+    export_as(directory, payload, images, GraphPackage::Local(thumbnail))
 }
 
 pub(in crate::editor::ui::model_viewer::paint) fn export_submission(
@@ -339,7 +372,7 @@ pub(in crate::editor::ui::model_viewer::paint) fn export_submission(
 }
 
 enum GraphPackage<'a> {
-    Local,
+    Local(Option<&'a [u8]>),
     Submission(Option<&'a [u8]>),
 }
 
@@ -394,8 +427,7 @@ fn export_as(
         .chain(bitmaps.keys().map(String::as_str))
         .collect();
     let preview = match format {
-        GraphPackage::Local => None,
-        GraphPackage::Submission(preview) => preview,
+        GraphPackage::Local(preview) | GraphPackage::Submission(preview) => preview,
     };
     let mut info = serde_json::json!({
         "id": id, "name": graph.name, "kind": "graph", "path": format!("items/{id}"),
@@ -516,6 +548,15 @@ mod tests {
             images.values().next().unwrap().pixels().get_pixel(0, 0).0,
             rgba
         );
+
+        let shelf_path = export_shelf(&directory, &encode(&imported), &images, Some(&png)).unwrap();
+        let (shelf_name, thumbnail) = shelf_metadata(&shelf_path).unwrap();
+        assert_eq!(shelf_name, "Shared graph");
+        assert_eq!(thumbnail.unwrap().pixels().get_pixel(0, 0).0, rgba);
+        let (saved_graph, saved_images) = super::super::load(&shelf_path).unwrap();
+        let id = &saved_graph.node(2).unwrap().def;
+        assert_eq!(library().find(id).unwrap().source, WGSL);
+        assert_eq!(saved_images.values().next().unwrap().pixels().get_pixel(0, 0).0, rgba);
 
         let output = export(&directory, &encode(&imported), &images).unwrap();
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();

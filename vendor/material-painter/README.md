@@ -21,6 +21,9 @@ rendered with `TEXTURES[i].render(256)` from `src/textures.rs` at the same
 revision. The tiles are in source order, five per row. The grain coverage
 adapts `src/shaders/apply.wgsl`, and the reflection adapts the screen-space
 symmetry in `src/shaders/stamp.wgsl` to Bevy's scene depth and object IDs.
+The adjacent `textures.rs` keeps the original generators for 1024 × 1024
+maps assigned from the texture shelf. The atlas still supplies the swatches
+and brush grain.
 
 The stamp spacing, pressure interpolation and stabilizer in
 `src/editor/model_paint_stroke.rs` adapt `App::continue_stroke` from `src/app.rs`.

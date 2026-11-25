@@ -78,6 +78,13 @@ enum ImageState {
 /// Images decoded on worker threads, waiting to be uploaded.
 type Decoded = (PathBuf, Result<image::RgbaImage, String>);
 
+struct ReadOutput<'a> {
+    usage: usize,
+    texture: &'a Tex,
+    row: u32,
+    bytes: u64,
+}
+
 pub struct Runtime {
     assets: PathBuf,
     blit: wgpu::RenderPipeline,
@@ -264,22 +271,68 @@ impl Runtime {
         graph: &Graph,
         lib: &Library,
     ) -> Result<[Option<image::RgbaImage>; super::USAGES.len()], String> {
+        self.read_outputs_with(device, queue, graph, lib, |_, width, height, stride, data| {
+            let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+            for padded in data.chunks_exact(stride) {
+                for channel in padded[..width as usize * 8].chunks_exact(2) {
+                    let value = half::f16::from_le_bytes([channel[0], channel[1]]).to_f32();
+                    pixels.push((value.clamp(0., 1.) * 255.).round() as u8);
+                }
+            }
+            image::RgbaImage::from_raw(width, height, pixels).ok_or_else(|| "Invalid graph output dimensions".into())
+        })
+    }
+
+    /// Reads each output in its native RGBA16Float layout, including row padding.
+    /// The decoder runs while the shared GPU readback buffer is mapped.
+    pub fn read_outputs_with<T>(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        graph: &Graph,
+        lib: &Library,
+        mut decode: impl FnMut(usize, u32, u32, usize, &[u8]) -> Result<T, String>,
+    ) -> Result<[Option<T>; super::USAGES.len()], String> {
         let outputs = graph.outputs(lib);
         let mut textures = Vec::new();
-        let mut length = 0;
+        let limit = device.limits().max_buffer_size.min(128 * 1024 * 1024);
         for (usage, node) in outputs.into_iter().enumerate() {
             let Some(node) = node else { continue };
             let tex = self
                 .output(node)
                 .ok_or_else(|| format!("Output {} did not render", super::USAGES[usage]))?;
             let row = (tex.width * 8).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            textures.push((usage, tex, length, row));
-            length += u64::from(row) * u64::from(tex.height);
+            let bytes = u64::from(row) * u64::from(tex.height);
+            if bytes > limit {
+                return Err(format!("Output {} exceeds the GPU readback limit", super::USAGES[usage]));
+            }
+            textures.push(ReadOutput { usage, texture: tex, row, bytes });
         }
         let mut result = std::array::from_fn(|_| None);
-        if textures.is_empty() {
-            return Ok(result);
+        let mut start = 0;
+        while start < textures.len() {
+            let mut length = 0;
+            let end = start + textures[start..].iter().take_while(|output| {
+                if length + output.bytes > limit {
+                    return false;
+                }
+                length += output.bytes;
+                true
+            }).count();
+            Self::read_output_batch(device, queue, &textures[start..end], length, &mut decode, &mut result)?;
+            start = end;
         }
+        Ok(result)
+    }
+
+    fn read_output_batch<T>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        textures: &[ReadOutput<'_>],
+        length: u64,
+        decode: &mut impl FnMut(usize, u32, u32, usize, &[u8]) -> Result<T, String>,
+        result: &mut [Option<T>; super::USAGES.len()],
+    ) -> Result<(), String> {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Material graph readback"),
             size: length,
@@ -287,19 +340,22 @@ impl Runtime {
             mapped_at_creation: false,
         });
         let mut encoder = device.create_command_encoder(&Default::default());
-        for &(_, texture, offset, row) in &textures {
+        let mut offset = 0;
+        for output in textures {
+            let texture = output.texture;
             encoder.copy_texture_to_buffer(
                 texture.copy_info(),
                 wgpu::TexelCopyBufferInfo {
                     buffer: &buffer,
                     layout: wgpu::TexelCopyBufferLayout {
                         offset,
-                        bytes_per_row: Some(row),
+                        bytes_per_row: Some(output.row),
                         rows_per_image: Some(texture.height),
                     },
                 },
                 texture.extent(),
             );
+            offset += output.bytes;
         }
         let submission = queue.submit([encoder.finish()]);
         let slice = buffer.slice(..);
@@ -317,22 +373,18 @@ impl Runtime {
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
         let mapped = slice.get_mapped_range().map_err(|e| e.to_string())?;
-        for (usage, texture, offset, row) in textures {
-            let stride = row as usize;
-            let start = offset as usize;
-            let end = start + stride * texture.height as usize;
-            let mut pixels = Vec::with_capacity((texture.width * texture.height * 4) as usize);
-            for padded in mapped[start..end].chunks_exact(stride) {
-                for channel in padded[..texture.width as usize * 8].chunks_exact(2) {
-                    let value = half::f16::from_le_bytes([channel[0], channel[1]]).to_f32();
-                    pixels.push((value.clamp(0., 1.) * 255.).round() as u8);
-                }
-            }
-            result[usage] = image::RgbaImage::from_raw(texture.width, texture.height, pixels);
+        let mut start = 0;
+        for output in textures {
+            let texture = output.texture;
+            let end = start + output.bytes as usize;
+            result[output.usage] = Some(decode(
+                output.usage, texture.width, texture.height, output.row as usize, &mapped[start..end],
+            )?);
+            start = end;
         }
         drop(mapped);
         buffer.unmap();
-        Ok(result)
+        Ok(())
     }
 
     /// A node's 8-bit thumbnail.

@@ -50,7 +50,7 @@ pub(super) struct Canvas {
     title: Entity,
     diagnostic: Entity,
     palettes: [Entity; 2],
-    export_tools: [Entity; 3],
+    export_tools: [Entity; 5],
     delete: Entity,
     library: Option<Arc<Library>>,
     open_palette: bool,
@@ -227,6 +227,8 @@ impl Canvas {
             "ZIP…",
             PaintAction::ExportGraphPackage,
         );
+        let save = button(commands, toolbar, font, "На полку", PaintAction::SaveGraphShelf);
+        let outputs = button(commands, toolbar, font, "Карты…", PaintAction::ExportGraphOutputs);
         let submission = button(commands, toolbar, font, "Пакет CC0…", PaintAction::ShareCommunityGraph);
         let diagnostic = text(commands, root, font, "", 12., Color::srgb(1., 0.64, 0.44));
         commands
@@ -339,7 +341,7 @@ impl Canvas {
             title,
             diagnostic,
             palettes,
-            export_tools: [export, package, submission],
+            export_tools: [export, package, outputs, save, submission],
             delete,
             library: None,
             open_palette: false,

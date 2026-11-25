@@ -1,5 +1,5 @@
-//! Bounded thumbnail jobs for the current page of the online material shelf.
-use super::{Material, Provider, cache};
+//! Bounded thumbnail jobs for the current page of a material shelf.
+use super::{Material, Provider, cache, downloaded::Record};
 use crate::editor::{
     hdri_catalog::public_thumbnail,
     image_previews::{DecodedImage, texture_image},
@@ -19,7 +19,13 @@ const WORKERS: usize = 3;
 
 struct Source {
     key: String,
-    url: String,
+    origin: Origin,
+}
+
+#[derive(Clone)]
+enum Origin {
+    Remote(String),
+    Local(PathBuf, Record),
 }
 
 struct Slot {
@@ -47,15 +53,42 @@ impl Previews {
         images: &mut Assets<Image>,
         placeholder: &Handle<Image>,
     ) {
-        self.visible = entries
+        let sources = entries
             .into_iter()
             .filter_map(|entry| {
                 Some(Source {
                     key: key(provider, entry)?,
-                    url: entry.thumbnail.clone()?,
+                    origin: Origin::Remote(entry.thumbnail.clone()?),
                 })
             })
             .collect();
+        self.set_page(sources, images, placeholder);
+    }
+
+    pub fn local_page<'a>(
+        &mut self,
+        root: &Path,
+        records: impl IntoIterator<Item = &'a Record>,
+        images: &mut Assets<Image>,
+        placeholder: &Handle<Image>,
+    ) {
+        let sources = records
+            .into_iter()
+            .map(|record| Source {
+                key: local_key(record),
+                origin: Origin::Local(root.to_path_buf(), record.clone()),
+            })
+            .collect();
+        self.set_page(sources, images, placeholder);
+    }
+
+    fn set_page(
+        &mut self,
+        sources: Vec<Source>,
+        images: &mut Assets<Image>,
+        placeholder: &Handle<Image>,
+    ) {
+        self.visible = sources;
         self.slots
             .retain(|key, _| self.visible.iter().any(|source| source.key == *key));
         for source in &self.visible {
@@ -77,6 +110,12 @@ impl Previews {
     pub fn image(&self, provider: Provider, entry: &Material) -> Option<Handle<Image>> {
         self.slots
             .get(&key(provider, entry)?)
+            .map(|slot| slot.image.clone())
+    }
+
+    pub fn local_image(&self, record: &Record) -> Option<Handle<Image>> {
+        self.slots
+            .get(&local_key(record))
             .map(|slot| slot.image.clone())
     }
 
@@ -114,17 +153,26 @@ impl Previews {
             if self.jobs.iter().any(|job| job.key == source.key) {
                 continue;
             }
-            let url = source.url.clone();
+            let origin = source.origin.clone();
             let key = source.key.clone();
             self.jobs.push(Job {
                 key: source.key.clone(),
                 task: IoTaskPool::get().spawn(async move {
-                    let file = cache().and_then(|directory| cache_file(&directory, &key));
-                    public_thumbnail(&url, file.as_deref(), UVec2::splat(EDGE))
+                    match origin {
+                        Origin::Remote(url) => {
+                            let file = cache().and_then(|directory| cache_file(&directory, &key));
+                            public_thumbnail(&url, file.as_deref(), UVec2::splat(EDGE))
+                        }
+                        Origin::Local(root, record) => record.preview(&root, EDGE),
+                    }
                 }),
             });
         }
     }
+}
+
+fn local_key(record: &Record) -> String {
+    format!("downloaded-{}", record.key())
 }
 
 fn key(provider: Provider, entry: &Material) -> Option<String> {

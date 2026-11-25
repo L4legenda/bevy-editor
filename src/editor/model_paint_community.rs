@@ -1,6 +1,6 @@
 //! Material Painter community index, portable packages and installed graph records.
 use super::{Material, valid_id};
-use crate::editor::model_paint_data::texture_fill::{self, Bitmap, GraphImages};
+use crate::editor::model_paint_data::texture_fill::{Bitmap, GraphImages};
 use crate::editor::{
     hdri_catalog::{atomic_write, clean_name, get, strings},
     ui::model_viewer::paint::{material_graph, node_library, presets},
@@ -28,6 +28,8 @@ pub(in super::super) enum Draft {
         preview: Option<Arc<Bitmap>>,
     },
     Smart(presets::Capture),
+    SavedSmart(presets::Entry),
+    SavedGraph(super::super::graph_shelf::Entry),
 }
 
 pub(in super::super) struct Submission {
@@ -46,20 +48,7 @@ pub(in super::super) fn prepare(root: &Path, draft: Draft) -> Result<Submission,
             images,
             preview,
         } => {
-            let thumbnail = preview
-                .as_ref()
-                .map(|bitmap| {
-                    let pixels = bitmap.pixels();
-                    let scale = (144. / pixels.width().max(pixels.height()) as f32).min(1.);
-                    let size = |value: u32| (value as f32 * scale).round().max(1.) as u32;
-                    let thumbnail = image::imageops::thumbnail(
-                        pixels,
-                        size(pixels.width()),
-                        size(pixels.height()),
-                    );
-                    texture_fill::encode_png(&thumbnail)
-                })
-                .transpose()?;
+            let thumbnail = super::super::graph_shelf::thumbnail(preview.as_deref())?;
             let name = clean_name(payload.get("name"), "Граф материала");
             let path = material_graph::file::package::export_submission(
                 &directory,
@@ -86,6 +75,19 @@ pub(in super::super) fn prepare(root: &Path, draft: Draft) -> Result<Submission,
                 omitted: report.omitted,
                 adjusted: report.adjusted,
             })
+        }
+        Draft::SavedSmart(entry) => {
+            let name = entry.name.clone();
+            let report = presets::export_saved_community_package(&directory, entry)?;
+            Ok(Submission { path: report.path, name, omitted: report.omitted, adjusted: report.adjusted })
+        }
+        Draft::SavedGraph(entry) => {
+            let (graph, images) = material_graph::file::load(&entry.path)?;
+            let thumbnail = super::super::graph_shelf::thumbnail(entry.thumbnail.as_deref())?;
+            let path = material_graph::file::package::export_submission(
+                &directory, &material_graph::encode(&graph), &images, thumbnail.as_deref(),
+            )?;
+            Ok(Submission { path, name: graph.name, omitted: 0, adjusted: 0 })
         }
     }
 }

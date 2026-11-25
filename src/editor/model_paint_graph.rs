@@ -18,6 +18,15 @@ pub(super) use material_painter_graph::presets::PRESETS;
 
 pub(super) const MPP_GRAPH_PENDING: &str = "bevy_mpp_graph_pending";
 pub(super) const MPP_GRAPH_KEEP_CACHE: &str = "bevy_mpp_graph_keep_cache";
+pub(super) const RESOLUTIONS: [u32; 5] = [256, 512, 1024, 2048, 4096];
+
+pub(super) fn render_limit(device: &RenderDevice) -> u32 {
+    let limits = device.limits();
+    RESOLUTIONS.into_iter().rev().find(|size| {
+        *size <= limits.max_texture_dimension_2d
+            && u64::from(*size).pow(2) * 8 <= limits.max_buffer_size
+    }).unwrap_or_else(|| limits.max_texture_dimension_2d.min(128))
+}
 
 pub(super) fn encode_without_rebuild(graph: &Graph, previous: &serde_json::Value) -> serde_json::Value {
     let mut payload = encode(graph);
@@ -79,6 +88,7 @@ pub(in crate::editor) enum Edit {
     LabelParameter(usize, bool),
     ClearBitmap(ParameterTarget),
     SetMeshMap(ParameterTarget, usize),
+    Resolution(Option<u32>),
 }
 
 impl Edit {
@@ -123,6 +133,16 @@ impl Edit {
                 .ok_or("Вход узла не найден")
         };
         match self {
+            Self::Resolution(size) => {
+                if shading || size.is_some_and(|size| !RESOLUTIONS.contains(&size)) {
+                    return Err("Неподдерживаемое разрешение графа".into());
+                }
+                graph.match_set = size.is_none();
+                if let Some(size) = size {
+                    graph.res = size;
+                }
+                Ok(None)
+            }
             Self::Add(index, pos) => {
                 let def = lib
                     .defs
@@ -274,8 +294,8 @@ pub(super) fn prepare(
 ) -> Result<Layer, String> {
     let preset = PRESETS.get(preset).ok_or("Граф материала не найден")?;
     let mut graph = (preset.build)();
-    graph.res = size.min(1024);
-    graph.match_set = false;
+    graph.res = size;
+    graph.match_set = true;
     prepare_graph(graph, &Default::default(), size, inputs, device, queue)
 }
 
@@ -308,6 +328,7 @@ pub(super) fn affected_layers(
     stack: &Stack,
     maps: bool,
     geometry: bool,
+    set_size: Option<u32>,
 ) -> Vec<(usize, bool, Graph)> {
     stack
         .layers
@@ -323,7 +344,15 @@ pub(super) fn affected_layers(
                         return None;
                     }
                     let graph = read(payload).ok()?;
-                    ((geometry && pending_import(payload))
+                    let cached = if mask {
+                        layer.mask.as_ref()?.graph.as_ref()?.output.as_deref()
+                    } else {
+                        layer.texture_fill.as_ref()?.images.iter().flatten().next().map(Arc::as_ref)
+                    };
+                    let needs_resize = graph.match_set && set_size.is_some_and(|size| {
+                        cached.is_some_and(|image| image.pixels().width() != size || image.pixels().height() != size)
+                    });
+                    (needs_resize || (geometry && pending_import(payload))
                         || (maps && !mesh_maps::used(&graph).is_empty())
                         || ((maps || geometry) && surface::used(&graph)))
                     .then_some((index, mask, graph))
@@ -570,24 +599,39 @@ fn render(
     if graph.nodes.is_empty() {
         return Ok((graph, Default::default(), Default::default()));
     }
-    graph.validate_texture_graph(library)?;
     let authored_resolution = graph.res;
+    let (runtime, images) = evaluate(&mut graph, images, set_size, inputs, device, queue, library)?;
+    let outputs = runtime.read_outputs(device.wgpu_device(), queue, &graph, library)?;
+    graph.res = authored_resolution;
+    Ok((graph, images, outputs))
+}
+
+fn evaluate(
+    graph: &mut Graph,
+    images: &texture_fill::GraphImages,
+    set_size: u32,
+    inputs: Inputs<'_>,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    library: &Library,
+) -> Result<(Runtime, texture_fill::GraphImages), String> {
+    graph.validate_texture_graph(library)?;
     let resolution = if graph.match_set {
         set_size
     } else {
-        authored_resolution
+        graph.res
     };
-    graph.res = resolution.clamp(16, 1024);
+    graph.res = resolution.clamp(16, render_limit(device));
     let mut runtime = Runtime::new(device.wgpu_device(), queue, assets());
-    let images = file::bind_images(&mut graph, images, &mut runtime, device, queue)?;
+    let images = file::bind_images(graph, images, &mut runtime, device, queue)?;
     let mesh = mesh_maps::Textures::new(
-        &mesh_maps::used(&graph),
+        &mesh_maps::used(graph),
         inputs.maps,
         graph.res,
         device,
         queue,
     );
-    let surface = if surface::used(&graph) {
+    let surface = if surface::used(graph) {
         let source = inputs
             .surface
             .ok_or("Для поверхностного узла нужен набор текстур модели")?;
@@ -605,7 +649,7 @@ fn render(
     runtime.evaluate(
         device,
         queue,
-        &graph,
+        graph,
         library,
         &|id| mesh.get(id),
         surface.as_ref().map(surface::Textures::inputs).as_ref(),
@@ -616,9 +660,59 @@ fn render(
         let title = graph.node(*node).map_or("Узел", |node| node.def.as_str());
         return Err(format!("{title} · {error}"));
     }
-    let outputs = runtime.read_outputs(device, queue, &graph, library)?;
-    graph.res = authored_resolution;
-    Ok((graph, images, outputs))
+    Ok((runtime, images))
+}
+
+pub(super) fn export_outputs(
+    directory: &std::path::Path,
+    payload: &serde_json::Value,
+    images: &texture_fill::GraphImages,
+    set_size: u32,
+    inputs: Inputs<'_>,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+) -> Result<export::Report, String> {
+    let mut graph = read(payload)?;
+    let library = library();
+    if graph.outputs(&library).iter().all(Option::is_none) {
+        return Err("В графе нет выходов".into());
+    }
+    let (runtime, _) = evaluate(&mut graph, images, set_size, inputs, device, queue, &library)?;
+    let outputs = runtime.read_outputs_with(
+        device.wgpu_device(), queue, &graph, &library, decode_output,
+    )?;
+    export::write_graph_outputs(directory, &graph.name, outputs).map_err(|error| error.to_string())
+}
+
+fn decode_output(
+    usage: usize,
+    width: u32,
+    height: u32,
+    stride: usize,
+    data: &[u8],
+) -> Result<image::DynamicImage, String> {
+    let pixels = data.chunks_exact(stride)
+        .flat_map(|row| row[..width as usize * 8].chunks_exact(8));
+    let sample = |pixel: &[u8], channel: usize| {
+        let offset = channel * 2;
+        half::f16::from_le_bytes([pixel[offset], pixel[offset + 1]]).to_f32().clamp(0., 1.)
+    };
+    let byte = |pixel: &[u8], channel| (sample(pixel, channel) * 255.).round() as u8;
+    let output = match usage {
+        0 | 6 | 7 => {
+            let rgb = pixels.flat_map(|pixel| [byte(pixel, 0), byte(pixel, 1), byte(pixel, 2)]).collect();
+            image::RgbImage::from_raw(width, height, rgb).map(image::DynamicImage::ImageRgb8)
+        }
+        3 => {
+            let height_values = pixels.map(|pixel| (sample(pixel, 0) * 65535.).round() as u16).collect();
+            image::ImageBuffer::from_raw(width, height, height_values).map(image::DynamicImage::ImageLuma16)
+        }
+        _ => {
+            let values = pixels.map(|pixel| byte(pixel, 0)).collect();
+            image::GrayImage::from_raw(width, height, values).map(image::DynamicImage::ImageLuma8)
+        }
+    };
+    output.ok_or_else(|| "Неверный размер выхода графа".into())
 }
 
 pub(super) fn assets() -> PathBuf {

@@ -584,6 +584,7 @@ dependencies = [
  "photocraft-geom",
  "photocraft-paint",
  "photocraft-raster",
+ "rayon",
  "reqwest",
  "resvg 0.49.0",
  "rmcp",

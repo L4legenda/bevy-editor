@@ -12,6 +12,8 @@ const COLUMNS: u32 = 6;
 const ATLAS: &[u8] = include_bytes!("../../assets/paint/brush-tips.png");
 const SPLATTER_CELL: u32 = 3;
 const GRAINS: &[u8] = include_bytes!("../../assets/paint/brush-grains.png");
+#[path = "../../vendor/material-painter/textures.rs"]
+mod procedural;
 const GRAIN_LABELS: [&str; 25] = [
     "Плитка",
     "Соты",
@@ -65,6 +67,44 @@ const LABELS: [&str; 24] = [
     "Кольцо",
     "Шайба",
 ];
+
+pub(super) fn texture_name(index: usize) -> &'static str {
+    GRAIN_LABELS[index]
+}
+
+pub(super) fn texture_matches(index: usize, query: &str) -> bool {
+    let source = &procedural::TEXTURES[index];
+    texture_name(index).to_lowercase().contains(query)
+        || source.name.to_lowercase().contains(query)
+        || source.category.to_lowercase().contains(query)
+}
+
+pub(super) fn texture_bitmap(index: usize) -> Result<super::texture_fill::Bitmap, String> {
+    use image::ImageEncoder;
+    const SIZE: u32 = 1024;
+    let texture = procedural::TEXTURES.get(index).ok_or("Текстура не найдена")?;
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&texture.render(SIZE), SIZE, SIZE, image::ExtendedColorType::L8)
+        .map_err(|error| error.to_string())?;
+    super::texture_fill::Bitmap::decode(format!("{}.png", texture_name(index)), &png)
+}
+
+pub(super) fn texture_layer(index: usize) -> Result<Vec<super::Layer>, String> {
+    use super::{Layer, LayerKind, texture_fill};
+    let bitmap = texture_bitmap(index)?;
+    let mut layer = Layer::new(texture_name(index).into(), LayerKind::Fill);
+    layer.edit_texture_fill(|fill| {
+        fill.settings.projection = texture_fill::Projection::Triplanar;
+        fill.settings.tiling = 2.;
+        fill.images[3] = Some(std::sync::Arc::new(bitmap));
+    });
+    Ok(vec![layer])
+}
+
+pub(super) fn has_texture(index: usize) -> bool {
+    index < GRAIN_LABELS.len()
+}
 
 pub(super) struct Tip {
     pub name: String,

@@ -479,6 +479,24 @@ enum ExportKind {
     Mesh,
 }
 
+pub(super) fn write_graph_outputs(
+    parent: &Path,
+    name: &str,
+    outputs: [Option<image::DynamicImage>; material_painter_graph::USAGES.len()],
+) -> io::Result<Report> {
+    let mut directory = ExportDirectory::create(parent, name, "outputs", FileOptions::default())?;
+    let stem = safe_stem(name);
+    for (usage, image) in material_painter_graph::USAGES.into_iter().zip(outputs) {
+        if let Some(image) = image {
+            let filename = format!("{stem}_{}.png", usage.replace(' ', ""));
+            let mut writer = directory.file(&filename)?;
+            image.write_to(&mut writer, image::ImageFormat::Png).map_err(io::Error::other)?;
+            writer.flush()?;
+        }
+    }
+    Ok(directory.finish(ExportKind::Maps))
+}
+
 #[cfg(test)]
 pub(super) fn write(
     parent: &Path,

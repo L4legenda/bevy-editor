@@ -20,6 +20,8 @@ mod previews;
 pub(super) use previews::Previews;
 #[path = "model_paint_community.rs"]
 pub(super) mod community;
+#[path = "model_paint_downloaded.rs"]
+pub(super) mod downloaded;
 
 const IMAGE_LIMIT: u64 = 64 * 1024 * 1024;
 const ARCHIVE_LIMIT: u64 = 192 * 1024 * 1024;
@@ -56,6 +58,8 @@ impl Provider {
 pub(super) struct Material {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    author: String,
     search: String,
     #[serde(default)]
     thumbnail: Option<String>,
@@ -69,6 +73,7 @@ impl Material {
         Self {
             id: id.into(),
             name,
+            author: String::new(),
             search,
             thumbnail: None,
             community: None,
@@ -137,7 +142,11 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn cache() -> Option<PathBuf> {
-    presets::directory().map(|root| root.join("online"))
+    presets::directory().as_deref().map(cache_in)
+}
+
+pub(super) fn cache_in(root: &Path) -> PathBuf {
+    root.join("online")
 }
 
 fn catalog(provider: Provider, refresh: bool) -> Result<Vec<Material>, String> {
@@ -182,6 +191,9 @@ fn poly_catalog(value: &Value) -> Result<Vec<Material>, String> {
             let mut tags = strings(data.get("tags"));
             tags.extend(strings(data.get("categories")));
             let mut entry = Material::new(id, clean_name(data.get("name"), id), tags);
+            entry.author = data["authors"].as_object()
+                .map(|authors| authors.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
             entry.thumbnail = data["thumbnail_url"].as_str().filter(|url| !url.is_empty()).map(str::to_owned)
                 .or_else(|| Some(format!("https://cdn.polyhaven.com/asset_img/thumbs/{id}.png?width=256&height=256&format=webp")));
             entry
@@ -204,6 +216,7 @@ fn ambient_catalog(value: &Value) -> Result<(usize, Vec<Material>), String> {
                     clean_name(data.get("title"), id),
                     strings(data.get("tags")),
                 );
+                entry.author = "ambientCG".into();
                 entry.thumbnail = ["256-WEBP", "256-PNG", "256-JPG-FFFFFF"]
                     .into_iter()
                     .find_map(|format| data["thumbnails"][format].as_str())
@@ -248,27 +261,36 @@ fn fetch_catalog(provider: Provider) -> Result<Vec<Material>, String> {
 
 type Maps = [Option<Arc<Bitmap>>; 8];
 
-pub(super) fn material(
-    provider: Provider,
-    asset: &Material,
-    resolution: u32,
-) -> Result<Vec<Layer>, String> {
-    material_in(cache(), provider, asset, resolution)
-}
-
-fn material_in(
+pub(super) fn material_in(
     cache: Option<PathBuf>,
     provider: Provider,
     asset: &Material,
     resolution: u32,
 ) -> Result<Vec<Layer>, String> {
+    let maps = texture_maps(cache, provider, asset, resolution)?;
+    let mut layer = Layer::new(asset.name.clone(), LayerKind::Fill);
+    let mut fill = Fill::default();
+    fill.images = maps;
+    layer.texture_fill = Some(Arc::new(fill));
+    Ok(vec![layer])
+}
+
+fn texture_maps(
+    cache: Option<PathBuf>,
+    provider: Provider,
+    asset: &Material,
+    resolution: u32,
+) -> Result<Maps, String> {
     if provider == Provider::Community || !valid_id(&asset.id) || !matches!(resolution, 1 | 2 | 4) {
         return Err("Некорректный материал каталога".into());
     }
-    let directory =
-        cache.map(|root| root.join(format!("{}-{}-{resolution}k", provider.key(), asset.id)));
-    let maps = if let Some(maps) = directory.as_deref().and_then(|path| read_maps(path).ok()) {
-        maps
+    let record = downloaded::Record::new(provider, asset, resolution);
+    let directory = cache.as_deref().map(|root| record.directory(root));
+    let cached = directory
+        .as_deref()
+        .and_then(|path| downloaded::read_maps(path).ok());
+    let (maps, fresh) = if let Some(maps) = cached {
+        (maps, false)
     } else {
         let maps = match provider {
             Provider::PolyHaven => poly_maps(asset, resolution)?,
@@ -278,48 +300,15 @@ fn material_in(
         if maps[0].is_none() {
             return Err("У материала отсутствует карта цвета".into());
         }
-        if let Some(directory) = &directory {
-            write_maps(directory, &maps)?;
-        }
-        maps
+        (maps, true)
     };
-    let mut layer = Layer::new(asset.name.clone(), LayerKind::Fill);
-    let mut fill = Fill::default();
-    fill.images = maps;
-    layer.texture_fill = Some(Arc::new(fill));
-    Ok(vec![layer])
-}
-
-fn read_maps(directory: &Path) -> Result<Maps, String> {
-    let mut bytes = Vec::new();
-    fs::File::open(directory.join("maps.json"))
-        .and_then(|file| file.take(1025).read_to_end(&mut bytes))
-        .map_err(|error| error.to_string())?;
-    let slots: [bool; 8] = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if bytes.len() > 1024 || !slots[0] {
-        return Err("В кэше нет описания карт материала".into());
-    }
-    let mut maps: Maps = Default::default();
-    for (index, used) in slots.into_iter().enumerate() {
-        if used {
-            maps[index] = Some(Arc::new(Bitmap::open(
-                &directory.join(format!("{index}.image")),
-            )?));
+    if let Some(directory) = &directory {
+        if fresh || !directory.join("meta.json").is_file() {
+            downloaded::write_maps(directory, &record, &maps, "CC0")?;
         }
+        record.write(directory)?;
     }
     Ok(maps)
-}
-
-fn write_maps(directory: &Path, maps: &Maps) -> Result<(), String> {
-    fs::create_dir_all(directory).map_err(|error| format!("Кэш материалов · {error}"))?;
-    for (index, image) in maps.iter().enumerate() {
-        if let Some(image) = image {
-            atomic_write(&directory.join(format!("{index}.image")), &image.bytes)?;
-        }
-    }
-    let slots = maps.each_ref().map(Option::is_some);
-    let manifest = serde_json::to_vec(&slots).map_err(|error| error.to_string())?;
-    atomic_write(&directory.join("maps.json"), &manifest)
 }
 
 fn poly_maps(asset: &Material, resolution: u32) -> Result<Maps, String> {
@@ -529,7 +518,7 @@ mod tests {
             for slot in [0, 1, 3, 6] {
                 assert_eq!(fill.images[slot].as_ref().unwrap().pixels().width(), 1024);
             }
-            let manifest = root.join(format!("{}-{id}-1k/maps.json", provider.key()));
+            let manifest = root.join(format!("{}-{id}-1k/meta.json", provider.key()));
             assert!(manifest.is_file());
             let cached = material_in(Some(root.clone()), provider, entry, 1).unwrap();
             assert_eq!(
