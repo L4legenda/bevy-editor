@@ -164,7 +164,9 @@ pub(in crate::editor) fn sync(
     let editing_mode = state.mode(editor.viewing_model);
     let (mode, _) = shading.viewport(editing_mode);
     let show_edges = mode == super::super::shading::Mode::Wire
-        || (editing_mode == crate::editor::model_document::Mode::Paint && state.wireframe);
+        || (editing_mode == crate::editor::model_document::Mode::Paint
+            && editor.viewing_model.and_then(|index| state.documents.get(&index))
+                .is_some_and(|doc| doc.paint_uv.show_wire_3d));
     for (entity, overlay, mut visibility, weights) in &mut overlays {
         visibility.set_if_neq(if show_edges {
             Visibility::Inherited

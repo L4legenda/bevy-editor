@@ -100,6 +100,17 @@ impl Viewer {
         self.field_of_view = Some(camera.fov);
         self.orthographic = camera.orthographic;
     }
+
+    fn set_paint_fov(&mut self, model: usize, doc: &mut crate::editor::model_document::Document, fov: f32) {
+        if self.model != Some(model) || !self.fitted || self.pending_document_camera || self.fov() == fov {
+            return;
+        }
+        let camera = ModelCamera { fov, ..self.camera() };
+        if camera.valid() {
+            self.field_of_view = Some(fov);
+            doc.model_camera = Some(camera);
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -122,6 +133,7 @@ impl Plugin for ModelViewerPlugin {
             .init_resource::<editing::State>()
             .init_resource::<editing::recovery::Preferences>()
             .init_resource::<paint::PaintState>()
+            .init_resource::<paint::save_copy::State>()
             .init_resource::<paint::sets::ShelfPick>()
             .init_resource::<paint::export::prefs::Store>()
             .init_resource::<paint::engine::Runtime>()
@@ -149,6 +161,9 @@ impl Plugin for ModelViewerPlugin {
                 Update,
                 paint::actions.after(actions).before(editing::input::input),
             )
+            .add_systems(Update, paint::mesh_tools::update.after(paint::actions)
+                .before(paint::engine::update).before(paint::refresh))
+            .add_systems(Update, paint::save_copy::update.after(paint::engine::update))
             .add_systems(
                 Update,
                 paint::refresh

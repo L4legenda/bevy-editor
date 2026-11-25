@@ -829,6 +829,7 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
     };
     let paint_uv = PaintUv {
         show_wire: manifest["view"]["show_wire"].as_bool().unwrap_or(true),
+        show_wire_3d: manifest["view"]["show_wire_3d"].as_bool().unwrap_or(false),
         wire_opacity: manifest["view"]["uv_wire_opacity"].as_f64().unwrap_or(0.45).clamp(0.05, 1.) as f32,
         show_seams_2d: manifest["view"]["show_seams_2d"].as_bool().unwrap_or(true),
         show_seams_3d: manifest["view"]["show_seams_3d"].as_bool().unwrap_or(false),
@@ -1378,7 +1379,7 @@ mod tests {
             use_baked_normal: false, ao_strength: 0.35,
         };
         assert_eq!(doc.paint_preview, paint_preview);
-        let paint_uv = PaintUv { show_wire: false, wire_opacity: 0.58, show_seams_2d: false, show_seams_3d: true };
+        let paint_uv = PaintUv { show_wire: false, wire_opacity: 0.58, show_seams_2d: false, show_seams_3d: true, ..default() };
         assert_eq!(doc.paint_uv, paint_uv);
         let paint_post = serde_json::to_value(doc.paint_post.unwrap()).unwrap();
         assert_eq!(paint_post["exposure"], -2.0);

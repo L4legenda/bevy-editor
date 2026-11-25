@@ -1,6 +1,7 @@
 //! Material Paint workspace state. Rendering and mesh editing stay isolated.
 use super::*;
 use crate::editor::model_document::Mode;
+use crate::editor::model_document::paint_mesh_replacement::{self, Command as MeshCommand};
 use crate::editor::model_paint_data::custom;
 pub(in crate::editor) use crate::editor::model_paint_data::LayerKind;
 use crate::editor::model_paint_data::mask::{
@@ -11,6 +12,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 #[path = "model_paint_brush_defaults.rs"]
 mod brush_defaults;
+#[path = "model_paint_mesh_tools.rs"]
+pub(super) mod mesh_tools;
+#[path = "model_paint_save_copy.rs"]
+pub(super) mod save_copy;
 #[path = "model_paint_dock.rs"]
 pub(super) mod dock;
 #[path = "model_paint_sidebar.rs"]
@@ -326,6 +331,7 @@ pub(in crate::editor) enum ShelfPlacement {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum PreviewParameter {
+    FieldOfView,
     Height,
     Emission,
     Occlusion,
@@ -335,6 +341,7 @@ pub(in crate::editor) enum PreviewParameter {
 impl PreviewParameter {
     fn label(self) -> &'static str {
         match self {
+            Self::FieldOfView => "Угол обзора по вертикали, °",
             Self::Height => "Сила рельефа",
             Self::Emission => "Сила свечения",
             Self::Occlusion => "Сила AO, %",
@@ -343,11 +350,16 @@ impl PreviewParameter {
     }
 
     fn min(self) -> f32 {
-        if self == Self::UvWireOpacity { 5. } else { 0. }
+        match self {
+            Self::FieldOfView => 10.,
+            Self::UvWireOpacity => 5.,
+            _ => 0.,
+        }
     }
 
     fn max(self) -> f32 {
         match self {
+            Self::FieldOfView => 90.,
             Self::Height => 8.,
             Self::Emission => 20.,
             Self::Occlusion | Self::UvWireOpacity => 100.,
@@ -357,6 +369,7 @@ impl PreviewParameter {
     fn value(self, doc: &crate::editor::model_document::Document) -> f32 {
         let preview = doc.paint_preview;
         match self {
+            Self::FieldOfView => doc.model_camera.map_or(FOV, |camera| camera.fov).to_degrees(),
             Self::Height => preview.height_strength.unwrap_or(1.),
             Self::Emission => preview.emission_strength,
             Self::Occlusion => preview.ao_strength * 100.,
@@ -368,6 +381,7 @@ impl PreviewParameter {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum PreviewEdit {
     Value { model: usize, parameter: PreviewParameter, value: f32 },
+    Reset { model: usize },
     AutomaticHeight,
     BakedNormal,
     UvWire,
@@ -377,6 +391,8 @@ pub(in crate::editor) enum PreviewEdit {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum PaintAction {
+    MeshReplacement(MeshCommand),
+    SaveCopy,
     Tool(PaintTool),
     Panel(Panel),
     View(View),
@@ -623,6 +639,7 @@ impl PaintAction {
             Self::PreviewMaterial(PreviewEdit::UvSeams2d) => "Подсветить границы островов и отмеченные швы поверх UV-карты.",
             Self::PreviewMaterial(PreviewEdit::UvSeams3d) => "Подсветить UV-швы на видимой стороне 3D-модели.",
             Self::PreviewMaterial(PreviewEdit::Value { .. }) => "Изменить предпросмотр материала.",
+            Self::PreviewMaterial(PreviewEdit::Reset { .. }) => "Вернуть стандартный угол камеры, сетку и настройки обработки изображения.",
             Self::TraceSamples(_) => "Число отсчётов на пиксель. Дополнительные отсчёты уменьшают шум.",
             Self::TraceBounces(_) => "Предельное число отражений света.",
             Self::TraceGround => "Добавить плоскость под моделью для теней в трассированном виде.",
@@ -645,6 +662,8 @@ impl PaintAction {
             Self::Select(_) => "Выбрать слой и показать его свойства.",
             Self::Set(_) => "Выбрать объект и набор текстур модели.",
             Self::SetMenu => "Выбрать набор текстур прямо из панели слоёв. У каждого набора свой стек и история.",
+            Self::MeshReplacement(_) => "Заменить геометрию и перенести слои в соответствующие наборы текстур.",
+            Self::SaveCopy => "Ctrl+Shift+S · Сохранить текущую модель и слои рисования в отдельный GLB.",
             Self::SetHide(..) => "Показать или скрыть грани этого набора в режиме рисования.",
             Self::SetPin(..) => "Закрепить подсветку граней набора в 3D-виде.",
             Self::ExportMaps(true) => "Экспортировать карты всех наборов по выбранному шаблону.",
@@ -835,6 +854,8 @@ struct Session {
     channel: usize,
     set: usize,
     set_menu: bool,
+    mesh_menu: bool,
+    mesh_loading: bool,
     color: usize,
     preset: usize,
     size: f32,
@@ -895,6 +916,7 @@ struct Session {
     smart_loading: bool,
     graph_bake: Option<std::sync::Weak<bake::Maps>>,
     graph_surfaces: HashMap<(usize, usize), Arc<material_graph::surface::Source>>,
+    mesh_graph_refresh: std::collections::HashSet<(usize, usize)>,
     graph_map_menu: Option<material_graph::ParameterTarget>,
     histories: HashMap<(usize, usize), (Vec<Stack>, Vec<Stack>)>,
     busy: bool,
@@ -962,6 +984,8 @@ impl Default for Session {
             channel: 0,
             set: 0,
             set_menu: false,
+            mesh_menu: false,
+            mesh_loading: false,
             color: 0,
             preset: 0,
             size: defaults.size,
@@ -1022,6 +1046,7 @@ impl Default for Session {
             smart_loading: false,
             graph_bake: None,
             graph_surfaces: HashMap::new(),
+            mesh_graph_refresh: default(),
             graph_map_menu: None,
             histories: HashMap::new(),
             busy: false,
@@ -2248,6 +2273,8 @@ impl Session {
                 self.set_menu = false;
             }
             PaintAction::SetMenu => self.set_menu = !self.set_menu,
+            PaintAction::MeshReplacement(_) => {},
+            PaintAction::SaveCopy => {},
             PaintAction::SetHide(object, slot) => self.set_appearance.toggle_visibility((object, slot)),
             PaintAction::SetPin(object, slot) => self.set_appearance.toggle_pin((object, slot)),
             PaintAction::Resolution(size) => self.resize_request = Some(size),
@@ -2839,6 +2866,7 @@ impl Session {
                 .is_some_and(|layer| layer.blend == mode),
             PaintAction::Set(value) => self.set == value,
             PaintAction::SetMenu => self.set_menu,
+            PaintAction::MeshReplacement(MeshCommand::Toggle) => self.mesh_menu,
             PaintAction::SetHide(object, slot) => !self.set_appearance.visibility.shown(object, slot),
             PaintAction::SetPin(object, slot) => self.set_appearance.pinned.contains(&(object, slot)),
             PaintAction::BakePreview(map) => self.bake_view == map,
@@ -3073,6 +3101,7 @@ pub(super) fn actions(
     mut editor: ResMut<Editor>,
     mut paint: ResMut<PaintState>,
     mut editing: ResMut<editing::State>,
+    mut viewer: ResMut<Viewer>,
     mut images: ResMut<Assets<Image>>,
     time: Res<Time<Real>>,
     device: Option<Res<bevy::render::renderer::RenderDevice>>,
@@ -3315,18 +3344,21 @@ pub(super) fn actions(
     {
         let session = paint.sessions.get_mut(&index).unwrap();
         if let Action::ModelView(ModelViewAction::Paint(mut action)) = action {
+            if matches!(action, PaintAction::MeshReplacement(_) | PaintAction::SaveCopy) {
+                continue;
+            }
             if let PaintAction::PreviewMaterial(edit) = action {
                 if !editor.browser_popup && !editor.hdri_library_open
                     && let Some(doc) = editing.documents.get_mut(&index)
                     && doc.can_store_paint_preview()
                 {
-                    let preview = &mut doc.paint_preview;
-                    let previous = (*preview, doc.paint_uv);
+                    let previous = (doc.paint_preview, doc.paint_uv, doc.paint_post, doc.model_camera);
                     match edit {
                         PreviewEdit::AutomaticHeight => {
-                            preview.height_strength = if preview.height_strength.is_some() { None } else { Some(1.) };
+                            let height = &mut doc.paint_preview.height_strength;
+                            *height = if height.is_some() { None } else { Some(1.) };
                         }
-                        PreviewEdit::BakedNormal => preview.use_baked_normal = !preview.use_baked_normal,
+                        PreviewEdit::BakedNormal => doc.paint_preview.use_baked_normal = !doc.paint_preview.use_baked_normal,
                         PreviewEdit::UvWire => doc.paint_uv.show_wire = !doc.paint_uv.show_wire,
                         PreviewEdit::UvSeams2d => doc.paint_uv.show_seams_2d = !doc.paint_uv.show_seams_2d,
                         PreviewEdit::UvSeams3d => doc.paint_uv.show_seams_3d = !doc.paint_uv.show_seams_3d,
@@ -3334,15 +3366,27 @@ pub(super) fn actions(
                             if model == index && (parameter.min()..=parameter.max()).contains(&value) =>
                         {
                             match parameter {
-                                PreviewParameter::Height => preview.height_strength = Some(value),
-                                PreviewParameter::Emission => preview.emission_strength = value,
-                                PreviewParameter::Occlusion => preview.ao_strength = value / 100.,
+                                PreviewParameter::FieldOfView => viewer.set_paint_fov(index, doc, value.to_radians()),
+                                PreviewParameter::Height => doc.paint_preview.height_strength = Some(value),
+                                PreviewParameter::Emission => doc.paint_preview.emission_strength = value,
+                                PreviewParameter::Occlusion => doc.paint_preview.ao_strength = value / 100.,
                                 PreviewParameter::UvWireOpacity => doc.paint_uv.wire_opacity = value / 100.,
                             }
                         }
-                        PreviewEdit::Value { .. } => {}
+                        PreviewEdit::Reset { model } if model == index => {
+                            use crate::editor::model_document::{PaintPreview, PaintUv};
+                            doc.paint_preview = PaintPreview {
+                                height_strength: doc.paint_preview.height_strength,
+                                use_baked_normal: doc.paint_preview.use_baked_normal,
+                                ..default()
+                            };
+                            doc.paint_uv = PaintUv { show_wire: doc.paint_uv.show_wire, ..default() };
+                            doc.paint_post = None;
+                            viewer.set_paint_fov(index, doc, FOV);
+                        }
+                        PreviewEdit::Value { .. } | PreviewEdit::Reset { .. } => {}
                     }
-                    if (*preview, doc.paint_uv) != previous {
+                    if (doc.paint_preview, doc.paint_uv, doc.paint_post, doc.model_camera) != previous {
                         doc.ui_revision += 1;
                     }
                 }
@@ -4099,11 +4143,14 @@ pub(super) fn actions(
         let Some(surface) = surface else {
             return;
         };
-        let graphs = material_graph::affected_layers(&session.stack, new_maps, new_surface);
+        let mesh_replaced = session.mesh_graph_refresh.contains(&binding);
+        let graphs = material_graph::affected_layers(&session.stack, new_maps || mesh_replaced, new_surface);
         if graphs.is_empty() {
+            session.mesh_graph_refresh.remove(&binding);
             session.graph_bake = stamp;
             session.graph_surfaces.insert(binding, surface);
         } else if let Some((device, queue)) = device.as_deref().zip(queue.as_deref()) {
+            session.mesh_graph_refresh.remove(&binding);
             let (device, queue) = (device.clone(), queue.clone());
             let size = session.texture_size;
             let maps = maps.cloned();

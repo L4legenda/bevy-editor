@@ -50,6 +50,94 @@ fn fixture() -> (Glb, Object) {
 }
 
 #[test]
+fn paint_camera_angle_marks_the_document_dirty_but_framing_alone_does_not() {
+    use crate::editor::model_document::ModelCamera;
+
+    let (source, object) = fixture();
+    let folder = source.path.parent().unwrap().to_path_buf();
+    let mut doc = Document::new(source, vec![object]);
+    let camera = ModelCamera {
+        center: [1., 2., 3.], distance: 6., yaw: 0.1, pitch: 0.2,
+        fov: crate::editor::viewport::EDITOR_FOV, orthographic: false,
+    };
+    doc.model_camera = Some(camera);
+    assert!(!doc.dirty());
+    let changed = ModelCamera { fov: 75_f32.to_radians(), ..camera };
+    doc.model_camera = Some(changed);
+    assert!(doc.dirty());
+    doc.save().unwrap();
+    let mut reopened = Document::new(Glb::load(&doc.source.path).unwrap(), doc.objects.clone());
+    assert_eq!(reopened.model_camera, Some(changed));
+    reopened.model_camera = Some(ModelCamera { center: [2., 3., 4.], distance: 4., ..changed });
+    assert!(!reopened.dirty());
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn paint_mesh_replacement_transfers_active_layers_and_round_trips_through_glb() {
+    use crate::editor::{
+        model_document::paint_mesh_replacement::{Shape, primitive},
+        model_paint_data::{Layer, LayerKind, Stack, Surface, mask::{BakedInputs, Mask, INPUT_CHANNELS}, solid},
+    };
+
+    let (source, original) = fixture();
+    let folder = source.path.parent().unwrap().to_path_buf();
+    let mut other = original.clone();
+    other.id = 1;
+    other.source_node = None;
+    other.materials[0].source["extras"]["bevy_editor_udim"] = json!(1013);
+    let mut layer = Layer::new("Мазки".into(), LayerKind::Paint);
+    layer.mask = Some(Mask::new(solid(16, [173; 4]), Vec::new()).into());
+    let surface = Arc::new(Surface {
+        size: 16,
+        base: std::array::from_fn(|_| solid(16, [128; 4])),
+        stack: Stack { layers: vec![layer, Layer::new("Заливка".into(), LayerKind::Fill)], selected: 1 },
+        material: json!({"name": "gold"}),
+        baked: Some(Arc::new(BakedInputs {
+            size: 16, edge_reach: 1., disabled_inputs: 0,
+            texels: vec![[128; INPUT_CHANNELS]; 16 * 16], part_ids: None, custom: vec![],
+        })),
+    });
+    other.materials[0].paint = Some(surface.clone());
+    let mut doc = Document::new(source, vec![original, other]);
+    doc.paint_set = Some(1);
+    doc.select_object(1, false);
+    let mut materials = Assets::default();
+    let report = doc.replace_paint_mesh(primitive(Shape::Plane).unwrap(), true, false, true, &mut materials).unwrap();
+    assert_eq!((report.transferred, report.omitted), (1, 1));
+    assert!(doc.auto_bake_pending);
+    let check_surface = |paint: &Surface| {
+        assert_eq!(paint.size, 16);
+        assert_eq!(paint.stack.selected, 1);
+        assert_eq!(paint.stack.layers[0].name, "Мазки");
+        assert_eq!(paint.stack.layers[1].name, "Заливка");
+        assert_eq!(paint.stack.layers[0].mask.as_ref().unwrap().pixels[0], 173);
+        assert!(paint.baked.is_none());
+    };
+    let slot = &doc.objects[0].materials[0];
+    check_surface(slot.paint.as_deref().unwrap());
+    assert!(slot.udim().is_none());
+    assert!(doc.can_restore_paint_mesh(false));
+    doc.undo();
+    assert_eq!(doc.paint_set_index(), 1);
+    assert!(Arc::ptr_eq(doc.objects[1].materials[0].paint.as_ref().unwrap(), &surface));
+    assert!(doc.can_restore_paint_mesh(true));
+    doc.redo();
+    assert_eq!(doc.paint_set_index(), 0);
+    assert_eq!(doc.objects.len(), 1);
+    for _ in 0..2 {
+        doc.save().unwrap();
+        let saved = Glb::load(&doc.source.path).unwrap();
+        let live: Vec<_> = saved.json["nodes"].as_array().unwrap().iter()
+            .filter_map(|node| node["mesh"].as_u64()).collect();
+        assert_eq!(live.len(), 1);
+        let primitive = &saved.json["meshes"][live[0] as usize]["primitives"][0];
+        check_surface(&saved.paint_surface(primitive).unwrap().unwrap());
+    }
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
 fn imported_bake_defaults_are_clean_and_explicit_factory_settings_survive_profile_changes() {
     use crate::editor::model_bake_settings::{Defaults, Quality, Settings};
 
@@ -92,7 +180,7 @@ fn paint_preview_settings_are_saved_without_changing_material_channels() {
         ao_strength: 0.255,
     };
     assert!(!doc.dirty());
-    let wire = PaintUv { show_wire: true, wire_opacity: 0.68, show_seams_2d: true, show_seams_3d: true };
+    let wire = PaintUv { show_wire: true, show_wire_3d: true, wire_opacity: 0.68, show_seams_2d: true, show_seams_3d: true };
     doc.paint_uv = wire;
     assert!(doc.dirty());
     doc.paint_preview = settings;

@@ -4,11 +4,11 @@ use crate::editor::model_document::MeshData;
 use crate::editor::model_paint_data::{
     Blend, Layer, LayerKind, MAX_LAYER_DEPTH, MAX_LAYERS,
     mask::{
-        BakedInputs, Filter, FilterKind, Generator, GeneratorKind, GeneratorSurface, MAX_FILTERS,
+        BakedInputs, Filter, FilterKind, Generator, GeneratorInput, GeneratorKind, GeneratorSurface, MAX_FILTERS,
         MAX_MASK_LAYERS, Mask, MaskBlend, MaskLayer,
     },
     over, solid,
-    texture_fill::{Bitmap, Fill, Projection},
+    texture_fill::{Bitmap, Fill, Projection, pad_texels, raster, triplanar_coordinates},
 };
 
 #[path = "model_paint_spp_anchors.rs"]
@@ -763,6 +763,9 @@ impl Rebuild<'_> {
         mask.affine = leading_generator.is_some();
         mask.generator = leading_generator;
         self.summary.mask_effects += usize::from(leading_generator.is_some());
+        if let Some(generator) = leading_generator {
+            self.summary.mask_generator(generator);
+        }
         let mut before_paint = None;
         let mut omitted = leading_generator.is_some();
         let mut filters = Vec::new();
@@ -994,19 +997,24 @@ impl Rebuild<'_> {
                         offset: [0.; 2],
                         tiling: true,
                     });
-                    if !transform.rotation.is_finite()
-                        || transform
-                            .scale
-                            .into_iter()
-                            .chain(transform.offset)
-                            .any(|v| !v.is_finite())
-                        || !self.prepare_mask_paint(mask, before_paint, filters)
-                    {
+                    let Some(mapping) = MaskBitmapTransform::new(transform) else {
+                        partial = true;
+                        continue;
+                    };
+                    if projection == 2 {
+                        let applied = self.triplanar_mask_bitmap(mask, before_paint, filters,
+                            &bitmap, &mapping, blend, opacity);
+                        self.summary.mask_effects += usize::from(applied);
+                        self.summary.triplanar_mask_bitmaps += usize::from(applied);
+                        // Painter's projection volume is not available in the imported document.
+                        partial = true;
+                        continue;
+                    }
+                    if !self.prepare_mask_paint(mask, before_paint, filters) {
                         partial = true;
                         continue;
                     }
                     let size = self.size as usize;
-                    let (sin, cos) = transform.rotation.sin_cos();
                     for (index, pixel) in Arc::make_mut(&mut mask.pixels)
                         .chunks_exact_mut(4)
                         .enumerate()
@@ -1014,20 +1022,7 @@ impl Rebuild<'_> {
                         let uv =
                             Vec2::new((index % size) as f32 + 0.5, (index / size) as f32 + 0.5)
                                 / self.size as f32;
-                        let d = (Vec2::new(uv.x, 1. - uv.y)
-                            - Vec2::splat(0.5)
-                            - Vec2::from_array(transform.offset))
-                            * Vec2::from_array(transform.scale);
-                        let uv =
-                            Vec2::new(0.5 + d.x * cos - d.y * sin, 0.5 - d.x * sin - d.y * cos);
-                        if uv.is_finite()
-                            && (transform.tiling
-                                || (uv.min_element() >= 0. && uv.max_element() <= 1.))
-                        {
-                            let value = bitmap
-                                .sample(uv, 0.)
-                                .truncate()
-                                .dot(Vec3::new(0.2126, 0.7152, 0.0722));
+                        if let Some(value) = mapping.sample(&bitmap, uv, 0.) {
                             apply_mask_value(pixel, mask.affine, blend, value, opacity);
                         }
                     }
@@ -1091,6 +1086,7 @@ impl Rebuild<'_> {
                             ..MaskLayer::default()
                         });
                         self.summary.mask_effects += 1;
+                        self.summary.mask_generator(generator);
                     }
                     partial = true;
                 }
@@ -1098,6 +1094,54 @@ impl Rebuild<'_> {
             }
         }
         partial
+    }
+
+    fn triplanar_mask_bitmap(
+        &mut self,
+        mask: &mut Mask,
+        before_paint: &mut Option<Arc<Vec<u8>>>,
+        filters: &mut Vec<Filter>,
+        bitmap: &Bitmap,
+        mapping: &MaskBitmapTransform,
+        blend: MaskBlend,
+        opacity: f32,
+    ) -> bool {
+        let texels = (self.size * self.size) as usize;
+        let temporary_bytes = texels * (size_of::<[u8; 2]>() + size_of::<u8>())
+            + self.mesh.positions.len() * size_of::<Vec3>();
+        if !self.reserve(temporary_bytes) {
+            return false;
+        }
+        let mut covered = vec![0; texels];
+        let mut samples = vec![[0, 0]; texels];
+        let offset = self.tile.map_or(Vec2::ZERO, Tile::offset);
+        raster(self.mesh, self.slot, self.size, offset, Transform::IDENTITY,
+            &self.mesh.positions, &mut covered, |index, _, position, normal, _, width| {
+                let (uvs, weights) = triplanar_coordinates(position, normal, 4.);
+                let mut value = 0.;
+                let mut coverage = 0.;
+                for (uv, weight) in uvs.into_iter().zip(weights.to_array()) {
+                    if weight > 0. && let Some(sample) = mapping.sample(bitmap, uv, width) {
+                        value += sample * weight;
+                        coverage += weight;
+                    }
+                }
+                if coverage > 0. {
+                    samples[index] = [byte(value / coverage), byte(coverage)];
+                }
+            });
+        let applied = samples.iter().any(|sample| sample[1] != 0)
+            && self.prepare_mask_paint(mask, before_paint, filters);
+        if applied {
+            pad_texels(self.size as usize, &mut covered, |to, from| samples[to] = samples[from]);
+            for (pixel, [value, coverage]) in Arc::make_mut(&mut mask.pixels).chunks_exact_mut(4).zip(samples) {
+                if coverage != 0 {
+                    apply_mask_value(pixel, mask.affine, blend, value as f32 / 255., opacity * coverage as f32 / 255.);
+                }
+            }
+        }
+        *self.remaining += temporary_bytes;
+        applied
     }
 
     fn bake_mask_filters(
@@ -1148,6 +1192,37 @@ impl Rebuild<'_> {
             *base = Some(mask.pixels.clone());
         }
         true
+    }
+}
+
+struct MaskBitmapTransform {
+    scale: Vec2,
+    center: Vec2,
+    sin: f32,
+    cos: f32,
+    repeat: bool,
+}
+
+impl MaskBitmapTransform {
+    fn new(transform: UvTransform) -> Option<Self> {
+        let scale = Vec2::from_array(transform.scale);
+        let offset = Vec2::from_array(transform.offset);
+        if !scale.is_finite() || !offset.is_finite() || !transform.rotation.is_finite() {
+            return None;
+        }
+        let (sin, cos) = transform.rotation.sin_cos();
+        Some(Self { scale, center: Vec2::splat(0.5) + offset, sin, cos, repeat: transform.tiling })
+    }
+
+    fn sample(&self, bitmap: &Bitmap, uv: Vec2, width: f32) -> Option<f32> {
+        let d = (Vec2::new(uv.x, 1. - uv.y) - self.center) * self.scale;
+        let uv = Vec2::new(0.5 + d.x * self.cos - d.y * self.sin, 0.5 - d.x * self.sin - d.y * self.cos);
+        if !uv.is_finite() || (!self.repeat && (uv.min_element() < 0. || uv.max_element() > 1.)) {
+            return None;
+        }
+        let width = width * self.scale.abs().max_element();
+        let rgba = if self.repeat { bitmap.sample(uv, width) } else { bitmap.sample_clamped(uv, width) };
+        Some(rgba.truncate().dot(Vec3::new(0.2126, 0.7152, 0.0722)))
     }
 }
 
@@ -1228,7 +1303,8 @@ pub(super) fn mask_generators(layers: &[LayerInfo], generators: &mut Vec<Generat
 }
 
 fn generator(graph: &GraphRef) -> Option<Generator> {
-    let kind = match graph.name().to_ascii_lowercase().as_str() {
+    let name = graph.name().to_ascii_lowercase();
+    let kind = match name.as_str() {
         "mg_dirt" | "mg_ambient_occlusion" | "mg_mask_editor" | "mg_mask_builder" => {
             GeneratorKind::Dirt
         }
@@ -1248,10 +1324,78 @@ fn generator(graph: &GraphRef) -> Option<Generator> {
         _ => return None,
     };
     let mut generator = Generator::new(kind);
-    generator.invert = ["invert", "global_invert"]
-        .iter()
-        .any(|key| graph.value(key).is_some_and(|value| value > 0.5));
+    let value = |keys: &[&str]| keys.iter().find_map(|key| graph.value(key).filter(|v| v.is_finite()));
+    let unit = |keys: &[&str]| value(keys).map(|v| v.clamp(0., 1.));
+    let enabled = |key| unit(&[key]).is_some_and(|v| v > 0.5);
+    generator.invert = unit(&["global_invert", "invert"]).is_some_and(|value| value > 0.5);
+    // Substance balance raises coverage. Our generator's level is a threshold.
+    if let Some(balance) = unit(&["global_balance", "dirt_level", "balance", "position"]) {
+        generator.values[0] = (1. - balance) * 100.;
+    }
+    if let Some(contrast) = unit(&["global_contrast", "dirt_contrast", "contrast"]) {
+        generator.values[1] = ((1. - contrast) * 50.).max(0.1);
+    }
+    if let Some(scale) = value(&["grunge_scale", "tiling_amount", "scale"]) {
+        generator.values[2] = scale.clamp(0.1, 64.);
+    }
+    if let Some(amount) = unit(&["grunge_amount"]) {
+        generator.values[3] = amount * 100.;
+    }
+    if let Some(seed) = value(&["$randomseed"]) {
+        generator.values[4] = seed.round().rem_euclid(101.);
+    }
+    match name.as_str() {
+        "mg_dirt" => {
+            if let Some(amount) = unit(&["edges_masking"]) {
+                generator.set_weight(GeneratorInput::Convexity, -(amount * 100.).round() as i16);
+            }
+        }
+        "mg_ambient_occlusion" => {
+            generator.values[3] = 0.;
+            generator.set_weight(GeneratorInput::Cavity, 0);
+            generator.set_weight(GeneratorInput::Concavity, 0);
+            set_spp_map_weight(&mut generator, GeneratorInput::Occlusion, 1., !enabled("invert_ao"));
+        }
+        "mg_mask_editor" => {
+            if let Some(ao) = unit(&["ao"]) {
+                set_spp_map_weight(&mut generator, GeneratorInput::Occlusion, ao, !enabled("invert_ao"));
+            }
+            if let Some(curvature) = unit(&["curv"]) {
+                generator.set_weight(GeneratorInput::Convexity, (curvature * 100.).round() as i16);
+                generator.set_weight(GeneratorInput::Cavity, 0);
+                generator.set_weight(GeneratorInput::Concavity, 0);
+            }
+            if let Some(thickness) = unit(&["thick"]) {
+                set_spp_map_weight(&mut generator, GeneratorInput::Thin, thickness, !enabled("thick_invert"));
+            }
+            if let Some(position) = unit(&["position_gradient"]) {
+                set_spp_map_weight(&mut generator, GeneratorInput::Height, position, enabled("grad_invert"));
+            }
+            if let Some((amount, scale)) = [(unit(&["tex"]), value(&["scale_tex"])), (unit(&["tex2"]), value(&["tex2_scale"]))]
+                .into_iter().filter_map(|(amount, scale)| Some((amount?, scale)))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+            {
+                generator.values[3] = amount * 100.;
+                if let Some(scale) = scale {
+                    generator.values[2] = scale.clamp(0.1, 64.);
+                }
+            }
+        }
+        _ => {}
+    }
+    generator.values[0] = generator.values[0].clamp(-100., 200.);
     Some(generator)
+}
+
+fn set_spp_map_weight(generator: &mut Generator, input: GeneratorInput, amount: f32, complement: bool) {
+    let weight = (amount * 100.).round() as i16;
+    if complement {
+        // w × (1 - map) is equivalent to -w × map with a lower threshold.
+        generator.values[0] -= f32::from(weight);
+        generator.set_weight(input, -weight);
+    } else {
+        generator.set_weight(input, weight);
+    }
 }
 
 fn mask_filter(action: &ActionInfo) -> Option<(Filter, bool)> {

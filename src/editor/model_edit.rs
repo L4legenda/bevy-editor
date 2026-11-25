@@ -124,7 +124,7 @@ struct Saving {
 #[path = "model_recovery.rs"]
 pub(in crate::editor) mod recovery;
 
-fn write_model_metadata(
+pub(super) fn write_model_metadata(
     source: &mut document::glb::Glb,
     custom: &[crate::editor::model_paint_data::custom::Recipe],
     settings: &crate::editor::model_bake_settings::Settings,
@@ -158,7 +158,6 @@ pub(in crate::editor) struct State {
     pub tool: Tool,
     pub(super) extrude_tool: bool,
     pub xray: bool,
-    pub wireframe: bool,
     pub local: bool,
     pub snap: bool,
     snap_target: SnapTarget,
@@ -196,7 +195,6 @@ impl Default for State {
             tool: Tool::Universal,
             extrude_tool: false,
             xray: false,
-            wireframe: false,
             local: false,
             snap: false,
             snap_target: SnapTarget::Step,
@@ -319,7 +317,7 @@ impl State {
             EditAction::ExtrudeTool => self.extrude_tool && self.mode(index) == Mode::Edit,
             EditAction::SelectObject(id) => doc.is_some_and(|d| d.selected.contains(&id)),
             EditAction::Xray => self.xray,
-            EditAction::Wireframe => self.wireframe,
+            EditAction::Wireframe => doc.is_some_and(|d| d.paint_uv.show_wire_3d),
             EditAction::Local => self.local,
             EditAction::Snap => self.snap,
             EditAction::SnapTarget(target) => self.snap_target == target,
@@ -362,7 +360,8 @@ impl State {
             return true;
         }
         if action == EditAction::Wireframe {
-            return self.mode(index) == Mode::Paint;
+            return index.and_then(|index| self.documents.get(&index))
+                .is_some_and(|doc| doc.mode == Mode::Paint && doc.can_store_paint_preview());
         }
         let doc = index.and_then(|i| self.documents.get(&i));
         let Some(doc) = doc else {
@@ -1191,7 +1190,14 @@ pub(super) fn process_actions(
                 state.clear_gesture(Some(index), true);
             }
             EditAction::Xray => state.xray = !state.xray,
-            EditAction::Wireframe => state.wireframe = !state.wireframe,
+            EditAction::Wireframe => {
+                if let Some(doc) = state.documents.get_mut(&index)
+                    && doc.mode == Mode::Paint && doc.can_store_paint_preview()
+                {
+                    doc.paint_uv.show_wire_3d = !doc.paint_uv.show_wire_3d;
+                    doc.ui_revision += 1;
+                }
+            }
             EditAction::Local => state.local = !state.local,
             EditAction::Snap => state.snap = !state.snap,
             EditAction::SnapTarget(target) if state.available(action, Some(index)) => {
@@ -1495,6 +1501,10 @@ pub(in crate::editor) fn shortcuts(
             KeyCode::SuperRight,
         ]);
         let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+        if mode == Mode::Paint && control && shift && keys.just_pressed(KeyCode::KeyS) {
+            actions.write(Action::ModelView(ModelViewAction::Paint(super::paint::PaintAction::SaveCopy)));
+            return true;
+        }
         let edit = if control && keys.just_pressed(KeyCode::KeyS) {
             Some(EditAction::Save)
         } else if control && keys.just_pressed(KeyCode::KeyZ) {

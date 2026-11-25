@@ -159,6 +159,8 @@ mod tests {
             hidden: false,
         };
         let base = Snapshot {
+            paint_set: None,
+            mesh_replacement: false,
             bake_settings: default(),
             cage_edits: default(),
             objects: vec![object(0, 1.0), object(1, 0.0), object(2, -1.0)],

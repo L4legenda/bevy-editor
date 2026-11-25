@@ -19,6 +19,8 @@ use std::{
 pub(super) mod glb;
 #[path = "model_udim.rs"]
 pub(super) mod udim;
+#[path = "model_paint_mesh_replacement.rs"]
+pub(super) mod paint_mesh_replacement;
 
 #[derive(Clone, Debug)]
 pub(super) struct MaterialSlot {
@@ -147,6 +149,8 @@ impl PartialEq for Object {
 }
 #[derive(Clone, Debug)]
 pub(super) struct Snapshot {
+    pub paint_set: Option<usize>,
+    pub mesh_replacement: bool,
     pub bake_settings: super::model_bake_settings::Settings,
     pub cage_edits: Arc<super::model_cage_data::Edits>,
     pub objects: Vec<Object>,
@@ -224,6 +228,7 @@ fn read_paint_post(root: &serde_json::Value) -> Option<DocumentPost> {
 #[serde(default)]
 pub(super) struct PaintUv {
     pub show_wire: bool,
+    pub show_wire_3d: bool,
     pub wire_opacity: f32,
     pub show_seams_2d: bool,
     pub show_seams_3d: bool,
@@ -231,7 +236,7 @@ pub(super) struct PaintUv {
 
 impl Default for PaintUv {
     fn default() -> Self {
-        Self { show_wire: false, wire_opacity: 0.45, show_seams_2d: false, show_seams_3d: false }
+        Self { show_wire: false, show_wire_3d: false, wire_opacity: 0.45, show_seams_2d: false, show_seams_3d: false }
     }
 }
 
@@ -414,6 +419,8 @@ impl Document {
             || self.paint_preview != PaintPreview::read(&self.source.json)
             || self.paint_uv != PaintUv::read(&self.source.json)
             || self.paint_post != read_paint_post(&self.source.json)
+            || self.model_camera.is_some_and(|camera| camera.fov != ModelCamera::read(&self.source.json)
+                .map_or(crate::editor::viewport::EDITOR_FOV, |saved| saved.fov))
             || (!Arc::ptr_eq(&self.cage_edits, &self.saved_cage_edits)
                 && self.cage_edits != self.saved_cage_edits)
     }
@@ -492,6 +499,8 @@ impl Document {
     }
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            paint_set: self.paint_set,
+            mesh_replacement: false,
             bake_settings: self.bake_settings.clone(),
             cage_edits: self.cage_edits.clone(),
             objects: self.objects.clone(),
@@ -502,6 +511,9 @@ impl Document {
         }
     }
     pub fn restore(&mut self, state: Snapshot) {
+        if state.mesh_replacement {
+            self.paint_set = state.paint_set;
+        }
         self.objects = state.objects;
         self.custom_bakes = state.custom_bakes;
         self.bake_settings = state.bake_settings;
@@ -572,14 +584,18 @@ impl Document {
     }
     pub fn undo(&mut self) {
         if let Some(previous) = self.undo.pop() {
-            self.redo.push(self.snapshot());
+            let mut current = self.snapshot();
+            current.mesh_replacement = previous.mesh_replacement;
+            self.redo.push(current);
             self.restore(previous);
             self.recovery_edits += 1;
         }
     }
     pub fn redo(&mut self) {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(self.snapshot());
+            let mut current = self.snapshot();
+            current.mesh_replacement = next.mesh_replacement;
+            self.undo.push(current);
             self.restore(next);
             self.recovery_edits += 1;
         }

@@ -667,6 +667,8 @@ fn graph_of(p: &Obj) -> Option<GraphRef> {
             f.to_vec()
         } else if let Some(i) = t.int("value") {
             vec![i as f32]
+        } else if let Some(value) = t.bool("value") {
+            vec![f32::from(u8::from(value))]
         } else {
             continue;
         };

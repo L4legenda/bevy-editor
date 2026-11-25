@@ -58,6 +58,56 @@ pub(super) fn convert(
     name: &str,
     auto_unwrap: AutoUnwrap,
 ) -> Result<ImportedMesh, String> {
+    let (objects, images, unwrapped_sets) = read(path, name, auto_unwrap, true)?;
+    let bytes = Glb::new_asset_with_pngs(&objects, &images.pngs)?;
+    if bytes.len() > 512 * 1024 * 1024 {
+        return Err("Преобразованный GLB превышает 512 МиБ".into());
+    }
+    for suffix in 1..10_000 {
+        let file = if suffix == 1 {
+            format!("{name}.glb")
+        } else {
+            format!("{name} ({suffix}).glb")
+        };
+        let destination = target.join(&file);
+        if std::fs::symlink_metadata(&destination).is_ok() {
+            continue;
+        }
+        match atomic_write(&destination, &bytes, Revision::Missing) {
+            Ok(_) => {
+                return Ok(ImportedMesh {
+                    name: PathBuf::from(file),
+                    warnings: images.warnings,
+                    unwrapped_sets,
+                });
+            }
+            Err(_) if std::fs::symlink_metadata(&destination).is_ok() => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Не удалось подобрать имя для импортированной модели".into())
+}
+
+pub(super) fn replacement(path: &Path, auto_unwrap: AutoUnwrap) -> Result<Vec<Object>, String> {
+    if !path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("fbx") || extension.eq_ignore_ascii_case("obj")
+    }) {
+        return Err("Для замены сетки выберите OBJ или FBX".into());
+    }
+    let name = path.file_stem().and_then(|name| name.to_str()).unwrap_or("Модель");
+    let (objects, images, _) = read(path, name, auto_unwrap, false)?;
+    if let Some(error) = images.warnings.into_iter().next() {
+        return Err(error);
+    }
+    Ok(objects)
+}
+
+fn read(
+    path: &Path,
+    name: &str,
+    auto_unwrap: AutoUnwrap,
+    include_textures: bool,
+) -> Result<(Vec<Object>, Images, usize), String> {
     let is_fbx = path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("fbx"));
@@ -117,6 +167,7 @@ pub(super) fn convert(
                     material.map(|v| &**v),
                     mesh,
                     format,
+                    include_textures,
                 ));
                 slot
             });
@@ -244,35 +295,7 @@ pub(super) fn convert(
     if objects.is_empty() {
         return Err(format!("В {format} нет полигональных поверхностей"));
     }
-    let bytes = Glb::new_asset_with_pngs(&objects, &images.pngs)?;
-    if bytes.len() > 512 * 1024 * 1024 {
-        return Err("Преобразованный GLB превышает 512 МиБ".into());
-    }
-    for suffix in 1..10_000 {
-        let file = if suffix == 1 {
-            format!("{name}.glb")
-        } else {
-            format!("{name} ({suffix}).glb")
-        };
-        let destination = target.join(&file);
-        if std::fs::symlink_metadata(&destination).is_ok() {
-            continue;
-        }
-        match atomic_write(&destination, &bytes, Revision::Missing) {
-            Ok(_) => {
-                return Ok(ImportedMesh {
-                    name: PathBuf::from(file),
-                    warnings: images.warnings,
-                    unwrapped_sets,
-                });
-            }
-            Err(_) if std::fs::symlink_metadata(&destination).is_ok() => continue,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Err(format!(
-        "Не удалось подобрать имя для импортированного {format}"
-    ))
+    Ok((objects, images, unwrapped_sets))
 }
 
 fn unwrap_materials(
@@ -350,10 +373,13 @@ impl Images {
         material: Option<&ufbx::Material>,
         mesh: &ufbx::Mesh,
         format: &str,
+        include_textures: bool,
     ) -> MaterialSlot {
         let authored = material.map(|material| {
             let pbr = &material.pbr;
-            let mut texture = |map| self.texture(scene, folders, map, mesh, format);
+            let mut texture = |map| {
+                if include_textures { self.texture(scene, folders, map, mesh, format) } else { None }
+            };
             let base = texture(&pbr.base_color);
             let normal = texture(&pbr.normal_map);
             let emission = texture(&pbr.emission_color);
@@ -394,7 +420,7 @@ impl Images {
         MaterialSlot {
             bake_fixes: Default::default(),
             material: default(),
-            source: json!({"material":0}),
+            source: if include_textures { json!({"material":0}) } else { json!({}) },
             paint: None,
             authored,
         }

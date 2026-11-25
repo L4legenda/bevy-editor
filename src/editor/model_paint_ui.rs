@@ -226,7 +226,7 @@ fn hide_paint_drop(
 pub(in crate::editor::ui::model_viewer) struct Value(Parameter);
 
 #[derive(Component, Clone, Copy)]
-pub(in crate::editor::ui::model_viewer) struct PreviewValue(PreviewParameter);
+pub(in crate::editor::ui::model_viewer) struct PreviewValue(pub(super) PreviewParameter);
 
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct UvWire;
@@ -665,6 +665,37 @@ fn layer_set_selector(
             let choice = button(commands, choices, font, &label, PaintAction::Set(index));
             commands.entity(choice).insert(sets::SetRow(key));
         }
+    }
+}
+
+fn mesh_replacement(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    doc: &crate::editor::model_document::Document,
+    session: &Session,
+) {
+    let action = PaintAction::MeshReplacement;
+    let title = if session.mesh_loading { "Загрузка сетки…" }
+        else if session.mesh_menu { "Замена сетки ▴" } else { "Замена сетки ▾" };
+    button(commands, parent, font, title, action(MeshCommand::Toggle));
+    if !session.mesh_menu || session.mesh_loading {
+        return;
+    }
+    let choices = node(commands, parent, Node { flex_wrap: FlexWrap::Wrap, ..row(3.) });
+    for shape in paint_mesh_replacement::Shape::ALL {
+        button(commands, choices, font, shape.label(), action(MeshCommand::Primitive(shape)));
+    }
+    button(commands, parent, font, "Загрузить сетку OBJ / FBX…", action(MeshCommand::Import));
+    let omitted = doc.paint_sets_available_on_mesh_undo();
+    if omitted > 0 {
+        text(commands, parent, font, &format!("Исходные наборы доступны через отмену: {omitted}"), 11., MUTED);
+    }
+    if doc.can_restore_paint_mesh(false) {
+        button(commands, parent, font, "Отменить замену сетки", action(MeshCommand::Undo));
+    }
+    if doc.can_restore_paint_mesh(true) {
+        button(commands, parent, font, "Повторить замену сетки", action(MeshCommand::Redo));
     }
 }
 
@@ -1570,6 +1601,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)),
         Look::Primary,
     );
+    button(&mut commands, toolbar, font, "Сохранить как…", PaintAction::SaveCopy);
     button(
         &mut commands, toolbar, font, "Экспорт карт…", PaintAction::ExportMaps(true),
     );
@@ -2733,6 +2765,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             Panel::Layers => {
                 ui.layer_thumbs.begin_list();
                 layer_set_selector(&mut commands, stack, font, doc, session);
+                mesh_replacement(&mut commands, stack, font, doc, session);
                 let tools = node(
                     &mut commands,
                     stack,
@@ -3773,6 +3806,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     button(&mut commands, stack, font, name, PaintAction::View(view));
                 }
                 if doc.can_store_paint_preview() {
+                    text(&mut commands, stack, font, "Камера", 12., TEXT);
+                    preview_number(&mut commands, stack, font, PreviewParameter::FieldOfView);
                     text(&mut commands, stack, font, "Карты материала", 12., TEXT);
                     button(&mut commands, stack, font, "Автоматический рельеф",
                         PaintAction::PreviewMaterial(PreviewEdit::AutomaticHeight));
@@ -3783,6 +3818,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     }
                     button(&mut commands, stack, font, "UV-сетка",
                         PaintAction::PreviewMaterial(PreviewEdit::UvWire));
+                    super::super::super::button(&mut commands, stack, font, "Каркас 3D · W",
+                        Action::ModelView(ModelViewAction::Edit(editing::EditAction::Wireframe)), Look::Regular);
                     preview_number(&mut commands, stack, font, PreviewParameter::UvWireOpacity);
                     button(&mut commands, stack, font, "UV-швы в 2D",
                         PaintAction::PreviewMaterial(PreviewEdit::UvSeams2d));
@@ -3794,6 +3831,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 button(&mut commands, stack, font, title, PaintAction::PostPanel);
                 if session.post_panel {
                     environment::paint_post_controls(&mut commands, stack, font, environment_settings.paint_post(Some(doc)));
+                }
+                if doc.can_store_paint_preview() {
+                    button(&mut commands, stack, font, "Сбросить настройки предпросмотра",
+                        PaintAction::PreviewMaterial(PreviewEdit::Reset { model: index }));
                 }
                 text(&mut commands, stack, font, "Шейдер 3D-вида", 12., TEXT);
                 button(&mut commands, stack, font, "PBR сцены", PaintAction::PreviewShader(None));
@@ -4239,6 +4280,7 @@ impl PreviewValue {
 
 fn preview_number(commands: &mut Commands, parent: Entity, font: &Handle<Font>, parameter: PreviewParameter) {
     let step = match parameter {
+        PreviewParameter::FieldOfView => 1.,
         PreviewParameter::Occlusion | PreviewParameter::UvWireOpacity => 0.5,
         _ => 0.05,
     };

@@ -238,6 +238,14 @@ impl Bitmap {
     }
 
     pub(in crate::editor) fn sample(&self, uv: Vec2, footprint: f32) -> Vec4 {
+        self.sample_filtered(uv, footprint, true)
+    }
+
+    pub(in crate::editor) fn sample_clamped(&self, uv: Vec2, footprint: f32) -> Vec4 {
+        self.sample_filtered(uv, footprint, false)
+    }
+
+    fn sample_filtered(&self, uv: Vec2, footprint: f32, repeat: bool) -> Vec4 {
         let max_side = self.mips[0].width().max(self.mips[0].height()) as f32;
         let lod = (footprint * max_side)
             .max(1.)
@@ -247,14 +255,16 @@ impl Bitmap {
             let image = &self.mips[level];
             let w = image.width() as i32;
             let h = image.height() as i32;
-            let p = uv.rem_euclid(Vec2::ONE) * Vec2::new(w as f32, h as f32) - Vec2::splat(0.5);
+            let uv = if repeat { uv.rem_euclid(Vec2::ONE) } else { uv.clamp(Vec2::ZERO, Vec2::ONE) };
+            let p = uv * Vec2::new(w as f32, h as f32) - Vec2::splat(0.5);
             let cell = p.floor();
             let f = p - cell;
             let (x, y) = (cell.x as i32, cell.y as i32);
             let at = |x: i32, y: i32| {
+                let edge = |x: i32, size: i32| if repeat { x.rem_euclid(size) } else { x.clamp(0, size - 1) };
                 Vec4::from_array(
                     image
-                        .get_pixel(x.rem_euclid(w) as u32, y.rem_euclid(h) as u32)
+                        .get_pixel(edge(x, w) as u32, edge(y, h) as u32)
                         .0
                         .map(f32::from),
                 ) / 255.
@@ -496,16 +506,10 @@ impl Fill {
                 &mut covered,
                 |index, _, p, n, axes, pixel_width| {
                     let (coords, weights, width) = if projection == Projection::Triplanar {
-                        let q = p * tiling;
-                        let w = n.abs().powf(self.settings.sharpness);
+                        let (coords, weights) = triplanar_coordinates(p * tiling, n, self.settings.sharpness);
                         (
-                            [
-                                Vec2::new(q.z, -q.y),
-                                Vec2::new(q.x, q.z),
-                                Vec2::new(q.x, -q.y),
-                            ]
-                            .map(|uv| rotate(uv) + slide),
-                            w / w.element_sum().max(1e-4),
+                            coords.map(|uv| rotate(uv) + slide),
+                            weights,
                             pixel_width * tiling,
                         )
                     } else {
@@ -596,6 +600,12 @@ impl Fill {
     }
 }
 
+pub(in crate::editor) fn triplanar_coordinates(point: Vec3, normal: Vec3, sharpness: f32) -> ([Vec2; 3], Vec3) {
+    let [x, y, z] = point.to_array();
+    let weight = normal.abs().powf(sharpness);
+    ([Vec2::new(z, -y), Vec2::new(x, z), Vec2::new(x, -y)], weight / weight.element_sum().max(1e-4))
+}
+
 pub(in crate::editor) fn raster(
     mesh: &MeshData,
     slot: usize,
@@ -684,6 +694,14 @@ pub(in crate::editor) fn raster(
 }
 
 fn pad(size: usize, covered: &mut [u8], output: &mut [Option<Vec<u8>>; CHANNEL_COUNT]) {
+    pad_texels(size, covered, |target, source| {
+        for plane in output.iter_mut().flatten() {
+            plane.copy_within(source * 4..source * 4 + 4, target * 4);
+        }
+    });
+}
+
+pub(in crate::editor) fn pad_texels(size: usize, covered: &mut [u8], mut copy: impl FnMut(usize, usize)) {
     for ring in 1..=2 {
         for y in 0..size {
             for x in 0..size {
@@ -703,9 +721,7 @@ fn pad(size: usize, covered: &mut [u8], output: &mut [Option<Vec<u8>>; CHANNEL_C
                     .find(|&i| (1..=ring).contains(&covered[i]))
                 {
                     covered[p] = ring + 1;
-                    for plane in output.iter_mut().flatten() {
-                        plane.copy_within(source * 4..source * 4 + 4, p * 4);
-                    }
+                    copy(p, source);
                 }
             }
         }
@@ -716,6 +732,15 @@ fn pad(size: usize, covered: &mut [u8], output: &mut [Option<Vec<u8>>; CHANNEL_C
 mod tests {
     use super::*;
     use crate::editor::model_mesh::{Corner, Face, Geometry};
+
+    #[test]
+    fn clamped_bitmap_edges_sample_only_nearest_border() {
+        let pixels = RgbaImage::from_raw(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
+        let bitmap = Bitmap::from_rgba("Edges".into(), pixels).unwrap();
+        assert_eq!(bitmap.sample(Vec2::ZERO, 0.).x, 0.5);
+        assert_eq!(bitmap.sample_clamped(Vec2::ZERO, 0.).x, 0.);
+        assert_eq!(bitmap.sample_clamped(Vec2::ONE, 0.).x, 1.);
+    }
 
     #[test]
     fn fill_variation_tracks_connected_parts_seed_and_solid_values() {

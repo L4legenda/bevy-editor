@@ -61,6 +61,8 @@ struct Summary {
     stroke_actions: usize,
     mesh_masks: usize,
     mask_effects: usize,
+    triplanar_mask_bitmaps: usize,
+    tuned_mask_generators: usize,
     baked_mask_filters: usize,
     baked_mask_generators: usize,
     baked_generator_sets: usize,
@@ -78,6 +80,10 @@ pub(super) struct ImportDetails {
 }
 
 impl Summary {
+    fn mask_generator(&mut self, generator: Generator) {
+        self.tuned_mask_generators += usize::from(generator != Generator::new(generator.kind));
+    }
+
     fn overview(&self) -> String {
         let mut summary = format!(
             "SPP · сеток: {} · наборов: {} · карт: {}",
@@ -106,6 +112,12 @@ impl Summary {
                 " · геометрических масок: {} · эффектов маски: {}",
                 self.mesh_masks, self.mask_effects
             ));
+        }
+        if self.triplanar_mask_bitmaps > 0 {
+            summary.push_str(&format!(" · трипланарных растровых масок: {}", self.triplanar_mask_bitmaps));
+        }
+        if self.tuned_mask_generators > 0 {
+            summary.push_str(&format!(" · генераторов с параметрами: {}", self.tuned_mask_generators));
         }
         if self.baked_mask_filters > 0 {
             summary.push_str(&format!(
@@ -137,7 +149,10 @@ impl Summary {
         summary
     }
 
-    fn details(self) -> ImportDetails {
+    fn details(mut self) -> ImportDetails {
+        if self.triplanar_mask_bitmaps > 0 {
+            self.notes.push("Положение трипланарной проекции масок приближённо восстановлено по сетке".into());
+        }
         let overview = self.overview();
         let mut label = overview.clone();
         if let Some(note) = self.notes.first() {
@@ -1256,6 +1271,99 @@ mod tests {
             std::array::from_fn::<_, 6, _>(|slot| outline.value(slot)),
             [75., 2.5, 1., 1., -25., 1.]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_projects_triplanar_bitmap_masks_through_the_mesh() {
+        let root = std::env::temp_dir().join(format!("bevy-spp-mask-projection-{}", bevy::asset::uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let key = "1234567890123456789012345678901234567890.image";
+        let mut colors = [0, 0, 0, 255].repeat(4);
+        colors.extend([255; 16]);
+        let mut right_side = Vec::new();
+        for (projection, name) in [(0, "UV"), (2, "Triplanar")] {
+            let source = root.join(format!("{name}.spp"));
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_compressed_uv_quad()),
+                ("paint/document.bin", fixture::document_with_bitmap_mask_projection(&format!("Mask?version={key}"), projection)),
+                (&format!("resources/{key}"), fixture::bitmap_row(&colors)),
+            ])).unwrap();
+            let (file, report) = convert(&source, &root).unwrap();
+            assert_eq!(report.overview.contains("трипланарных растровых масок: 1"), projection == 2);
+            let glb = Glb::load(&root.join(file)).unwrap();
+            let surface = glb.paint_surface(&glb.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+            let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
+            let mask = layer.mask.as_ref().unwrap();
+            let size = surface.size as usize;
+            let sample = |x| mask.pixels[(size * (size / 2) + x) * 4];
+            right_side.push(sample(size * 3 / 8));
+            if projection == 2 {
+                assert!(report.warnings.iter().any(|warning| warning.contains("приближённо восстановлено по сетке")));
+                assert_eq!(sample(size / 8), 0);
+                assert_eq!(sample(size / 2 + 1), sample(size / 2 - 1));
+                assert_eq!(sample(size / 2 + 2), 255);
+            }
+        }
+        assert_eq!(right_side, [0, 255]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn spp_import_keeps_procedural_mask_settings_editable_in_glb() {
+        use crate::editor::model_paint_data::mask::GeneratorInput;
+        use fixture::GeneratorTweak::{Bool, Float, Int};
+
+        let root = std::env::temp_dir().join(format!(
+            "bevy-spp-generator-settings-{}", bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        for (name, tweaks, values, weights, inverted) in [
+            (
+                "mg_dirt",
+                vec![Float("dirt_level", 0.75), Float("dirt_contrast", 0.8),
+                    Float("Grunge_Scale", 6.), Float("grunge_amount", 0.45),
+                    Int("$randomseed", 431), Float("edges_masking", 0.4), Bool("invert", true)],
+                [25., 10., 6., 45., 27.],
+                vec![(GeneratorInput::Occlusion, 100), (GeneratorInput::Convexity, -40)], true,
+            ),
+            (
+                "mg_mask_editor",
+                vec![Float("global_balance", 0.625), Float("global_contrast", 0.5),
+                    Float("AO", 0.7), Bool("invert_ao", false), Float("curv", 0.25),
+                    Float("thick", 0.2), Bool("thick_invert", true), Float("Position_Gradient", 0.1),
+                    Float("tex", 0.5), Float("scale_tex", 2.), Float("tex2", 0.25), Float("tex2_scale", 9.)],
+                [-32.5, 25., 2., 50., 0.],
+                vec![(GeneratorInput::Occlusion, -70), (GeneratorInput::Convexity, 25),
+                    (GeneratorInput::Cavity, 0), (GeneratorInput::Concavity, 0),
+                    (GeneratorInput::Thin, 20), (GeneratorInput::Height, 10)], false,
+            ),
+            (
+                "noise_clouds_2",
+                vec![Float("balance", 0.75), Float("contrast", 1.), Float("scale", 80.), Int("$randomseed", -1)],
+                [25., 0.1, 64., 0., 100.], vec![(GeneratorInput::Noise, 100)], false,
+            ),
+        ] {
+            let source = root.join(format!("{name}.spp"));
+            fs::write(&source, fixture::hdf5_file(&[
+                ("paint/scene.assbin", fixture::assbin_quad_with_margin()),
+                ("paint/document.bin", fixture::document_with_generator_tweaks(&format!("starter/{name}/{name}"), &tweaks)),
+            ])).unwrap();
+            let (filename, report) = convert(&source, &root).unwrap();
+            assert!(report.overview.contains("генераторов с параметрами: 1"), "{}", report.overview);
+            let model = Glb::load(&root.join(filename)).unwrap();
+            let surface = model.paint_surface(&model.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+            let layer = surface.stack.layers.iter().find(|layer| layer.name == "Rust").unwrap();
+            let generator = layer.mask.as_ref().unwrap().generator.unwrap();
+            assert!(generator.valid());
+            for (actual, expected) in generator.values.into_iter().zip(values) {
+                assert!((actual - expected).abs() < 1e-3, "{name}: {actual} != {expected}");
+            }
+            for (input, expected) in weights {
+                assert_eq!(generator.weight(input), expected, "{name}, {input:?}");
+            }
+            assert_eq!(generator.invert, inverted);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

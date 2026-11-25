@@ -692,6 +692,94 @@ pub(super) fn paint_ready(app: &mut App) {
 }
 
 #[test]
+#[ignore = "requires GPU; exercises the paint mesh replacement menu and live rebinding"]
+fn gpu_paint_mesh_replacement_menu_restores_the_previous_model() {
+    use paint_mesh_replacement::Shape;
+
+    let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let started = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 20);
+    }
+    let original = app.world().resource::<editing::State>().documents[&0].objects[0].id;
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(
+        editing::EditAction::Mode(Mode::Paint),
+    )));
+    warm(&mut app, 10);
+    let mesh = PaintAction::MeshReplacement;
+    paint_click(&mut app, window, mesh(MeshCommand::Toggle));
+    paint_click(&mut app, window, mesh(MeshCommand::Primitive(Shape::Plane)));
+    warm(&mut app, 8);
+    let replacement = app.world().resource::<editing::State>().documents[&0].objects[0].id;
+    assert_ne!(replacement, original);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].binding, Some((replacement, 0)));
+    scroll_to_paint_control(&mut app, mesh(MeshCommand::Undo));
+    paint_click(&mut app, window, mesh(MeshCommand::Undo));
+    warm(&mut app, 8);
+    assert_eq!(app.world().resource::<editing::State>().documents[&0].objects[0].id, original,
+        "{}", app.world().resource::<Editor>().status);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].binding, Some((original, 0)));
+    scroll_to_paint_control(&mut app, mesh(MeshCommand::Redo));
+    paint_click(&mut app, window, mesh(MeshCommand::Redo));
+    warm(&mut app, 8);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].binding, Some((replacement, 0)));
+}
+
+#[test]
+#[ignore = "requires GPU; exercises Save As in the paint workspace and opens the new model tab"]
+fn gpu_paint_save_copy_opens_a_separate_editable_tab() {
+    let directory = std::env::temp_dir().join(format!("bevy-paint-save-copy-{}", bevy::asset::uuid::Uuid::new_v4()));
+    let mut project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    copy_tree(&project.asset_root, &directory);
+    project.asset_root = directory.clone();
+    let (mut app, window, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let started = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 20);
+    }
+    let source = app.world().resource::<editing::State>().documents[&0].source.path.clone();
+    let original = std::fs::read(&source).unwrap();
+    let destination = source.with_file_name("paint-copy-test.glb");
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Paint))));
+    warm(&mut app, 8);
+    paint_message(&mut app, PaintAction::Add(LayerKind::Fill));
+    let original_stack = app.world().resource::<PaintState>().sessions[&0].stack.clone();
+    assert!(app.world().resource::<editing::State>().documents[&0].dirty());
+    app.world_mut().resource_mut::<save_copy::State>().test_path = Some(destination.clone());
+    paint_click(&mut app, window, PaintAction::SaveCopy);
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        if let Some(index) = app.world().resource::<Editor>().viewing_model.filter(|&index| index != 0)
+            && let Some(doc) = app.world().resource::<editing::State>().documents.get(&index)
+            && doc.mode == Mode::Paint
+            && let Some(session) = app.world().resource::<PaintState>().sessions.get(&index)
+            && session.binding.is_some()
+        {
+            assert_eq!(session.stack.layers.len(), original_stack.layers.len());
+            assert_eq!(session.stack.layers.last().unwrap().kind, LayerKind::Fill);
+            assert!(!doc.dirty());
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    assert!(destination.is_file());
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert!(app.world().resource::<editing::State>().documents[&0].dirty());
+    assert!(app.world().resource::<Editor>().model_tabs.contains(&0));
+    drop(app);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 #[ignore = "requires GPU; uses the paint layer name field, folder disclosure and graph buttons"]
 fn gpu_paint_folder_graph_opens_from_the_renamed_layer_group() {
     let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
@@ -2043,7 +2131,7 @@ fn gpu_paint_imported_camera_uses_its_fov_and_reopens_after_a_camera_only_save()
     source.json["extras"][MODEL_CAMERA_EXTRA] = serde_json::json!(imported);
     std::fs::write(&path, source.encode(&[], &[]).unwrap()).unwrap();
 
-    let (mut app, _, _) = fixture_project(project);
+    let (mut app, window, _) = fixture_project(project);
     app.world_mut().resource_mut::<Editor>().drawer = false;
     let wait = |app: &mut App, condition: &dyn Fn(&World) -> bool| {
         let started = std::time::Instant::now();
@@ -2078,6 +2166,59 @@ fn gpu_paint_imported_camera_uses_its_fov_and_reopens_after_a_camera_only_save()
     wait(&mut app, &|world| !world.resource::<editing::State>().documents.contains_key(&0));
     app.world_mut().write_message(Action::ViewModel(0));
     wait(&mut app, &|world| world.resource::<Viewer>().camera() == reframed);
+
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Paint))));
+    paint_message(&mut app, PaintAction::Panel(Panel::Preview));
+    let field = {
+        let world = app.world_mut();
+        world.query::<(Entity, &ui::PreviewValue)>().iter(world)
+            .find_map(|(entity, value)| (value.0 == PreviewParameter::FieldOfView).then_some(entity)).unwrap()
+    };
+    scroll_to_paint_entity(&mut app, field);
+    app.world_mut().resource_mut::<InputFocus>().set(field, bevy::input_focus::FocusCause::Auto);
+    warm(&mut app, 2);
+    app.world_mut().get_mut::<bevy::text::EditableText>(field).unwrap().editor_mut().set_text("65");
+    fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Pressed);
+    fill_modifier(&mut app, window, KeyCode::Enter, Key::Enter, ButtonState::Released);
+    let adapted = ModelCamera { fov: 65_f32.to_radians(), ..reframed };
+    wait(&mut app, &|world| world.resource::<Viewer>().camera() == adapted);
+    let Projection::Perspective(lens) = projection.single(app.world()).unwrap() else {
+        panic!("Paint perspective camera");
+    };
+    assert!((lens.fov - adapted.fov).abs() < 1e-6);
+    assert!(app.world().resource::<editing::State>().documents[&0].dirty());
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Wireframe)));
+    warm(&mut app, 4);
+    assert!(app.world().resource::<editing::State>().documents[&0].paint_uv.show_wire_3d);
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)));
+    wait(&mut app, &|world| !world.resource::<editing::State>().documents[&0].dirty());
+    let saved = Glb::load(&path).unwrap();
+    assert_eq!(saved.json["extras"][MODEL_CAMERA_EXTRA], serde_json::json!(adapted));
+    assert_eq!(saved.json["extras"][crate::editor::model_document::PAINT_UV_EXTRA]["show_wire_3d"], true);
+
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        doc.paint_preview.height_strength = Some(2.);
+        doc.paint_preview.use_baked_normal = true;
+        doc.paint_preview.emission_strength = 9.;
+        doc.paint_uv.show_wire = true;
+        doc.paint_uv.show_seams_3d = true;
+        doc.paint_post = Some(DocumentPost { exposure: 1., ..default() });
+        doc.ui_revision += 1;
+    }
+    let reset = PaintAction::PreviewMaterial(PreviewEdit::Reset { model: 0 });
+    warm(&mut app, 4);
+    scroll_to_paint_control(&mut app, reset);
+    paint_click(&mut app, window, reset);
+    assert_eq!(app.world().resource::<Viewer>().camera(), ModelCamera { fov: FOV, ..reframed });
+    let doc = &app.world().resource::<editing::State>().documents[&0];
+    assert_eq!(doc.paint_preview.height_strength, Some(2.));
+    assert!(doc.paint_preview.use_baked_normal);
+    assert_eq!(doc.paint_preview.emission_strength, 1.);
+    assert!(doc.paint_uv.show_wire);
+    assert!(!doc.paint_uv.show_wire_3d && !doc.paint_uv.show_seams_3d);
+    assert_eq!(doc.paint_post, None);
     drop(app);
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -4499,7 +4640,7 @@ fn gpu_paint_uv_seams_show_island_borders_in_2d_and_depth_test_in_3d() {
     };
     app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Wireframe)));
     warm(&mut app, 4);
-    assert!(app.world().resource::<editing::State>().wireframe);
+    assert!(app.world().resource::<editing::State>().documents[&0].paint_uv.show_wire_3d);
     let output = std::env::temp_dir().join(format!("bevy-uv-seams-{}", bevy::asset::uuid::Uuid::new_v4()));
     std::fs::create_dir(&output).unwrap();
     let base = capture_when(&mut app, &target, &output.join("before.png"), |_| true);
@@ -5892,10 +6033,10 @@ fn gpu_paint_shortcuts_switch_tools_and_views_without_editing_layers() {
         press(&mut app, KeyCode::F10, Key::F10);
         assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_trace, expected);
     }
-    let wireframe = app.world().resource::<editing::State>().wireframe;
+    let wireframe = app.world().resource::<editing::State>().documents[&0].paint_uv.show_wire_3d;
     for expected in [!wireframe, wireframe] {
         press(&mut app, KeyCode::KeyW, Key::Character("w".into()));
-        assert_eq!(app.world().resource::<editing::State>().wireframe, expected);
+        assert_eq!(app.world().resource::<editing::State>().documents[&0].paint_uv.show_wire_3d, expected);
     }
     let distance = app.world().resource::<Viewer>().distance;
     app.world_mut().resource_mut::<Viewer>().distance *= 1.5;
@@ -5917,7 +6058,7 @@ fn gpu_paint_shortcuts_switch_tools_and_views_without_editing_layers() {
     };
     right(&mut app, ButtonState::Pressed);
     press(&mut app, KeyCode::KeyW, Key::Character("w".into()));
-    assert_eq!(app.world().resource::<editing::State>().wireframe, wireframe);
+    assert_eq!(app.world().resource::<editing::State>().documents[&0].paint_uv.show_wire_3d, wireframe);
     right(&mut app, ButtonState::Released);
     assert_eq!(app.world().resource::<PaintState>().sessions[&0].undo.len(), undo);
 }

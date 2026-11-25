@@ -241,15 +241,18 @@ impl DocWriter {
         if let Some(i) = self.classes.iter().position(|c| *c == name) {
             self.u32(i as u32);
         } else {
-            self.u32(u32::MAX);
-            self.string(name);
-            self.u32(props.len() as u32);
-            for (n, t) in props {
-                self.string(n);
-                self.u32(*t);
-            }
-            self.classes.push(name);
+            self.define_class(name, props);
         }
+    }
+    fn define_class(&mut self, name: &'static str, props: &[(&str, u32)]) {
+        self.u32(u32::MAX);
+        self.string(name);
+        self.u32(props.len() as u32);
+        for (n, t) in props {
+            self.string(n);
+            self.u32(*t);
+        }
+        self.classes.push(name);
     }
 }
 
@@ -383,6 +386,20 @@ pub fn document_with_mask_effects(url: &str) -> Vec<u8> {
     document_options(0, None, TestMask::Effects(url, false))
 }
 
+pub fn document_with_bitmap_mask_projection(url: &str, projection: u32) -> Vec<u8> {
+    document_options(0, None, TestMask::BitmapProjection(url, projection))
+}
+
+pub enum GeneratorTweak {
+    Float(&'static str, f32),
+    Int(&'static str, i32),
+    Bool(&'static str, bool),
+}
+
+pub fn document_with_generator_tweaks(url: &str, tweaks: &[GeneratorTweak]) -> Vec<u8> {
+    document_options(0, None, TestMask::TunedGenerator(url, tweaks))
+}
+
 pub fn document_with_mask_outline(url: &str) -> Vec<u8> {
     document_options(0, None, TestMask::Effects(url, true))
 }
@@ -478,6 +495,8 @@ enum TestMask<'a> {
     Strokes,
     PaintFill,
     Effects(&'a str, bool),
+    BitmapProjection(&'a str, u32),
+    TunedGenerator(&'a str, &'a [GeneratorTweak]),
     OrderedFilters,
     TonalFilters,
     Anchors,
@@ -612,6 +631,25 @@ fn document_options(normal_syscoord: i32, bitmap: Option<&str>, mask: TestMask<'
         write_strokes(&mut w, 0x400, true, None, None, false, false);
     } else if let Some(url) = mask_image {
         write_mask_effects(&mut w, url, matches!(mask, TestMask::Effects(_, true)));
+    } else if let TestMask::BitmapProjection(url, projection) = mask {
+        w.u32(0x600);
+        w.class("DataStackActions", &[("items", 19)]);
+        w.u32(1);
+        w.u32(0x601);
+        w.define_class("DataActionFill", &[("projection", 9), ("sources", 19)]);
+        w.u32(projection);
+        w.u32(1);
+        w.u32(0x602);
+        w.class("DataSourceBitmap", &[("channelTypes", 12), ("bitmap", 18)]);
+        w.out.extend(u64::MAX.to_le_bytes());
+        w.u32(0x603);
+        w.class("DataBitmap", &[("urlToBitmapRes", 16)]);
+        w.string(url);
+    } else if let TestMask::TunedGenerator(url, tweaks) = mask {
+        w.u32(0x600);
+        w.class("DataStackActions", &[("items", 19)]);
+        w.u32(1);
+        write_generator_fill(&mut w, url, tweaks);
     } else if matches!(mask, TestMask::TonalFilters) {
         w.u32(0x600);
         w.class("DataStackActions", &[("items", 19)]);
@@ -933,10 +971,10 @@ fn write_mask_effects(w: &mut DocWriter, url: &str, outline: bool) {
 
 fn write_generator(w: &mut DocWriter) {
     w.u32(1);
-    write_generator_fill(w, "starter/mg_dirt/mg_dirt");
+    write_generator_fill(w, "starter/mg_dirt/mg_dirt", &[]);
 }
 
-fn write_generator_fill(w: &mut DocWriter, url: &str) {
+fn write_generator_fill(w: &mut DocWriter, url: &str, tweaks: &[GeneratorTweak]) {
     w.u32(0x610);
     w.class("DataActionFill", &[("channelTypes", 12), ("sources", 19)]);
     w.out.extend(u64::MAX.to_le_bytes());
@@ -950,7 +988,27 @@ fn write_generator_fill(w: &mut DocWriter, url: &str) {
     w.u32(0x612);
     w.class("DataProcedural", &[("urlToSbsRes", 16), ("tweaks", 19)]);
     w.string(url);
-    w.u32(0);
+    w.u32(tweaks.len() as u32);
+    for (index, tweak) in tweaks.iter().enumerate() {
+        w.u32(0x620 + index as u32);
+        match *tweak {
+            GeneratorTweak::Float(name, value) => {
+                w.class("DataTweakFloat", &[("identifier", 16), ("value", 1)]);
+                w.string(name);
+                w.u32(value.to_bits());
+            }
+            GeneratorTweak::Int(name, value) => {
+                w.class("DataTweakInt", &[("identifier", 16), ("value", 5)]);
+                w.string(name);
+                w.u32(value as u32);
+            }
+            GeneratorTweak::Bool(name, value) => {
+                w.class("DataTweakBool", &[("identifier", 16), ("value", 10)]);
+                w.string(name);
+                w.out.push(u8::from(value));
+            }
+        }
+    }
 }
 
 fn write_polygon_mask(w: &mut DocWriter, generator: Option<&str>) {
@@ -971,7 +1029,7 @@ fn write_polygon_mask(w: &mut DocWriter, generator: Option<&str>) {
         w.u32(0x604);
         w.class("DataStackActions", &[("items", 19)]);
         w.u32(1);
-        write_generator_fill(w, url);
+        write_generator_fill(w, url, &[]);
     }
     w.u32(0x321);
     w.class("DataActionDecal", &[("hits", 19)]);
@@ -1370,6 +1428,10 @@ pub fn assbin_projection_layers(back_depth: f32, front_normal: f32) -> Vec<u8> {
 
 pub fn assbin_two_parts() -> Vec<u8> {
     assbin_quads(&[("Left", 0., 0.5, 0., 0.), ("Right", 0.5, 1., 0., 0.)])
+}
+
+pub fn assbin_compressed_uv_quad() -> Vec<u8> {
+    assbin_quads_with_uv_scale(&[("Cube", 0., 1., 0., 0.)], [0.5, 1.], 1.)
 }
 
 pub fn assbin_udim() -> Vec<u8> {

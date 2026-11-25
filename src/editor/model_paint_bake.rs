@@ -748,6 +748,16 @@ pub(super) struct FixPreview {
     pub fixes: Arc<Fixes>,
 }
 impl State {
+    pub(super) fn cancel_mesh_work(&mut self, model: usize) {
+        if self.running.as_ref().is_some_and(|job| job.key.model == model) {
+            self.running = None;
+        }
+        if self.picking.as_ref().is_some_and(|(index, _, _)| *index == model) {
+            self.picking = None;
+        }
+        self.automatic.remove(&model);
+    }
+
     fn begin(
         &mut self,
         key: Key,

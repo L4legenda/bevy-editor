@@ -1014,6 +1014,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     // Keep the saved graph result when opening a set. A new bake
                     // or a subsequent mesh change will refresh the generated maps.
                     if !runtime.lives.contains_key(&key)
+                        && !session.mesh_graph_refresh.contains(&(object.id, slot))
                         && !super::material_graph::needs_initial_render(&session.stack)
                         && let Some(source) = super::material_graph::surface::Source::capture(
                             doc, (object.id, slot),
@@ -1926,6 +1927,17 @@ pub(in crate::editor::ui::model_viewer) fn input(
     }
 }
 impl Runtime {
+    pub(super) fn discard_mesh(&mut self, model: usize, queue: &mut gpu::Queue) {
+        self.lives.retain(|(index, _, _), live| {
+            if *index == model {
+                live.controller.invalidate(queue);
+            }
+            *index != model
+        });
+        self.line_anchor = None;
+        self.map_cache = None;
+    }
+
     pub(in crate::editor::ui::model_viewer) fn stroke_active(&self) -> bool {
         self.gesture.is_some() || self.fix.drawing()
     }
