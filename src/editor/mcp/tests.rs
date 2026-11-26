@@ -37,7 +37,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 41);
+    assert_eq!(tools.tools.len(), 42);
     for name in [
         "get_editor_state",
         "get_paint_state",
@@ -53,6 +53,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
         "import_paint_preset",
         "export_paint_preset",
         "export_textures",
+        "export_paint_mesh",
         "bake_maps",
         "set_bake_levels",
         "get_bake_state",
@@ -787,6 +788,7 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         "paint_stroke",
         "save_model",
         "export_textures",
+        "export_paint_mesh",
         "bake_maps",
         "capture_paint_view",
     ] {
@@ -879,6 +881,35 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         }
     };
     assert_eq!(wait_for_paint(&mut client, &mut app)["resolution"], 512);
+    let invalid_mesh = client.request(&mut app, "tools/call", json!({
+        "name": "export_paint_mesh", "arguments": {"model_id": 1, "folder": "."},
+    }));
+    assert_eq!(invalid_mesh["isError"], true);
+    let mesh_folder = scratch.0.join("exported-mesh");
+    fs::create_dir(&mesh_folder).unwrap();
+    let mesh_args = json!({"model_id": 0, "folder": mesh_folder});
+    let mesh = client.tool(&mut app, "export_paint_mesh", mesh_args.clone());
+    let report = &mesh["structuredContent"];
+    let files = report["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    let find_file = |extension| {
+        files.iter()
+            .filter_map(Value::as_str)
+            .map(Path::new)
+            .find(|file| file.extension().is_some_and(|ext| ext == extension))
+            .unwrap()
+    };
+    let obj = fs::read_to_string(find_file("obj")).unwrap();
+    let mtl = find_file("mtl");
+    assert!(obj.contains(&format!("mtllib {}", mtl.file_name().unwrap().to_string_lossy())));
+    assert!(fs::read_to_string(mtl).unwrap().contains("newmtl "));
+    assert_eq!(obj.lines().filter(|line| line.starts_with("f ")).count(), 2);
+    assert!(obj.lines().any(|line| line == "v -1 -1 0"));
+    assert!(obj.lines().any(|line| line == "vt 0 1"));
+    assert!(obj.lines().any(|line| line == "vt 1 0"));
+    let repeated = client.tool(&mut app, "export_paint_mesh", mesh_args);
+    assert_ne!(report["folder"], repeated["structuredContent"]["folder"]);
+    assert_eq!(fs::read_to_string(find_file("obj")).unwrap(), obj);
     let view = client.tool(
         &mut app,
         "set_paint_view",

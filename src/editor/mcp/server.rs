@@ -276,6 +276,18 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Export the active paint model's current geometry and global UVs as OBJ and MTL in a new folder. Use export_textures to write texture maps separately",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn export_paint_mesh(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::ExportMeshArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintExportMesh(args), context).await
+    }
+
+    #[tool(
         description = "Start baking mesh maps for the active paint texture set using its resolution, with optional quality and high-poly settings. Poll get_bake_state for completion",
         annotations(destructive_hint = false, open_world_hint = false)
     )]

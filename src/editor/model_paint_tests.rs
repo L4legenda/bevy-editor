@@ -7112,6 +7112,25 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         assert_eq!(map.layout, Layout::Rgb);
         assert!(map.channels[1].invert && map.channels[1].src == Source::Roughness);
     }
+    scroll_to_paint_control(&mut app, PaintAction::NewExportTemplate);
+    paint_click(&mut app, window, PaintAction::NewExportTemplate);
+    let export::Template::Custom(draft) = app.world().resource::<export::prefs::Store>().settings().template else {
+        panic!("Новый шаблон не выбран");
+    };
+    assert_ne!(draft, recipe);
+    assert!(app.world().resource::<export::prefs::Store>().recipe(draft).unwrap().maps.is_empty());
+    for edit in [Edit::Add, Edit::Remove] {
+        let action = PaintAction::EditExportTemplate { recipe: draft, output: 0, channel: 0, edit };
+        scroll_to_paint_control(&mut app, action);
+        paint_click(&mut app, window, action);
+    }
+    assert!(app.world().resource::<export::prefs::Store>().recipe(draft).unwrap().maps.is_empty());
+    let delete_draft = PaintAction::DeleteExportTemplate(draft);
+    scroll_to_paint_control(&mut app, delete_draft);
+    paint_click(&mut app, window, delete_draft);
+    let store = app.world().resource::<export::prefs::Store>();
+    assert!(store.recipe(draft).is_none());
+    assert_eq!(store.settings().template, export::Template::Custom(recipe));
     for action in [PaintAction::ExportFileMenu, PaintAction::ExportPreviewScope(true)] {
         scroll_to_paint_control(&mut app, action);
         paint_click(&mut app, window, action);

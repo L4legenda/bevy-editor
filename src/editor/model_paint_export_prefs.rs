@@ -168,19 +168,25 @@ impl Store {
     }
 
     pub(super) fn duplicate(&mut self) -> io::Result<()> {
-        let mut recipe = self
+        let recipe = self
             .selected_recipe()
             .map(|recipe| (*recipe).clone())
             .or_else(|| recipe::Recipe::from_builtin(self.current.settings.template))
             .ok_or_else(|| io::Error::other("Шаблон не найден"))?;
+        let root: String = recipe.name.chars().take(85).collect();
+        self.add_recipe(recipe, format!("{root} · копия"))
+    }
+
+    pub(super) fn create_recipe(&mut self) -> io::Result<()> {
+        let name = "Мой шаблон".to_owned();
+        self.add_recipe(recipe::Recipe { name: name.clone(), maps: Vec::new() }, name)
+    }
+
+    fn add_recipe(&mut self, mut recipe: recipe::Recipe, stem: String) -> io::Result<()> {
         let index = self.current.recipes.len();
         if index == recipe::MAX_TEMPLATES {
-            return Err(io::Error::other(
-                "В библиотеке уже 64 пользовательских шаблона",
-            ));
+            return Err(io::Error::other("В библиотеке уже 64 пользовательских шаблона"));
         }
-        let root: String = recipe.name.chars().take(85).collect();
-        let stem = format!("{root} · копия");
         recipe.name = stem.clone();
         for suffix in 2.. {
             if self
@@ -197,6 +203,26 @@ impl Store {
         self.current.settings.template = Template::Custom(index);
         self.revision += 1;
         Ok(())
+    }
+
+    pub(super) fn delete_selected(&mut self, index: usize) -> bool {
+        if self.current.settings.template != Template::Custom(index) || self.recipe(index).is_none() {
+            return false;
+        }
+        self.current.recipes.remove(index);
+        self.current.settings.template = match self.current.recipes.len() {
+            0 => Template::default(),
+            len => Template::Custom(index.min(len - 1)),
+        };
+        self.revision += 1;
+        true
+    }
+
+    pub(in crate::editor::ui::model_viewer::paint) fn template_has_maps(&self) -> bool {
+        match self.current.settings.template {
+            Template::Custom(index) => self.recipe(index).is_some_and(|recipe| !recipe.maps.is_empty()),
+            _ => true,
+        }
     }
 
     pub(super) fn edit(
@@ -391,6 +417,37 @@ mod tests {
         assert_eq!(reopened.template_label(Template::Custom(0)), "Mask");
         assert_eq!(reopened.selected_recipe().unwrap().name, "Mask");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_export_templates_persist_and_deletion_keeps_a_valid_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("paint-export.json");
+        let mut store = Store::open(Some(path.clone()));
+        store.create_recipe().unwrap();
+        store.create_recipe().unwrap();
+        assert_ne!(store.recipe(0).unwrap().name, store.recipe(1).unwrap().name);
+        assert!(!store.template_has_maps());
+        store.edit(1, 0, 0, recipe::Edit::Add, None).unwrap();
+        assert!(store.template_has_maps());
+        store.edit(1, 0, 0, recipe::Edit::Remove, None).unwrap();
+        assert!(!store.template_has_maps());
+        store.flush().unwrap();
+
+        let mut reopened = Store::open(Some(path.clone()));
+        assert_eq!(reopened.settings().template, Template::Custom(1));
+        let draft = reopened.selected_recipe().unwrap();
+        assert!(draft.maps.is_empty());
+        let json = draft.write_json(directory.path()).unwrap();
+        assert_eq!(recipe::load(&json).unwrap(), vec![draft.as_ref().clone()]);
+        assert!(!reopened.delete_selected(0));
+        assert!(reopened.delete_selected(1));
+        assert_eq!(reopened.settings().template, Template::Custom(0));
+        assert!(reopened.delete_selected(0));
+        assert!(!reopened.delete_selected(0));
+        assert_eq!(reopened.settings().template, Template::default());
+        reopened.flush().unwrap();
+        assert_eq!(Store::open(Some(path)).recipe_labels().count(), 0);
     }
 
     #[test]

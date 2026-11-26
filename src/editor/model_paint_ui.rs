@@ -1587,13 +1587,14 @@ fn export_recipe_editor(
     let controls = node(commands, parent, Node {
         flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
     });
+    button(commands, controls, font, "Новый шаблон", PaintAction::NewExportTemplate);
     button(commands, controls, font, "Копировать шаблон", PaintAction::CopyExportTemplate);
     button(commands, controls, font, "Сохранить JSON…", PaintAction::SaveExportTemplate);
     let export::Template::Custom(index) = session.export_settings.template else { return };
     let Some(recipe) = prefs.recipe(index) else { return };
-    let output = session.export_output.min(recipe.maps.len() - 1);
-    let map = &recipe.maps[output];
-    let channel = session.export_component.min(map.layout.len() - 1);
+    icon(commands, controls, icons::Glyph::Trash, "Удалить шаблон", PaintAction::DeleteExportTemplate(index));
+    let output = session.export_output.min(recipe.maps.len().saturating_sub(1));
+    let channel = recipe.maps.get(output).map_or(0, |map| session.export_component.min(map.layout.len() - 1));
     let edit = |edit| PaintAction::EditExportTemplate { recipe: index, output, channel, edit };
     export_text_input(commands, parent, font, "Имя шаблона",
         export::RecipeName { recipe: index, output: None }, &recipe.name, edit(Edit::RenameTemplate));
@@ -1608,9 +1609,8 @@ fn export_recipe_editor(
     if recipe.maps.len() < 32 {
         button(commands, operations, font, "+ Карта", edit(Edit::Add));
     }
-    if recipe.maps.len() > 1 {
-        icon(commands, operations, icons::Glyph::Trash, "Убрать карту из шаблона", edit(Edit::Remove));
-    }
+    let Some(map) = recipe.maps.get(output) else { return };
+    icon(commands, operations, icons::Glyph::Trash, "Убрать карту из шаблона", edit(Edit::Remove));
     if output > 0 { button(commands, operations, font, "↑", edit(Edit::Move(true))); }
     if output + 1 < recipe.maps.len() { button(commands, operations, font, "↓", edit(Edit::Move(false))); }
     export_text_input(commands, parent, font, "Имя файла",
@@ -2868,7 +2868,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 !session.busy && session.resize_request.is_none() && !session.smart_loading
                     && session.history_step_set(doc, button.0).is_some()
             }
-            PaintAction::ExportMaps(_) | PaintAction::ExportMesh => {
+            PaintAction::ExportMaps(_) => {
+                export_preferences.template_has_maps() && !export_activity.exporting() && session.available(button.0)
+            }
+            PaintAction::ExportMesh => {
                 !export_activity.exporting() && session.available(button.0)
             }
             action => session.available(action),

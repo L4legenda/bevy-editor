@@ -19,7 +19,7 @@ mod image_output;
 #[path = "model_paint_mcp_output.rs"]
 mod mcp_output;
 #[cfg(feature = "mcp")]
-pub(in crate::editor) use mcp_output::{ExportArgs, McpOutput, OutputReply};
+pub(in crate::editor) use mcp_output::{ExportArgs, ExportMeshArgs, McpOutput, OutputReply};
 #[cfg(feature = "mcp")]
 pub(super) use mcp_output::output_folder;
 #[path = "model_paint_export_mesh.rs"]
@@ -742,6 +742,9 @@ fn write_textures(
     } = settings;
     if matches!(template, Template::Custom(_)) && custom.is_none() {
         return Err(io::Error::other("Пользовательский шаблон не найден"));
+    }
+    if custom.is_some_and(|recipe| recipe.maps.is_empty()) {
+        return Err(io::Error::other("Добавьте выходную карту в шаблон экспорта"));
     }
     let multiple_sets = has_distinct_stems(sets.iter().map(|set| set.stem.as_str()));
     let mut output = ExportDirectory::create(parent, model, "textures", options)?;
@@ -1613,6 +1616,8 @@ pub(in crate::editor::ui::model_viewer) fn actions(
             | PaintAction::RevealExportResult
             | PaintAction::ImportExportTemplate
             | PaintAction::CopyExportTemplate
+            | PaintAction::NewExportTemplate
+            | PaintAction::DeleteExportTemplate(_)
             | PaintAction::SaveExportTemplate
             | PaintAction::EditExportTemplate { .. }),
         )) = *action
@@ -1702,6 +1707,27 @@ pub(in crate::editor::ui::model_viewer) fn actions(
             };
             continue;
         }
+        if action == PaintAction::NewExportTemplate {
+            editor.status = match preferences.create_recipe() {
+                Ok(()) => "Создан пустой шаблон экспорта".into(),
+                Err(error) => format!("Не удалось создать шаблон · {error}"),
+            };
+            continue;
+        }
+        if let PaintAction::DeleteExportTemplate(recipe) = action {
+            if preferences.delete_selected(recipe) {
+                if let Some(session) = paint.sessions.get_mut(&index) {
+                    session.export_output = 0;
+                    session.export_component = 0;
+                    session.export_source_menu = false;
+                    session.revision += 1;
+                }
+                editor.status = "Шаблон удалён".into();
+                messages.clear();
+                break;
+            }
+            continue;
+        }
         if let PaintAction::EditExportTemplate {
             recipe,
             output,
@@ -1731,14 +1757,13 @@ pub(in crate::editor::ui::model_viewer) fn actions(
                             recipe::Edit::Add => updated.maps.len() - 1,
                             recipe::Edit::Move(true) => output - 1,
                             recipe::Edit::Move(false) => output + 1,
-                            _ => session.export_output.min(updated.maps.len() - 1),
+                            _ => session.export_output.min(updated.maps.len().saturating_sub(1)),
                         };
                         if matches!(edit, recipe::Edit::SetSource(_)) {
                             session.export_source_menu = false;
                         }
-                        session.export_component = session
-                            .export_component
-                            .min(updated.maps[session.export_output].layout.len() - 1);
+                        session.export_component = updated.maps.get(session.export_output)
+                            .map_or(0, |map| session.export_component.min(map.layout.len() - 1));
                         session.revision += 1;
                     }
                 }
@@ -1806,6 +1831,10 @@ pub(in crate::editor::ui::model_viewer) fn actions(
         }
         let mesh = action == PaintAction::ExportMesh;
         let job = if let PaintAction::ExportMaps(all) = action {
+            if !preferences.template_has_maps() {
+                editor.status = "Добавьте выходную карту в шаблон экспорта".into();
+                continue;
+            }
             let selected = if all {
                 None
             } else {

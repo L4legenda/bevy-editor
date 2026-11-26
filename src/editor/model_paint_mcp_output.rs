@@ -42,6 +42,16 @@ struct NormalPatch {
     use_baked: Option<bool>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct ExportMeshArgs {
+    /// model_id returned by get_paint_state.
+    pub(in crate::editor::ui::model_viewer::paint) model_id: usize,
+    /// Existing destination folder. Relative paths are resolved in the project asset folder.
+    folder: PathBuf,
+}
+
 #[derive(SystemParam)]
 pub(in crate::editor) struct McpOutput<'w, 's> {
     images: Option<Res<'w, Assets<Image>>>,
@@ -174,15 +184,36 @@ impl McpOutput<'_, '_> {
                 Some(path) => Some(load_template(&path, args.template_name.as_deref())?),
                 None => recipe,
             };
-            let folder = folder.canonicalize().map_err(|error| error.to_string())?;
-            if !folder.is_dir() {
-                return Err("The export destination must be an existing folder".into());
-            }
-            let report = write_textures(&folder, &model, &project, sets, settings, recipe.as_ref())
-                .map_err(|error| error.to_string())?;
-            Ok(json!({"folder": report.path, "files": report.paths}))
+            let folder = existing_folder(&folder)?;
+            report_paths(write_textures(&folder, &model, &project, sets, settings, recipe.as_ref()))
         })
     }
+
+    pub(in crate::editor::ui::model_viewer::paint) fn prepare_mesh_export(
+        &self,
+        editor: &Editor,
+        doc: &Document,
+        args: ExportMeshArgs,
+    ) -> Result<impl FnOnce() -> Result<Value, String> + Send + 'static, String> {
+        let folder = output_folder(&editor.project.asset_root, &args.folder)?;
+        let snapshot = mesh::Snapshot::capture(doc);
+        let model = model_name(doc).to_owned();
+        Ok(move || report_paths(snapshot.write(&existing_folder(&folder)?, &model)))
+    }
+}
+
+fn existing_folder(path: &Path) -> Result<PathBuf, String> {
+    let folder = path.canonicalize().map_err(|error| error.to_string())?;
+    if !folder.is_dir() {
+        return Err("The export destination must be an existing folder".into());
+    }
+    Ok(folder)
+}
+
+fn report_paths(report: std::io::Result<Report>) -> Result<Value, String> {
+    report
+        .map(|report| json!({"folder": report.path, "files": report.paths}))
+        .map_err(|error| error.to_string())
 }
 
 fn named_template(preferences: &prefs::Store, name: &str) -> Result<Template, String> {

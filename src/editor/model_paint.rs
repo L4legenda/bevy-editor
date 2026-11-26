@@ -573,6 +573,8 @@ pub(in crate::editor) enum PaintAction {
     ImportExportTemplate,
     ExportTemplate(export::Template),
     CopyExportTemplate,
+    NewExportTemplate,
+    DeleteExportTemplate(usize),
     SaveExportTemplate,
     ExportOutput(usize),
     ExportComponent(usize),
@@ -764,6 +766,8 @@ impl PaintAction {
             Self::ExportTemplateMenu => "Показать шаблоны экспорта.",
             Self::ImportExportTemplate => "Добавить шаблоны из файла JSON Material Painter.",
             Self::CopyExportTemplate => "Создать редактируемую копию выбранного шаблона.",
+            Self::NewExportTemplate => "Создать пустой шаблон экспорта.",
+            Self::DeleteExportTemplate(_) => "Удалить выбранный пользовательский шаблон из библиотеки.",
             Self::SaveExportTemplate => "Записать шаблон в JSON, совместимый с Material Painter.",
             Self::ExportOutput(_) => "Выбрать выходную карту шаблона.",
             Self::ExportComponent(_) => "Выбрать канал выходной карты.",
@@ -2627,6 +2631,7 @@ impl Session {
             PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ApplyExportMeshName
             | PaintAction::ApplyExportDestination | PaintAction::BrowseExportDestination | PaintAction::RevealExportResult
             | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
+            | PaintAction::NewExportTemplate | PaintAction::DeleteExportTemplate(_)
             | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
             | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
             | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
@@ -5258,6 +5263,7 @@ pub(super) fn actions(
                 PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ApplyExportMeshName
                 | PaintAction::ApplyExportDestination | PaintAction::BrowseExportDestination | PaintAction::RevealExportResult
                 | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
+                | PaintAction::NewExportTemplate | PaintAction::DeleteExportTemplate(_)
                 | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
                 | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
                 | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces

@@ -391,7 +391,7 @@ impl Recipe {
                 ));
             }
             Edit::Remove => {
-                if self.maps.len() <= 1 || output >= self.maps.len() {
+                if output >= self.maps.len() {
                     return Err(invalid());
                 }
                 self.maps.remove(output);
@@ -452,11 +452,10 @@ impl Recipe {
         if self.name.trim().is_empty()
             || self.name.chars().count() > 100
             || self.name.chars().any(char::is_control)
-            || self.maps.is_empty()
             || self.maps.len() > 32
         {
             return Err(io::Error::other(
-                "Шаблон должен иметь имя и от 1 до 32 выходных карт",
+                "Шаблон должен иметь имя и не более 32 выходных карт",
             ));
         }
         let mut names = std::collections::HashSet::new();

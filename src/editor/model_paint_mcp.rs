@@ -4,7 +4,7 @@ use crate::editor::model_document::Document;
 use crate::editor::model_paint_data::mask::MaskBlend;
 pub(in crate::editor) use bake::{BakeArgs, BakeLevelsArgs, BakeTarget, McpBake};
 pub(in crate::editor) use engine::McpPaintInput;
-pub(in crate::editor) use export::{ExportArgs, McpOutput, OutputReply};
+pub(in crate::editor) use export::{ExportArgs, ExportMeshArgs, McpOutput, OutputReply};
 pub(in crate::editor) use mcp_preview::offscreen::{RenderArgs, render};
 pub(in crate::editor) use mcp_preview::{
     CageArgs, CaptureArgs, CaptureReply, McpPreview, ViewArgs as PaintViewArgs, cage, capture,
@@ -1221,6 +1221,19 @@ pub(in crate::editor) fn export_textures(
             output.prepare_export(editor, doc, binding, args)
         },
     );
+    output.write(job, reply);
+}
+
+pub(in crate::editor) fn export_mesh(
+    output: &mut McpOutput,
+    editor: &Editor,
+    editing: &editing::State,
+    paint: &PaintState,
+    args: ExportMeshArgs,
+    reply: OutputReply,
+) {
+    let job = output_document(output, editor, editing, paint, args.model_id)
+        .and_then(|(doc, _)| output.prepare_mesh_export(editor, doc, args));
     output.write(job, reply);
 }
 

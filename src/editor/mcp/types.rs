@@ -118,6 +118,7 @@ pub(super) enum Command {
     PaintPresetImport(super::mcp_state::ImportPresetArgs),
     PaintPresetExport(super::mcp_state::ExportPresetArgs),
     PaintExport(super::mcp_state::ExportArgs),
+    PaintExportMesh(super::mcp_state::ExportMeshArgs),
     BakeStatus(super::mcp_state::BakeTarget),
     BakeStart(super::mcp_state::BakeArgs),
     BakeCancel(super::mcp_state::BakeTarget),
