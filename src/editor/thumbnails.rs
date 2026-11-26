@@ -75,6 +75,29 @@ impl Target {
     }
 }
 
+/// Paths outlive the offscreen entities so a texture edit can refresh a cached card.
+struct ThumbnailFiles {
+    paths: HashSet<String>,
+    source: String,
+    direction: Option<[f32; 3]>,
+    pending: Option<bevy::tasks::Task<HashSet<String>>>,
+    changes: HashSet<String>,
+}
+
+impl ThumbnailFiles {
+    fn changed(&mut self, changed: &HashSet<String>) -> bool {
+        if let Some(task) = &mut self.pending {
+            self.changes.extend(changed.iter().cloned());
+            if let Some(paths) = bevy::tasks::block_on(bevy::tasks::poll_once(task)) {
+                self.pending = None;
+                self.paths.extend(paths);
+                return !self.paths.is_disjoint(&std::mem::take(&mut self.changes));
+            }
+        }
+        !self.paths.is_disjoint(changed)
+    }
+}
+
 #[derive(Resource)]
 pub(super) struct Thumbnails {
     pub(super) images: Vec<Handle<Image>>,
@@ -95,6 +118,7 @@ pub(super) struct Thumbnails {
     model_environment: Option<crate::SceneLighting>,
     changed_assets: HashSet<String>,
     asset_versions: HashMap<String, (u64, std::time::SystemTime)>,
+    files: HashMap<Target, ThumbnailFiles>,
     job: Option<Job>,
 }
 
@@ -156,6 +180,7 @@ impl Thumbnails {
             model_environment: None,
             changed_assets: HashSet::new(),
             asset_versions: HashMap::new(),
+            files: default(),
             job: None,
         }
     }
@@ -189,6 +214,7 @@ impl Thumbnails {
                     self.snapshots[i] = None;
                 }
             }
+            self.files.remove(&evicted);
             self.completed.remove(&evicted);
             self.failed.remove(&evicted);
         }
@@ -217,6 +243,64 @@ impl Thumbnails {
             .is_none_or(|previous| previous != version)
     }
 
+    fn remember_files(&mut self, editor: &Editor, target: Target, asset: &str) {
+        let mut models = Vec::new();
+        if !asset.is_empty() {
+            models.push(asset.to_owned());
+        }
+        let (source, direction) = match target {
+            Target::Model(i) => (
+                asset.to_owned(),
+                Some(editor.project.catalog[i].preview_direction),
+            ),
+            Target::Scene(i) => {
+                if let Some(snapshot) = &self.snapshots[i] {
+                    models.extend(
+                        snapshot
+                            .edits
+                            .models
+                            .iter()
+                            .map(|model| model.asset.clone()),
+                    );
+                }
+                (editor.project.scenes[i].file.clone(), None)
+            }
+        };
+        let mut paths: HashSet<_> = models.iter().map(|path| asset_key(editor, path)).collect();
+        paths.insert(asset_key(editor, &source));
+        for model in &models {
+            self.remember_asset(editor, model);
+        }
+        let root = editor.root.clone();
+        let pending = bevy::tasks::IoTaskPool::get().spawn(async move {
+            let mut paths = HashSet::new();
+            for model in models {
+                let path = crate::asset_paths::resolve_asset_path(&root, &model).unwrap_or(model);
+                if let Ok(inputs) =
+                    super::file_moves::model_inputs(&root, std::path::Path::new(&path))
+                {
+                    for input in inputs {
+                        let path = input.to_string_lossy().replace('\\', "/");
+                        paths.insert(
+                            crate::asset_paths::original_asset_path(&root, &path).unwrap_or(path),
+                        );
+                    }
+                }
+            }
+            paths
+        });
+        self.files.insert(
+            target,
+            ThumbnailFiles {
+                source,
+                direction,
+                paths,
+                pending: Some(pending),
+                changes: default(),
+            },
+        );
+    }
+
     fn refresh_models(
         &mut self,
         editor: &Editor,
@@ -226,30 +310,37 @@ impl Thumbnails {
         let lighting_changed = self.model_environment.as_ref() != Some(environment);
         self.model_environment = Some(environment.clone());
         let changed = std::mem::take(&mut self.changed_assets);
-        if !lighting_changed && changed.is_empty() {
-            return;
-        }
-        let key = |path: &str| asset_key(editor, path);
-        let changed: HashSet<_> = changed.iter().map(|path| key(path)).collect();
-        let invalid = |target: Target| match target {
-            Target::Model(index) => {
-                lighting_changed
-                    || editor
-                        .project
-                        .catalog
-                        .get(index)
-                        .is_some_and(|model| changed.contains(&key(&model.asset)))
+        let changed: HashSet<_> = changed.iter().map(|path| asset_key(editor, path)).collect();
+        let mut invalid = HashSet::new();
+        for (&target, files) in &mut self.files {
+            if files.changed(&changed) || (lighting_changed && matches!(target, Target::Model(_))) {
+                invalid.insert(target);
             }
-            // A model can occur in multiple scene documents, including closed ones.
-            Target::Scene(_) => !changed.is_empty(),
-        };
-        if self.job.as_ref().is_some_and(|job| invalid(job.target)) {
+        }
+        for (i, scene) in editor.project.scenes.iter().enumerate() {
+            if !changed.is_empty() && changed.contains(&asset_key(editor, &scene.file)) {
+                invalid.insert(Target::Scene(i));
+                self.pending_snapshots.remove(&i);
+                if let Some(snapshot) = self.snapshots.get_mut(i) {
+                    *snapshot = None;
+                }
+            }
+        }
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|job| invalid.contains(&job.target))
+        {
             self.cancel(commands);
         }
-        self.completed.retain(|&target| !invalid(target));
-        self.failed.retain(|&target| !invalid(target));
-        if !changed.is_empty() {
-            self.changed.fill(Instant::now());
+        for target in invalid {
+            self.completed.remove(&target);
+            self.failed.remove(&target);
+            if let Target::Scene(i) = target
+                && let Some(stamp) = self.changed.get_mut(i)
+            {
+                *stamp = Instant::now();
+            }
         }
     }
 
@@ -472,6 +563,10 @@ pub(super) fn update(
     subjects: Query<(), With<scene::Subject>>,
     children: Query<&Children>,
     meshes: Query<(&Aabb, &GlobalTransform)>,
+    (mesh_materials, materials): (
+        Query<&MeshMaterial3d<StandardMaterial>>,
+        Res<Assets<StandardMaterial>>,
+    ),
     mut backdrop_assets: (
         ResMut<Assets<Mesh>>,
         ResMut<Assets<super::viewport_background::BackgroundMaterial>>,
@@ -486,50 +581,61 @@ pub(super) fn update(
     previews.refresh_models(&editor, &model_environment, &mut commands);
     let scene_count = editor.project.scenes.len();
     let placeholder = previews.placeholder.clone();
-    previews.scene_images.resize(scene_count, placeholder);
+    previews
+        .scene_images
+        .resize(scene_count, placeholder.clone());
     previews.snapshots.resize_with(scene_count, || None);
     previews.changed.resize_with(scene_count, Instant::now);
     if previews.scan_revision != Some(browser.scan_revision) {
-        if previews.scan_revision.is_some() {
-            let mut paths: HashSet<_> = editor
-                .project
-                .scenes
-                .iter()
-                .map(|scene| scene.asset.clone())
-                .collect();
-            for target in &previews.completed {
-                if let Target::Model(index) = *target
-                    && let Some(model) = editor.project.catalog.get(index)
-                {
-                    paths.insert(model.asset.clone());
+        // A rescan can reassign catalog slots. Keep every card whose source
+        // still occupies its slot. Actual content changes arrive from the registry.
+        let remapped: Vec<_> = previews
+            .files
+            .iter()
+            .filter_map(|(&target, files)| {
+                let unchanged = match target {
+                    Target::Model(i) => editor.project.catalog.get(i).is_some_and(|model| {
+                        model.asset == files.source
+                            && Some(model.preview_direction) == files.direction
+                    }),
+                    Target::Scene(i) => editor
+                        .project
+                        .scenes
+                        .get(i)
+                        .is_some_and(|scene| scene.file == files.source),
+                };
+                (!unchanged).then_some(target)
+            })
+            .collect();
+        for target in remapped {
+            if previews
+                .job
+                .as_ref()
+                .is_some_and(|job| job.target == target)
+            {
+                previews.cancel(&mut commands);
+            }
+            previews.files.remove(&target);
+            previews.completed.remove(&target);
+            previews.failed.remove(&target);
+            previews.recent.retain(|&cached| cached != target);
+            match target {
+                Target::Model(i) => {
+                    if let Some(image) = previews.images.get_mut(i) {
+                        *image = placeholder.clone();
+                    }
                 }
-            }
-            for snapshot in previews.snapshots.iter().flatten() {
-                paths.insert(snapshot.asset.clone());
-                paths.extend(
-                    snapshot
-                        .edits
-                        .models
-                        .iter()
-                        .map(|model| model.asset.clone()),
-                );
-            }
-            // reload only touches assets already loaded; unopened scenes stay lazy.
-            for path in paths {
-                if !path.is_empty() {
-                    assets.reload(path);
+                Target::Scene(i) => {
+                    if let Some(image) = previews.scene_images.get_mut(i) {
+                        *image = placeholder.clone();
+                    }
+                    if let Some(snapshot) = previews.snapshots.get_mut(i) {
+                        *snapshot = None;
+                    }
+                    previews.pending_snapshots.remove(&i);
                 }
             }
         }
-        previews.cancel(&mut commands);
-        let placeholder = previews.placeholder.clone();
-        previews.images.fill(placeholder.clone());
-        previews.scene_images.fill(placeholder);
-        previews.recent.clear();
-        previews.completed.clear();
-        previews.failed.clear();
-        previews.snapshots.fill(None);
-        previews.pending_snapshots.clear();
         previews.browser_revision = None;
         previews.scan_revision = Some(browser.scan_revision);
     }
@@ -594,17 +700,7 @@ pub(super) fn update(
                 Target::Model(index) => &editor.project.catalog[index].asset,
                 Target::Scene(room) => &editor.project.scenes[room].asset,
             };
-            previews.remember_asset(&editor, path);
-            if let Target::Scene(room) = target {
-                let dependencies: Vec<_> = previews.snapshots[room]
-                    .iter()
-                    .flat_map(|snapshot| &snapshot.edits.models)
-                    .map(|model| model.asset.clone())
-                    .collect();
-                for path in dependencies {
-                    previews.remember_asset(&editor, &path);
-                }
-            }
+            previews.remember_files(&editor, target, path);
             let asset = (!path.is_empty()).then(|| ModelSource::load(&assets, path, true));
             let root = commands
                 .spawn((
@@ -719,6 +815,22 @@ pub(super) fn update(
         }
     } else if job.camera.is_some() {
         if job.stable_frames >= 5 {
+            if let Some(files) = previews.files.get_mut(&job.target) {
+                use bevy::asset::VisitAssetDependencies;
+                for entity in children.iter_descendants(job.root) {
+                    if let Ok(handle) = mesh_materials.get(entity)
+                        && let Some(material) = materials.get(&handle.0)
+                    {
+                        material.visit_dependencies(&mut |id| {
+                            if let Some(path) = assets.get_path(id) {
+                                files
+                                    .paths
+                                    .insert(asset_key(&editor, &path.path().to_string_lossy()));
+                            }
+                        });
+                    }
+                }
+            }
             previews.complete(job.target);
             previews.stop(job, &mut commands);
             return;

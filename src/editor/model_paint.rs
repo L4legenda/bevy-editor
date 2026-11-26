@@ -4941,7 +4941,7 @@ pub(super) fn actions(
                                                 if mask {
                                                     let mask = Arc::make_mut(layer.mask.as_mut().unwrap());
                                                     Arc::make_mut(mask.graph.as_mut().unwrap()).payload = Arc::new(payload);
-                                                    if !matches!(edit, material_graph::Edit::Move(..) | material_graph::Edit::Batch(_, material_graph::BatchKind::Move)) {
+                                                    if !edit.moves_nodes() {
                                                         let selected = session.stack.selected;
                                                         folder_graph::sync_standalone_mask(&mut session.stack, selected);
                                                     }

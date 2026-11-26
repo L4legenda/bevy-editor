@@ -1,6 +1,7 @@
 //! A transient model follows the pointer; only release creates an undoable edit.
 use bevy::{
     camera::{primitives::Aabb, visibility::RenderLayers},
+    tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
     ecs::system::SystemParam,
     light::{NotShadowCaster, RectLight},
     picking::mesh_picking::ray_cast::MeshRayCast,
@@ -13,7 +14,7 @@ use super::{drop_point, placement_position};
 use crate::editor::{
     Action, Editor, Scene, Selection, apply_asset_drop, bounds_for,
     browser::{Browser, Entry},
-    load_error, ui, viewport,
+    load_error, scene_image_reference, ui, viewport,
 };
 use crate::{BoxBounds, PlacedModel, runtime};
 
@@ -45,6 +46,13 @@ struct Job {
 pub(in crate::editor) struct PlacementPreview {
     job: Option<Job>,
     scene_contact: Option<Vec3>,
+    image: Option<ImageJob>,
+}
+
+struct ImageJob {
+    room: usize,
+    pose: Transform,
+    task: Task<Result<scene_image_reference::Prepared, String>>,
 }
 
 #[derive(SystemParam)]
@@ -185,6 +193,7 @@ pub(in crate::editor) fn update(
     if !window.focused
         || !editor.has_scene()
         || !editor.ready
+        || editor.asset_viewer_open()
         || editor.pending.is_some()
         || drag.cancelled_this_frame
         || keys.just_pressed(KeyCode::Escape)
@@ -193,17 +202,29 @@ pub(in crate::editor) fn update(
             job.room != editor.room || job.scan_revision != browser.scan_revision
         })
     {
-        if preview.job.as_ref().is_some_and(|job| job.pending) {
+        if preview.image.take().is_some() || preview.job.as_ref().is_some_and(|job| job.pending) {
             editor.status = "Размещение отменено".into();
         }
         preview.clear(&mut commands);
         return;
     }
+    if preview.image.as_ref().is_some_and(|job| job.room != editor.room) {
+        preview.image = None;
+    }
+    let loaded = preview.image.as_mut().and_then(|job| {
+        block_on(poll_once(&mut job.task)).map(|result| (job.pose, result))
+    });
+    if let Some((pose, result)) = loaded {
+        preview.image = None;
+        if let Err(error) = result.and_then(|image| scene_image_reference::place(&mut editor, image, pose)) {
+            editor.status = format!("Не удалось добавить референс · {error}");
+        }
+    }
     let source = drag.payload.filter(|_| drag.active());
     let entry = released
         .map(|(entry, _)| entry)
         .or_else(|| source.map(|source| source.entry));
-    if let Some(entry @ Entry::Scene { .. }) = entry {
+    if let Some(entry @ (Entry::Scene { .. } | Entry::Image(_))) = entry {
         preview.clear(&mut commands);
         let cursor = released
             .map(|(_, cursor)| cursor)
@@ -219,7 +240,7 @@ pub(in crate::editor) fn update(
                 return None;
             }
             let (camera, view) = ray.camera.single().ok()?;
-            drop_point(
+            let point = drop_point(
                 camera,
                 view,
                 cursor - ui::viewport_rect(&window, &editor.sidebar).min,
@@ -227,14 +248,33 @@ pub(in crate::editor) fn update(
                 &scene,
                 &ray.parents,
                 editor.snap,
-            )
+            )?;
+            Some((point, *view.back()))
         });
-        preview.scene_contact = point;
+        preview.scene_contact = point.map(|(point, _)| point);
         if released.is_some()
-            && let Some(point) = point
+            && let Some((point, back)) = point
         {
             if let Some(error) = numeric.as_ref().and_then(|n| n.error_message()) {
                 editor.status = error.into();
+            } else if let Entry::Image(index) = entry {
+                if preview.image.is_some() {
+                    editor.status = "Референс ещё загружается…".into();
+                } else if let Some(file) = browser.files.get(index) {
+                    let root = editor.root.clone();
+                    let path = file.path.clone();
+                    // Keep the image upright and face the camera at placement time.
+                    let yaw = back.x.atan2(back.z);
+                    preview.image = Some(ImageJob {
+                        room: editor.room,
+                        pose: Transform::from_translation(point)
+                            .with_rotation(Quat::from_rotation_y(yaw)),
+                        task: AsyncComputeTaskPool::get().spawn(async move {
+                            scene_image_reference::prepare(&root, &path)
+                        }),
+                    });
+                    editor.status = "Загрузка референса…".into();
+                }
             } else {
                 apply_asset_drop(&mut editor, &browser, entry, point, None);
             }
@@ -604,7 +644,6 @@ mod pending_tests {
             .resource_mut::<Assets<WorldAsset>>()
             .add(WorldAsset::new(World::new()));
         app.insert_resource(PlacementPreview {
-            scene_contact: None,
             job: Some(Job {
                 root,
                 handle,
@@ -619,6 +658,7 @@ mod pending_tests {
                 pending: true,
                 error: None,
             }),
+            ..default()
         });
         (app, root)
     }

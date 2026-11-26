@@ -257,6 +257,9 @@ fn setup_level(
         .map(|h| h.spawn(&mut commands))
         .unwrap_or_default();
     for model in &level.edits.models {
+        if crate::data::is_image_reference(&model.asset) {
+            continue;
+        }
         status.pending_instances += 1;
         let handle = super::load_model(&server, model);
         status.models.push(handle.clone());

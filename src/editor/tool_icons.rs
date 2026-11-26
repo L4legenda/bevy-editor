@@ -5,6 +5,12 @@ use super::{Action, EDGE, Look, Tool, control, icons, row, surface};
 
 pub(super) const IDLE: Color = Color::srgb(0.102, 0.105, 0.133);
 pub(super) const HOVER: Color = Color::srgb(0.183, 0.168, 0.218);
+pub(super) const TRANSFORMS: [(Tool, icons::Glyph); 4] = [
+    (Tool::Universal, icons::Glyph::Cursor),
+    (Tool::Move, icons::Glyph::Move),
+    (Tool::Rotate, icons::Glyph::Rotate),
+    (Tool::Scale, icons::Glyph::Scale),
+];
 
 pub(super) fn label(tool: Tool, model: bool) -> &'static str {
     match (tool, model) {
@@ -41,15 +47,7 @@ pub(super) fn group(
         },
         IDLE,
     );
-    for (index, (tool, glyph)) in [
-        (Tool::Universal, icons::Glyph::Cursor),
-        (Tool::Move, icons::Glyph::Move),
-        (Tool::Rotate, icons::Glyph::Rotate),
-        (Tool::Scale, icons::Glyph::Scale),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, (tool, glyph)) in TRANSFORMS.into_iter().enumerate() {
         if index != 0 {
             commands.spawn((
                 Node {

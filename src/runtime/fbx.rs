@@ -258,17 +258,22 @@ impl ImportProfile {
     }
 }
 
+fn import_profile(path: &Path) -> Option<PathBuf> {
+    if !path.starts_with("models/hospital/Meshes") {
+        return None;
+    }
+    Some(
+        PathBuf::from("models/hospital/fbx-profiles")
+            .join(path.file_name()?)
+            .with_extension("json"),
+    )
+}
+
 async fn import_profiles(context: &mut LoadContext<'_>) -> io::Result<Vec<ImportProfile>> {
     let source = context.path().clone();
-    let path = source.path();
-    if !path.starts_with("models/hospital/Meshes") {
+    let Some(profile) = import_profile(source.path()) else {
         return Ok(Vec::new());
-    }
-    let file = path
-        .file_name()
-        .ok_or_else(|| invalid("Missing hospital FBX file name"))?;
-    let mut profile = PathBuf::from("models/hospital/fbx-profiles").join(file);
-    profile.set_extension("json");
+    };
     let bytes = context
         .read_asset_bytes(AssetPath::from_path_buf(profile).with_source(source.source().clone()))
         .await
@@ -834,6 +839,20 @@ pub(crate) fn external_texture_paths(
                 texture_location(destination, file),
             ))
         })
+        .collect())
+}
+
+#[cfg(feature = "editor")]
+pub(crate) fn preview_inputs(root: &Path, source: &Path) -> io::Result<Vec<PathBuf>> {
+    if let Some(profile) = import_profile(source) {
+        return Ok(vec![profile]);
+    }
+    if source.starts_with("models/clinic_rooms") {
+        return Ok(vec![PathBuf::from(CLINIC_ROOM_MATERIALS)]);
+    }
+    Ok(external_texture_paths(root, source, source)?
+        .into_iter()
+        .map(|(path, _)| path)
         .collect())
 }
 

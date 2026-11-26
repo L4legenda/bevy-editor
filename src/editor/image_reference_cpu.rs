@@ -1,7 +1,10 @@
 //! Software fallback for a reference camera that cannot produce pixels.
 use bevy::{
     math::Affine3A,
-    mesh::{PrimitiveTopology, VertexAttributeValues},
+    mesh::{
+        PrimitiveTopology, VertexAttributeValues,
+        skinning::{SkinnedMesh, SkinnedMeshInverseBindposes},
+    },
     prelude::*,
 };
 use photocraft_color::convert::{linear_to_srgb, srgb_to_linear};
@@ -18,10 +21,19 @@ pub(in crate::editor) struct Geometry<'w, 's> {
             Option<&'static MeshMaterial3d<StandardMaterial>>,
             &'static GlobalTransform,
             &'static InheritedVisibility,
+            Option<&'static SkinnedMesh>,
         ),
     >,
     meshes: Res<'w, Assets<Mesh>>,
     materials: Res<'w, Assets<StandardMaterial>>,
+    bindposes: Res<'w, Assets<SkinnedMeshInverseBindposes>>,
+    transforms: Query<'w, 's, &'static GlobalTransform>,
+}
+
+struct Joint {
+    entity: Entity,
+    inverse_bind: Affine3A,
+    transform: Affine3A,
 }
 
 pub(super) struct Part {
@@ -29,6 +41,7 @@ pub(super) struct Part {
     transform: Affine3A,
     material: StandardMaterial,
     texture: Option<Image>,
+    joints: Vec<Joint>,
 }
 
 impl Geometry<'_, '_> {
@@ -39,12 +52,29 @@ impl Geometry<'_, '_> {
     ) -> Vec<Part> {
         descendants
             .filter_map(|entity| {
-                let (handle, material, transform, visibility) = self.instances.get(entity).ok()?;
+                let (handle, material, transform, visibility, skin) =
+                    self.instances.get(entity).ok()?;
                 if !visibility.get() {
                     return None;
                 }
                 let mesh = self.meshes.get(&handle.0)?;
                 let material = material.and_then(|handle| self.materials.get(&handle.0));
+                let joints = skin
+                    .and_then(|skin| {
+                        let bindposes = self.bindposes.get(&skin.inverse_bindposes)?;
+                        skin.joints
+                            .iter()
+                            .zip(bindposes.iter())
+                            .map(|(&entity, matrix)| {
+                                Some(Joint {
+                                    entity,
+                                    inverse_bind: Affine3A::from_mat4(*matrix),
+                                    transform: self.transforms.get(entity).ok()?.affine(),
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .unwrap_or_default();
                 Some(Part {
                     mesh: mesh.clone(),
                     transform: transform.affine(),
@@ -53,18 +83,11 @@ impl Geometry<'_, '_> {
                         .and_then(|material| material.base_color_texture.as_ref())
                         .and_then(|handle| images.get(handle))
                         .cloned(),
+                    joints,
                 })
             })
             .collect()
     }
-}
-
-pub(super) fn render(
-    parts: Vec<Part>,
-    view: Transform,
-    projection: Projection,
-) -> image::RgbaImage {
-    render_transformed(&parts, Affine3A::IDENTITY, view, projection)
 }
 
 pub(super) fn render_transformed(
@@ -72,6 +95,7 @@ pub(super) fn render_transformed(
     transform: Affine3A,
     view: Transform,
     projection: Projection,
+    joints: &std::collections::HashMap<Entity, Affine3A>,
 ) -> image::RgbaImage {
     let view_projection = projection.get_clip_from_view() * view.to_matrix().inverse();
     let light = (*view.back() * 0.55 - *view.right() * 0.55 + *view.up()).normalize();
@@ -94,11 +118,45 @@ pub(super) fn render_transformed(
             Ok(VertexAttributeValues::Float32x2(values)) => values.as_slice(),
             _ => &[],
         };
+        let skinning = match (
+            part.mesh.try_attribute(Mesh::ATTRIBUTE_JOINT_INDEX),
+            part.mesh.try_attribute(Mesh::ATTRIBUTE_JOINT_WEIGHT),
+        ) {
+            (
+                Ok(VertexAttributeValues::Uint16x4(indices)),
+                Ok(VertexAttributeValues::Float32x4(weights)),
+            ) if !part.joints.is_empty() => {
+                let matrices = part
+                    .joints
+                    .iter()
+                    .map(|joint| {
+                        transform
+                            * *joints.get(&joint.entity).unwrap_or(&joint.transform)
+                            * joint.inverse_bind
+                    })
+                    .collect::<Vec<_>>();
+                Some((indices, weights, matrices))
+            }
+            _ => None,
+        };
         let vertices: Vec<_> = positions
             .iter()
             .enumerate()
             .map(|(index, &position)| {
-                let world = world_transform.transform_point3(Vec3::from_array(position));
+                let position = Vec3::from_array(position);
+                let world = skinning
+                    .as_ref()
+                    .and_then(|(indices, weights, matrices)| {
+                        Some(indices.get(index)?.iter().zip(weights.get(index)?).fold(
+                            Vec3::ZERO,
+                            |sum, (&joint, &weight)| {
+                                sum + matrices.get(joint as usize).map_or(Vec3::ZERO, |matrix| {
+                                    matrix.transform_point3(position) * weight
+                                })
+                            },
+                        ))
+                    })
+                    .unwrap_or_else(|| world_transform.transform_point3(position));
                 let clip = view_projection * world.extend(1.0);
                 let ndc = clip.truncate() / clip.w;
                 Vertex {

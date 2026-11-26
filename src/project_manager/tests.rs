@@ -29,7 +29,7 @@ fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
     let scratch = Scratch::new();
     for (name, template, models) in [
         ("empty", Template::Empty, 0),
-        ("starter", Template::Starter, 1),
+        ("starter", Template::Starter, 2),
     ] {
         let root = scratch.0.join(name);
         let file = projects::create_project(&root, "Мой проект", template).unwrap();
@@ -53,29 +53,64 @@ fn templates_produce_loadable_portable_projects_and_valid_glb_assets() {
         assert!(raw["scenes"][0].get("asset").is_none());
         assert!(raw["scenes"][0].get("cameras").is_none());
         assert!(!root.join("assets/levels").exists());
-        for asset in [&project.catalog[0].asset] {
-            let bytes = fs::read(project.asset_root.join(asset)).unwrap();
-            let parsed = gltf::Gltf::from_slice(&bytes)
-                .expect("A template must produce a valid glTF 2.0 binary");
-            for mesh in parsed.meshes() {
-                for primitive in mesh.primitives() {
-                    let reader = primitive.reader(|_| parsed.blob.as_deref());
-                    let positions: Vec<_> = reader.read_positions().unwrap().collect();
-                    let indices: Vec<_> = reader.read_indices().unwrap().into_u32().collect();
-                    assert_eq!(positions.len(), 24);
-                    assert_eq!(indices.len(), 36);
-                    assert!(
-                        indices
-                            .iter()
-                            .all(|index| (*index as usize) < positions.len())
-                    );
-                }
+        if template == Template::Starter {
+            let character = &edits.models[1];
+            assert_eq!(character.asset, "characters/superhero_male.glb");
+            assert_eq!(project.catalog[1].asset, character.asset);
+            assert!(project.asset_root.join("characters/LICENSE.txt").is_file());
+            let bytes = fs::read(project.asset_root.join(&character.asset)).unwrap();
+            let parsed = gltf::Gltf::from_slice(&bytes).unwrap();
+            assert_eq!(parsed.skins().next().unwrap().joints().count(), 65);
+            assert!(parsed.nodes().any(|node| {
+                node.skin().is_some()
+                    && node.mesh().is_some_and(|mesh| {
+                        mesh.primitives().any(|primitive| {
+                            let reader = primitive.reader(|_| parsed.blob.as_deref());
+                            reader.read_joints(0).is_some() && reader.read_weights(0).is_some()
+                        })
+                    })
+            }));
+            assert!(parsed.images().next().is_some());
+            assert!(
+                parsed
+                    .images()
+                    .all(|image| matches!(image.source(), gltf::image::Source::View { .. }))
+            );
+        } else {
+            assert!(!project.asset_root.join("characters").exists());
+        }
+        let bytes = fs::read(project.asset_root.join(&project.catalog[0].asset)).unwrap();
+        let parsed = gltf::Gltf::from_slice(&bytes)
+            .expect("A template must produce a valid glTF 2.0 binary");
+        assert_eq!(
+            parsed
+                .materials()
+                .next()
+                .unwrap()
+                .pbr_metallic_roughness()
+                .base_color_factor(),
+            [0.85, 0.34, 0.075, 1.0]
+        );
+        for mesh in parsed.meshes() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|_| parsed.blob.as_deref());
+                let positions: Vec<_> = reader.read_positions().unwrap().collect();
+                let indices: Vec<_> = reader.read_indices().unwrap().into_u32().collect();
+                assert_eq!(positions.len(), 24);
+                assert_eq!(indices.len(), 36);
+                assert!(
+                    indices
+                        .iter()
+                        .all(|index| (*index as usize) < positions.len())
+                );
             }
         }
         // Moving the entire project must preserve every relative reference.
         let moved = scratch.0.join(format!("{name}-moved"));
         fs::rename(&root, &moved).unwrap();
-        assert_eq!(EditorProject::load(&moved).unwrap().title, project.title);
+        let moved_project = EditorProject::load(&moved).unwrap();
+        assert_eq!(moved_project.title, project.title);
+        assert_eq!(moved_project.read_scene(0).unwrap(), edits);
     }
 }
 

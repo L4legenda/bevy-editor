@@ -715,3 +715,78 @@ fn paint_damage_compositing_benchmark() {
         );
     }
 }
+
+
+#[test]
+fn pending_reference_pixels_follow_the_authored_version_through_edits_and_history() {
+    use crate::editor::image_reference::{ModelReference, ReferenceRender, ReferenceTarget};
+    let file = Fixture::new();
+    let mut doc = PhotoDocument::load(&file.0).unwrap();
+    let document = doc.document.id;
+    let initial = ModelReference {
+        uid: None,
+        asset: "model.glb".into(),
+        center: [8.; 2],
+        direction: [0., 0., 1.],
+        pose: bevy::prelude::Transform::IDENTITY.into(),
+        joints: Default::default(),
+        pixels_per_unit: 1.,
+        pending_frame: None,
+    };
+    let mut first = Surface::new(PixelFormat::RGBA8);
+    first.write_interleaved(Rect::new(0, 0, 1, 1), &[255, 0, 0, 255]);
+    doc.add_reference("model".into(), first.clone(), &initial)
+        .unwrap();
+    let id = doc.active_id().unwrap();
+    let mut queue = ReferenceRender::default();
+    let moved = bevy::prelude::Transform::from_xyz(3., 0., 0.).into();
+    queue.transform_selected(1, &mut doc, moved).unwrap();
+    let packet = doc.document.layer(id).unwrap().xmp.clone().unwrap();
+    let mut authored = ModelReference::from_xmp(&packet).unwrap();
+    assert_eq!(authored.pose, moved);
+    assert!(authored.pending_frame.take().is_some());
+    let target = ReferenceTarget {
+        packet,
+        previous_pose: initial.reference_pose(),
+    };
+
+    doc.duplicate_layer();
+    let copy = doc.active_id().unwrap();
+    assert_ne!(id, copy);
+    doc.add_layer();
+    doc.undo();
+    doc.undo();
+    doc.undo();
+    assert_eq!(
+        doc.active_layer()
+            .unwrap()
+            .surface()
+            .unwrap()
+            .content_bounds(),
+        Rect::new(0, 0, 1, 1)
+    );
+    let mut finished = Surface::new(PixelFormat::RGBA8);
+    finished.write_interleaved(Rect::new(3, 0, 4, 1), &[0, 255, 0, 255]);
+    let rev = doc.revision;
+    doc.finish_reference(document, &target, &finished, &authored)
+        .unwrap();
+    assert_eq!(doc.revision, rev);
+    assert_eq!(
+        ModelReference::from_xmp(doc.active_layer().unwrap().xmp.as_deref().unwrap()).unwrap(),
+        initial
+    );
+    doc.redo();
+    doc.redo();
+    doc.redo();
+    for id in [id, copy] {
+        let layer = doc.document.layer(id).unwrap();
+        assert_eq!(
+            ModelReference::from_xmp(layer.xmp.as_deref().unwrap()).unwrap(),
+            authored
+        );
+        assert_eq!(
+            layer.surface().unwrap().content_bounds(),
+            Rect::new(3, 0, 4, 1)
+        );
+    }
+}

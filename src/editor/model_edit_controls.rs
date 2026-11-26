@@ -74,16 +74,31 @@ pub(in crate::editor::ui) fn geometry_toolbar(commands: &mut Commands, parent: E
         .and_modify(|mut node| {
             node.display = Display::None;
         });
-    let action = EditAction::ExtrudeTool;
-    let button = icons::button(
-        commands,
-        section,
-        icons::Glyph::Extrude,
-        "Экструдировать вершины, рёбра и грани · E",
-        self::action(action),
-        Look::Regular,
-    );
-    commands.entity(button).insert(EditButton(action));
+    for (glyph, label, edit) in [
+        (
+            icons::Glyph::Extrude,
+            "Экструдировать вершины, рёбра и грани · E",
+            EditAction::ExtrudeTool,
+        ),
+        (
+            icons::Glyph::Bevel,
+            "Фаска (Bevel) · Ctrl+B",
+            EditAction::BeginBevel { vertices: false },
+        ),
+        (
+            icons::Glyph::LoopCut,
+            "Разрез петлёй (Loop Cut) · Ctrl+R",
+            EditAction::BeginLoopCut,
+        ),
+        (
+            icons::Glyph::Knife,
+            "Нож (Knife) · K",
+            EditAction::BeginKnife { only_selected: false },
+        ),
+    ] {
+        let button = icons::button(commands, section, glyph, label, action(edit), Look::Regular);
+        commands.entity(button).insert(EditButton(edit));
+    }
 }
 
 fn entry(

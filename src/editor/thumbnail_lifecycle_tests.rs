@@ -96,6 +96,9 @@ fn reloaded_models_invalidate_variants_and_scenes_and_lighting_rebuilds_model_ca
     )
     .unwrap();
     project.catalog.push(project.catalog[0].clone());
+    // Only the first scene references this model; the other scene has an independent card.
+    project.scenes[0].asset = project.catalog[0].asset.clone();
+    IoTaskPool::get_or_init(TaskPool::new);
     let editor = Editor::new(project, Default::default());
     let mut previews = Thumbnails::new(&mut Assets::<Image>::default(), 3, 2);
     let environment = crate::SceneLighting::editor_default();
@@ -116,6 +119,20 @@ fn reloaded_models_invalidate_variants_and_scenes_and_lighting_rebuilds_model_ca
         studio: true,
     });
     previews.job = Some(job(Target::Model(0), root, camera));
+    for index in 0..editor.project.catalog.len() {
+        previews.remember_files(
+            &editor,
+            Target::Model(index),
+            &editor.project.catalog[index].asset,
+        );
+    }
+    for index in 0..editor.project.scenes.len() {
+        previews.remember_files(
+            &editor,
+            Target::Scene(index),
+            &editor.project.scenes[index].asset,
+        );
+    }
     previews.invalidate_asset(&editor.project.catalog[0].asset);
     let mut state = SystemState::<Commands>::new(&mut world);
     previews.refresh_models(
@@ -124,17 +141,60 @@ fn reloaded_models_invalidate_variants_and_scenes_and_lighting_rebuilds_model_ca
         &mut state.get_mut(&mut world).unwrap(),
     );
     state.apply(&mut world);
-    assert_eq!(previews.completed, HashSet::from([Target::Model(1)]));
+    assert_eq!(
+        previews.completed,
+        HashSet::from([Target::Model(1), Target::Scene(1)])
+    );
     assert!(previews.job.is_none());
     assert!(world.get_entity(root).is_err());
     let mut darker = environment.clone();
     darker.exposure_ev100 += 1.0;
     previews.refresh_models(&editor, &darker, &mut state.get_mut(&mut world).unwrap());
     state.apply(&mut world);
-    assert!(previews.completed.is_empty());
+    assert_eq!(previews.completed, HashSet::from([Target::Scene(1)]));
 }
 
 struct Scratch(std::path::PathBuf);
+
+#[test]
+fn external_texture_edits_only_invalidate_cards_that_use_the_texture() {
+    IoTaskPool::get_or_init(TaskPool::new);
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut project = EditorProject::load(fixtures.join("legacy/project.json")).unwrap();
+    project.catalog[0].asset = "props_external.FBX".into();
+    project.catalog[1].asset = "panel_ascii.fbx".into();
+    let mut editor = Editor::new(project, Default::default());
+    editor.root = fixtures.join("fbx");
+    let mut previews = Thumbnails::new(&mut Assets::<Image>::default(), 2, 0);
+    let environment = crate::SceneLighting::editor_default();
+    previews.model_environment = Some(environment.clone());
+    for index in 0..2 {
+        let target = Target::Model(index);
+        previews.remember_files(&editor, target, &editor.project.catalog[index].asset);
+        previews.completed.insert(target);
+    }
+    // Deliver the edit before polling the asynchronous dependency reads.
+    previews.invalidate_asset("textures/checker.png");
+    let mut world = World::new();
+    let mut state = SystemState::<Commands>::new(&mut world);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        previews.refresh_models(
+            &editor,
+            &environment,
+            &mut state.get_mut(&mut world).unwrap(),
+        );
+        if previews.files.values().all(|files| files.pending.is_none()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "thumbnail dependency read timed out"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(previews.completed, HashSet::from([Target::Model(1)]));
+}
 
 impl Scratch {
     fn new() -> Self {

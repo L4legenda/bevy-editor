@@ -60,6 +60,8 @@ pub(in crate::editor) enum EditAction {
     Edit,
     Tool(PhotoTool),
     ModelTool(Tool),
+    ModelPose,
+    ModelPoseReset,
     ModelPanel,
     EraserMode(EraserMode),
     DrawingTool,
@@ -218,7 +220,10 @@ enum Gesture {
 #[derive(Default)]
 pub(in crate::editor) struct State {
     pub(in crate::editor) model_tool: Option<Tool>,
-    pub(super) model_panel_closed: bool,
+    pub(in crate::editor) model_has_rig: bool,
+    pub(super) model_posing: bool,
+    pub(super) model_pose_reset: bool,
+    pub(super) model_panel_open: bool,
     pub selection: selection::SelectionState,
     pub layers: layers::LayerState,
     sessions: HashMap<usize, Session>,
@@ -310,7 +315,11 @@ impl State {
             return false;
         }
         match action {
-            EditAction::ModelTool(tool) => self.model_tool.unwrap_or(Tool::Universal) == tool,
+            EditAction::ModelTool(tool) => {
+                !self.model_posing && self.model_tool.unwrap_or(Tool::Universal) == tool
+            }
+            EditAction::ModelPose => self.model_posing,
+            EditAction::ModelPanel => self.model_panel_open,
             EditAction::Layers(layers::LayerAction::BalanceTone(tone)) => self.layers.balance_tone == tone,
             EditAction::GradientRadial(radial) => self.gradient.radial == radial,
             EditAction::GradientTransparent => self.gradient.transparent,
@@ -388,6 +397,9 @@ impl State {
     pub fn document(&self, id: Option<usize>) -> Option<&PhotoDocument> {
         Some(&self.sessions.get(&id?)?.doc)
     }
+    pub(in crate::editor) fn document_mut(&mut self, id: usize) -> Option<&mut PhotoDocument> {
+        Some(&mut self.sessions.get_mut(&id)?.doc)
+    }
     pub(super) fn display_model_preview(
         &mut self,
         id: usize,
@@ -398,22 +410,47 @@ impl State {
             session.rendered = None;
         }
     }
+    pub(super) fn retain_model_preview(&mut self, tab: usize, before: u64, after: u64) {
+        if let Some(session) = self.sessions.get_mut(&tab) {
+            if let Some((revision, _)) = &mut session.rendered
+                && *revision == before
+            {
+                *revision = after;
+            }
+            if let Some((revision, _, _)) = &mut session.prepared
+                && *revision == before
+            {
+                *revision = after;
+            }
+        }
+    }
     pub(super) fn clear_model_preview(&mut self, id: usize) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.prepared = None;
             session.rendered = None;
         }
     }
+    fn reference_layer(&self, id: Option<usize>) -> Option<&photocraft_doc::Layer> {
+        let photo = self.document(id)?;
+        if photo.mask_target || photo.filter_target {
+            return None;
+        }
+        photo.active_layer()
+    }
+
+    pub(super) fn model_layer_selected(&self, id: Option<usize>) -> bool {
+        self.reference_layer(id)
+            .and_then(|layer| layer.xmp.as_deref())
+            .and_then(crate::editor::image_reference::ModelReference::from_xmp)
+            .is_some()
+    }
+
     pub(in crate::editor) fn model_reference(
         &self,
         id: Option<usize>,
     ) -> Option<crate::editor::image_reference::ModelReference> {
-        let photo = self.document(id)?;
-        let layer = photo.active_layer()?;
-        if photo.mask_target || photo.filter_target || layer.locks.position || layer.locks.all {
-            return None;
-        }
-        layer
+        self.reference_layer(id)
+            .filter(|layer| !layer.locks.position && !layer.locks.all)?
             .xmp
             .as_deref()
             .and_then(crate::editor::image_reference::ModelReference::from_xmp)
@@ -426,7 +463,7 @@ impl State {
         name: String,
         surface: &Surface,
         reference: &crate::editor::image_reference::ModelReference,
-        replace: Option<crate::editor::image_reference::ReferenceTarget>,
+        replace: Option<&crate::editor::image_reference::ReferenceTarget>,
     ) -> Result<bool, String> {
         if self.file_busy(id)
             || self.gesture.as_ref().is_some_and(|(tab, _)| *tab == id)
@@ -444,21 +481,22 @@ impl State {
         let Some(session) = self.sessions.get_mut(&id) else {
             return Err("документ закрыт".into());
         };
+        if let Some(target) = replace {
+            session
+                .doc
+                .finish_reference(document, target, surface, reference)?;
+            return Ok(true);
+        }
         let current = session.doc.size();
         if document != session.doc.document.id || size != UVec2::new(current.width, current.height)
         {
             return Err("холст изменился во время рендера".into());
         }
-        if let Some(target) = replace {
-            session
-                .doc
-                .replace_reference(target, surface.clone(), reference)?;
-        } else {
-            session
-                .doc
-                .add_reference(name, surface.clone(), reference)?;
-            self.model_tool = Some(Tool::Move);
-        }
+        session
+            .doc
+            .add_reference(name, surface.clone(), reference)?;
+        self.model_tool = Some(Tool::Move);
+        self.model_posing = false;
         Ok(true)
     }
     pub fn available(&self, action: EditAction, id: Option<usize>) -> bool {
@@ -483,6 +521,12 @@ impl State {
         match action {
             EditAction::ModelTool(_) | EditAction::ModelPanel => {
                 self.editing(id) && self.model_reference(id).is_some()
+            }
+            EditAction::ModelPose | EditAction::ModelPoseReset => {
+                self.editing(id)
+                    && self.model_has_rig
+                    && self.model_reference(id).is_some()
+                    && (!matches!(action, EditAction::ModelPoseReset) || self.model_posing)
             }
             EditAction::Selection(selection::SelectionAction::FlipSelection(_)) => {
                 self.editing(id)
@@ -594,6 +638,7 @@ impl State {
     }
     fn select_tool(&mut self, tool: PhotoTool) {
         self.model_tool = None;
+        self.model_posing = false;
         if self.tool != tool {
             if !selection::finish_pending(self) {
                 return;
@@ -691,8 +736,8 @@ impl State {
     }
 }
 
-pub(super) fn request_close(editor: &mut Editor, id: usize) {
-    if editor.image_tab(id).is_some_and(|tab| tab.dirty) {
+pub(super) fn request_close(editor: &mut Editor, id: usize, pending_edit: bool) {
+    if pending_edit || editor.image_tab(id).is_some_and(|tab| tab.dirty) {
         editor.activate_image_tab(id);
         editor.pending = Some(PendingAction::CloseImageTab(id));
         editor.status = "Есть несохранённые изменения изображения".into();
@@ -792,6 +837,7 @@ pub(super) fn update(
                 }
                 browser.refresh(&mut editor.project);
                 match editor.pending {
+                    _ if editor.image_tab(id).is_some_and(|tab| tab.dirty) => {}
                     Some(PendingAction::CloseImageTab(closing)) if closing == id => {
                         editor.pending = None;
                         editor.close_image_tab(id);
@@ -990,9 +1036,20 @@ pub(super) fn update(
             EditAction::Tool(tool) => {
                 state.select_tool(tool);
             }
-            EditAction::ModelPanel => state.model_panel_closed ^= true,
+            EditAction::ModelPanel => state.model_panel_open ^= true,
+            EditAction::ModelPose if state.available(action, Some(id)) => {
+                state.model_posing = !state.model_posing;
+                state.model_tool = Some(Tool::Rotate);
+                state.selection.transform = None;
+                state.selection.draft = None;
+                viewer.gesture = None;
+            }
+            EditAction::ModelPoseReset if state.available(action, Some(id)) => {
+                state.model_pose_reset = true;
+            }
             EditAction::ModelTool(tool) => {
                 if state.model_reference(Some(id)).is_some() {
+                    state.model_posing = false;
                     state.model_tool = (tool != Tool::Universal).then_some(tool);
                     state.selection.transform = None;
                     state.selection.draft = None;
@@ -1223,6 +1280,7 @@ pub(super) fn update(
             EditAction::SelectLayer(_) | EditAction::Layers(layers::LayerAction::Select(..))
         ) {
             state.model_tool = state.model_reference(Some(id)).map(|_| Tool::Move);
+            state.model_posing = false;
         }
     }
     state
@@ -1688,7 +1746,8 @@ pub(in crate::editor) fn shortcuts(
     if !viewer.edit.editing(viewer.tab) {
         return false;
     }
-    if selection::shortcuts(keys, viewer, actions) {
+    let model_selected = viewer.edit.model_layer_selected(viewer.tab);
+    if !model_selected && selection::shortcuts(keys, viewer, actions) {
         return true;
     }
     if keys.just_pressed(KeyCode::Escape)
@@ -1760,6 +1819,17 @@ pub(in crate::editor) fn shortcuts(
         }
     } else {
         if viewer.edit.model_reference(viewer.tab).is_some() {
+            if keys.just_pressed(KeyCode::KeyN)
+                && !keys.any_pressed([
+                    KeyCode::ShiftLeft,
+                    KeyCode::ShiftRight,
+                    KeyCode::AltLeft,
+                    KeyCode::AltRight,
+                ])
+            {
+                actions.write(Action::ImageEdit(EditAction::ModelPanel));
+                return true;
+            }
             for (key, tool) in [
                 (KeyCode::KeyQ, Tool::Universal),
                 (KeyCode::KeyG, Tool::Move),
@@ -1781,6 +1851,9 @@ pub(in crate::editor) fn shortcuts(
                 layers::LayerAction::Command("layer.renameLayer"),
             )));
             return true;
+        }
+        if model_selected {
+            return false;
         }
         if keys.just_pressed(KeyCode::KeyB) {
             let action = if keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]) {

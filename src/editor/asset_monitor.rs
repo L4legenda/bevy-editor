@@ -228,7 +228,16 @@ fn worker(
             if full {
                 next = Instant::now() + interval;
             }
-            if !report(scanner.events(if full { None } else { Some(&paths) }, &moves)) {
+            let result = scanner.events(if full { None } else { Some(&paths) }, &moves).map(|mut changes| {
+                // Buffers and import sidecars can be Bevy loader dependencies without
+                // a public project UID. Forward only the paths reported by the watcher.
+                changes.modified.extend(paths.iter().filter_map(|p| {
+                    let name = p.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+                    (!asset_registry::supported(&name) && !root.join(p).is_dir()).then_some(name)
+                }));
+                changes
+            });
+            if !report(result) {
                 next = Instant::now() + Duration::from_secs(1);
             }
         }
@@ -307,6 +316,7 @@ pub(super) fn update(
     interface: Res<super::ui::Interface>,
     buttons: Query<&RepairButton, Added<bevy::ui::Pressed>>,
     assets: Option<Res<AssetServer>>,
+    source_events: Option<Res<crate::asset_paths::ProjectAssetEvents>>,
     mut thumbs: Option<ResMut<super::thumbnails::Thumbnails>>,
 ) {
     let received: Vec<_> = monitor.rx.lock().unwrap().try_iter().collect();
@@ -314,6 +324,22 @@ pub(super) fn update(
     for message in received {
         match message {
             ResultEvent::Indexed(changes) => {
+                for path in &changes.modified {
+                    if let Some(source) = &source_events {
+                        source.modified(path);
+                        if let Ok(logical) =
+                            crate::asset_paths::original_asset_path(&editor.root, path)
+                            && logical != *path
+                        {
+                            source.modified(&logical);
+                        }
+                    } else if let Some(assets) = &assets {
+                        assets.reload(path.clone());
+                    }
+                    if let Some(thumbs) = thumbs.as_mut() {
+                        thumbs.invalidate_asset(path);
+                    }
+                }
                 if changes.refresh {
                     let old_scene = editor
                         .has_scene()
@@ -329,7 +355,10 @@ pub(super) fn update(
                         });
                     }
                     for (from, to) in &changes.moves {
-                        if let Some(assets) = &assets
+                        if let Some(source) = &source_events {
+                            source.modified(from);
+                            source.modified(to);
+                        } else if let Some(assets) = &assets
                             && assets.get_handle_untyped(from.clone()).is_some()
                         {
                             assets.reload(from.clone());

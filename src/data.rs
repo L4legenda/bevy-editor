@@ -7,6 +7,12 @@ use std::{
     path::{Component as PathComponent, Path},
 };
 
+pub(crate) const IMAGE_REFERENCE_DIRECTORY: &str = ".bevy-editor/image-references";
+
+pub(crate) fn is_image_reference(path: &str) -> bool {
+    Path::new(path).starts_with(IMAGE_REFERENCE_DIRECTORY)
+}
+
 pub(crate) fn relative_path(path: &str, extension: &str) -> bool {
     relative_asset_path(path)
         && Path::new(path).extension().is_some_and(|value| {

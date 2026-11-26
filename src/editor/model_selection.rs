@@ -55,6 +55,10 @@ impl Material for FaceMaterial {
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Blend
     }
+    fn depth_bias(&self) -> f32 {
+        // Draw X-Ray feedback after the translucent model and depth-writing gizmos.
+        if self.xray { f32::INFINITY } else { 0.0 }
+    }
     fn enable_prepass() -> bool {
         false
     }
@@ -85,6 +89,8 @@ impl Material for FaceMaterial {
 const ORANGE: Vec3 = Vec3::new(1.0, 0.25, 0.018);
 const ACTIVE: Vec3 = Vec3::ONE;
 const CAGE: Vec3 = Vec3::new(0.012, 0.016, 0.022);
+const XRAY_EDGE: Vec3 = Vec3::new(0.015, 0.022, 0.033);
+const UV_SEAM: Vec3 = Vec3::new(1.0, 0.040, 0.013);
 
 pub(super) fn highlighted(selection: &MeshSelection, edge: Edge, faces: &[usize]) -> bool {
     match selection.kind {
@@ -145,8 +151,7 @@ impl FeedbackMesh {
     }
 }
 
-fn geometry(doc: &Document, object: &Object, state: &State) -> FeedbackMesh {
-    let mut result = FeedbackMesh::default();
+fn selection_geometry(result: &mut FeedbackMesh, doc: &Document, object: &Object, state: &State) {
     let mesh = &object.geometry;
     let selection = &doc.selection;
     let active = selection.active();
@@ -212,6 +217,46 @@ fn geometry(doc: &Document, object: &Object, state: &State) -> FeedbackMesh {
             }
         }
     }
+}
+
+fn geometry(doc: &Document, state: &State) -> FeedbackMesh {
+    let mut result = FeedbackMesh::default();
+    let active = doc
+        .active()
+        .filter(|object| doc.mode == Mode::Edit && !object.hidden);
+    if state.xray {
+        // Put cage and selection in the same depth-independent mesh. In particular
+        // a cage edge must never compete with its highlighted copy in a gizmo pass.
+        for object in doc.objects.iter().filter(|object| !object.hidden) {
+            let Some(rendered) = state.render_objects.get(&object.id) else {
+                continue;
+            };
+            let mesh = &object.geometry;
+            let editing = active.is_some_and(|active| active.id == object.id);
+            let world = |vertex| object.transform.transform_point(mesh.positions[vertex]);
+            for (&edge, faces) in rendered.edges.iter() {
+                if editing && highlighted(&doc.selection, edge, faces) {
+                    continue;
+                }
+                let color = if editing && mesh.uv_seams.contains(&edge) {
+                    UV_SEAM
+                } else {
+                    XRAY_EDGE
+                };
+                result.edge(world(edge.0), world(edge.1), [color; 2]);
+            }
+            if editing && doc.selection.kind == Element::Vertex {
+                for vertex in 0..mesh.positions.len() {
+                    if !doc.selection.vertices.contains(&vertex) {
+                        result.dot(world(vertex), CAGE);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(object) = active {
+        selection_geometry(&mut result, doc, object, state);
+    }
     result
 }
 
@@ -220,7 +265,7 @@ pub(in crate::editor) struct Overlay {
     entity: Option<Entity>,
     mesh: Option<Handle<Mesh>>,
     materials: Option<[Handle<FaceMaterial>; 2]>,
-    stamp: Option<(Entity, u64, u64)>,
+    stamp: Option<(Entity, u64, u64, Mode, bool)>,
     geometry: bool,
     pixel_scale: f32,
 }
@@ -268,15 +313,12 @@ pub(in crate::editor) fn sync(
         .viewing_model
         .and_then(|i| state.documents.get(&i))
         .filter(|doc| {
-            doc.mode == Mode::Edit && editor.pending.is_none() && editor.viewing_image.is_none()
-        })
-        .and_then(|doc| {
-            doc.active()
-                .filter(|object| !object.hidden)
-                .map(|object| (doc, object))
+            (doc.mode == Mode::Edit || (doc.mode == Mode::Object && state.xray))
+                && editor.pending.is_none()
+                && editor.viewing_image.is_none()
         })
         .zip(viewer.root);
-    let Some(((doc, object), root)) = selected else {
+    let Some((doc, root)) = selected else {
         if let Some(entity) = overlay.entity
             && let Ok((mut visible, _)) = fills.get_mut(entity)
         {
@@ -285,9 +327,9 @@ pub(in crate::editor) fn sync(
         overlay.stamp = None;
         return;
     };
-    let stamp = (root, doc.revision, doc.ui_revision);
+    let stamp = (root, doc.revision, doc.ui_revision, doc.mode, state.xray);
     if overlay.stamp != Some(stamp) {
-        let feedback = geometry(doc, object, &state);
+        let feedback = geometry(doc, &state);
         overlay.geometry = !feedback.positions.is_empty();
         if overlay.geometry {
             let mesh = feedback.mesh();

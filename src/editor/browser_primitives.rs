@@ -4,7 +4,7 @@ use crate::editor::{
     model_document::{MaterialSlot, Object, glb::Glb},
     model_primitives::{Parameters, Primitive},
 };
-use std::{fs::OpenOptions, io::Write, path::Path};
+use std::{fs::OpenOptions, io::Write, path::Path, sync::Arc};
 
 const WIDTH: f32 = 216.0;
 const HEIGHT: f32 = 8.0 * 32.0 + 7.0 * 3.0 + 14.0;
@@ -424,7 +424,8 @@ pub(super) fn create(
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
             bake_fixes: Default::default(),
-            authored: None,
+            authored: (primitive == Primitive::Cube)
+                .then(|| Arc::new(crate::editor::default_cube_material())),
             paint: None,
             material: default(),
             source: serde_json::json!({"material": 0}),

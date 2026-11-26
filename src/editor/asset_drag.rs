@@ -159,6 +159,7 @@ fn can_place(entry: Entry, browser: &Browser, editor: &Editor) -> bool {
         && editor.ready
         && ((editor.definition().is_native()
             && matches!(entry,Entry::Scene {room,..} if room!=editor.room && editor.project.scenes.get(room).is_some_and(|s|s.is_native())))
+            || matches!(entry, Entry::Image(index) if browser.files.get(index).is_some())
             || browser
                 .model_asset(&editor.project.catalog, entry)
                 .is_some())
@@ -471,7 +472,9 @@ pub(crate) fn visuals(
             GREEN,
         ),
         Some(DropTarget::Scene(_)) => (
-            if placement.loading() {
+            if matches!(payload.entry, Entry::Image(_)) {
+                "Добавить референс · Esc — отмена"
+            } else if placement.loading() {
                 "Загрузка…"
             } else {
                 "Разместить · Esc — отмена"

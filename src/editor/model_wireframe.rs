@@ -163,8 +163,13 @@ pub(in crate::editor) fn sync(
         .collect();
     let editing_mode = state.mode(editor.viewing_model);
     let (mode, _) = shading.viewport(editing_mode);
-    let show_edges = mode == super::super::shading::Mode::Wire
-        || (editing_mode == crate::editor::model_document::Mode::Paint
+    use crate::editor::model_document::Mode;
+    let editable = editor
+        .viewing_model
+        .is_some_and(|index| state.documents.contains_key(&index));
+    let xray_overlay = state.xray && editable && matches!(editing_mode, Mode::Edit | Mode::Object);
+    let show_edges = (mode == super::super::shading::Mode::Wire && !xray_overlay)
+        || (editing_mode == Mode::Paint
             && editor.viewing_model.and_then(|index| state.documents.get(&index))
                 .is_some_and(|doc| doc.paint_uv.show_wire_3d));
     for (entity, overlay, mut visibility, weights) in &mut overlays {

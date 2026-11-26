@@ -237,3 +237,17 @@ fn large_project_index_benchmark() {
     assert_eq!(warm.hashed, 0);
     assert_eq!(moved.hashed, 0);
 }
+
+#[test]
+fn source_notifications_only_include_changed_content() {
+    let project = Project::new();
+    project.file("character.glb", b"character");
+    let mut scanner = project.scan();
+    scanner.run(None).unwrap();
+    project.file("unrelated.png", b"unrelated");
+    assert_eq!(scanner.run(None).unwrap().modified, ["unrelated.png"]);
+    project.file("character.glb", b"character");
+    assert!(scanner.run(None).unwrap().modified.is_empty());
+    project.file("character.glb", b"new shape");
+    assert_eq!(scanner.run(None).unwrap().modified, ["character.glb"]);
+}

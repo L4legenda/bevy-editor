@@ -1,26 +1,36 @@
 //! Image-canvas handles for a reference model's world transform.
 use super::*;
-use crate::editor::image_reference::{ModelReference, ReferenceRender};
-use bevy::{math::Rot2, ui::UiTransform};
+use crate::editor::image_reference::{
+    ModelReference, ModelView, ReferencePose, ReferenceRender,
+    live::{CameraImage, RasterFrame, Shot},
+    rig::{Effector, Reach, Rig, Rotations},
+};
 use photocraft_doc::{DocId, LayerId};
+use std::sync::Arc;
 
 const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
-use crate::editor::viewport::{AXIS_COLORS, ROTATION_COLORS};
+use crate::editor::viewport::{
+    self, AXIS_COLORS, ROTATION_COLORS,
+    transform_handles::{HandleMaterial, ImageOverlay, scale_cube_offsets},
+};
 #[path = "image_rotation_rings.rs"]
 mod rotation_rings;
 
 const RADIUS: f32 = 64.0;
-const RING_STEPS: usize = 32;
+const HANDLE_LENGTH: f32 = 87.5;
+const MOVE_AXES: [Vec2; 2] = [Vec2::X, Vec2::NEG_Y];
 const FREE: usize = 3;
 const FREE_RADIUS: f32 = 82.0;
-const PLANE_START: usize = 4;
-const HANDLE_COUNT: usize = 7;
 const HIGHLIGHT: Color = Color::srgb(1.0, 0.81, 0.38);
 
 fn coordinates(vector: Vec2, u: Vec2, v: Vec2) -> Option<Vec2> {
     let determinant = u.perp_dot(v);
     (determinant.abs() > 0.12)
         .then(|| Vec2::new(vector.perp_dot(v), u.perp_dot(vector)) / determinant)
+}
+
+fn project_to_canvas(view: &Transform, direction: Vec3) -> Vec2 {
+    Vec2::new(direction.dot(*view.right()), -direction.dot(*view.up()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,101 +41,303 @@ pub(super) struct Binding {
     revision: u64,
 }
 
+impl Binding {
+    fn same_layer(self, other: Self) -> bool {
+        (self.tab, self.photo, self.layer) == (other.tab, other.photo, other.layer)
+    }
+}
+
+pub(super) struct BoneSelection {
+    bound: Binding,
+    joint: String,
+}
+
+struct BoneHandle<'a> {
+    key: &'a str,
+    name: &'a str,
+    center: Vec2,
+    depth: f32,
+    basis: Quat,
+    effector: Option<Effector>,
+}
+
+struct BoneView<'a> {
+    rig: &'a Rig,
+    model: Transform,
+    camera: Transform,
+    origin: Vec2,
+    pixels_per_unit: Vec2,
+}
+
+impl<'a> BoneView<'a> {
+    fn new(
+        references: &'a ReferenceRender,
+        shot: Option<&'a Shot>,
+        model: &ModelReference,
+        dimensions: UVec2,
+        image: Rect,
+    ) -> Option<Self> {
+        let (rig, (model, center, camera, density)) = match shot {
+            Some(shot) => (shot.rig(), shot.joint_view()),
+            None => (
+                references.live.rig()?,
+                references.live.joint_view(model, dimensions)?,
+            ),
+        };
+        let scale = image.size() / dimensions.as_vec2();
+        Some(Self {
+            rig,
+            model,
+            camera,
+            origin: image.min + center * scale,
+            pixels_per_unit: density * scale,
+        })
+    }
+
+    fn markers(&self, rotations: &Rotations) -> Vec<BoneHandle<'a>> {
+        let affine = self.model.compute_affine();
+        self.rig
+            .joints(rotations)
+            .into_iter()
+            .map(|joint| {
+                let displacement =
+                    affine.transform_point3(joint.position) - self.camera.translation;
+                BoneHandle {
+                    key: joint.key,
+                    name: joint.name,
+                    center: self.origin
+                        + self.pixels_per_unit * project_to_canvas(&self.camera, displacement),
+                    depth: displacement.dot(*self.camera.back()),
+                    basis: self.model.rotation * joint.basis,
+                    effector: joint.effector,
+                }
+            })
+            .filter(|joint| joint.center.is_finite())
+            .collect()
+    }
+
+    fn reach(&self, key: &str, rotations: &Rotations) -> Option<BoneDrag> {
+        let inverse = self.model.compute_affine().inverse();
+        let right = inverse.transform_vector3(*self.camera.right()) / self.pixels_per_unit.x;
+        let down = inverse.transform_vector3(-*self.camera.up()) / self.pixels_per_unit.y;
+        if !right.is_finite() || !down.is_finite() {
+            return None;
+        }
+        Some(BoneDrag::Reach {
+            limb: Box::new(self.rig.reach(key, rotations)?),
+            right,
+            down,
+            delta: Vec2::ZERO,
+        })
+    }
+}
+
+fn bone_at(markers: &[BoneHandle<'_>], pointer: Vec2, input: Rect) -> Option<usize> {
+    markers
+        .iter()
+        .enumerate()
+        .filter(|(_, joint)| {
+            input.contains(joint.center) && pointer.distance_squared(joint.center) <= 81.0
+        })
+        .min_by(|(_, a), (_, b)| {
+            // The larger wrist handle remains grabbable among the finger dots.
+            let grip =
+                |j: &BoneHandle| j.effector.is_some() && pointer.distance_squared(j.center) <= 36.0;
+            grip(b)
+                .cmp(&grip(a))
+                .then_with(|| {
+                    pointer
+                        .distance_squared(a.center)
+                        .total_cmp(&pointer.distance_squared(b.center))
+                })
+                .then_with(|| b.depth.total_cmp(&a.depth))
+        })
+        .map(|(index, _)| index)
+}
+
+fn effector_hint(effector: Effector) -> &'static str {
+    match effector {
+        Effector::Hand => "Кисть · тяните точку",
+        Effector::Foot => "Стопа · тяните точку",
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_bone_center(
+    viewer: &ImageViewer,
+    references: &ReferenceRender,
+    tab: usize,
+    canvas: Rect,
+    name: &str,
+) -> Vec2 {
+    let dimensions = viewer.dimensions.unwrap();
+    let model = viewer.edit.model_reference(Some(tab)).unwrap();
+    let shot = viewer
+        .layer_preview
+        .as_ref()
+        .and_then(LayerPreview::displayed_shot);
+    BoneView::new(
+        references,
+        shot,
+        &model,
+        dimensions,
+        viewer.image_rect(dimensions, canvas),
+    )
+    .unwrap()
+    .markers(shot.map_or(&model.joints, |s| &s.view.pose.joints))
+    .into_iter()
+    .find(|joint| joint.name == name)
+    .expect("The reference rig must have the test joint")
+    .center
+}
+
 use super::edit::selection::{
     frame_quad,
     live::{Live, Placement},
 };
 
-/// Cache the surrounding layers. Translation reuses authored pixels, while rotation
-/// and scale composite the prepared mesh directly from its offscreen camera.
+/// Cache the surrounding layers. A fully visible model can reuse its authored
+/// pixels during translation. A clipped model needs a fresh render of the whole
+/// mesh so the newly visible area has the same shading as the rest of the model.
 pub(in crate::editor) struct LayerPreview {
     bound: Binding,
+    generation: u64,
     view_revision: u64,
+    tool: Tool,
     live: Option<Live>,
     frame: [f32; 4],
     offset: Vec2,
-    waiting_for_mesh: bool,
     model: ModelReference,
     size: UVec2,
     render_3d: bool,
-    requested: Option<crate::Pose>,
-    camera_image: Option<(Handle<Image>, [f32; 4])>,
+    requested: Option<ReferencePose>,
+    camera_image: Option<CameraImage>,
+    composing: Option<Task<(Arc<Shot>, photocraft_raster::Rgba8Image)>>,
+    composing_id: Option<u64>,
+    composite_shot: Option<Arc<Shot>>,
 }
 
 impl LayerPreview {
     fn new(
         bound: Binding,
         photo: &crate::editor::photo_document::PhotoDocument,
-        render: &ReferenceRender,
         model: &ModelReference,
         tool: Tool,
+        generation: u64,
     ) -> Self {
         let size = UVec2::new(photo.size().width, photo.size().height);
-        let mut frame = [0.0; 4];
-        let mut waiting_for_mesh = false;
-        let render_3d = matches!(tool, Tool::Rotate | Tool::Scale);
-        let live = photo.active_layer().and_then(|layer| {
-            if render_3d {
-                // Under/above are static. The live camera supplies the moving plane.
-                frame = [0., 0., 1., 1.];
-                return Live::for_model(photo, frame, layer.id, None);
-            }
-            let mut rect = layer.surface()?.content_bounds();
-            let clipped = rect.is_empty()
-                || rect.x0 <= 0
-                || rect.y0 <= 0
-                || rect.x1 >= size.x as i32
-                || rect.y1 >= size.y as i32;
-            let extension = if clipped {
-                if !render.live.mesh_ready(&model.asset) {
-                    waiting_for_mesh = true;
-                    return None;
-                }
-                let (full, extend) = render.live.extend_layer(model, size, rect)?;
-                rect = full;
-                Some(extend)
-            } else {
-                None
-            };
-            frame = [
-                rect.x0 as f32,
-                rect.y0 as f32,
-                rect.x1 as f32,
-                rect.y1 as f32,
-            ];
-            let live = Live::for_model(photo, frame, layer.id, extension)?;
-            Some(live)
-        });
+        let raster_frame = photo
+            .active_layer()
+            .filter(|_| tool == Tool::Move)
+            .and_then(|layer| layer.surface())
+            .map(|surface| surface.content_bounds())
+            .filter(|rect| {
+                !rect.is_empty()
+                    && rect.x0 > 0
+                    && rect.y0 > 0
+                    && rect.x1 < size.x as i32
+                    && rect.y1 < size.y as i32
+            })
+            .map(|rect| {
+                [
+                    rect.x0 as f32,
+                    rect.y0 as f32,
+                    rect.x1 as f32,
+                    rect.y1 as f32,
+                ]
+            });
+        let render_3d = raster_frame.is_none();
+        // For a live camera the surrounding layers are static. Only the camera's
+        // frame is used to place the model in the final composition.
+        let frame = raster_frame.unwrap_or([0., 0., 1., 1.]);
+        let live = Live::for_model(photo, frame, bound.layer);
         Self {
             bound,
+            generation,
             view_revision: photo.view_revision,
+            tool,
             live,
             frame,
             offset: Vec2::ZERO,
-            waiting_for_mesh,
             render_3d,
             model: model.clone(),
             size,
             requested: None,
             camera_image: None,
+            composite_shot: None,
+            composing: None,
+            composing_id: None,
         }
     }
 
-    pub(in crate::editor) fn camera_request(
-        &self,
-    ) -> Option<(&ModelReference, UVec2, Option<crate::Pose>)> {
-        (self.render_3d && self.live.is_some()).then_some((&self.model, self.size, self.requested))
+    pub(in crate::editor) fn camera_request(&self) -> Option<(ModelView, bool)> {
+        let native = self.live.as_ref().is_none_or(|live| !live.usable());
+        (self.render_3d || native).then(|| {
+            (
+                ModelView::new(
+                    self.bound.photo,
+                    Some(self.bound.layer),
+                    &self.model,
+                    self.size,
+                    self.requested
+                        .clone()
+                        .unwrap_or_else(|| self.model.reference_pose()),
+                ),
+                native && self.requested.is_some(),
+            )
+        })
     }
-    pub(in crate::editor) fn set_camera_image(&mut self, image: Option<(Handle<Image>, [f32; 4])>) {
+    pub(in crate::editor) fn set_camera_image(&mut self, image: Option<CameraImage>) {
         self.camera_image = image;
     }
-    fn request_pose(&mut self, pose: Option<crate::Pose>) {
-        self.requested = pose.filter(|p| *p != self.model.pose);
+
+    fn composite(
+        &mut self,
+        photo: &crate::editor::photo_document::PhotoDocument,
+        raster: Option<&RasterFrame>,
+    ) -> Option<(Arc<Shot>, photocraft_raster::Rgba8Image)> {
+        let completed = self
+            .composing
+            .as_mut()
+            .and_then(|task| block_on(poll_once(task)));
+        if completed.is_some() {
+            self.composing = None;
+        }
+        if self.composing.is_none()
+            && let Some(frame) = raster
+            && self.composing_id != Some(frame.id())
+            && let Some((view, _)) = self.camera_request()
+            && frame.view().same_layer_view(&view)
+        {
+            self.composing_id = Some(frame.id());
+            let mut doc = photo.document.clone();
+            let layer = self.bound.layer;
+            let surface = frame.surface.clone();
+            let shot = frame.shot.clone();
+            self.composing = Some(AsyncComputeTaskPool::get().spawn(async move {
+                doc.layer_mut(layer).unwrap().content =
+                    photocraft_doc::LayerContent::Raster(surface);
+                let image = crate::editor::photo_document::composite_region(
+                    &doc,
+                    photocraft_geom::Rect::from_size(doc.size),
+                );
+                (shot, image)
+            }));
+        }
+        completed
+    }
+    fn request_pose(&mut self, pose: Option<ReferencePose>) {
+        self.requested =
+            pose.filter(|p| p.root != self.model.pose || p.joints != self.model.joints);
         self.offset = self
             .requested
-            .map_or(Vec2::ZERO, |p| projected_offset(&self.model, p));
+            .as_ref()
+            .map_or(Vec2::ZERO, |p| projected_offset(&self.model, p.root));
         if self.requested.is_none() {
             self.camera_image = None;
+            self.composite_shot = None;
+            self.composing = None;
+            self.composing_id = None;
         }
     }
     fn on_gpu(&self) -> bool {
@@ -137,12 +349,21 @@ impl LayerPreview {
             .is_some_and(|live| live.ready_for_display())
     }
 
+    fn displayed_shot(&self) -> Option<&Shot> {
+        self.requested.as_ref()?;
+        if self.on_gpu() {
+            self.camera_image.as_ref().map(|frame| frame.shot.as_ref())
+        } else {
+            self.composite_shot.as_deref()
+        }
+    }
+
     pub(super) fn placement(&mut self) -> Option<Placement<'_>> {
         let camera = self
             .camera_image
             .as_ref()
             .filter(|_| self.requested.is_some());
-        let frame = camera.map_or(self.frame, |(_, frame)| *frame);
+        let frame = camera.map_or(self.frame, |frame| frame.rect);
         let deferred = if self.render_3d {
             camera.is_some()
         } else {
@@ -152,10 +373,23 @@ impl LayerPreview {
             live: self.live.as_mut()?,
             frame,
             quad: frame_quad(frame).map(|p| if self.render_3d { p } else { p + self.offset }),
-            camera: camera.map(|(image, _)| image.clone()),
+            camera: camera.map(|frame| frame.image.clone()),
             deferred,
         })
     }
+}
+
+enum BoneDrag {
+    Rotate {
+        key: String,
+        basis: Quat,
+    },
+    Reach {
+        limb: Box<Reach>,
+        right: Vec3,
+        down: Vec3,
+        delta: Vec2,
+    },
 }
 
 pub(super) struct Drag {
@@ -169,6 +403,7 @@ pub(super) struct Drag {
     view: Transform,
     initial: crate::Pose,
     pub(super) preview: crate::Pose,
+    bone: Option<BoneDrag>,
 }
 
 struct Frame {
@@ -192,75 +427,79 @@ impl Frame {
     }
 
     fn project(&self, direction: Vec3) -> Vec2 {
-        Vec2::new(
-            direction.dot(*self.view.right()),
-            -direction.dot(*self.view.up()),
-        )
+        project_to_canvas(&self.view, direction)
     }
 
     fn segments(&self, tool: Tool, axis: usize) -> Vec<(Vec2, Vec2)> {
-        if axis >= PLANE_START {
-            if tool != Tool::Move {
-                return Vec::new();
+        match tool {
+            Tool::Move => self
+                .move_tip(axis)
+                .map(|tip| vec![(self.center, tip)])
+                .unwrap_or_default(),
+            Tool::Rotate => rotation_rings::segments(self, axis),
+            Tool::Scale => {
+                let direction = self.scale_direction(axis);
+                vec![(
+                    self.center + direction * 12.0,
+                    self.center + direction * RADIUS,
+                )]
             }
-            let normal = axis - PLANE_START;
-            let u = self.project(AXES[(normal + 1) % 3]);
-            let v = self.project(AXES[(normal + 2) % 3]);
-            if coordinates(Vec2::ZERO, u, v).is_none() {
-                return Vec::new();
-            }
-            let corners = [
-                Vec2::new(18.0, 18.0),
-                Vec2::new(33.0, 18.0),
-                Vec2::splat(33.0),
-                Vec2::new(18.0, 33.0),
-            ]
-            .map(|p| self.center + u * p.x + v * p.y);
-            return (0..4).map(|i| (corners[i], corners[(i + 1) % 4])).collect();
+            Tool::Universal => Vec::new(),
         }
-        if tool == Tool::Rotate {
-            return rotation_rings::segments(self, axis);
-        }
-        if axis == FREE {
-            let radius = 8.0;
-            if tool == Tool::Scale {
-                let corners = [
-                    Vec2::NEG_ONE,
-                    Vec2::new(1.0, -1.0),
-                    Vec2::ONE,
-                    Vec2::new(-1.0, 1.0),
-                ];
-                return (0..4)
-                    .map(|i| {
-                        (
-                            self.center + corners[i] * radius,
-                            self.center + corners[(i + 1) % 4] * radius,
-                        )
-                    })
-                    .collect();
-            }
-            let point = |i: usize| {
-                self.center
-                    + radius
-                        * Vec2::from_angle(std::f32::consts::TAU * i as f32 / RING_STEPS as f32)
-            };
-            return (0..RING_STEPS).map(|i| (point(i), point(i + 1))).collect();
-        }
-        let direction = if tool == Tool::Scale {
-            self.model.pose.transform().rotation * AXES[axis]
-        } else {
-            AXES[axis]
-        };
-        let projected = self.project(direction);
-        let direction = if projected.length_squared() > 0.04 {
+    }
+
+    fn scale_direction(&self, axis: usize) -> Vec2 {
+        let projected = self.project(self.model.pose.transform().rotation * AXES[axis]);
+        if projected.length_squared() > 0.04 {
             projected.normalize()
         } else {
             Vec2::from_angle((axis as f32 * 2.0 + 1.0) * std::f32::consts::FRAC_PI_3)
+        }
+    }
+
+    fn move_tip(&self, axis: usize) -> Option<Vec2> {
+        MOVE_AXES
+            .get(axis)
+            .map(|direction| self.center + *direction * HANDLE_LENGTH)
+    }
+
+    fn handle_material(
+        &self,
+        tool: Tool,
+        viewport: Rect,
+        highlight: Option<usize>,
+    ) -> HandleMaterial {
+        let scale = tool == Tool::Scale;
+        let center = self.center - viewport.min;
+        let mut material = HandleMaterial {
+            viewport: viewport.size().extend(1.0).extend(if scale { 1.0 } else { 0.0 }),
+            pivot: center.extend(1.0).extend(if highlight == Some(FREE) { 1.0 } else { 0.0 }),
+            ..default()
         };
-        vec![(
-            self.center + direction * 12.0,
-            self.center + direction * RADIUS,
-        )]
+        for (axis, color) in AXIS_COLORS.into_iter().enumerate() {
+            let tip = if scale {
+                Some(self.center + self.scale_direction(axis) * RADIUS)
+            } else {
+                self.move_tip(axis)
+            };
+            let Some(tip) = tip else { continue };
+            let tip = tip - viewport.min;
+            material.tips[axis] = tip.extend(1.0).extend(0.0);
+            let tint = if highlight == Some(axis) { HIGHLIGHT } else { color };
+            material.colors[axis] = tint.to_linear();
+            if scale {
+                let rotation = self.model.pose.transform().rotation;
+                for (corner, offset) in
+                    scale_cube_offsets(rotation, *self.view.back(), HANDLE_LENGTH)
+                        .into_iter()
+                        .enumerate()
+                {
+                    material.faces[axis * 12 + corner] =
+                        (tip + self.project(offset)).extend(0.0).extend(0.0);
+                }
+            }
+        }
+        material
     }
 
     fn hit(&self, tool: Tool, pointer: Vec2) -> Option<(usize, Vec2, f32)> {
@@ -284,24 +523,8 @@ impl Frame {
         if tool == Tool::Rotate && (distance - FREE_RADIUS).abs() < 8.0 {
             return Some((FREE, Vec2::ZERO, 1.0));
         }
-        if tool == Tool::Move {
-            for normal in 0..3 {
-                let u = self.project(AXES[(normal + 1) % 3]);
-                let v = self.project(AXES[(normal + 2) % 3]);
-                if let Some(point) = coordinates(pointer - self.center, u, v)
-                    && point.cmpge(Vec2::splat(15.0)).all()
-                    && point.cmple(Vec2::splat(35.0)).all()
-                {
-                    return Some((
-                        PLANE_START + normal,
-                        Vec2::ZERO,
-                        self.pixels_per_unit.recip(),
-                    ));
-                }
-            }
-        }
         let mut best = None;
-        let mut nearest = 8.0;
+        let mut nearest = if tool == Tool::Scale { 10.0 } else { 8.0 };
         for axis in 0..3 {
             for (a, b) in self.segments(tool, axis) {
                 let segment = b - a;
@@ -315,10 +538,7 @@ impl Frame {
                 if distance < nearest {
                     nearest = distance;
                     let factor = match tool {
-                        Tool::Move => {
-                            1.0 / (self.pixels_per_unit
-                                * self.project(AXES[axis]).length().max(0.25))
-                        }
+                        Tool::Move => self.pixels_per_unit.recip(),
                         Tool::Rotate => (rotation_rings::ANGLE_STEP / length).min(0.04),
                         _ => 1.0 / RADIUS,
                     };
@@ -359,7 +579,7 @@ pub(super) fn test_handle(
         dimensions,
     );
     for (a, b) in frame.segments(tool, 0) {
-        let point = (a + b) * 0.5;
+        let point = if tool == Tool::Scale { b } else { (a + b) * 0.5 };
         if canvas.contains(point)
             && let Some((0, direction, _)) = frame.hit(tool, point)
         {
@@ -370,7 +590,37 @@ pub(super) fn test_handle(
 }
 
 impl Drag {
+    fn reference_pose(&self, model: &ModelReference) -> ReferencePose {
+        let mut pose = model.reference_pose();
+        match &self.bone {
+            Some(BoneDrag::Reach {
+                limb,
+                right,
+                down,
+                delta,
+            }) => {
+                limb.apply(*right * delta.x + *down * delta.y, &mut pose.joints);
+            }
+            Some(BoneDrag::Rotate { key, basis }) if self.preview != self.initial => {
+                let rotation = (basis.inverse() * self.preview.transform().rotation).normalize();
+                pose.joints.insert(key.clone(), rotation.to_array());
+            }
+            Some(BoneDrag::Rotate { .. }) => {}
+            None => pose.root = self.preview,
+        }
+        pose
+    }
+
     fn update(&mut self, pointer: Vec2, snap: bool) {
+        if let Some(BoneDrag::Reach { delta, .. }) = &mut self.bone {
+            let motion = pointer - self.origin;
+            *delta = if motion.length_squared() >= 9.0 {
+                motion
+            } else {
+                Vec2::ZERO
+            };
+            return;
+        }
         if pointer.distance_squared(self.origin) < 1.0 {
             self.preview = self.initial;
             return;
@@ -378,35 +628,34 @@ impl Drag {
         let amount = (pointer - self.origin).dot(self.direction) * self.sensitivity;
         let index = self.axis;
         let mut transform = self.initial.transform();
-        if index >= PLANE_START {
-            let u = AXES[(index - PLANE_START + 1) % 3];
-            let v = AXES[(index - PLANE_START + 2) % 3];
-            let project =
-                |axis: Vec3| Vec2::new(axis.dot(*self.view.right()), -axis.dot(*self.view.up()));
-            if let Some(delta) = coordinates(pointer - self.origin, project(u), project(v)) {
-                let mut delta = delta * self.sensitivity;
-                if snap {
-                    delta = (delta * 4.0).round() * 0.25;
-                }
-                let displacement = u * delta.x + v * delta.y;
-                transform.translation = (transform.translation + displacement)
-                    .clamp(Vec3::splat(-100_000.0), Vec3::splat(100_000.0));
+        if self.tool == Tool::Move {
+            let mut offset = if index == FREE {
+                (pointer - self.origin) * self.sensitivity
+            } else {
+                self.direction * amount
+            };
+            if snap {
+                offset = (offset * 4.0).round() * 0.25;
             }
+            let displacement = *self.view.right() * offset.x - *self.view.up() * offset.y;
+            // Stop in the drag direction at the pose limit, preserving camera depth.
+            let mut fraction = 1.0_f32;
+            for (component, step) in transform
+                .translation
+                .to_array()
+                .into_iter()
+                .zip(displacement.to_array())
+            {
+                if step != 0.0 && (component + step).abs() > 100_000.0 {
+                    fraction = fraction.min((100_000.0_f32.copysign(step) - component) / step);
+                }
+            }
+            transform.translation += displacement * fraction.max(0.0);
             self.preview = transform.into();
             return;
         }
         if index == FREE {
-            let delta = pointer - self.origin;
             match self.tool {
-                Tool::Move => {
-                    let mut offset = delta * self.sensitivity;
-                    if snap {
-                        offset = (offset * 4.0).round() * 0.25;
-                    }
-                    let displacement = *self.view.right() * offset.x - *self.view.up() * offset.y;
-                    transform.translation = (transform.translation + displacement)
-                        .clamp(Vec3::splat(-100_000.0), Vec3::splat(100_000.0));
-                }
                 Tool::Rotate => {
                     let a = self.origin - self.center;
                     let b = pointer - self.center;
@@ -427,28 +676,16 @@ impl Drag {
                     let maximum = 1000.0 / transform.scale.abs().max_element();
                     transform.scale *= factor.clamp(minimum.min(maximum), maximum);
                 }
-                Tool::Universal => {}
+                Tool::Move | Tool::Universal => {}
             }
             self.preview = transform.into();
             return;
         }
         match self.tool {
-            Tool::Move => {
-                let amount = if snap {
-                    (amount * 4.0).round() * 0.25
-                } else {
-                    amount
-                };
-                transform.translation[index] =
-                    (transform.translation[index] + amount).clamp(-100_000.0, 100_000.0);
-            }
             Tool::Rotate => {
                 let step = 15.0_f32.to_radians();
-                let project = |axis: Vec3| {
-                    Vec2::new(axis.dot(*self.view.right()), -axis.dot(*self.view.up()))
-                };
-                let u = project(AXES[(index + 1) % 3]);
-                let v = project(AXES[(index + 2) % 3]);
+                let u = project_to_canvas(&self.view, AXES[(index + 1) % 3]);
+                let v = project_to_canvas(&self.view, AXES[(index + 2) % 3]);
                 let amount = coordinates(self.origin - self.center, u, v)
                     .zip(coordinates(pointer - self.center, u, v))
                     .map_or(amount, |(start, end)| {
@@ -472,7 +709,7 @@ impl Drag {
                 };
                 transform.scale[index] = scale.signum() * magnitude.clamp(0.0001, 1000.0);
             }
-            Tool::Universal => {}
+            Tool::Move | Tool::Universal => {}
         }
         self.preview = transform.into();
     }
@@ -520,8 +757,21 @@ fn target(
 
 fn projected_offset(model: &ModelReference, pose: crate::Pose) -> Vec2 {
     let delta = Vec3::from(pose.position) - Vec3::from(model.pose.position);
-    let view = model.view();
-    Vec2::new(delta.dot(*view.right()), -delta.dot(*view.up())) * model.pixels_per_unit
+    project_to_canvas(&model.view(), delta) * model.pixels_per_unit
+}
+
+fn display_composite(viewer: &mut ImageViewer, references: &ReferenceRender, bound: Binding) {
+    let Some(cache) = &mut viewer.layer_preview else {
+        return;
+    };
+    if !cache.on_gpu()
+        && let Some(photo) = viewer.edit.document(Some(bound.tab))
+        && let Some((shot, image)) = cache.composite(photo, references.live.raster())
+    {
+        cache.composite_shot = Some(shot);
+        viewer.edit.display_model_preview(bound.tab, image);
+        viewer.model_preview = Some((bound.tab, bound.revision));
+    }
 }
 
 pub(super) fn pointer(
@@ -535,6 +785,7 @@ pub(super) fn pointer(
     keys: &ButtonInput<KeyCode>,
     over_control: bool,
 ) -> bool {
+    let reset = std::mem::take(&mut viewer.edit.model_pose_reset);
     let context = (|| {
         let tab = editor.viewing_image?;
         let tool = viewer.edit.model_tool?;
@@ -564,43 +815,73 @@ pub(super) fn pointer(
         })
     })();
     let Some((bound, tool, frame)) = context else {
-        viewer.released_model = None;
+        viewer.bone_selection = None;
         viewer.layer_preview = None;
         viewer.clear_model_preview();
-        references.live.reset();
         return viewer.model_drag.take().is_some();
     };
+    let posing = viewer.edit.model_posing;
+    if !posing
+        || viewer
+            .bone_selection
+            .as_ref()
+            .is_some_and(|selection| !selection.bound.same_layer(bound))
+    {
+        viewer.bone_selection = None;
+    }
+    if reset && posing {
+        viewer.model_drag = None;
+        if let Err(error) = references.pose_selected(
+            bound.tab,
+            viewer.edit.document_mut(bound.tab).unwrap(),
+            Default::default(),
+        ) {
+            viewer.edit.error = Some(error);
+        }
+        return true;
+    }
     {
         let photo = viewer.edit.document(Some(bound.tab)).unwrap();
         if viewer.layer_preview.as_ref().is_none_or(|cache| {
             cache.bound != bound
-                || cache.render_3d != (tool != Tool::Move)
+                || cache.tool != tool
                 || cache.model.asset != frame.model.asset
                 || cache.view_revision != photo.view_revision
-                || (cache.waiting_for_mesh && references.live.mesh_ready(&frame.model.asset))
         }) {
+            let mut raster_model = frame.model.clone();
+            if let Some(previous) = photo
+                .active_layer()
+                .and_then(|l| l.xmp.as_ref())
+                .and_then(|packet| references.previous_pose(packet))
+            {
+                raster_model.pose = previous.root;
+                raster_model.joints.clone_from(&previous.joints);
+            }
             viewer.layer_preview = Some(LayerPreview::new(
                 bound,
                 photo,
-                references,
-                &frame.model,
+                &raster_model,
                 tool,
+                references.live.generation,
             ));
+        } else if let Some(cache) = &mut viewer.layer_preview
+            && cache.generation != references.live.generation
+        {
+            // The last displayed frame still owns its original rig. Only work
+            // awaiting composition needs to be invalidated on re-instantiation.
+            cache.generation = references.live.generation;
+            cache.composing = None;
+            cache.composing_id = None;
         }
         if let Some(live) = viewer.layer_preview.as_mut().and_then(|m| m.live.as_mut()) {
             live.poll(bound.revision);
         }
     }
-    let released = viewer
-        .released_model
-        .filter(|(binding, _)| *binding == bound)
-        .and_then(|(_, pose)| {
-            (references.pending_pose(bound.tab, bound.layer) == Some(pose)).then_some(pose)
-        });
+    let released = frame.model.pending_frame.and_then(|_| {
+        let pose = frame.model.reference_pose();
+        (references.pending_reference_pose(bound.tab, bound.layer) == Some(&pose)).then_some(pose)
+    });
     if viewer.model_drag.is_none() && released.is_none() {
-        if viewer.released_model.take().is_some() {
-            references.live.reset();
-        }
         if let Some(cache) = &mut viewer.layer_preview {
             cache.request_pose(None);
         }
@@ -613,29 +894,15 @@ pub(super) fn pointer(
             cache.request_pose(None);
         }
         viewer.clear_model_preview();
-        references.live.reset();
         return viewer.model_drag.take().is_some();
     }
-    if let Some(pose) = released
+    if let Some(pose) = released.as_ref()
         && let Some(cache) = &mut viewer.layer_preview
     {
-        cache.request_pose(Some(pose));
+        cache.request_pose(Some(pose.clone()));
     }
-    if viewer.model_drag.is_none()
-        && let Some(pose) = released
-        && viewer
-            .layer_preview
-            .as_ref()
-            .is_none_or(|cache| !cache.on_gpu())
-        && let Some(image) = references.live.poll(
-            viewer.edit.document(Some(bound.tab)).unwrap(),
-            &frame.model,
-            pose,
-            true,
-        )
-    {
-        viewer.edit.display_model_preview(bound.tab, image);
-        viewer.model_preview = Some((bound.tab, bound.revision));
+    if viewer.model_drag.is_none() && released.is_some() {
+        display_composite(viewer, references, bound);
     }
     if keys.pressed(KeyCode::Space) {
         return false;
@@ -646,9 +913,9 @@ pub(super) fn pointer(
             || drag.bound.layer != bound.layer
             || drag.bound.revision != bound.revision
             || drag.tool != tool
+            || drag.bone.is_some() != posing
         {
             viewer.clear_model_preview();
-            references.live.reset();
             return true;
         }
         if let Some(cursor) = window.cursor_position() {
@@ -657,46 +924,124 @@ pub(super) fn pointer(
                 keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
             );
         }
+        let pose = drag.reference_pose(&frame.model);
+        let changed = pose.root != frame.model.pose || pose.joints != frame.model.joints;
         let on_gpu = if let Some(cache) = &mut viewer.layer_preview {
-            cache.request_pose(Some(drag.preview));
+            cache.request_pose(Some(pose.clone()));
             cache.on_gpu()
         } else {
             false
         };
         if mouse.just_released(MouseButton::Left) {
-            let doc = viewer.edit.document(Some(bound.tab)).unwrap();
-            if let Err(error) = references.transform_selected(bound.tab, doc, drag.preview) {
+            let doc = viewer.edit.document_mut(bound.tab).unwrap();
+            let result = if posing {
+                references.pose_selected(bound.tab, doc, pose.joints.clone())
+            } else {
+                references.transform_selected(bound.tab, doc, pose.root)
+            };
+            if let Err(error) = result {
                 viewer.clear_model_preview();
                 viewer.edit.error = Some(error);
-            } else if drag.preview != drag.initial {
-                viewer.released_model = Some((bound, drag.preview));
+            } else if changed {
+                let committed = Binding {
+                    revision: doc.revision,
+                    ..bound
+                };
+                if let Some(cache) = &mut viewer.layer_preview {
+                    cache.bound = committed;
+                }
+                if viewer.model_preview == Some((bound.tab, bound.revision)) {
+                    viewer
+                        .edit
+                        .retain_model_preview(bound.tab, bound.revision, committed.revision);
+                    viewer.model_preview = Some((bound.tab, committed.revision));
+                }
             }
         } else if mouse.pressed(MouseButton::Left) {
-            if drag.preview != drag.initial && !on_gpu {
-                let doc = viewer.edit.document(Some(bound.tab)).unwrap();
-                if let Some(image) = references.live.poll(doc, &frame.model, drag.preview, false) {
-                    viewer.edit.display_model_preview(bound.tab, image);
-                    viewer.model_preview = Some((bound.tab, bound.revision));
-                }
-            } else if drag.preview == drag.initial {
+            if changed && !on_gpu {
+                display_composite(viewer, references, bound);
+            } else if !changed {
                 viewer.clear_model_preview();
-                references.live.reset();
             }
             viewer.model_drag = Some(drag);
         } else {
             viewer.clear_model_preview();
-            references.live.reset();
         }
         return true;
     }
     if mouse.just_pressed(MouseButton::Left)
         && !over_control
         && let Some(cursor) = window.cursor_position().filter(|p| input.contains(*p))
-        && !references.pending_for(Some(bound.tab))
-        && let Some((axis, direction, sensitivity)) =
-            target(&frame, tool, viewer, bound.tab, canvas, cursor)
+        && references
+            .pending_reference_pose(bound.tab, bound.layer)
+            .is_none()
     {
-        references.live.reset();
+        let mut frame = frame;
+        let mut bone = None;
+        let mut initial = frame.model.pose;
+        let hit = if posing {
+            let dimensions = viewer.dimensions.unwrap();
+            let shot = viewer
+                .layer_preview
+                .as_ref()
+                .and_then(LayerPreview::displayed_shot);
+            let Some(view) = BoneView::new(
+                references,
+                shot,
+                &frame.model,
+                dimensions,
+                viewer.image_rect(dimensions, canvas),
+            ) else {
+                return true;
+            };
+            let rotations = shot.map_or(&frame.model.joints, |s| &s.view.pose.joints);
+            let markers = view.markers(rotations);
+            if let Some(index) = bone_at(&markers, cursor, input) {
+                let marker = &markers[index];
+                viewer.bone_selection = Some(BoneSelection {
+                    bound,
+                    joint: marker.key.to_owned(),
+                });
+                if marker.effector.is_none() {
+                    return true;
+                }
+                let Some(reach) = view.reach(marker.key, rotations) else {
+                    return true;
+                };
+                bone = Some(reach);
+                frame.center = marker.center;
+                Some((FREE, Vec2::ZERO, 1.0))
+            } else {
+                let selected = viewer.bone_selection.as_ref().and_then(|selection| {
+                    markers.iter().find(|marker| marker.key == selection.joint)
+                });
+                let hit = selected.and_then(|joint| {
+                    frame.center = joint.center;
+                    frame.hit(Tool::Rotate, cursor).map(|hit| (joint, hit))
+                });
+                if let Some((joint, hit)) = hit {
+                    let offset = frame
+                        .model
+                        .joints
+                        .get(joint.key)
+                        .map_or(Quat::IDENTITY, |offset| Quat::from_array(*offset));
+                    initial = Transform::from_rotation((joint.basis * offset).normalize()).into();
+                    bone = Some(BoneDrag::Rotate {
+                        key: joint.key.to_owned(),
+                        basis: joint.basis,
+                    });
+                    Some(hit)
+                } else {
+                    viewer.bone_selection = None;
+                    return true;
+                }
+            }
+        } else {
+            target(&frame, tool, viewer, bound.tab, canvas, cursor)
+        };
+        let Some((axis, direction, sensitivity)) = hit else {
+            return true;
+        };
         viewer.gesture = None;
         viewer.model_drag = Some(Drag {
             bound,
@@ -707,8 +1052,9 @@ pub(super) fn pointer(
             sensitivity,
             center: frame.center,
             view: frame.view,
-            initial: frame.model.pose,
-            preview: frame.model.pose,
+            initial,
+            preview: initial,
+            bone,
         });
     }
     // While a model tool is selected, a click on the canvas must not paint.
@@ -716,7 +1062,7 @@ pub(super) fn pointer(
 }
 
 fn handle_hint(tool: Tool, axis: usize, drag: Option<&Drag>) -> String {
-    let label = ["X", "Y", "Z", "холст", "YZ", "ZX", "XY"][axis];
+    let label = ["X", "Y", "Z", "холст"][axis];
     let name = match (tool, axis) {
         (Tool::Move, _) => "Перемещение",
         (Tool::Rotate, _) => "Поворот",
@@ -734,10 +1080,14 @@ fn handle_hint(tool: Tool, axis: usize, drag: Option<&Drag>) -> String {
     let before = drag.initial.transform();
     let after = drag.preview.transform();
     let value = match tool {
-        Tool::Move if axis < 3 => format!("{:+.2}", (after.translation - before.translation)[axis]),
         Tool::Move => {
-            let v = after.translation - before.translation;
-            format!("X {:+.2}  Y {:+.2}  Z {:+.2}", v.x, v.y, v.z)
+            let offset = project_to_canvas(&drag.view, after.translation - before.translation)
+                * Vec2::new(1.0, -1.0);
+            if axis == FREE {
+                format!("X {:+.2}  Y {:+.2}", offset.x, offset.y)
+            } else {
+                format!("{:+.2}", offset[axis])
+            }
         }
         Tool::Scale => format!(
             "×{:.2}",
@@ -764,22 +1114,29 @@ fn handle_hint(tool: Tool, axis: usize, drag: Option<&Drag>) -> String {
 }
 
 pub(super) struct Overlay {
+    canvas: Entity,
+    markers: Vec<Entity>,
     hint: Entity,
     hint_text: Entity,
     hint_value: String,
-    nodes: Vec<Entity>,
+    handle_material: Handle<HandleMaterial>,
     rings: rotation_rings::Overlay,
-    last: Option<(Tool, Vec2, Vec3, [f32; 4], Option<usize>, bool)>,
+    last: Option<(Tool, Vec2, Vec2, Vec3, [f32; 4], Option<usize>)>,
 }
 
 impl Overlay {
     #[cfg(test)]
     pub(super) fn handle_geometry(&self) -> (Vec2, [f32; 4]) {
-        let (_, center, _, rotation, _, _) = self.last.unwrap();
+        let (_, center, _, _, rotation, _) = self.last.unwrap();
         (center, rotation)
     }
 
-    pub(super) fn setup(commands: &mut Commands, canvas: Entity, font: &Handle<Font>) -> Self {
+    pub(super) fn setup(
+        commands: &mut Commands,
+        canvas: Entity,
+        font: &Handle<Font>,
+        handles: &mut Assets<HandleMaterial>,
+    ) -> Self {
         let hint = surface(
             commands,
             canvas,
@@ -796,32 +1153,16 @@ impl Overlay {
         commands.entity(hint).insert((Pickable::IGNORE, ZIndex(14)));
         let hint_text = text(commands, hint, font, "", 12.0, Color::WHITE);
         commands.entity(hint_text).insert(Pickable::IGNORE);
-        let nodes = (0..3 * 5 + RING_STEPS + (HANDLE_COUNT - PLANE_START) * 4)
-            .map(|_| {
-                commands
-                    .spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            display: Display::None,
-                            border_radius: BorderRadius::all(px(2)),
-                            ..default()
-                        },
-                        UiTransform::IDENTITY,
-                        Outline::new(px(1), px(0), Color::srgba(0.02, 0.02, 0.02, 0.9)),
-                        BackgroundColor(Color::NONE),
-                        Pickable::IGNORE,
-                        ZIndex(12),
-                        ChildOf(canvas),
-                    ))
-                    .id()
-            })
-            .collect();
+        let (overlay, handle_material) = viewport::spawn_overlay(commands, handles, canvas);
+        commands.entity(overlay).insert((ImageOverlay, ZIndex(12)));
         Self {
+            canvas,
+            markers: Vec::new(),
             hint,
             hint_text,
             hint_value: String::new(),
             rings: rotation_rings::Overlay::setup(commands, canvas, font),
-            nodes,
+            handle_material,
             last: None,
         }
     }
@@ -835,9 +1176,12 @@ impl Overlay {
         pointer: Option<Vec2>,
         density: f32,
         images: &mut Assets<Image>,
+        handles: &mut Assets<HandleMaterial>,
         nodes: &mut Query<&mut Node>,
         commands: &mut Commands,
     ) {
+        let mut markers = Vec::new();
+        let mut selected_bone = None;
         let geometry = (|| {
             let tab = editor.viewing_image?;
             let tool = viewer.edit.model_tool?;
@@ -854,24 +1198,141 @@ impl Overlay {
                 return None;
             }
             let layer = viewer.edit.document(Some(tab))?.active_id()?;
-            if let Some(pose) = viewer
+            let pending = references.pending_reference_pose(tab, layer);
+            let displayed = viewer
+                .layer_preview
+                .as_ref()
+                .filter(|preview| preview.bound.tab == tab && preview.bound.layer == layer)
+                .and_then(LayerPreview::displayed_shot);
+            if viewer.edit.model_posing {
+                // Keep the dots on the rendered limbs while the preview warms up
+                // or a software frame is still being composed.
+                if let Some(pose) = displayed.map(|shot| &shot.view.pose)
+                    .or_else(|| {
+                        let layer = viewer.edit.document(Some(tab))?.active_layer()?;
+                        references.previous_pose(layer.xmp.as_ref()?)
+                    })
+                {
+                    model.pose = pose.root;
+                    model.joints.clone_from(&pose.joints);
+                }
+            } else if let Some(drag) = viewer
                 .model_drag
                 .as_ref()
                 .filter(|drag| drag.bound.tab == tab && drag.bound.layer == layer)
-                .map(|drag| drag.preview)
-                .or_else(|| references.pending_pose(tab, layer))
             {
-                model.pose = pose;
+                let pose = drag.reference_pose(&model);
+                model.pose = pose.root;
+                model.joints = pose.joints;
+            } else if let Some(pose) = pending {
+                model.pose = pose.root;
+                model.joints.clone_from(&pose.joints);
             }
-            let frame = Frame::new(model, viewer.image_rect(dimensions, viewport), dimensions);
+            let image = viewer.image_rect(dimensions, viewport);
+            let mut frame = Frame::new(model, image, dimensions);
+            if viewer.edit.model_posing {
+                let model = frame.model.clone().resolved(&editor.root);
+                markers = BoneView::new(references, displayed, &model, dimensions, image)?
+                    .markers(&model.joints);
+                let selection = viewer.bone_selection.as_ref()?;
+                let photo = viewer.edit.document(Some(tab))?;
+                if (
+                    selection.bound.tab,
+                    selection.bound.photo,
+                    selection.bound.layer,
+                ) != (tab, photo.document.id, layer)
+                {
+                    return None;
+                }
+                let joint = markers.iter().find(|bone| bone.key == selection.joint)?;
+                frame.center = joint.center;
+                let label = match joint.effector {
+                    Some(kind) => effector_hint(kind),
+                    None => joint.name,
+                };
+                selected_bone = Some((joint.key, label));
+            }
             viewport.contains(frame.center).then_some((tool, frame))
         })();
+        let hovered_bone = pointer.and_then(|point| bone_at(&markers, point, viewport));
+        let mut visible = 0;
+        for (index, joint) in markers
+            .iter()
+            .enumerate()
+            .filter(|(_, joint)| viewport.contains(joint.center))
+        {
+            let selected = selected_bone.is_some_and(|(key, _)| key == joint.key);
+            let hovered = hovered_bone == Some(index);
+            let ik = joint.effector.is_some();
+            let size = if ik {
+                13.0
+            } else if selected || hovered {
+                11.0
+            } else {
+                8.0
+            };
+            let order = ZIndex(if ik { 13 } else { 11 });
+            let point = joint.center - viewport.min;
+            let marker = Node {
+                position_type: PositionType::Absolute,
+                left: px(point.x - size / 2.0),
+                top: px(point.y - size / 2.0),
+                width: px(size),
+                height: px(size),
+                border: UiRect::all(px(1.5)),
+                border_radius: if ik {
+                    BorderRadius::all(px(3))
+                } else {
+                    BorderRadius::MAX
+                },
+                ..default()
+            };
+            let color = BackgroundColor(if selected || hovered {
+                HIGHLIGHT
+            } else if ik {
+                Color::srgb(0.20, 0.86, 0.79)
+            } else {
+                Color::WHITE
+            });
+            if let Some(&entity) = self.markers.get(visible) {
+                if let Ok(mut node) = nodes.get_mut(entity) {
+                    node.set_if_neq(marker);
+                }
+                commands.entity(entity).insert((color, order));
+            } else {
+                self.markers.push(
+                    commands
+                        .spawn((
+                            marker,
+                            color,
+                            BorderColor::all(Color::srgb(0.12, 0.14, 0.17)),
+                            Pickable::IGNORE,
+                            order,
+                            ChildOf(self.canvas),
+                        ))
+                        .id(),
+                );
+            }
+            visible += 1;
+        }
+        for &entity in &self.markers[visible..] {
+            if let Ok(mut node) = nodes.get_mut(entity) {
+                node.display = Display::None;
+            }
+        }
         let dragging = viewer.model_drag.is_some();
+        let reaching = viewer
+            .model_drag
+            .as_ref()
+            .is_some_and(|drag| matches!(drag.bone, Some(BoneDrag::Reach { .. })));
         let highlight = viewer
             .model_drag
             .as_ref()
             .map(|drag| drag.axis)
             .or_else(|| {
+                if hovered_bone.is_some() {
+                    return None;
+                }
                 let (tool, frame) = geometry.as_ref()?;
                 target(
                     frame,
@@ -882,10 +1343,11 @@ impl Overlay {
                     pointer.filter(|point| viewport.contains(*point))?,
                 )
                 .map(|hit| hit.0)
-            });
+            })
+            .filter(|_| !reaching);
         let rotating = geometry
             .as_ref()
-            .filter(|(tool, _)| *tool == Tool::Rotate)
+            .filter(|(tool, _)| *tool == Tool::Rotate && !reaching)
             .map(|(_, frame)| frame);
         self.rings.refresh(
             rotating,
@@ -913,6 +1375,19 @@ impl Overlay {
                     commands.entity(self.hint_text).insert(Text::new(&value));
                     self.hint_value = value;
                 }
+            } else if let Some(name) = hovered_bone
+                .filter(|_| !dragging)
+                .and_then(|i| markers[i].effector.map(effector_hint))
+                .or_else(|| selected_bone.map(|(_, name)| name))
+            {
+                node.display = Display::Flex;
+                node.max_width = px(viewport.width());
+                node.left = px(12.0);
+                node.top = px(12.0);
+                if name != self.hint_value {
+                    commands.entity(self.hint_text).insert(Text::new(name));
+                    self.hint_value = name.to_owned();
+                }
             } else {
                 node.display = Display::None;
             }
@@ -921,96 +1396,20 @@ impl Overlay {
             (
                 *tool,
                 frame.center - viewport.min,
+                viewport.size(),
                 *frame.view.back(),
                 frame.model.pose.rotation,
                 highlight,
-                dragging,
             )
         });
         if self.last == key {
             return;
         }
-        let had_segments = self.last.is_some_and(|(tool, ..)| tool != Tool::Rotate);
         self.last = key;
-        if geometry
-            .as_ref()
-            .is_none_or(|(tool, _)| *tool == Tool::Rotate)
-        {
-            if had_segments {
-                for &entity in &self.nodes {
-                    if let Ok(mut node) = nodes.get_mut(entity) {
-                        node.display = Display::None;
-                    }
-                }
-            }
-            return;
-        }
-        for axis in 0..HANDLE_COUNT {
-            let mut segments = geometry
-                .as_ref()
-                .map(|(tool, frame)| frame.segments(*tool, axis))
-                .unwrap_or_default();
-            let mut color = Color::srgb(0.88, 0.89, 0.92);
-            if let Some((tool, _)) = &geometry {
-                if axis >= PLANE_START {
-                    color = AXIS_COLORS[axis - PLANE_START].with_alpha(0.75);
-                } else if axis != FREE {
-                    color = AXIS_COLORS[axis];
-                    if let Some(&(start, end)) = segments.first() {
-                        let direction = (end - start).normalize();
-                        let side = direction.perp() * 5.0;
-                        let base = end - direction * 11.0;
-                        if *tool == Tool::Move {
-                            segments.extend([
-                                (end, base + side),
-                                (end, base - side),
-                                (base + side, base - side),
-                            ]);
-                        } else {
-                            let back = end - direction * 10.0;
-                            segments.extend([
-                                (end + side, end - side),
-                                (end + side, back + side),
-                                (end - side, back - side),
-                                (back - side, back + side),
-                            ]);
-                        }
-                    }
-                }
-            }
-            if highlight == Some(axis) {
-                color = HIGHLIGHT;
-            } else if dragging {
-                color = color.with_alpha(0.3);
-            }
-            let range = if axis < FREE {
-                axis * 5..(axis + 1) * 5
-            } else if axis == FREE {
-                15..15 + RING_STEPS
-            } else {
-                let start = 15 + RING_STEPS + (axis - PLANE_START) * 4;
-                start..start + 4
-            };
-            for (index, &entity) in self.nodes[range].iter().enumerate() {
-                let Ok(mut node) = nodes.get_mut(entity) else {
-                    continue;
-                };
-                let Some(&(start, end)) = segments.get(index) else {
-                    node.display = Display::None;
-                    continue;
-                };
-                let midpoint = (start + end) * 0.5 - viewport.min;
-                let vector = end - start;
-                let length = vector.length();
-                node.display = Display::Flex;
-                node.left = px(midpoint.x - length * 0.5);
-                node.top = px(midpoint.y - 1.5);
-                node.width = px(length + 1.0);
-                node.height = px(3);
-                commands.entity(entity).insert((
-                    BackgroundColor(color),
-                    UiTransform::from_rotation(Rot2::radians(vector.y.atan2(vector.x))),
-                ));
+        if let Some(mut material) = handles.get_mut(&self.handle_material) {
+            material.viewport.z = 0.0;
+            if let Some((tool @ (Tool::Move | Tool::Scale), frame)) = &geometry {
+                *material = frame.handle_material(*tool, viewport, highlight);
             }
         }
     }
@@ -1038,11 +1437,12 @@ mod tests {
             view: Transform::IDENTITY,
             initial: pose,
             preview: pose,
+            bone: None,
         }
     }
 
     #[test]
-    fn model_transform_free_and_plane_handles_constrain_the_correct_components() {
+    fn model_transform_free_and_axis_handles_constrain_the_correct_components() {
         let mut free = drag(Tool::Move, FREE, Vec2::ZERO);
         free.update(Vec2::new(50.0, -100.0), false);
         assert_eq!(free.preview.position, [0.5, 1.0, 0.0]);
@@ -1055,11 +1455,16 @@ mod tests {
                 .abs()
                 < 1e-5
         );
-        free.view = Transform::IDENTITY;
-        free.update(Vec2::new(50.0, -100.0), true);
-        let mut plane = drag(Tool::Move, PLANE_START + 2, Vec2::ZERO);
-        plane.update(Vec2::new(50.0, -100.0), false);
-        assert_eq!(plane.preview.position, free.preview.position);
+        for (index, direction) in MOVE_AXES.into_iter().enumerate() {
+            let mut axis = drag(Tool::Move, index, Vec2::ZERO);
+            axis.direction = direction;
+            axis.view = free.view;
+            axis.initial.position = [1.0, 2.0, 3.0];
+            axis.update(direction * 53.0 + direction.perp() * 100.0, true);
+            let delta = Vec3::from(axis.preview.position) - Vec3::from(axis.initial.position);
+            assert!(project_to_canvas(&axis.view, delta).abs_diff_eq(direction * 0.5, 1e-5));
+            assert!(delta.dot(*axis.view.back()).abs() < 1e-5);
+        }
 
         let mut uniform = drag(Tool::Scale, FREE, Vec2::ZERO);
         uniform.update(Vec2::new(30.0, 0.0), false);

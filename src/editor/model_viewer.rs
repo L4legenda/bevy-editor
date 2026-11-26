@@ -361,7 +361,7 @@ fn setup(
         },
         ChildOf(canvas),
     ));
-    let handle_overlay =
+    let (handle_overlay, _) =
         crate::editor::viewport::spawn_overlay(&mut commands, &mut handles, canvas);
     commands
         .entity(handle_overlay)

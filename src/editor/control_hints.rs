@@ -236,6 +236,8 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
             super::ImageEditAction::Undo => "Ctrl+Z · Отменить последнее изменение изображения.".into(),
             super::ImageEditAction::SizeMenu => "Библиотека кистей или параметры карандаша и ластика. Колесо или Shift + движение мыши меняют размер.".into(),
             super::ImageEditAction::Redo => "Ctrl+Shift+Z / Ctrl+Y · Повторить изменение изображения.".into(),
+            super::ImageEditAction::ModelPose => "Тяните за квадрат на запястье или щиколотке, чтобы согнуть конечность. Для вращения выберите сустав и потяните кольцо. Esc отменяет жест.".into(),
+            super::ImageEditAction::ModelPoseReset => "Вернуть все суставы к исходной позе.".into(),
             super::ImageEditAction::ColorPicker(_) => "Выбрать цвет. Изменения применяются по ОК; Esc — отмена.".into(),
             super::ImageEditAction::SwapColors => "X · Поменять основной и фоновый цвета местами.".into(),
             super::ImageEditAction::ResetColors => "D · Вернуть чёрный основной и белый фоновый цвет.".into(),
@@ -330,7 +332,13 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Xray)) =>
             "Alt+Z · X-Ray: полупрозрачная модель, скрытые вершины и рёбра, выделение сквозь геометрию.".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::ExtrudeTool)) =>
-            "Экструдировать вершины (1), рёбра (2) или грани (3). Потяните ручку «+» над выделением или нажмите E, чтобы начать сразу.".into(),
+            "Потяните ручку «+» над выделением или нажмите E. Во время экструзии X, Y и Z ограничивают движение по мировой оси.".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::BeginBevel { vertices: false })) =>
+            "Фаска (Bevel) · Ctrl+B".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::BeginLoopCut)) =>
+            "Разрез петлёй (Loop Cut) · Ctrl+R".into(),
+        Action::ModelView(ModelViewAction::Edit(ModelEditAction::BeginKnife { only_selected: false })) =>
+            "Нож (Knife) · K".into(),
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Element(kind))) => {
             use crate::editor::model_mesh::Element;
             match kind {

@@ -390,21 +390,22 @@ fn refresh(
     let state = &viewer.edit;
     let tools = &state.selection;
     let editing = state.editing(editor.viewing_image);
+    let raster_tools = editing && !state.model_layer_selected(editor.viewing_image);
     let transforming = tools
         .transform
         .as_ref()
         .is_some_and(|t| Some(t.id) == editor.viewing_image);
     let selecting = matches!(state.tool, PhotoTool::Select(_));
     for (entity, shown) in [
-        (ui.options, editing && (selecting || transforming)),
+        (ui.options, raster_tools && (selecting || transforming)),
         (ui.selection_options, selecting && !transforming),
         (
             ui.intersection,
             state.tool != PhotoTool::Select(SelectionTool::Quick),
         ),
         (ui.transform_options, transforming),
-        (ui.menu, editing && tools.menu == 1),
-        (ui.transform_menu, editing && tools.menu == 2),
+        (ui.menu, raster_tools && tools.menu == 1),
+        (ui.transform_menu, raster_tools && tools.menu == 2),
         (
             ui.wand_options,
             state.tool == PhotoTool::Select(SelectionTool::Wand),

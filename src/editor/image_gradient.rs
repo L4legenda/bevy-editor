@@ -221,7 +221,9 @@ fn refresh(
 ) {
     let Some(ui) = interface else { return };
     let tab = editor.viewing_image;
-    let enabled = viewer.edit.editing(tab) && viewer.edit.tool == PhotoTool::Gradient;
+    let enabled = viewer.edit.editing(tab)
+        && !viewer.edit.model_layer_selected(tab)
+        && viewer.edit.tool == PhotoTool::Gradient;
     if let Ok(mut options) = nodes.get_mut(ui.options) {
         let display = if enabled {
             Display::Flex

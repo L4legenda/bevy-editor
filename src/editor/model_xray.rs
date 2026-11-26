@@ -11,7 +11,7 @@ pub(in crate::editor) struct SourceMaterial(pub Handle<StandardMaterial>);
 pub(in crate::editor) struct Materials {
     channels: HashMap<AssetId<Image>, Handle<StandardMaterial>>,
     bake_map: bake::view3d::Overlay,
-    variants: HashMap<(AssetId<StandardMaterial>, bool, bool), Handle<StandardMaterial>>,
+    variants: HashMap<(AssetId<StandardMaterial>, bool, bool, bool), Handle<StandardMaterial>>,
     solid: Option<Handle<StandardMaterial>>,
 }
 
@@ -36,12 +36,14 @@ pub(in crate::editor::ui::model_viewer) fn sync(
 ) {
     for event in changes.read() {
         if let AssetEvent::Modified { id } = event {
-            cache.variants.retain(|(source, _, _), _| source != id);
+            cache.variants.retain(|(source, ..), _| source != id);
         }
     }
     let mut used = std::collections::HashSet::new();
     let mut shown_channels = std::collections::HashSet::new();
     let editing_mode = state.mode(editor.viewing_model);
+    // Newly extruded strips are open surfaces and must be visible from both sides.
+    let mesh_editing = editing_mode == crate::editor::model_document::Mode::Edit;
     let (mode, _) = shading.viewport(editing_mode);
     let paint_model = editor
         .viewing_model
@@ -128,8 +130,10 @@ pub(in crate::editor::ui::model_viewer) fn sync(
                 .clone()
         };
         let unlit = mode == Mode::Material;
-        let handle = if unlit || state.xray {
-            let key = (source.id(), unlit, state.xray);
+        let two_sided = !state.xray && mesh_editing && materials.get(&source)
+            .is_some_and(|material| material.cull_mode.is_some() || !material.double_sided);
+        let handle = if unlit || state.xray || two_sided {
+            let key = (source.id(), unlit, state.xray, two_sided);
             used.insert(key);
             if !cache.variants.contains_key(&key) {
                 let Some(mut material) = materials.get(&source).cloned() else {
@@ -141,6 +145,8 @@ pub(in crate::editor::ui::model_viewer) fn sync(
                         .base_color
                         .with_alpha(material.base_color.alpha() * 0.22);
                     material.alpha_mode = AlphaMode::Blend;
+                }
+                if two_sided || state.xray {
                     material.double_sided = true;
                     material.cull_mode = None;
                 }

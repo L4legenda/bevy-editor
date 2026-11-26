@@ -315,8 +315,9 @@ pub(in crate::editor) fn cursor(
         if viewer.edit.color_dragging {
             return CursorIcon::from(SystemCursorIcon::Default);
         }
+        let model_selected = viewer.edit.model_layer_selected(editor.viewing_image);
         let hand = !editing
-            || viewer.edit.tool == PhotoTool::Hand
+            || (!model_selected && viewer.edit.tool == PhotoTool::Hand)
             || keys.pressed(KeyCode::Space)
             || mouse.pressed(MouseButton::Middle);
         if hand {
@@ -326,9 +327,7 @@ pub(in crate::editor) fn cursor(
                 SystemCursorIcon::Grab
             });
         }
-        if viewer.edit.model_tool.is_some()
-            && viewer.edit.model_reference(editor.viewing_image).is_some()
-        {
+        if model_selected {
             return CursorIcon::from(if viewer.model_drag.is_some() {
                 SystemCursorIcon::Grabbing
             } else {

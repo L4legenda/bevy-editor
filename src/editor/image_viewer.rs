@@ -101,9 +101,9 @@ struct SavedView {
 pub(in crate::editor) struct ImageViewer {
     pub edit: edit::State,
     model_drag: Option<model_transform::Drag>,
+    bone_selection: Option<model_transform::BoneSelection>,
     pub(in crate::editor) layer_preview: Option<model_transform::LayerPreview>,
     model_preview: Option<(usize, u64)>,
-    released_model: Option<(model_transform::Binding, crate::Pose)>,
     save_after_render: std::collections::BTreeSet<usize>,
     panel: panel_resize::Panel,
     tab: Option<usize>,
@@ -198,9 +198,10 @@ impl ImageViewer {
         self.zoom = saved.map_or(Zoom::Fit, |view| view.zoom);
         self.pan = saved.map_or(Vec2::ZERO, |view| view.pan);
         self.gesture = None;
-        self.released_model = None;
         self.layer_preview = None;
         self.model_drag = None;
+        self.bone_selection = None;
+        self.edit.model_posing = false;
         self.clear_model_preview();
         self.last_click = None;
     }
@@ -304,6 +305,7 @@ pub(super) fn setup(
     root: Entity,
     font: &Handle<Font>,
     checker_image: &Handle<Image>,
+    handles: &mut Assets<viewport::HandleMaterial>,
 ) {
     let overlay = surface(
         commands,
@@ -400,7 +402,7 @@ pub(super) fn setup(
         AccessibleLabel("Изображение: колесо — масштаб, перетаскивание — панорама".into()),
     ));
     let checker = checker(commands, canvas, checker_image);
-    edit::setup(commands, editing_controls, body, canvas, root, font, checker_image);
+    edit::setup(commands, editing_controls, body, canvas, root, font, checker_image, handles);
     let picture = commands
         .spawn((
             MaterialNode(canvas_material::HANDLE),
@@ -656,6 +658,30 @@ pub(in crate::editor) fn update(
         viewer.views.insert(tab, view);
     }
     let mut actions: Vec<_> = messages.read().copied().collect();
+    if viewer.model_drag.is_some()
+        && mouse.just_released(MouseButton::Left)
+        && actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::ImageEdit(edit::EditAction::Save)
+                    | Action::CloseImageTab(_)
+                    | Action::ImageView(ImageAction::Close)
+            )
+        })
+        && let Some(render) = references.as_deref_mut()
+    {
+        model_transform::pointer(
+            &mut viewer,
+            &mut editor,
+            render,
+            rect,
+            input_rect,
+            &window,
+            &mouse,
+            &keys,
+            hovering_controls,
+        );
+    }
     let mut edit_tab = None;
     for action in &actions {
         let enabled =
@@ -686,13 +712,29 @@ pub(in crate::editor) fn update(
                 focus.clear();
             }
             Action::CloseImageTab(id) if enabled => {
-                edit::request_close(&mut editor, id);
+                edit::request_close(
+                    &mut editor,
+                    id,
+                    references.as_ref().is_some_and(|r| r.pending_for(Some(id)))
+                        || viewer
+                            .edit
+                            .document(Some(id))
+                            .is_some_and(|doc| doc.dirty()),
+                );
             }
             Action::ImageView(action) if enabled && editor.viewing_image.is_some() => {
                 match action {
                     ImageAction::Close => {
                         let id = editor.viewing_image.unwrap();
-                        edit::request_close(&mut editor, id);
+                        edit::request_close(
+                            &mut editor,
+                            id,
+                            references.as_ref().is_some_and(|r| r.pending_for(Some(id)))
+                                || viewer
+                                    .edit
+                                    .document(Some(id))
+                                    .is_some_and(|doc| doc.dirty()),
+                        );
                         focus.clear();
                     }
                     ImageAction::Previous | ImageAction::Next => {
@@ -731,16 +773,47 @@ pub(in crate::editor) fn update(
     if edit_tab.is_some() && edit_tab == editor.viewing_image {
         actions.push(Action::ImageEdit(edit::EditAction::Edit));
     }
-    if let Some(tab) = editor.viewing_image
-        && references
-            .as_deref()
-            .is_some_and(|render| render.pending_for(Some(tab)))
-        && actions
-            .iter()
-            .any(|a| matches!(a, Action::ImageEdit(edit::EditAction::Save)))
+    let save_tab = match editor.pending {
+        Some(
+            crate::editor::PendingAction::CloseImageTab(tab)
+            | crate::editor::PendingAction::CloseImageEditor(tab),
+        ) => Some(tab),
+        _ => editor.viewing_image,
+    };
+    if let Some(tab) = save_tab
+        && let Some(render) = references.as_deref_mut()
     {
-        actions.retain(|a| !matches!(a, Action::ImageEdit(edit::EditAction::Save)));
-        viewer.save_after_render.insert(tab);
+        if actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::ImageEdit(edit::EditAction::Save) | Action::SaveAndContinue
+            )
+        }) {
+            render.retry_failed(tab);
+            if render.pending_for(Some(tab))
+                || matches!(
+                    editor.pending,
+                    Some(
+                        crate::editor::PendingAction::CloseImageTab(_)
+                            | crate::editor::PendingAction::CloseImageEditor(_)
+                    )
+                )
+            {
+                actions.retain(|a| {
+                    !matches!(
+                        a,
+                        Action::ImageEdit(edit::EditAction::Save) | Action::SaveAndContinue
+                    )
+                });
+                viewer.save_after_render.insert(tab);
+            }
+        }
+        if actions
+            .iter()
+            .any(|a| matches!(a, Action::DiscardAndContinue | Action::CancelPending))
+        {
+            viewer.save_after_render.remove(&tab);
+        }
     }
     viewer
         .save_after_render
@@ -765,9 +838,6 @@ pub(in crate::editor) fn update(
         .and_then(|(_, path)| browser.files.iter().position(|file| file.path == *path));
     if let Some((id, path)) = &active {
         if viewer.tab != Some(*id) || viewer.path.as_ref() != Some(path) {
-            if let Some(render) = references.as_deref_mut() {
-                render.live.reset();
-            }
             viewer.reset(
                 *id,
                 path.clone(),
@@ -780,18 +850,12 @@ pub(in crate::editor) fn update(
             viewer.error = None;
         }
     } else {
-        if viewer.tab.is_some()
-            && let Some(render) = references.as_deref_mut()
-        {
-            render.live.reset();
-        }
         viewer.tab = None;
         viewer.path = None;
         viewer.image = None;
         viewer.dimensions = None;
         viewer.error = None;
         viewer.gesture = None;
-        viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
         viewer.clear_model_preview();
@@ -841,18 +905,14 @@ pub(in crate::editor) fn update(
     if viewer.edit.color_dragging || viewer.edit.layers.context_menu_dismissed {
         viewer.edit.cancel_gradient();
         viewer.gesture = None;
-        viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
         viewer.clear_model_preview();
-        if let Some(render) = references.as_deref_mut() {
-            render.live.reset();
-        }
         return;
     }
-    let model_manipulating = viewer.edit.model_tool.is_some()
-        && viewer.edit.model_reference(editor.viewing_image).is_some();
-    let adjusting_size = !model_manipulating
+    let model_selected = viewer.edit.editing(editor.viewing_image)
+        && viewer.edit.model_layer_selected(editor.viewing_image);
+    let adjusting_size = !model_selected
         && (viewer.edit.resizing_brush()
             || (!hovering_controls && !pressed_controls && !viewer.edit.mode_menu_dismissed))
         && edit::resize_brush(
@@ -871,25 +931,17 @@ pub(in crate::editor) fn update(
         || viewer.error.is_some()
     {
         viewer.edit.cancel_gradient();
-        viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
         viewer.clear_model_preview();
-        if let Some(render) = references.as_deref_mut() {
-            render.live.reset();
-        }
         viewer.gesture = None;
         return;
     }
     if !window.focused {
         viewer.edit.cancel_gradient();
-        viewer.released_model = None;
         viewer.layer_preview = None;
         viewer.model_drag = None;
         viewer.clear_model_preview();
-        if let Some(render) = references.as_deref_mut() {
-            render.live.reset();
-        }
         viewer.gesture = None;
         viewer.last_click = None;
         return;
@@ -916,16 +968,17 @@ pub(in crate::editor) fn update(
         )
     });
     let edit_pointer = model_pointer
-        || edit::pointer(
-            &mut viewer,
-            &mut editor,
-            rect,
-            input_rect,
-            &drawing_mouse,
-            &keys,
-            &mut focus,
-            &samples,
-        );
+        || (!model_selected
+            && edit::pointer(
+                &mut viewer,
+                &mut editor,
+                rect,
+                input_rect,
+                &drawing_mouse,
+                &keys,
+                &mut focus,
+                &samples,
+            ));
     // Present this batch, including its live interpolation tail, in the frame that received it.
     edit::sync(&mut viewer, &editor, &mut images, uploads.as_deref_mut());
     if viewer.panel.blocks_canvas() || viewer.edit.color_picker.is_some() || viewer.edit.size_menu {

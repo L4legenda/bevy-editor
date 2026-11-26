@@ -290,6 +290,29 @@ fn decode_uri(uri: &str) -> io::Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(decoded)))
 }
 
+/// Read the external inputs of an asset without loading its embedded GLB vertices.
+pub(super) fn model_inputs(root: &Path, source: &Path) -> io::Result<Vec<PathBuf>> {
+    if source
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("fbx"))
+    {
+        return crate::runtime::fbx::preview_inputs(root, source);
+    }
+    let json = glb_json(&root.join(source))?;
+    let parent = source.parent().unwrap_or(Path::new(""));
+    let mut paths = Vec::new();
+    for key in ["buffers", "images"] {
+        for item in json[key].as_array().into_iter().flatten() {
+            if let Some(uri) = item["uri"].as_str()
+                && let Some(relative) = decode_uri(uri)?
+            {
+                paths.push(normalize(&parent.join(relative))?);
+            }
+        }
+    }
+    Ok(paths)
+}
+
 fn check_uris(
     value: &serde_json::Value,
     root: &Path,

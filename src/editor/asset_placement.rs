@@ -99,7 +99,9 @@ pub(super) fn drop_point(
             .chain(parents.iter_ancestors(entity))
             .any(|ancestor| {
                 Some(ancestor) == scene.root
-                    || scene.models.values().any(|(root, _)| *root == ancestor)
+                    || scene.models.values().any(|(root, asset)| {
+                        *root == ancestor && !crate::data::is_image_reference(asset)
+                    })
             })
     };
     let settings = MeshRayCastSettings::default().with_filter(&filter);

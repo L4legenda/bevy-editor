@@ -158,6 +158,8 @@ pub(super) enum Template {
     Starter,
 }
 
+const STARTER_CHARACTER: &str = "characters/superhero_male.glb";
+
 pub(super) fn folder_name(title: &str) -> String {
     let name: String = title
         .trim()
@@ -216,6 +218,11 @@ pub(super) fn create_project(
             fs::create_dir(&path)?;
             folders.push(path);
         }
+        if template == Template::Starter {
+            let path = directory.join("assets/characters");
+            fs::create_dir(&path)?;
+            folders.push(path);
+        }
         let mut write = |relative: &str, bytes: &[u8]| -> io::Result<()> {
             let path = directory.join(relative);
             let mut file = fs::OpenOptions::new()
@@ -228,7 +235,7 @@ pub(super) fn create_project(
         };
         write("assets/models/cube.glb", &cube_glb())?;
         let view = Transform::from_xyz(5.0, 4.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y);
-        let project = EditorProject {
+        let mut project = EditorProject {
             title: title.into(),
             asset_root: "assets".into(),
             scenes: vec![SceneDefinition {
@@ -269,6 +276,23 @@ pub(super) fn create_project(
         });
         edits.lighting = Some(crate::SceneLighting::editor_default());
         if template == Template::Starter {
+            write(
+                &format!("assets/{STARTER_CHARACTER}"),
+                include_bytes!("../../assets/project_templates/characters/superhero_male.glb"),
+            )?;
+            write(
+                "assets/characters/LICENSE.txt",
+                include_bytes!("../../assets/project_templates/characters/LICENSE.txt"),
+            )?;
+            let label = "Манекен Quaternius";
+            project.catalog.push(CatalogItem {
+                uid: None,
+                label: label.into(),
+                asset: STARTER_CHARACTER.into(),
+                category: "Персонажи".into(),
+                solid: false,
+                preview_direction: [0.4, 0.2, 1.0],
+            });
             edits.models.push(crate::PlacedModel {
                 selector: None,
                 uid: None,
@@ -277,6 +301,15 @@ pub(super) fn create_project(
                 pose: Transform::from_xyz(0.0, 0.5, 0.0).into(),
                 bounds: None,
             });
+            edits.models.push(crate::PlacedModel {
+                selector: None,
+                uid: None,
+                id: 2,
+                asset: STARTER_CHARACTER.into(),
+                pose: Transform::from_xyz(-1.75, 0.0, 0.0).into(),
+                bounds: None,
+            });
+            edits.model_names.insert(2, label.into());
         }
         write(
             "assets/scenes/main.scene",
@@ -347,7 +380,7 @@ fn geometry_glb() -> Vec<u8> {
         "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":normal_offset,"target":34962},{"buffer":0,"byteOffset":normal_offset,"byteLength":index_offset-normal_offset,"target":34962},{"buffer":0,"byteOffset":index_offset,"byteLength":indices.len()*2,"target":34963}],
         "accessors":[{"bufferView":0,"componentType":5126,"count":24,"type":"VEC3","min":[-0.5,-0.5,-0.5],"max":[0.5,0.5,0.5]},{"bufferView":1,"componentType":5126,"count":24,"type":"VEC3"},{"bufferView":2,"componentType":5123,"count":36,"type":"SCALAR"}],
         "meshes":[{"primitives":[primitive(0)]}],
-        "materials":[{"name":"Warm clay","pbrMetallicRoughness":{"baseColorFactor":[0.65,0.32,0.12,1],"metallicFactor":0,"roughnessFactor":0.7}}]
+        "materials":[crate::editor::default_cube_material()]
     });
     encode_glb(json, bytes)
 }

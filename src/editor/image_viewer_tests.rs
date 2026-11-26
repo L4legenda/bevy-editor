@@ -1847,6 +1847,680 @@ fn model_target_pixels(app: &mut App, image: &Handle<Image>) -> Vec<u8> {
     }
 }
 
+#[track_caller]
+fn wait_for_pose(app: &mut App, ready: &dyn Fn(&World) -> bool) {
+    use crate::editor::selection_outline::render_tests::frame;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        frame(app);
+        let world = app.world();
+        assert!(
+            world.resource::<ImageViewer>().edit.error.is_none(),
+            "{:?}",
+            world.resource::<ImageViewer>().edit.error
+        );
+        if ready(world) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}",
+            world.resource::<Editor>().status
+        );
+    }
+}
+
+fn pose_fixture(folder: &std::path::Path) -> (App, Entity, Handle<Image>, usize, PathBuf) {
+    use crate::editor::selection_outline::render_tests::frame;
+    let project = crate::project_manager::create_test_project(folder).unwrap();
+    let source = project.asset_root.join("pose-canvas.png");
+    image::RgbaImage::new(720, 560).save(&source).unwrap();
+    let (mut app, window, output) =
+        lighting_ui_render::fixture_project_with_pipeline_compilation(project, false);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    let image = file(&app, "pose-canvas.png");
+    app.world_mut().write_message(Action::ViewImage(image));
+    frame(&mut app);
+    let tab = app.world().resource::<Editor>().viewing_image.unwrap();
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Edit));
+
+    wait_for_pose(&mut app, &|world| {
+        world.resource::<ImageViewer>().edit.editing(Some(tab))
+    });
+    let model = app
+        .world()
+        .resource::<Editor>()
+        .project
+        .catalog
+        .iter()
+        .position(|item| item.asset == "characters/superhero_male.glb")
+        .unwrap();
+    let scan_revision = app.world().resource::<Browser>().scan_revision;
+    app.world_mut().write_message(Action::DropModelReference {
+        entry: browser::Entry::Model(model),
+        scan_revision,
+        document: tab,
+        point: Vec2::new(360.0, 280.0),
+    });
+    wait_for_pose(&mut app, &|world| {
+        world.resource::<ImageViewer>().edit.model_has_rig
+    });
+    (app, window, output, tab, source)
+}
+
+fn pose_canvas_rect(app: &mut App) -> Rect {
+    let world = app.world_mut();
+    let (node, transform) = world
+        .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<ImageCanvas>>()
+        .single(world)
+        .unwrap();
+    Rect::from_center_size(
+        transform.translation * node.inverse_scale_factor(),
+        node.size() * node.inverse_scale_factor(),
+    )
+}
+
+fn pose_joint(world: &World, tab: usize, canvas: Rect, name: &str) -> Vec2 {
+    super::model_transform::test_bone_center(
+        world.resource::<ImageViewer>(),
+        world.resource::<crate::editor::image_reference::ReferenceRender>(),
+        tab,
+        canvas,
+        name,
+    )
+}
+
+#[test]
+#[ignore = "requires GPU adapter; drags a wrist and ankle on a skinned character"]
+fn gpu_ik_reaches_with_the_hand_and_foot_on_the_canvas() {
+    use crate::editor::{
+        image_reference::{ModelReference, ReferenceRender},
+        selection_outline::render_tests::frame,
+    };
+    use bevy::input::{
+        ButtonState,
+        keyboard::{Key, KeyboardInput},
+    };
+    use lighting_ui_render::{mouse, move_pointer};
+
+    let folder = tempfile::tempdir().unwrap();
+    let (mut app, window, output, tab, source) = pose_fixture(folder.path());
+    frame(&mut app);
+    click_action(&mut app, window, |action| {
+        matches!(action, Action::ImageEdit(edit::EditAction::ModelPose))
+    });
+    let canvas = pose_canvas_rect(&mut app);
+    let model = |world: &World| {
+        world
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .unwrap()
+    };
+    let pixels = |world: &World| {
+        world
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .preview()
+            .pixels
+    };
+    let viewer = app.world().resource::<ImageViewer>();
+    let size = viewer.dimensions.unwrap();
+    let image = viewer.image_rect(size, canvas);
+    let opaque = |pixels: &[u8], size: UVec2, bounds: Rect, point: Vec2| {
+        let p = ((point - bounds.min) * size.as_vec2() / bounds.size())
+            .round()
+            .as_ivec2();
+        (-2..=2).any(|dy| {
+            (-2..=2).any(|dx| {
+                let p = p + IVec2::new(dx, dy);
+                p.cmpge(IVec2::ZERO).all()
+                    && p.cmplt(size.as_ivec2()).all()
+                    && pixels[4 * (p.y as usize * size.x as usize + p.x as usize) + 3] > 128
+            })
+        })
+    };
+
+    // A click with ordinary mouse jitter still selects the wrist for FK.
+    let start = pose_joint(app.world(), tab, canvas, "hand_l");
+    let revision = viewer.edit.document(Some(tab)).unwrap().revision;
+    move_pointer(&mut app, window, start);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, start + Vec2::X);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .revision,
+        revision
+    );
+    move_pointer(&mut app, window, start);
+    mouse(&mut app, window, ButtonState::Pressed);
+    let cancelled = start + Vec2::new(-22., 18.);
+    move_pointer(&mut app, window, cancelled);
+    wait_for_pose(&mut app, &|world| {
+        pose_joint(world, tab, canvas, "hand_l").distance(cancelled) < 2.
+    });
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(KeyboardInput {
+            window,
+            key_code: KeyCode::Escape,
+            logical_key: Key::Escape,
+            state,
+            text: None,
+            repeat: false,
+        });
+        frame(&mut app);
+    }
+    mouse(&mut app, window, ButtonState::Released);
+    assert!(model(app.world()).joints.is_empty());
+    assert_eq!(
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .revision,
+        revision
+    );
+    assert!(pose_joint(app.world(), tab, canvas, "hand_l").distance(start) < 1.);
+
+    let mut wrist_pose = None;
+    for (tip, hinge, probe, delta) in [
+        ("hand_l", "lowerarm_l", "middle_01_l", Vec2::new(-36., 45.)),
+        ("foot_r", "calf_r", "foot_r", Vec2::new(-38., -43.)),
+    ] {
+        let before = model(app.world());
+        let before_pixels = pixels(app.world());
+        let start = pose_joint(app.world(), tab, canvas, tip);
+        let old_hinge = pose_joint(app.world(), tab, canvas, hinge);
+        let old_probe = pose_joint(app.world(), tab, canvas, probe);
+        let goal = start + delta;
+        assert!(opaque(&before_pixels, size, image, old_probe));
+        move_pointer(&mut app, window, start);
+        mouse(&mut app, window, ButtonState::Pressed);
+        move_pointer(&mut app, window, goal);
+        wait_for_pose(&mut app, &|world| {
+            pose_joint(world, tab, canvas, tip).distance(goal) < 2.0
+                && world
+                    .resource::<ReferenceRender>()
+                    .live
+                    .presented_frame()
+                    .is_some_and(|(_, image)| {
+                        world
+                            .resource::<Assets<CanvasMaterial>>()
+                            .get(&super::canvas_material::HANDLE)
+                            .is_some_and(|m| {
+                                m.transform_style.x == 1.
+                                    && m.transform_moving.as_ref() == Some(image)
+                            })
+                    })
+        });
+        assert!(pose_joint(app.world(), tab, canvas, hinge).distance(old_hinge) > 4.);
+        assert_eq!(model(app.world()).joints, before.joints);
+        // Sample the live 3D texture while the mouse is still down, before
+        // the saved raster or joint overlays could mask a skinning error.
+        let material = app
+            .world()
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::canvas_material::HANDLE)
+            .unwrap();
+        let target = material.transform_moving.clone().unwrap();
+        let uv = material.transform_frame;
+        let live_rect = Rect::from_corners(
+            image.min + uv.xy() * image.size(),
+            image.min + (uv.xy() + uv.zw()) * image.size(),
+        );
+        let live_size = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&target)
+            .unwrap()
+            .size();
+        let new_probe = pose_joint(app.world(), tab, canvas, probe);
+        let live_pixels = model_target_pixels(&mut app, &target);
+        assert!(
+            opaque(&live_pixels, live_size, live_rect, new_probe),
+            "live skin missed {probe}"
+        );
+        assert!(
+            !opaque(&live_pixels, live_size, live_rect, old_probe),
+            "live skin stayed at {probe}"
+        );
+        mouse(&mut app, window, ButtonState::Released);
+        assert_ne!(model(app.world()).joints, before.joints);
+        wait_for_pose(&mut app, &|world| model(world).pending_frame.is_none());
+        let after = model(app.world());
+        assert_eq!(after.pose, before.pose);
+        let new_probe = pose_joint(app.world(), tab, canvas, probe);
+        let painted = pixels(app.world());
+        assert!(
+            opaque(&painted, size, image, new_probe),
+            "missing skin at the moved {probe}"
+        );
+        assert!(
+            !opaque(&painted, size, image, old_probe),
+            "{probe} stayed at its old position"
+        );
+        if tip == "hand_l" {
+            wrist_pose = Some(after.joints);
+        }
+    }
+    let final_pose = model(app.world());
+    let final_pixels = pixels(app.world());
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    frame(&mut app);
+    assert_eq!(Some(model(app.world()).joints), wrist_pose);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Redo));
+    frame(&mut app);
+    assert_eq!(model(app.world()).joints, final_pose.joints);
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    wait_for_pose(&mut app, &|world| {
+        !world.resource::<ImageViewer>().edit.file_busy(tab)
+            && source.with_extension("pcraft").is_file()
+    });
+    let restored = crate::editor::photo_document::PhotoDocument::load(&source).unwrap();
+    let saved =
+        ModelReference::from_xmp(restored.active_layer().unwrap().xmp.as_deref().unwrap()).unwrap();
+    assert_eq!(saved.joints, final_pose.joints);
+    assert_eq!(restored.preview().pixels, final_pixels);
+    assert_eq!(
+        image::open(&source).unwrap().into_rgba8().as_raw(),
+        &final_pixels
+    );
+    let capture = model_target_pixels(&mut app, &output);
+    let output_size = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(&output)
+        .unwrap()
+        .size();
+    image::save_buffer(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/pose-ik.png"),
+        capture.as_slice(),
+        output_size.x,
+        output_size.y,
+        image::ColorType::Rgba8,
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "requires GPU adapter; poses a skinned GLB on the PhotoCraft canvas"]
+fn gpu_reference_pose_survives_undo_and_save() {
+    use crate::editor::{
+        image_reference::{ModelReference, ReferenceRender},
+        selection_outline::render_tests::frame,
+    };
+    use bevy::input::ButtonState;
+    use lighting_ui_render::{mouse, move_pointer};
+
+    let folder = tempfile::tempdir().unwrap();
+    let (mut app, window, output, tab, source) = pose_fixture(folder.path());
+    let pixels = |app: &App| {
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .document(Some(tab))
+            .unwrap()
+            .preview()
+            .pixels
+    };
+    let rotations = |app: &App| {
+        app.world()
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .unwrap()
+            .joints
+    };
+    let before = pixels(&app);
+    frame(&mut app);
+    click_action(&mut app, window, |action| {
+        matches!(action, Action::ImageEdit(edit::EditAction::ModelPose))
+    });
+    assert!(app.world().resource::<ImageViewer>().edit.model_posing);
+    let canvas = pose_canvas_rect(&mut app);
+    let shoulder = pose_joint(app.world(), tab, canvas, "upperarm_l");
+    let hand = |app: &App| pose_joint(app.world(), tab, canvas, "middle_01_l");
+    let rest_hand = hand(&app);
+    assert!(canvas.contains(shoulder + Vec2::Y * 82.0));
+    move_pointer(&mut app, window, shoulder);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    move_pointer(&mut app, window, shoulder + Vec2::Y * 82.0);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(
+        &mut app,
+        window,
+        shoulder + Vec2::new(-1.0, 1.0).normalize() * 82.0,
+    );
+    let live_target = |world: &World| {
+        let material = world
+            .resource::<Assets<CanvasMaterial>>()
+            .get(&super::canvas_material::HANDLE)
+            .unwrap();
+        (material.transform_style.x == 1.0)
+            .then(|| material.transform_moving.clone())
+            .flatten()
+    };
+    wait_for_pose(&mut app, &|world| live_target(world).is_some());
+    let target = live_target(app.world()).unwrap();
+    let first_frame = model_target_pixels(&mut app, &target);
+    let first_canvas = model_target_pixels(&mut app, &output);
+    move_pointer(&mut app, window, shoulder + Vec2::NEG_X * 82.0);
+    for _ in 0..5 {
+        frame(&mut app);
+    }
+    // Catalog refreshes must keep the prepared character alive. A genuine model
+    // reload, in contrast, replaces the bones underneath the persistent root.
+    let root = app.world().resource::<ReferenceRender>().live.model_root();
+    let previous_frame = app.world().resource::<ReferenceRender>().live.presented_frame().unwrap().0;
+    let old_child = app.world().get::<Children>(root).unwrap()[0];
+    app.world_mut().resource_mut::<Browser>().scan_revision += 1;
+    for _ in 0..8 {
+        frame(&mut app);
+    }
+    assert!(app.world().get_entity(old_child).is_ok());
+    let scene = app.world().get::<WorldAssetRoot>(root).unwrap().0.id();
+    app.world_mut()
+        .write_message(AssetEvent::<WorldAsset>::Modified { id: scene });
+    wait_for_pose(&mut app, &|world| {
+        world.get_entity(old_child).is_err()
+            && world.resource::<ReferenceRender>().live.presented_frame().is_some_and(|(id, target)|
+                id > previous_frame && live_target(world).as_ref() == Some(target))
+    });
+    for _ in 0..5 {
+        frame(&mut app);
+    }
+    let target = live_target(app.world()).unwrap();
+    let second_frame = model_target_pixels(&mut app, &target);
+    let target_size = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(&target)
+        .unwrap()
+        .size();
+    let target_frame = app
+        .world()
+        .resource::<Assets<CanvasMaterial>>()
+        .get(&super::canvas_material::HANDLE)
+        .unwrap()
+        .transform_frame;
+    assert_eq!(live_target(app.world()), Some(target));
+    assert!(rotations(&app).is_empty());
+    assert!(first_frame.chunks_exact(4).any(|pixel| pixel[3] > 128));
+    assert!(second_frame.chunks_exact(4).any(|pixel| pixel[3] > 128));
+    let changed = first_frame
+        .chunks_exact(4)
+        .zip(second_frame.chunks_exact(4))
+        .filter(|(before, after)| (before[3] > 128) != (after[3] > 128))
+        .count();
+    let second_canvas = model_target_pixels(&mut app, &output);
+    let skin = |pixel: &[u8]| {
+        let [r, g, b] = [pixel[0], pixel[1], pixel[2]];
+        r.saturating_sub(g) > 15 && g.saturating_sub(b) > 8 && r.abs_diff(g) < 95
+    };
+    let painted = first_canvas
+        .chunks_exact(4)
+        .zip(second_canvas.chunks_exact(4))
+        .filter(|(before, after)| skin(before) != skin(after))
+        .count();
+    let ui_size = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(&output)
+        .unwrap()
+        .size();
+    let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/pose-shoulder.png");
+    image::save_buffer(
+        capture,
+        &second_canvas,
+        ui_size.x,
+        ui_size.y,
+        image::ColorType::Rgba8,
+    )
+    .unwrap();
+    app.world_mut()
+        .write_message(AssetEvent::<WorldAsset>::Modified { id: scene });
+    mouse(&mut app, window, ButtonState::Released);
+    assert!(
+        !rotations(&app).is_empty(),
+        "Mouse release must author the pose immediately"
+    );
+    wait_for_pose(&mut app, &|world| {
+        world
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .is_some_and(|model| !model.joints.is_empty() && model.pending_frame.is_none())
+    });
+    assert_eq!(
+        app.world().resource::<ReferenceRender>().live.model_root(),
+        root
+    );
+    let posed_hand = hand(&app);
+    let viewer = app.world().resource::<ImageViewer>();
+    let dimensions = viewer.dimensions.unwrap();
+    let rect = viewer.image_rect(dimensions, canvas);
+    let doc_point = |point: Vec2| {
+        ((point - rect.min) / rect.size() * dimensions.as_vec2())
+            .round()
+            .as_ivec2()
+    };
+    let rest_point = doc_point(rest_hand);
+    let posed_point = doc_point(posed_hand);
+    let after = pixels(&app);
+
+    let target_point = |point: IVec2| {
+        let uv = point.as_vec2() / dimensions.as_vec2();
+        ((uv - target_frame.xy()) / target_frame.zw() * target_size.as_vec2()).as_ivec2()
+    };
+    let opaque_near = |pixels: &[u8], size: UVec2, point: IVec2| {
+        (-3..=3)
+            .flat_map(|y| (-3..=3).map(move |x| point + IVec2::new(x, y)))
+            .filter(|p| {
+                p.cmpge(IVec2::ZERO).all()
+                    && p.cmplt(size.as_ivec2()).all()
+                    && pixels[4 * (p.y as usize * size.x as usize + p.x as usize) + 3] > 128
+            })
+            .count()
+    };
+    assert!(
+        opaque_near(&second_frame, target_size, target_point(posed_point)) > 15,
+        "the dragged hand missed its marker in the live camera"
+    );
+    assert_eq!(
+        opaque_near(&second_frame, target_size, target_point(rest_point)),
+        0,
+        "the live camera kept the hand at rest"
+    );
+    assert!(rest_point.distance_squared(posed_point) > 20 * 20);
+    assert!(
+        opaque_near(&before, dimensions, rest_point) > 15,
+        "rest hand"
+    );
+    assert!(
+        opaque_near(&after, dimensions, posed_point) > 15,
+        "missing hand under rotated wrist"
+    );
+    assert_eq!(
+        opaque_near(&after, dimensions, rest_point),
+        0,
+        "hand stayed in bind pose"
+    );
+    assert!(
+        changed > 100,
+        "The character's silhouette stayed still during the drag"
+    );
+    assert!(painted > 100, "The canvas kept showing the previous pose");
+    let posed = rotations(&app);
+    assert_eq!(posed.len(), 1);
+    assert_ne!(before, pixels(&app));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Undo));
+    frame(&mut app);
+    assert!(rotations(&app).is_empty());
+    assert_eq!(before, pixels(&app));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Redo));
+    frame(&mut app);
+    assert_eq!(posed, rotations(&app));
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    wait_for_pose(&mut app, &|world| {
+        !world.resource::<ImageViewer>().edit.file_busy(tab)
+            && source.with_extension("pcraft").is_file()
+    });
+    let restored = crate::editor::photo_document::PhotoDocument::load(&source).unwrap();
+    assert_eq!(restored.preview().pixels, after);
+    let packet = restored
+        .document
+        .layers
+        .last()
+        .unwrap()
+        .xmp
+        .as_deref()
+        .unwrap();
+    assert_eq!(ModelReference::from_xmp(packet).unwrap().joints, posed);
+    click_action(&mut app, window, |action| {
+        matches!(action, Action::ImageEdit(edit::EditAction::ModelPoseReset))
+    });
+    wait_for_pose(&mut app, &|world| {
+        world
+            .resource::<ImageViewer>()
+            .edit
+            .model_reference(Some(tab))
+            .is_some_and(|model| model.joints.is_empty() && model.pending_frame.is_none())
+    });
+
+    // Force native PhotoCraft composition. Hide a patch of the torso, leaving
+    // both hand positions visible, and keep an independently composed oracle.
+    let masked = {
+        let mut viewer = app.world_mut().resource_mut::<ImageViewer>();
+        let doc = viewer.edit.document_mut(tab).unwrap();
+        let id = doc.active_id().unwrap();
+        let torso = (0..after.len() / 4)
+            .filter(|&i| after[4 * i + 3] > 200)
+            .min_by_key(|&i| {
+                let p = IVec2::new(
+                    (i % dimensions.x as usize) as i32,
+                    (i / dimensions.x as usize) as i32,
+                );
+                p.distance_squared(dimensions.as_ivec2() / 2)
+            })
+            .unwrap();
+        let x = (torso % dimensions.x as usize) as i32;
+        let y = (torso / dimensions.x as usize) as i32;
+        let mut mask = photocraft_doc::LayerMask::reveal_all();
+        mask.surface.write_interleaved(
+            photocraft_geom::Rect::new(x - 8, y - 8, x + 8, y + 8),
+            &[0; 16 * 16],
+        );
+        doc.checkpoint();
+        doc.active_layer_mut().unwrap().mask = Some(mask);
+        doc.changed();
+        let mut expected = doc.document.clone();
+        expected.layer_mut(id).unwrap().content = restored.active_layer().unwrap().content.clone();
+        let pixels = crate::editor::photo_document::composite_region(
+            &expected,
+            photocraft_geom::Rect::from_size(expected.size),
+        )
+        .pixels;
+        assert_eq!(pixels[torso * 4 + 3], 0);
+        assert_ne!(pixels, after);
+        pixels
+    };
+    // Establish a clean file so the only subsequent reason to protect Close is the new pose.
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    wait_for_pose(&mut app, &|world| {
+        !world.resource::<Editor>().image_tab(tab).unwrap().dirty
+            && !world.resource::<ImageViewer>().edit.file_busy(tab)
+    });
+    move_pointer(&mut app, window, shoulder);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    move_pointer(&mut app, window, shoulder + Vec2::Y * 82.);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, shoulder + Vec2::NEG_X * 82.);
+
+    let matches_masked = |pixels: &[u8]| {
+        pixels.len() == masked.len()
+            && pixels
+                .iter()
+                .zip(&masked)
+                .filter(|(a, b)| a.abs_diff(**b) > 2)
+                .count()
+                < 64
+    };
+    wait_for_pose(&mut app, &|world| {
+        let viewer = world.resource::<ImageViewer>();
+        viewer.model_preview.is_some()
+            && viewer
+                .image
+                .as_ref()
+                .and_then(|handle| {
+                    world
+                        .resource::<Assets<Image>>()
+                        .get(handle)?
+                        .data
+                        .as_deref()
+                })
+                .is_some_and(&matches_masked)
+    });
+    assert_eq!(
+        live_target(app.world()),
+        None,
+        "Mask must be applied through PhotoCraft"
+    );
+    assert_eq!(
+        app.world().resource::<ReferenceRender>().live.model_root(),
+        root
+    );
+
+    // Invalidate the camera just before release so Save and Close are exercised
+    // with a genuine outstanding readback even when the displayed pose was cached.
+    let old_child = app.world().get::<Children>(root).unwrap()[0];
+    app.world_mut()
+        .write_message(AssetEvent::<WorldAsset>::Modified { id: scene });
+    wait_for_pose(&mut app, &|world| world.get_entity(old_child).is_err());
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(rotations(&app), posed);
+    assert!(
+        app.world()
+            .resource::<ReferenceRender>()
+            .pending_for(Some(tab))
+    );
+    app.world_mut()
+        .write_message(Action::ImageEdit(edit::EditAction::Save));
+    app.world_mut().write_message(Action::CloseImageTab(tab));
+    wait_for_pose(&mut app, &|world| {
+        world.resource::<Editor>().image_tab(tab).is_none()
+    });
+    let opened = crate::editor::photo_document::PhotoDocument::load(&source).unwrap();
+    assert!(
+        matches_masked(&opened.preview().pixels),
+        "Saved mask/pose diverged from the displayed frame"
+    );
+    assert!(matches_masked(
+        image::open(&source).unwrap().into_rgba8().as_raw()
+    ));
+    let saved =
+        ModelReference::from_xmp(opened.active_layer().unwrap().xmp.as_deref().unwrap()).unwrap();
+    assert_eq!(saved.joints, posed);
+    assert!(saved.pending_frame.is_none());
+}
+
 #[test]
 #[ignore = "requires GPU adapter; drags GLB and FBX onto the PhotoCraft canvas"]
 fn gpu_model_cards_add_transparent_reference_layers_and_save() {
@@ -1884,7 +2558,7 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
         transform: Transform::IDENTITY,
         materials: vec![MaterialSlot {
             bake_fixes: Default::default(),
-            authored: None,
+            authored: Some(crate::editor::default_cube_material().into()),
             material: default(),
             source: serde_json::json!({"material": 0}),
             paint: None,
@@ -2090,6 +2764,32 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .write_message(Action::ImageEdit(edit::EditAction::SelectLayer(index)));
         frame(app);
     };
+    let tool_rail = |app: &mut App| {
+        let world = app.world_mut();
+        let mut controls = world.query::<(&Control, &ComputedNode, &UiGlobalTransform)>();
+        let mut raster_visible = false;
+        let mut model_tools = Vec::new();
+        for (control, node, transform) in
+            controls.iter(world).filter(|(_, node, _)| !node.is_empty())
+        {
+            match control.action {
+                Action::ImageEdit(
+                    edit::EditAction::DrawingTool | edit::EditAction::ResetColors,
+                ) => {
+                    raster_visible = true;
+                }
+                Action::ImageEdit(edit::EditAction::ModelTool(tool)) => {
+                    model_tools.push((tool, transform.translation * node.inverse_scale_factor()));
+                }
+                _ => {}
+            }
+        }
+        model_tools.sort_by(|(_, a), (_, b)| a.y.total_cmp(&b.y));
+        (raster_visible, model_tools)
+    };
+    select_layer(&mut app, 0);
+    let (raster_visible, model_tools) = tool_rail(&mut app);
+    assert!(raster_visible && model_tools.is_empty());
     select_layer(&mut app, 1);
     let cube_canvas = {
         let world = app.world_mut();
@@ -2102,6 +2802,20 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             n.size() * n.inverse_scale_factor(),
         )
     };
+    let (raster_visible, model_tools) = tool_rail(&mut app);
+    assert!(!raster_visible);
+    assert_eq!(
+        model_tools
+            .iter()
+            .map(|(tool, _)| *tool)
+            .collect::<Vec<_>>(),
+        [Tool::Universal, Tool::Move, Tool::Rotate, Tool::Scale]
+    );
+    assert!(
+        model_tools
+            .iter()
+            .all(|(_, point)| { point.x < cube_canvas.min.x && point.y > cube_canvas.min.y })
+    );
     let center = edit::interface::model_handle_center(app.world());
     let origin = cube_canvas.min + center;
     move_pointer(&mut app, window, origin);
@@ -2194,8 +2908,8 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .x,
         0.0
     );
-    // Commit a clipped layer, then pull it back into view. The cached moving
-    // texture must include the geometry that was outside the saved document.
+    // Pull a clipped model back onto the canvas. The recovered area and the old
+    // area must come from the same render, including the pixels at the old edge.
     let wait_model = |app: &mut App| {
         let deadline = std::time::Instant::now() + Duration::from_secs(25);
         while app
@@ -2230,9 +2944,10 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
     let center = cube_canvas.min + edit::interface::model_handle_center(app.world());
     move_pointer(&mut app, window, center);
     mouse(&mut app, window, ButtonState::Pressed);
-    move_pointer(&mut app, window, center - Vec2::X * 80.0);
+    let distance = 80.0;
+    move_pointer(&mut app, window, center - Vec2::X * distance);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let (target, placement) = loop {
         frame(&mut app);
         let m = app
             .world()
@@ -2240,32 +2955,42 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .get(&super::canvas_material::HANDLE)
             .unwrap();
         if m.transform_style.x == 1.0 {
-            let moving = app
-                .world()
-                .resource::<Assets<Image>>()
-                .get(m.transform_moving.as_ref().unwrap())
-                .unwrap();
-            let boundary = ((1.0 - m.transform_frame.x) / m.transform_frame.z
-                * moving.width() as f32)
-                .ceil()
-                .max(0.0) as usize;
-            assert!(boundary < moving.width() as usize);
-            assert!(
-                moving
-                    .data
-                    .as_ref()
-                    .unwrap()
-                    .chunks_exact(moving.width() as usize * 4)
-                    .any(|row| row[boundary * 4..].chunks_exact(4).any(|p| p[3] > 128)),
-                "Revealed model geometry was cropped"
-            );
-            break;
+            break (m.transform_moving.clone().unwrap(), m.transform_frame);
         }
         assert!(
             std::time::Instant::now() < deadline,
             "Clipped model did not acquire a GPU preview"
         );
-    }
+    };
+    let moving = app
+        .world()
+        .resource::<Assets<Image>>()
+        .get(&target)
+        .unwrap();
+    assert!(
+        moving
+            .texture_descriptor
+            .usage
+            .contains(bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT)
+    );
+    let width = moving.width() as usize;
+    let boundary = ((1.0 - distance / image.width() - placement.x) / placement.z * width as f32)
+        .round() as usize;
+    assert!(boundary > 4 && boundary < width - 4);
+    let pixels = model_target_pixels(&mut app, &target);
+    assert!(
+        pixels.chunks_exact(width * 4).any(|row| {
+            let before = &row[(boundary - 4) * 4..(boundary - 3) * 4];
+            let after = &row[(boundary + 4) * 4..(boundary + 5) * 4];
+            before[3] == 255
+                && after[3] == 255
+                && before[..3]
+                    .iter()
+                    .zip(&after[..3])
+                    .all(|(a, b)| a.abs_diff(*b) <= 2)
+        }),
+        "Revealed model geometry should have the same color across the old edge"
+    );
     mouse(&mut app, window, ButtonState::Released);
     wait_model(&mut app);
     select_layer(&mut app, 2);
@@ -2292,6 +3017,80 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             let center = transform.translation * node.inverse_scale_factor();
             Rect::from_center_size(center, node.size() * node.inverse_scale_factor())
         };
+        if tool == Tool::Scale {
+            move_pointer(&mut app, window, canvas.min + Vec2::splat(4.0));
+        }
+        let handle_material = {
+            use crate::editor::viewport::transform_handles::{HandleMaterial, ImageOverlay};
+            let world = app.world_mut();
+            let handle = world
+                .query_filtered::<&MaterialNode<HandleMaterial>, With<ImageOverlay>>()
+                .single(world)
+                .unwrap()
+                .0
+                .clone();
+            world
+                .resource::<Assets<HandleMaterial>>()
+                .get(&handle)
+                .unwrap()
+                .clone()
+        };
+        let material = &handle_material;
+        assert_eq!(material.viewport.z == 1.0, tool != Tool::Rotate);
+        if tool != Tool::Rotate {
+            assert_eq!(material.viewport.truncate().truncate(), canvas.size());
+            assert_eq!(material.tips[0].z, 1.0);
+            assert_eq!(material.pivot.z, 1.0);
+            assert!(material.planes.iter().all(|corner| *corner == Vec4::ZERO));
+        }
+        if tool == Tool::Move {
+            assert!(material.tips[0].x > material.pivot.x);
+            assert_eq!(material.tips[0].y, material.pivot.y);
+            assert_eq!(material.tips[1].x, material.pivot.x);
+            assert!(material.tips[1].y < material.pivot.y);
+            assert_eq!(material.tips[1].z, 1.0);
+            assert_eq!(material.tips[2], Vec4::ZERO);
+        }
+        if tool == Tool::Scale {
+            assert_eq!(material.viewport.w, 1.0);
+            let dpi = app.world().get::<Window>(window).unwrap().scale_factor();
+            let screen_pixel = |point: Vec2| ((canvas.min + point) * dpi).as_uvec2();
+            let pivot = screen_pixel(material.pivot.xy());
+            // Use the largest projected face so edge-on faces do not affect the test.
+            let heads: [UVec2; 3] = std::array::from_fn(|axis| {
+                let cube = &material.faces[axis * 12..(axis + 1) * 12];
+                let face = cube
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .max_by(|a, b| {
+                        let area = |corners: &[Vec4; 4]| {
+                            (corners[1] - corners[0])
+                                .xy()
+                                .perp_dot((corners[3] - corners[0]).xy())
+                                .abs()
+                        };
+                        area(a).total_cmp(&area(b))
+                    })
+                    .unwrap();
+                screen_pixel(face.iter().map(|corner| corner.xy()).sum::<Vec2>() * 0.25)
+            });
+            capture_when(
+                &mut app,
+                &output,
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/model-scale-handles.png"),
+                |image| {
+                    image.get_pixel(pivot.x, pivot.y).0[..3]
+                        .iter()
+                        .all(|&channel| channel > 245)
+                        && heads.iter().enumerate().all(|(axis, point)| {
+                            let pixel = image.get_pixel(point.x, point.y).0;
+                            pixel[axis] > 150
+                                && pixel[axis] > pixel[(axis + 1) % 3].saturating_add(30)
+                        })
+                },
+            );
+        }
         if tool == Tool::Rotate {
             let center = canvas.min + edit::interface::model_handle_center(app.world());
             move_pointer(&mut app, window, canvas.min + Vec2::splat(4.0));
@@ -2334,6 +3133,12 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             canvas,
             tool,
         );
+        let start_center = edit::interface::model_handle_center(app.world());
+        let end = if tool == Tool::Move {
+            end + Vec2::Y * 16.0
+        } else {
+            end
+        };
         move_pointer(&mut app, window, start);
         mouse(&mut app, window, ButtonState::Pressed);
         let placement = |app: &App| {
@@ -2363,8 +3168,15 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
         };
         let first_pixels = (tool != Tool::Move).then(|| model_target_pixels(&mut app, &target));
         move_pointer(&mut app, window, end);
+        // The camera draws the new pose into the back buffer before publishing it.
+        for _ in 0..3 {
+            frame(&mut app);
+        }
         let (end_target, end_rows) = placement(&app).expect("Live canvas dropped a pointer sample");
-        assert_eq!(end_target, target);
+        if tool == Tool::Move {
+            assert_eq!(end_target, target);
+        }
+        let target = end_target;
         let mut end_pixels = first_pixels.map(|first| {
             let last = model_target_pixels(&mut app, &target);
             assert!(last.chunks_exact(4).any(|px| px[3] > 128));
@@ -2382,15 +3194,34 @@ fn gpu_model_cards_add_transparent_reference_layers_and_save() {
             .unwrap()
             .preview;
         let handles = edit::interface::model_handle_geometry(app.world());
+        if tool == Tool::Move {
+            assert!((handles.0 - start_center).abs_diff_eq(Vec2::X * 34.0, 0.1));
+        }
         assert_eq!(handles.1, expected.rotation);
         assert_ne!(expected, before);
         assert_eq!(model_pose(&app), before);
         mouse(&mut app, window, ButtonState::Released);
         let deadline = std::time::Instant::now() + Duration::from_secs(40);
         let mut pending_frames = 0;
-        while model_pose(&app) == before {
+        assert_eq!(
+            model_pose(&app),
+            expected,
+            "The authoring command must precede readback"
+        );
+        while app
+            .world()
+            .resource::<crate::editor::image_reference::ReferenceRender>()
+            .pending_for(Some(tab))
+        {
             let viewer = app.world().resource::<ImageViewer>();
-            assert_eq!(viewer.released_model.map(|(_, pose)| pose), Some(expected));
+            assert_eq!(
+                viewer
+                    .edit
+                    .model_reference(Some(tab))
+                    .filter(|m| m.pending_frame.is_some())
+                    .map(|m| m.pose),
+                Some(expected)
+            );
             assert_eq!(
                 placement(&app),
                 Some((target.clone(), end_rows)),
@@ -2590,10 +3421,11 @@ fn exercise_model_inspector(app: &mut App, window: Entity, tab: usize) {
                     if !canvas.contains(p) || on_handle(p) {
                         continue;
                     }
-                    if surface.sample_channel(x as i32, y as i32, 3) > 0.5 {
-                        solid = Some(p);
-                    } else {
-                        clear = Some(p);
+                    let alpha = surface.sample_channel(x as i32, y as i32, 3);
+                    if alpha > 0.5 {
+                        solid.get_or_insert(p);
+                    } else if alpha == 0.0 {
+                        clear.get_or_insert(p);
                     }
                     if solid.is_some() && clear.is_some() {
                         break;
@@ -2659,6 +3491,56 @@ fn exercise_model_inspector(app: &mut App, window: Entity, tab: usize) {
             assert!(delta.dot(*model.view().back()).abs() < 1e-4);
         }
     }
+    let slide = |app: &mut App, open| {
+        use super::model_fields::PanelPart;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(app);
+            let world = app.world_mut();
+            let mut parts = world.query::<(&PanelPart, &ComputedNode)>();
+            let mut width = |part| {
+                parts
+                    .iter(world)
+                    .find_map(|(kind, node)| {
+                        (*kind == part).then_some(node.size().x * node.inverse_scale_factor())
+                    })
+                    .unwrap()
+            };
+            let revealed = width(PanelPart::Reveal);
+            let finished = if open {
+                revealed > 0.0 && (revealed - width(PanelPart::Card)).abs() < 0.1
+            } else {
+                revealed == 0.0
+            };
+            if finished {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Transform panel did not finish sliding"
+            );
+        }
+    };
+    let canvas_size = |app: &mut App| {
+        let world = app.world_mut();
+        world
+            .query_filtered::<&ComputedNode, With<ImageCanvas>>()
+            .single(world)
+            .unwrap()
+            .size()
+    };
+    let toggle = |action| matches!(action, Action::ImageEdit(edit::EditAction::ModelPanel));
+    let original_canvas = canvas_size(app);
+    slide(app, false);
+    press(app, KeyCode::KeyN, Key::Character("n".into()));
+    slide(app, true);
+    assert_eq!(canvas_size(app), original_canvas);
+    click_action(app, window, toggle);
+    slide(app, false);
+    assert_eq!(canvas_size(app), original_canvas);
+    click_action(app, window, toggle);
+    slide(app, true);
+
     let field = |app: &mut App, name: &str| {
         let w = app.world_mut();
         w.query_filtered::<(Entity, &AccessibleLabel, &ComputedNode), With<super::model_fields::PoseField>>()

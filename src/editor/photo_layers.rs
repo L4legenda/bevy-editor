@@ -9,6 +9,10 @@ pub(super) struct Parent {
     redo: Vec<Snapshot>,
 }
 impl Parent {
+    pub(super) fn snapshots_mut(&mut self) -> impl Iterator<Item = &mut Snapshot> {
+        std::iter::once(&mut self.snapshot).chain(&mut self.undo).chain(&mut self.redo)
+    }
+
     pub fn dirty(&self) -> bool {
         self.snapshot.revision != self.saved
     }

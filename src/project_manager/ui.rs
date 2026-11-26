@@ -334,7 +334,10 @@ pub(super) fn update_status(
                     .split_once("+build.")
                     .unwrap_or((&release.tag_name, ""));
                 let build = build.rsplit_once('.').map_or(build, |(number, _)| number);
-                format!("Доступна {} (сборка {build})", version.trim_start_matches('v'))
+                format!(
+                    "Доступна {} (сборка {build})",
+                    version.trim_start_matches('v')
+                )
             } else {
                 String::new()
             };
@@ -550,10 +553,15 @@ pub(super) fn setup(
         true,
         false,
     );
-    commands.entity(update_button).entry::<Node>().and_modify(|mut node| {
-        node.display = Display::None;
-    });
-    commands.entity(status_bar).insert(UpdateControls(update_button, update_label));
+    commands
+        .entity(update_button)
+        .entry::<Node>()
+        .and_modify(|mut node| {
+            node.display = Display::None;
+        });
+    commands
+        .entity(status_bar)
+        .insert(UpdateControls(update_button, update_label));
     commands.insert_resource(Interface {
         font,
         root,
@@ -976,7 +984,11 @@ fn build_dialog(
         );
         for (template, title, description) in [
             (Template::Empty, "Пустой", "Только камера"),
-            (Template::Starter, "3D-сцена", "Куб, камера и свет"),
+            (
+                Template::Starter,
+                "3D-сцена",
+                "Куб, персонаж, камера и свет",
+            ),
         ] {
             let (card, _) = button(
                 commands,
@@ -1202,8 +1214,7 @@ pub(super) fn styles(
             || (matches!(control.action, Action::UpdateEditor) && updates.available.is_none())
             || (!control.modal && manager.form.is_some())
             || (manager.context.is_some() && !menu_item)
-            || (manager.selected.is_none()
-                && matches!(control.action, Action::Forget))
+            || (manager.selected.is_none() && matches!(control.action, Action::Forget))
             || (picker.busy() && !matches!(control.action, Action::Close));
         tab.0 = if disabled { -1 } else { 0 };
         if disabled {

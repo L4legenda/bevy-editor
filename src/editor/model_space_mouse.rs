@@ -57,7 +57,9 @@ struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Opt in before scanning HID devices on model focus. Native HID
+            // enumeration can terminate the process on macOS.
+            enabled: false,
             speed: 10,
             invert_rotate: false,
             invert_pan: false,
@@ -522,6 +524,8 @@ mod tests {
             translation: [1., 1., 0.],
             rotation: [1., 0., 1.],
         };
+        assert!(!state.drive(&mut viewer, 0.1));
+        state.prefs.enabled = true;
         state.focused = false;
         assert!(!state.drive(&mut viewer, 0.1));
         state.focused = true;
@@ -557,8 +561,9 @@ mod tests {
             bevy::asset::uuid::Uuid::new_v4()
         ));
         let path = root.join("space-mouse.json");
+        assert!(!serde_json::from_str::<Preferences>(r#"{"speed":28}"#).unwrap().enabled);
         let prefs = Preferences {
-            enabled: false,
+            enabled: true,
             speed: 28,
             invert_rotate: true,
             invert_pan: true,

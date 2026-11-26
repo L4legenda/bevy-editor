@@ -471,13 +471,47 @@ mod native {
     /// Native hosts must install this before `DefaultPlugins` / `AssetPlugin`.
     pub struct AssetRedirectPlugin {
         redirects: AssetRedirects,
+        #[cfg(feature = "editor")]
+        registry_events: bool,
+    }
+
+    // The project scanner already watches the filesystem and compares content hashes.
+    // Feed those changes into Bevy's dependency-aware asset source.
+    #[cfg(feature = "editor")]
+    #[derive(bevy::prelude::Resource, Clone, Default)]
+    pub(crate) struct ProjectAssetEvents(
+        std::sync::Arc<
+            std::sync::OnceLock<async_channel::Sender<bevy::asset::io::AssetSourceEvent>>,
+        >,
+    );
+    #[cfg(feature = "editor")]
+    impl bevy::asset::io::AssetWatcher for ProjectAssetEvents {}
+    #[cfg(feature = "editor")]
+    impl ProjectAssetEvents {
+        pub(crate) fn modified(&self, path: &str) {
+            if let Some(sender) = self.0.get() {
+                let _ = sender.try_send(bevy::asset::io::AssetSourceEvent::ModifiedAsset(
+                    path.into(),
+                ));
+            }
+        }
     }
 
     impl AssetRedirectPlugin {
         pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
             Ok(Self {
                 redirects: AssetRedirects::new(root)?,
+                #[cfg(feature = "editor")]
+                registry_events: false,
             })
+        }
+    }
+
+    #[cfg(feature = "editor")]
+    impl AssetRedirectPlugin {
+        pub(crate) fn watch_registry(mut self) -> Self {
+            self.registry_events = true;
+            self
         }
     }
 
@@ -486,12 +520,21 @@ mod native {
             let shared = self.redirects.clone();
             let reader = shared.clone();
             let root = shared.root.to_string_lossy().into_owned();
-            app.register_asset_source(
-                AssetSourceId::Default,
-                AssetSourceBuilder::platform_default(&root, None)
-                    .with_reader(move || Box::new(RedirectReader::new(reader.clone()))),
-            )
-            .insert_resource(shared);
+            let source = AssetSourceBuilder::platform_default(&root, None)
+                .with_reader(move || Box::new(RedirectReader::new(reader.clone())));
+            #[cfg(feature = "editor")]
+            let source = if self.registry_events {
+                let events = ProjectAssetEvents::default();
+                app.insert_resource(events.clone());
+                source.with_watcher(move |sender| {
+                    let _ = events.0.set(sender);
+                    Some(Box::new(events.clone()))
+                })
+            } else {
+                source
+            };
+            app.register_asset_source(AssetSourceId::Default, source)
+                .insert_resource(shared);
         }
     }
 
@@ -824,3 +867,6 @@ mod tests {
         assert!(shared.resolve("escape/image.png").is_err());
     }
 }
+
+#[cfg(all(feature = "editor", not(target_arch = "wasm32")))]
+pub(crate) use native::ProjectAssetEvents;

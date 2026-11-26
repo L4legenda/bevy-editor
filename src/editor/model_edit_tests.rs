@@ -25,6 +25,45 @@ fn warm(app: &mut App, count: usize) {
 }
 
 #[test]
+#[ignore = "requires GPU; clicks the mesh-editing toolbar buttons"]
+fn gpu_mesh_toolbar_starts_bevel_loop_cut_and_knife() {
+    let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    send(&mut app, EditAction::Element(Element::Edge));
+    {
+        let mut state = app.world_mut().resource_mut::<State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        let edge = *doc.active().unwrap().geometry.edges().keys().next().unwrap();
+        doc.selection.edges = [edge].into();
+    }
+    warm(&mut app, 3);
+    for (label, started) in [
+        ("Фаска (Bevel) · Ctrl+B", input::Gesture::is_beveling as fn(&input::Gesture) -> bool),
+        ("Разрез петлёй (Loop Cut) · Ctrl+R", input::Gesture::is_loop_cutting),
+        ("Нож (Knife) · K", input::Gesture::is_knifing),
+    ] {
+        let position = {
+            let world = app.world_mut();
+            let (_, node, transform) = world
+                .query::<(&AccessibleLabel, &ComputedNode, &UiGlobalTransform)>()
+                .iter(world)
+                .find(|(name, node, _)| name.0 == label && !node.is_empty())
+                .expect("Mesh tool must be visible in the toolbar");
+            transform.affine().translation * node.inverse_scale_factor()
+        };
+        move_pointer(&mut app, window, position);
+        mouse(&mut app, window, ButtonState::Pressed);
+        mouse(&mut app, window, ButtonState::Released);
+        warm(&mut app, 3);
+        assert!(app.world().resource::<State>().gesture.as_ref().is_some_and(started), "{label}");
+        key(&mut app, window, KeyCode::Escape, Key::Escape);
+        assert!(app.world().resource::<State>().gesture.is_none());
+    }
+}
+
+#[test]
 #[ignore = "requires GPU; exercises the real Loop Cut and Knife input paths"]
 fn gpu_cut_tools_preview_cancel_and_commit_once() {
     let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
@@ -1578,6 +1617,18 @@ fn gpu_model_xray_reveals_hidden_faces_without_changing_materials() {
     assert!(app.world().resource::<State>().xray);
     {
         let world = app.world_mut();
+        let (mesh, material) = world
+            .query::<(&Mesh3d, &MeshMaterial3d<selection::FaceMaterial>)>()
+            .single(world)
+            .unwrap();
+        assert!(world.resource::<Assets<Mesh>>().get(&mesh.0).unwrap().count_vertices() > 0);
+        assert_eq!(
+            world.resource::<Assets<selection::FaceMaterial>>().get(&material.0).unwrap().depth_bias(),
+            f32::INFINITY,
+        );
+    }
+    {
+        let world = app.world_mut();
         let assets = world.resource::<Assets<StandardMaterial>>();
         for (handle, expected) in sources.iter().zip(&original) {
             let m = assets.get(handle).unwrap();
@@ -1632,6 +1683,10 @@ fn gpu_model_xray_reveals_hidden_faces_without_changing_materials() {
             .contains(&hidden_face),
         "X-Ray must pick a hidden face by its center"
     );
+    let first = capture_when(&mut app, &target, &output.join("02-xray-selection.png"), |_| true);
+    warm(&mut app, 8);
+    let last = capture_when(&mut app, &target, &output.join("02-xray-selection-later.png"), |_| true);
+    assert!(differences(&first, &last) < 20, "Stationary X-Ray edges must remain stable");
     send(&mut app, EditAction::Mode(Mode::Object));
     capture_when(
         &mut app,
@@ -1666,6 +1721,8 @@ fn gpu_model_xray_reveals_hidden_faces_without_changing_materials() {
             let original = assets.get(&source.0).unwrap();
             let restored = assets.get(&displayed.0).unwrap();
             assert!(restored.unlit);
+            assert!(restored.double_sided);
+            assert!(restored.cull_mode.is_none());
             assert_eq!(restored.base_color, original.base_color);
             assert_eq!(restored.alpha_mode, original.alpha_mode);
         }
@@ -2457,6 +2514,43 @@ fn gpu_model_edit_warped_cube_has_whole_quad_faces_without_diagonals() {
             assert!(new_center.distance(center + delta) < 1.0);
             assert!(edge_along.perp_dot(new_center - center).abs() > 10.0);
         }
+        send(&mut app, EditAction::Undo);
+    }
+    {
+        let mut viewer = app.world_mut().resource_mut::<Viewer>();
+        viewer.yaw = 0.65;
+        viewer.pitch = 0.45;
+    }
+    warm(&mut app, 5);
+    for (index, (axis, code, label)) in [
+        (Vec3::X, KeyCode::KeyX, "x"),
+        (Vec3::Y, KeyCode::KeyY, "y"),
+        (Vec3::Z, KeyCode::KeyZ, "z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A strip extruded parallel to its source edge has zero area.
+        if axis.dot(tangent).abs() > 0.99 {
+            continue;
+        }
+        let direction = {
+            let viewer = app.world().resource::<Viewer>();
+            (input::project(viewer, rect, pivot + axis).unwrap()
+                - input::project(viewer, rect, pivot).unwrap())
+            .normalize()
+        };
+        move_pointer(&mut app, window, rect.center());
+        key(&mut app, window, KeyCode::KeyE, Key::Character("e".into()));
+        key(&mut app, window, code, Key::Character(label.into()));
+        let state = app.world().resource::<State>();
+        assert_eq!(state.gesture.as_ref().unwrap().axis, Some(index));
+        move_pointer(&mut app, window, rect.center() + direction * 30.0 + direction.perp() * 12.0);
+        key(&mut app, window, KeyCode::Enter, Key::Enter);
+        let doc = &app.world().resource::<State>().documents[&0];
+        let moved = doc.selection_center().unwrap() - pivot;
+        assert!(moved.dot(axis) > 0.001);
+        assert!(moved.cross(axis).length() < 0.0001);
         send(&mut app, EditAction::Undo);
     }
     send(&mut app, EditAction::Element(Element::Vertex));

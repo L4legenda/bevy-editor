@@ -67,6 +67,7 @@ type Inventory = BTreeMap<String, Seen>;
 
 #[derive(Default)]
 pub(crate) struct Changes {
+    pub modified: Vec<String>,
     pub moves: Vec<(String, String)>,
     pub companions: Vec<(String, String)>,
     pub refresh: bool,
@@ -515,6 +516,15 @@ impl Scanner {
                         .push((previous.path.clone(), current.path.clone()));
                 }
                 changes.refresh = true;
+            }
+        }
+        for (id, current) in &manifest.assets {
+            match self.published.manifest.assets.get(id) {
+                Some(previous) if !current.missing && (current.hash != previous.hash || previous.missing) => {
+                    changes.modified.push(current.path.clone());
+                }
+                None if self.initialized && !current.missing => changes.modified.push(current.path.clone()),
+                _ => {}
             }
         }
         self.publish(manifest, rev, dirty)?;

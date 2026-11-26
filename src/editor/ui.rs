@@ -557,11 +557,12 @@ pub(super) fn setup(
         &mut commands,
         tool_bar,
         &font,
-        "Выберите объект в сцене или дереве",
+        "",
         12.0,
         MUTED,
     );
     commands.entity(navigation_hint).insert(Node {
+        display: Display::None,
         min_width: px(0),
         flex_shrink: 1.0,
         overflow: Overflow::clip(),
@@ -751,7 +752,7 @@ pub(super) fn setup(
 
     let checker = image_viewer::checker_texture(&mut images);
     drawer::setup(&mut commands, root, &font, &stars, &checker);
-    image_viewer::setup(&mut commands, viewport, root, &font, &checker);
+    image_viewer::setup(&mut commands, viewport, root, &font, &checker, &mut transform_handless);
     browser_context::setup(&mut commands, root, &font);
     narrative::setup(&mut commands, root, &font, &stars, &mut fonts);
     generation::setup(&mut commands, root, &font, &checker);
@@ -1981,37 +1982,34 @@ pub(super) fn refresh(
             tint.set_if_neq(TextColor(color));
         }
     };
-    set_label(
-        interface.navigation_hint,
-        if editor.viewing_image.is_some() {
-            if image_viewer
-                .as_ref()
-                .is_some_and(|viewer| viewer.edit.editing(editor.viewing_image))
-            {
-                "Редактирование изображения · Пробел — панорама · Ctrl+S — сохранить"
-            } else {
-                "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
-            }
-        } else if let Some(model) = editor
-            .viewing_model
-            .and_then(|i| editor.project.catalog.get(i))
+    let navigation_hint = if editor.viewing_image.is_some() {
+        if image_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.edit.editing(editor.viewing_image))
         {
-            use crate::data::ModelFormat;
-            match ModelFormat::from_path(&model.asset) {
-                Some(ModelFormat::Fbx) => "Просмотр FBX · ПКМ + WASD — полёт · Alt+ЛКМ — орбита",
-                _ => "Модель · ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Tab — режим",
-            }
-        } else if !editor.has_scene() {
-            "Откройте сцену в файловом менеджере"
-        } else if editor.pilot {
-            "ПКМ + WASD / Q E · Shift — быстрее · Esc — выйти"
-        } else if editor.selection.is_some() {
-            "Num . — фокус · Alt + ЛКМ — орбита · СКМ — панорама"
+            "Редактирование изображения · Пробел — панорама · Ctrl+S — сохранить"
         } else {
-            "Выберите объект в сцене или дереве · ПКМ + WASD — полёт"
-        },
-        MUTED,
-    );
+            "Просмотр изображения · Колесо — масштаб · Перетаскивание — панорама"
+        }
+    } else if let Some(model) = editor
+        .viewing_model
+        .and_then(|i| editor.project.catalog.get(i))
+    {
+        use crate::data::ModelFormat;
+        match ModelFormat::from_path(&model.asset) {
+            Some(ModelFormat::Fbx) => "Просмотр FBX · ПКМ + WASD — полёт · Alt+ЛКМ — орбита",
+            _ => "Модель · ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Tab — режим",
+        }
+    } else if !editor.has_scene() {
+        "Откройте сцену в файловом менеджере"
+    } else if editor.pilot {
+        "ПКМ + WASD / Q E · Shift — быстрее · Esc — выйти"
+    } else if editor.selection.is_some() {
+        "Num . — фокус · Alt + ЛКМ — орбита · СКМ — панорама"
+    } else {
+        ""
+    };
+    set_label(interface.navigation_hint, navigation_hint, MUTED);
     set_label(
         interface.field_error,
         numeric.error_message().unwrap_or_default(),
@@ -2181,6 +2179,7 @@ pub(super) fn refresh(
             && editor.selection.is_some_and(|target| editor.pose(target).is_some())),
         (interface.camera_scope, camera),
         (interface.field_error, numeric.error_message().is_some()),
+        (interface.navigation_hint, !navigation_hint.is_empty()),
         (interface.rotation_scope, editor.inspector_targets(Field::Rotation(0)).all(|target| !matches!(target,
             Selection::Light(id) if editor.light(id).is_some_and(|light| light.kind == crate::lighting::LightKind::Point)))),
         (interface.scale_scope, editor.inspector_targets(Field::Scale(0)).all(|target| !matches!(target,

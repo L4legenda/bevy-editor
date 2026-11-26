@@ -13,6 +13,7 @@ pub(super) fn create_project(directory: &Path) -> EditorProject {
     let mut project = crate::project_manager::create_test_project(directory).unwrap();
     let mut document = project.read_scene(0).unwrap();
     let model = document.models[0].clone();
+    document.model_names.clear();
     document.models = [-2.0, 0.0, 2.0]
         .into_iter()
         .enumerate()
@@ -94,8 +95,21 @@ fn browser_discovers_unlisted_scene_files_and_treats_every_glb_as_a_model() {
     let mut browser = browser::Browser::new(&mut project);
     assert_eq!(project.scenes.len(), 2);
     assert!(project.scenes.iter().all(SceneDefinition::is_native));
-    assert_eq!(project.catalog.len(), 1);
-    assert!(browser.files.iter().all(|file| file.extension == "scene"));
+    assert_eq!(project.catalog.len(), 2);
+    assert!(
+        project
+            .catalog
+            .iter()
+            .any(|item| item.asset == "characters/superhero_male.glb")
+    );
+    assert_eq!(
+        browser
+            .files
+            .iter()
+            .filter(|file| file.extension == "scene")
+            .count(),
+        2
+    );
     browser.set_search(".scene".into());
     for entry in browser.entries(&project.catalog) {
         assert!(matches!(entry, browser::Entry::Scene { .. }));

@@ -171,8 +171,9 @@ fn scene_objects_imported_removal_hides_descendants_and_undo_restores_names_and_
 #[test]
 fn scene_objects_renamed_instances_duplicate_independently_and_old_documents_still_load() {
     let mut app = app();
-    let target = Selection::Model(app.world().resource::<Editor>().edits.models[0].id);
     let mut editor = app.world_mut().resource_mut::<Editor>();
+    let target = Selection::Model(editor.edits.models[0].id);
+    assert_eq!(editor.label(target), "Блок");
     editor.select(Some(target));
     editor.rename_object(target, "Куб").unwrap();
     editor.duplicate_targets();

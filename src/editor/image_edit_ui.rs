@@ -39,6 +39,8 @@ pub(in crate::editor) struct EditUi {
     mode: Entity,
     menu: Entity,
     tools: Entity,
+    raster_tools: Entity,
+    color_tools: Entity,
     paint_button: Entity,
     eraser_button: Entity,
     brush_icon: Entity,
@@ -49,6 +51,8 @@ pub(in crate::editor) struct EditUi {
     error: Entity,
     size_group: Entity,
     model_tools: Entity,
+    model_pose: Entity,
+    model_pose_reset: Entity,
     model_overlay: super::super::model_transform::Overlay,
     brush_rail: Entity,
     size_button: Entity,
@@ -494,10 +498,12 @@ pub(in crate::editor) fn setup(
     root: Entity,
     font_handle: &Handle<Font>,
     checker_image: &Handle<Image>,
+    handles: &mut Assets<crate::editor::viewport::HandleMaterial>,
 ) {
     let brush_rail = brush_rail(commands, canvas, font_handle);
     let model_overlay =
-        super::super::model_transform::Overlay::setup(commands, canvas, font_handle);
+        super::super::model_transform::Overlay::setup(commands, canvas, font_handle, handles);
+    super::super::model_fields::setup(commands, canvas, font_handle);
     gradient::setup(commands, toolbar, canvas, font_handle);
     let size_group = node(
         commands,
@@ -532,13 +538,6 @@ pub(in crate::editor) fn setup(
         ..default()
     });
     icons::themed(commands, size_button, icons::Glyph::ChevronDown, 12.0);
-    let model_tools = crate::editor::ui::tool_icons::group(commands, toolbar, true, |tool| {
-        Action::ImageEdit(EditAction::ModelTool(tool))
-    });
-    commands
-        .entity(model_tools)
-        .entry::<Node>()
-        .and_modify(|mut node| node.display = Display::None);
     let size_menu = surface(
         commands,
         size_group,
@@ -759,10 +758,63 @@ pub(in crate::editor) fn setup(
         CHROME,
     );
     commands.entity(body).insert_children(0, &[tools]);
-    super::selection_ui::setup(commands, tools, toolbar, canvas, root, font_handle);
-    let paint_group = node(
+    let model_tools = node(
         commands,
         tools,
+        Node {
+            display: Display::None,
+            ..column(6.0)
+        },
+    );
+    for (tool, glyph) in crate::editor::ui::tool_icons::TRANSFORMS {
+        let item = control(
+            commands,
+            model_tools,
+            Action::ImageEdit(EditAction::ModelTool(tool)),
+            Look::Tool,
+            tool_node(),
+        );
+        commands.entity(item).insert((
+            CanvasControl,
+            AccessibleLabel(crate::editor::ui::tool_icons::label(tool, true).into()),
+        ));
+        icons::themed(commands, item, glyph, 18.0);
+    }
+    let model_pose = button(
+        commands,
+        model_tools,
+        font_handle,
+        "Поза",
+        Action::ImageEdit(EditAction::ModelPose),
+        Look::Tool,
+    );
+    commands
+        .entity(model_pose)
+        .insert(CanvasControl)
+        .entry::<Node>()
+        .and_modify(|mut node| {
+            node.width = px(38);
+            node.height = px(36);
+            node.padding = UiRect::horizontal(px(2));
+            node.justify_content = JustifyContent::Center;
+        });
+    let model_pose_reset = control(
+        commands,
+        model_tools,
+        Action::ImageEdit(EditAction::ModelPoseReset),
+        Look::Tool,
+        tool_node(),
+    );
+    icons::themed(commands, model_pose_reset, icons::Glyph::Refresh, 18.0);
+    commands.entity(model_pose_reset).insert((
+        CanvasControl,
+        AccessibleLabel("Сбросить позу".into()),
+    ));
+    let raster_tools = node(commands, tools, column(6.0));
+    super::selection_ui::setup(commands, raster_tools, toolbar, canvas, root, font_handle);
+    let paint_group = node(
+        commands,
+        raster_tools,
         Node {
             width: px(36),
             height: px(36),
@@ -785,7 +837,7 @@ pub(in crate::editor) fn setup(
     tool_menu_hint(commands, paint_button);
     let eraser_group = node(
         commands,
-        tools,
+        raster_tools,
         Node {
             width: px(36),
             height: px(36),
@@ -867,7 +919,7 @@ pub(in crate::editor) fn setup(
     ));
     tool_button(
         commands,
-        tools,
+        raster_tools,
         icons::Glyph::Gradient,
         "Градиент · U",
         PhotoTool::Gradient,
@@ -926,7 +978,8 @@ pub(in crate::editor) fn setup(
             Look::Regular,
         );
     }
-    super::picker_ui::setup(commands, root, tools, font_handle);
+    let color_tools = node(commands, tools, column(0.0));
+    super::picker_ui::setup(commands, root, color_tools, font_handle);
     let panel_root = node(
         commands,
         body,
@@ -963,7 +1016,6 @@ pub(in crate::editor) fn setup(
         ..default()
     });
     super::super::overview::setup(commands, panel, checker_image);
-    super::super::model_fields::setup(commands, panel, font_handle);
     let layer_header = node(
         commands,
         panel,
@@ -1011,6 +1063,8 @@ pub(in crate::editor) fn setup(
         mode,
         menu,
         tools,
+        raster_tools,
+        color_tools,
         paint_button,
         eraser_button,
         brush_icon,
@@ -1021,6 +1075,8 @@ pub(in crate::editor) fn setup(
         error,
         size_group,
         model_tools,
+        model_pose,
+        model_pose_reset,
         model_overlay,
         brush_rail,
         size_button,
@@ -1090,6 +1146,12 @@ pub(in crate::editor) fn color_pointer(
     }
     if !viewer.edit.editing(editor.viewing_image) {
         viewer.edit.paint_menu = false;
+        return;
+    }
+    if viewer.edit.model_layer_selected(editor.viewing_image) {
+        viewer.edit.paint_menu = false;
+        viewer.edit.size_menu = false;
+        viewer.edit.selection.menu = 0;
         return;
     }
     let hit_size = |entity| {
@@ -1223,10 +1285,11 @@ pub(in crate::editor) fn color_pointer(
 pub(in crate::editor) fn refresh(
     mut commands: Commands,
     editor: Res<Editor>,
-    (viewer, references, mut images): (
+    (viewer, references, mut images, mut handles): (
         Res<ImageViewer>,
         Res<crate::editor::image_reference::ReferenceRender>,
         ResMut<Assets<Image>>,
+        ResMut<Assets<crate::editor::viewport::HandleMaterial>>,
     ),
     window: Single<&Window, With<PrimaryWindow>>,
     mut ui: ResMut<EditUi>,
@@ -1250,15 +1313,7 @@ pub(in crate::editor) fn refresh(
     time: Res<Time>,
 ) {
     let editing = viewer.edit.editing(editor.viewing_image);
-    let model_active = editing && viewer.edit.model_reference(editor.viewing_image).is_some();
-    let model_manipulating = model_active && viewer.edit.model_tool.is_some();
-    if let Ok(mut node) = nodes.get_mut(ui.model_tools) {
-        node.display = if model_active {
-            Display::Flex
-        } else {
-            Display::None
-        };
-    }
+    let model_active = editing && viewer.edit.model_layer_selected(editor.viewing_image);
     ui.model_overlay.refresh(
         &editor,
         &viewer,
@@ -1267,11 +1322,12 @@ pub(in crate::editor) fn refresh(
         window.cursor_position(),
         window.scale_factor(),
         &mut images,
+        &mut handles,
         &mut nodes,
         &mut commands,
     );
     commands.entity(ui.brush_rail).insert(rail_fx::RevealTarget(
-        editing && viewer.edit.sizeable() && !model_manipulating,
+        editing && viewer.edit.sizeable() && !model_active,
     ));
     for (entity, visible) in [
         (ui.hardness_group, !viewer.edit.pixel_tool()),
@@ -1296,14 +1352,14 @@ pub(in crate::editor) fn refresh(
             .insert(AccessibleLabel(format!("Форма {tool} · {title}")));
     }
     if let Ok(mut group) = nodes.get_mut(ui.size_group) {
-        group.display = if editing && viewer.edit.sizeable() && !model_manipulating {
+        group.display = if editing && viewer.edit.sizeable() && !model_active {
             Display::Flex
         } else {
             Display::None
         };
     }
     let size_shown =
-        editing && viewer.edit.sizeable() && viewer.edit.size_menu && !model_manipulating;
+        editing && viewer.edit.sizeable() && viewer.edit.size_menu && !model_active;
     let library_shown = size_shown && viewer.edit.tool == PhotoTool::Brush;
     if let Ok(mut menu) = nodes.get_mut(ui.size_menu) {
         menu.width = px(if library_shown {
@@ -1403,9 +1459,18 @@ pub(in crate::editor) fn refresh(
     }
     for (entity, visible) in [
         (ui.tools, editing),
+        (ui.raster_tools, !model_active),
+        (ui.color_tools, !model_active),
+        (ui.model_tools, model_active),
+        (ui.model_pose, model_active && viewer.edit.model_has_rig),
+        (
+            ui.model_pose_reset,
+            model_active && viewer.edit.model_has_rig && viewer.edit.model_posing,
+        ),
         (
             ui.paint_menu,
             editing
+                && !model_active
                 && viewer.edit.paint_menu
                 && viewer.edit.tool_menu == ToolMenu::Paint
                 && editor.pending.is_none(),
@@ -1419,6 +1484,7 @@ pub(in crate::editor) fn refresh(
         (
             ui.eraser_modes,
             editing
+                && !model_active
                 && viewer.edit.paint_menu
                 && viewer.edit.tool_menu == ToolMenu::Eraser
                 && editor.pending.is_none(),

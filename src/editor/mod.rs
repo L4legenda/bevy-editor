@@ -13,6 +13,7 @@ mod hdri_catalog;
 mod image_brush_rail_fx;
 mod image_previews;
 mod image_reference;
+mod scene_image_reference;
 mod image_texture;
 mod lighting;
 mod lighting_gizmos;
@@ -27,6 +28,7 @@ mod model_paint_data;
 mod model_paint_mpp;
 mod model_paint_spp;
 mod model_primitives;
+pub(crate) use model_primitives::default_cube_material;
 mod model_source;
 mod model_uv_backend;
 mod model_uv_mesh;
@@ -643,13 +645,12 @@ impl Editor {
             Selection::Environment => "Окружение".into(),
             Selection::Model(id) => self.model(id).map_or_else(String::new, |model| {
                 let file = model.asset.rsplit('/').next().unwrap_or_default();
-                let label = self
-                    .project
+                self.project
                     .catalog
                     .iter()
                     .find(|item| item.asset == model.asset)
-                    .map_or(file, |item| item.label.as_str());
-                format!("{label} · {id}")
+                    .map_or(file, |item| item.label.as_str())
+                    .to_owned()
             }),
         }
     }
@@ -925,15 +926,18 @@ impl Editor {
         }
     }
 
-    fn add_model(&mut self, mut model: PlacedModel) {
+    fn add_model(&mut self, model: PlacedModel) {
+        self.add_named_model(model, None);
+    }
+
+    fn add_named_model(&mut self, mut model: PlacedModel, name: Option<String>) -> Option<u32> {
         if let Ok(index) = crate::asset_registry::index(&self.root) {
             index.bind(&mut model.asset, &mut model.uid);
         }
         if self.edits.hierarchy.is_some() {
-            if let Some(key) = self.edit_hierarchy(|h| h.add_model(model, None)) {
-                self.select(Some(Selection::Model(key)));
-            }
-            return;
+            let key = self.edit_hierarchy(|h| h.add_model(model, name))?;
+            self.select(Some(Selection::Model(key)));
+            return Some(key);
         }
         let next = self
             .edits
@@ -942,12 +946,14 @@ impl Editor {
             .map(|model| model.id)
             .max()
             .unwrap_or(0);
-        let Some(id) = next.checked_add(1) else {
-            return;
-        };
+        let id = next.checked_add(1)?;
         model.id = id;
         self.edits.models.push(model);
+        if let Some(name) = name {
+            self.edits.model_names.insert(id, name);
+        }
         self.select(Some(Selection::Model(id)));
+        Some(id)
     }
 
     fn add_light(&mut self, mut light: crate::lighting::SceneLight) -> Option<u32> {
@@ -1313,11 +1319,12 @@ fn build_app(plugin: EditorPlugin) -> Result<App, Box<dyn std::error::Error>> {
         app.insert_resource(render_worker::RenderWorker)
             .insert_resource(render_worker::update_settings());
     }
-    app.add_plugins(crate::AssetRedirectPlugin::new(&plugin.project.asset_root)?);
+    app.add_plugins(crate::AssetRedirectPlugin::new(&plugin.project.asset_root)?.watch_registry());
     app.add_plugins(
         DefaultPlugins
             .set(AssetPlugin {
                 file_path: plugin.project.asset_root.to_string_lossy().into_owned(),
+                watch_for_changes_override: Some(true),
                 ..default()
             })
             .set(WindowPlugin {
@@ -1593,7 +1600,11 @@ fn sync_placements(
     for model in &editor.edits.models {
         let (entity, _) = scene.models.entry(model.id).or_insert_with(|| {
             let entity = level::spawn_model(&mut commands, &server, model);
-            commands.entity(entity).observe(prepare_placed_model);
+            let mut instance = commands.entity(entity);
+            if crate::data::is_image_reference(&model.asset) {
+                instance.insert(scene_image_reference::ReferenceRoot);
+            }
+            instance.observe(prepare_placed_model);
             (entity, model.asset.clone())
         });
         if let Ok(mut transform) = transforms.get_mut(*entity) {
@@ -1608,12 +1619,17 @@ fn sync_placements(
 
 fn prepare_placed_model(
     ready: On<WorldInstanceReady>,
+    mut commands: Commands,
+    references: Query<(), With<scene_image_reference::ReferenceRoot>>,
     children: Query<&Children>,
     mut cameras: Query<&mut Camera>,
 ) {
     // A model may contain exported glTF cameras, but placing it must never
     // activate them or replace the editor's viewport.
     for entity in std::iter::once(ready.entity).chain(children.iter_descendants(ready.entity)) {
+        if references.contains(ready.entity) {
+            commands.entity(entity).insert((bevy::light::NotShadowCaster, bevy::light::NotShadowReceiver));
+        }
         if let Ok(mut camera) = cameras.get_mut(entity) {
             camera.is_active = false;
         }

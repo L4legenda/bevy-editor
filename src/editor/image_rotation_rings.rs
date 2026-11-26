@@ -291,8 +291,10 @@ mod tests {
                 uid: None,
                 direction: eye.to_array(),
                 center: [200., 150.],
+                pending_frame: None,
                 pixels_per_unit: 1.,
                 pose: Transform::IDENTITY.into(),
+                joints: Default::default(),
             };
             let frame = Frame::new(model, Rect::new(0., 0., 400., 300.), UVec2::new(400, 300));
             for axis in 0..3 {

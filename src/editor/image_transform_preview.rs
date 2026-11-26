@@ -7,9 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SERIAL: AtomicU64 = AtomicU64::new(1);
 
-pub(in crate::editor) type PrepareLayer =
-    Box<dyn FnOnce(&mut photocraft_raster::Surface) + Send + Sync>;
-
 pub(super) struct Planes {
     pub under: Rgba8Image,
     pub moving: Rgba8Image,
@@ -116,26 +113,24 @@ impl Live {
         if targets.iter().any(|id| !selected.contains(id)) {
             return None;
         }
-        Self::for_layers(doc, frame, &selected, None)
+        Self::for_layers(doc, frame, &selected)
     }
 
     pub(in crate::editor) fn for_model(
         doc: &PhotoDocument,
         frame: [f32; 4],
         layer: LayerId,
-        extend: Option<PrepareLayer>,
     ) -> Option<Self> {
         if doc.document.selection.is_some() {
             return None;
         }
-        Self::for_layers(doc, frame, &[layer], extend)
+        Self::for_layers(doc, frame, &[layer])
     }
 
     fn for_layers(
         doc: &PhotoDocument,
         frame: [f32; 4],
         selected: &[LayerId],
-        extend: Option<PrepareLayer>,
     ) -> Option<Self> {
         if doc.mask_target
             || doc.mask_view.is_some()
@@ -198,8 +193,7 @@ impl Live {
             0.0
         };
         source.doc.layers = flat;
-        let direct = extend.is_none()
-            && source.doc.layers.len() == 1
+        let direct = source.doc.layers.len() == 1
             && source.doc.selection.is_none()
             && frame[0] >= 0.0
             && frame[1] >= 0.0
@@ -218,23 +212,13 @@ impl Live {
             commit: None,
         };
         if !direct {
-            live.start(extend);
+            live.start();
         }
         Some(live)
     }
-    fn start(&mut self, extend: Option<PrepareLayer>) {
-        let mut source = self.source.clone();
-        self.task = Some(AsyncComputeTaskPool::get().spawn(async move {
-            if let Some(extend) = extend {
-                let layer = source
-                    .doc
-                    .layer_mut(source.moving[0])
-                    .and_then(Layer::surface_mut)
-                    .ok_or("Missing model layer")?;
-                extend(layer);
-            }
-            prepare(source)
-        }));
+    fn start(&mut self) {
+        let source = self.source.clone();
+        self.task = Some(AsyncComputeTaskPool::get().spawn(async move { prepare(source) }));
     }
     pub fn poll(&mut self, revision: u64) {
         // A command can change the document before the UI captures the original
@@ -246,7 +230,7 @@ impl Live {
             && self.ready.is_none()
             && !self.failed
         {
-            self.start(None);
+            self.start();
         }
         if let Some(result) = self.task.as_mut().and_then(|t| block_on(poll_once(t))) {
             self.task = None;

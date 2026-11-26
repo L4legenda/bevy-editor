@@ -76,6 +76,7 @@ pub(in crate::editor) enum Edit {
     Add(usize, IVec2),
     AddConnected(usize, IVec2, WireSource),
     UpdateSource(u64, usize),
+    #[cfg(test)]
     Move(u64, IVec2),
     Remove(u64),
     Connect(u64, u64, usize),
@@ -236,6 +237,15 @@ fn can_replace_source(graph: &Graph, id: u64, folder: bool) -> bool {
 }
 
 impl Edit {
+    pub(super) fn moves_nodes(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Move(..) => true,
+            Self::Batch(_, BatchKind::Move) => true,
+            _ => false,
+        }
+    }
+
     pub(super) fn rebuilds(self) -> bool {
         match self {
             Self::AddConnected(_, _, WireSource { input: Some(_), .. }) => true,
@@ -243,8 +253,9 @@ impl Edit {
                 .defs
                 .get(index)
                 .is_some_and(|def| def.id == material_painter_graph::OUTPUT_DEF),
-            Self::Move(..)
-            | Self::Batch(_, BatchKind::Move | BatchKind::ReplaceSource)
+            #[cfg(test)]
+            Self::Move(..) => false,
+            Self::Batch(_, BatchKind::Move | BatchKind::ReplaceSource)
             | Self::Publish(..)
             | Self::Unbind(..)
             | Self::RemoveParameter(_)
@@ -333,6 +344,7 @@ impl Edit {
                 }
                 Ok(Some(id))
             }
+            #[cfg(test)]
             Self::Move(id, pos) => {
                 graph.node_mut(id).ok_or("Узел не найден")?.pos = pos.as_vec2().to_array();
                 Ok(Some(id))

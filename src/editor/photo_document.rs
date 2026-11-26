@@ -320,33 +320,60 @@ impl PhotoDocument {
         self.changed();
         Ok(())
     }
-    pub(super) fn replace_reference(
+    pub(super) fn author_reference(
         &mut self,
-        target: crate::editor::image_reference::ReferenceTarget,
-        surface: Surface,
+        layer: LayerId,
+        model: &mut crate::editor::image_reference::ModelReference,
+    ) -> Result<std::sync::Arc<str>, String> {
+        model.pending_frame = Some(self.next_revision);
+        let packet = model.to_xmp()?;
+        self.checkpoint();
+        self.document.layer_mut(layer).unwrap().xmp = Some(packet.clone());
+        self.changed();
+        Ok(packet)
+    }
+
+    pub(super) fn finish_reference(
+        &mut self,
+        document: photocraft_doc::DocId,
+        target: &crate::editor::image_reference::ReferenceTarget,
+        surface: &Surface,
         model: &crate::editor::image_reference::ModelReference,
     ) -> Result<(), String> {
-        if self.revision != target.revision {
-            return Err("Документ изменился во время рендера".into());
+        let packet = model.to_xmp()?;
+        let apply = |doc: &mut Document| {
+            if doc.id != document {
+                return false;
+            }
+            // A layer can be duplicated, edited elsewhere, or undone while the
+            // GPU is working. Only fill copies of this exact authored version.
+            let ids: Vec<_> = doc
+                .walk()
+                .into_iter()
+                .filter(|(_, _, layer)| layer.xmp.as_ref() == Some(&target.packet))
+                .map(|(_, _, layer)| layer.id)
+                .collect();
+            for &id in &ids {
+                let layer = doc.layer_mut(id).unwrap();
+                layer.content = LayerContent::Raster(surface.clone());
+                layer.xmp = Some(packet.clone());
+            }
+            !ids.is_empty()
+        };
+        if apply(&mut self.document) {
+            self.view_revision += 1;
+            self.damage = None;
         }
-        let layer = self
-            .document
-            .layer(target.layer)
-            .ok_or("Слой больше не существует")?;
-        if !matches!(layer.content, LayerContent::Raster(_))
-            || layer.locks.position
-            || layer.locks.all
-        {
-            return Err("Трансформация слоя недоступна".into());
+        for snapshot in self.undo.iter_mut().chain(&mut self.redo).chain(
+            self.parents
+                .iter_mut()
+                .flat_map(layers::Parent::snapshots_mut),
+        ) {
+            apply(&mut snapshot.document);
         }
-        let xmp = model.to_xmp()?;
-        self.checkpoint();
-        let layer = self.document.layer_mut(target.layer).unwrap();
-        layer.xmp = Some(xmp);
-        layer.content = LayerContent::Raster(surface);
-        self.changed();
         Ok(())
     }
+
     #[cfg(test)]
     pub fn duplicate_layer(&mut self) {
         let _ = self.layer_command("layer.duplicate", serde_json::json!({}));

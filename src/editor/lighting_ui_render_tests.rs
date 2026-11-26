@@ -76,6 +76,7 @@ pub(in crate::editor) fn fixture_project_with_pipeline_compilation(
     let mut plugins = DefaultPlugins
         .set(AssetPlugin {
             file_path: project.asset_root.to_string_lossy().into_owned(),
+            watch_for_changes_override: Some(true),
             ..default()
         })
         .set(WindowPlugin {
@@ -92,7 +93,7 @@ pub(in crate::editor) fn fixture_project_with_pipeline_compilation(
     if synchronous_pipeline_compilation {
         plugins = plugins.disable::<PipelinedRenderingPlugin>();
     }
-    app.add_plugins(AssetRedirectPlugin::new(&project.asset_root).unwrap())
+    app.add_plugins(AssetRedirectPlugin::new(&project.asset_root).unwrap().watch_registry())
         .add_plugins(plugins)
         .add_plugins(EditorPlugin::new(project).unwrap())
         .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
@@ -1828,6 +1829,77 @@ fn gpu_lighting_menu_and_inspectors_fit_the_real_editor() {
         &output.join("06-short-window-menu.png"),
         ui_pixels,
     );
+}
+
+#[test]
+#[ignore = "requires GPU adapter; drags a PNG from the file manager onto a 3D scene"]
+fn gpu_scene_image_reference_drag_saves_a_textured_plane() {
+    use crate::editor::scene_image_reference::ReferenceRoot;
+    use std::time::Instant;
+    let fixture = crate::editor::scene_hierarchy::tests::fixture();
+    image::RgbaImage::from_fn(40, 20, |x, _| {
+        image::Rgba([240, 70, 50, if x < 10 { 0 } else { 255 }])
+    })
+    .save(fixture.root.join("reference.png"))
+    .unwrap();
+    let (mut app, window, _) = fixture_project(fixture.project.clone());
+    let initial_count = app.world().resource::<Editor>().edits.models.len();
+    app.world_mut().write_message(Action::Drawer);
+    warm(&mut app, 25);
+    let scale = app.world().get::<Window>(window).unwrap().scale_factor();
+    let card = labeled_rect(&mut app, "Открыть изображение reference.png").center() / scale;
+    let target = {
+        let world = app.world();
+        ui::scene_input_rect(
+            world.get::<Window>(window).unwrap(),
+            world.resource::<ui::DrawerMotion>(),
+            &world.resource::<Editor>().sidebar,
+        ).center()
+    };
+    move_pointer(&mut app, window, card);
+    mouse(&mut app, window, ButtonState::Pressed);
+    move_pointer(&mut app, window, target);
+    warm(&mut app, 3);
+    assert!(app.world().resource::<ui::AssetDrag>().scene_cursor().is_some());
+    mouse(&mut app, window, ButtonState::Released);
+    let start = Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world_mut();
+        let mut references = world.query_filtered::<Entity, With<ReferenceRoot>>();
+        let roots: Vec<_> = references.iter(world).collect();
+        let mut meshes = world.query::<(Entity, &MeshMaterial3d<StandardMaterial>)>();
+        let material = meshes.iter(world).find_map(|(mut entity, handle)| {
+            while !roots.contains(&entity) {
+                entity = world.get::<ChildOf>(entity)?.parent();
+            }
+            let material = world.resource::<Assets<StandardMaterial>>().get(&handle.0)?;
+            let image = world.resource::<Assets<Image>>().get(material.base_color_texture.as_ref()?)?;
+            Some((material, image))
+        });
+        if let Some((material, image)) = material {
+            assert!(material.unlit && material.double_sided);
+            assert_eq!(material.alpha_mode, AlphaMode::Blend);
+            assert_eq!(image.size(), UVec2::new(40, 20));
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 15, "{}", world.resource::<Editor>().status);
+    }
+    {
+        let editor = app.world().resource::<Editor>();
+        assert_eq!(editor.edits.models.len(), initial_count + 1);
+        let Some(Selection::Model(id)) = editor.selection else { panic!("Expected the reference selection") };
+        let model = editor.model(id).unwrap();
+        assert_eq!(editor.label(Selection::Model(id)), "Референс · reference");
+        assert!(model.bounds.is_none());
+        assert!(crate::data::is_image_reference(&model.asset));
+        editor.edits.write(&fixture.root, "saved-reference.scene").unwrap();
+        let saved = crate::LevelEdits::<String>::read(&fixture.root, "saved-reference.scene").unwrap();
+        assert!(saved.models.iter().any(|saved| saved.asset == model.asset && saved.pose == model.pose));
+    }
+    app.world_mut().write_message(Action::Undo);
+    warm(&mut app, 4);
+    assert_eq!(app.world().resource::<Editor>().edits.models.len(), initial_count);
 }
 
 #[test]

@@ -39,6 +39,8 @@ pub(in crate::editor) struct HandleMaterial {
 
 #[derive(Component)]
 pub(in crate::editor) struct ModelOverlay;
+#[derive(Component)]
+pub(in crate::editor) struct ImageOverlay;
 
 impl Default for HandleMaterial {
     fn default() -> Self {
@@ -64,6 +66,19 @@ impl UiMaterial for HandleMaterial {
     }
 }
 
+pub(in crate::editor) fn scale_cube_offsets(frame: Quat, toward_eye: Vec3, size: f32) -> [Vec3; 12] {
+    let eye = frame.inverse() * toward_eye;
+    let half = size * 0.06;
+    std::array::from_fn(|index| {
+        let face = index / 4;
+        let normal = AXES[face] * if eye[face] >= 0.0 { 1.0 } else { -1.0 };
+        let u = AXES[(face + 1) % 3];
+        let v = AXES[(face + 2) % 3];
+        let offset = [u + v, u - v, -u - v, -u + v][index % 4];
+        frame * (normal + offset) * half
+    })
+}
+
 pub(in crate::editor) struct HandlePlugin;
 
 impl Plugin for HandlePlugin {
@@ -82,10 +97,11 @@ pub(in crate::editor) fn spawn_overlay(
     commands: &mut Commands,
     materials: &mut Assets<HandleMaterial>,
     viewport: Entity,
-) -> Entity {
-    commands
+) -> (Entity, Handle<HandleMaterial>) {
+    let material = materials.add(HandleMaterial::default());
+    let entity = commands
         .spawn((
-            MaterialNode(materials.add(HandleMaterial::default())),
+            MaterialNode(material.clone()),
             Node {
                 position_type: PositionType::Absolute,
                 width: percent(100),
@@ -95,14 +111,15 @@ pub(in crate::editor) fn spawn_overlay(
             Pickable::IGNORE,
             ChildOf(viewport),
         ))
-        .id()
+        .id();
+    (entity, material)
 }
 
 fn sync(
     editor: Res<Editor>,
     pointer: Res<PointerState>,
     camera: Query<(&Camera, &Transform, &GlobalTransform), With<EditorCamera>>,
-    overlays: Query<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>,
+    overlays: Query<&MaterialNode<HandleMaterial>, (Without<ModelOverlay>, Without<ImageOverlay>)>,
     mut materials: ResMut<Assets<HandleMaterial>>,
 ) {
     for overlay in &overlays {
@@ -186,22 +203,14 @@ fn sync(
                 }
                 material.tips[axis] = Vec4::new(end.x, end.y, 1.0, 0.0);
                 if tool == Tool::Scale {
-                    let local_eye = frame.inverse() * (view.translation - center);
-                    let half = size * 0.06;
-                    for face in 0..3 {
-                        let normal = AXES[face] * if local_eye[face] >= 0.0 { 1.0 } else { -1.0 };
-                        let u = AXES[(face + 1) % 3];
-                        let v = AXES[(face + 2) % 3];
-                        for (corner, offset) in
-                            [u + v, u - v, -u - v, -u + v].into_iter().enumerate()
-                        {
-                            let position = center + frame * (normal + offset) * half;
-                            if let Ok(point) = camera.world_to_viewport(global, position) {
-                                material.faces[axis * 12 + face * 4 + corner] =
-                                    point.extend(0.0).extend(0.0);
-                            } else {
-                                material.tips[axis].z = 0.0;
-                            }
+                    for (corner, offset) in scale_cube_offsets(frame, view.translation - center, size)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if let Ok(point) = camera.world_to_viewport(global, center + offset) {
+                            material.faces[axis * 12 + corner] = point.extend(0.0).extend(0.0);
+                        } else {
+                            material.tips[axis].z = 0.0;
                         }
                     }
                 }
@@ -264,7 +273,7 @@ mod tests {
     fn handle_material(app: &mut App) -> HandleMaterial {
         let world = app.world_mut();
         let mut query =
-            world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
+            world.query_filtered::<&MaterialNode<HandleMaterial>, (Without<ModelOverlay>, Without<ImageOverlay>)>();
         let handle = query.single(world).unwrap().0.clone();
         world
             .resource::<Assets<HandleMaterial>>()
@@ -643,7 +652,7 @@ mod tests {
         let material = {
             let world = app.world_mut();
             let mut query =
-                world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
+                world.query_filtered::<&MaterialNode<HandleMaterial>, (Without<ModelOverlay>, Without<ImageOverlay>)>();
             let handle = query.single(world).unwrap().0.clone();
             world
                 .resource::<Assets<HandleMaterial>>()
@@ -751,7 +760,7 @@ mod tests {
         let scale_material = {
             let world = app.world_mut();
             let mut query =
-                world.query_filtered::<&MaterialNode<HandleMaterial>, Without<ModelOverlay>>();
+                world.query_filtered::<&MaterialNode<HandleMaterial>, (Without<ModelOverlay>, Without<ImageOverlay>)>();
             let handle = query.single(world).unwrap().0.clone();
             world
                 .resource::<Assets<HandleMaterial>>()

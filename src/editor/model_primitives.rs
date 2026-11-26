@@ -2,6 +2,17 @@
 use super::{model_document, model_mesh::Geometry};
 use bevy::{mesh::MeshBuilder, prelude::*};
 
+pub(crate) fn default_cube_material() -> serde_json::Value {
+    serde_json::json!({
+        "name": "Warm clay",
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0.85, 0.34, 0.075, 1.0],
+            "metallicFactor": 0.0,
+            "roughnessFactor": 0.7
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Primitive {
     Plane,

@@ -333,8 +333,9 @@ fn drag_extrusion(
     let start = *gesture.start.get_or_insert(cursor);
     let extrusion = gesture.extrusion.as_mut().unwrap();
     let delta = cursor - start;
+    let constraint = gesture.axis.map(|index| axis(doc, index, false));
     // Faces follow their normals. Vertices and edges follow the cursor in the view plane.
-    let free_offset = if gesture.base.selection.kind != Element::Face {
+    let free_offset = if constraint.is_none() && gesture.base.selection.kind != Element::Face {
         let pose = view_pose(viewer);
         let normal = *pose.forward();
         let pivot = extrusion.pivot;
@@ -386,6 +387,9 @@ fn drag_extrusion(
     };
     let mut distance = if delta.length_squared() < 4.0 {
         0.0
+    } else if let Some(direction) = constraint {
+        let motion = extrusion_motion(viewer, rect, extrusion.pivot, direction);
+        delta.dot(motion) / motion.length_squared()
     } else if let Some(offset) = free_offset {
         offset.length()
     } else {
@@ -398,15 +402,21 @@ fn drag_extrusion(
         let step = doc.amount.max(0.000001);
         distance = (distance / step).round() * step;
     }
-    let free_offset = free_offset.filter(|_| distance != 0.0).map(|offset| {
-        if snap {
-            offset.normalize_or_zero() * distance
-        } else {
-            offset
-        }
-    });
+    let offset = if let Some(direction) = constraint.filter(|_| distance != 0.0) {
+        let object = doc.active().ok_or("Нет активного объекта")?;
+        let inverse = object.transform.to_matrix().inverse();
+        Some(inverse.transform_vector3(direction * distance))
+    } else {
+        free_offset.filter(|_| distance != 0.0).map(|offset| {
+            if snap {
+                offset.normalize_or_zero() * distance
+            } else {
+                offset
+            }
+        })
+    };
     if !distance.is_finite()
-        || (distance == extrusion.distance && free_offset == extrusion.free_offset)
+        || (distance == extrusion.distance && offset == extrusion.free_offset)
     {
         return Ok(());
     }
@@ -421,7 +431,7 @@ fn drag_extrusion(
             object.geometry.discard_normals();
         }
         for &(vertex, origin, normal) in &extrusion.vertices {
-            let offset = free_offset.unwrap_or(normal * distance);
+            let offset = offset.unwrap_or(normal * distance);
             object.geometry.positions[vertex] = origin + offset;
         }
         doc.selection = selection;
@@ -429,7 +439,7 @@ fn drag_extrusion(
         doc.ui_revision += 1;
     }
     extrusion.distance = distance;
-    extrusion.free_offset = free_offset;
+    extrusion.free_offset = offset;
     Ok(())
 }
 
@@ -667,6 +677,12 @@ pub(in crate::editor) fn input(
         viewer.gesture = None;
     } else if extruding && let Some(mut gesture) = state.gesture.take() {
         let initial = gesture.start.is_none();
+        if let Some(axis) = [KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ]
+            .into_iter()
+            .position(|key| keys.just_pressed(key))
+        {
+            gesture.axis = (gesture.axis != Some(axis)).then_some(axis);
+        }
         if keys.just_pressed(KeyCode::Escape) || mouse.just_pressed(MouseButton::Right) {
             doc.restore(gesture.base);
             state.status.clear();
@@ -693,13 +709,14 @@ pub(in crate::editor) fn input(
             }
         } else {
             let extrusion = gesture.extrusion.as_ref().unwrap();
+            let axis = gesture.axis.map_or("X/Y/Z — ось", |axis| ["X", "Y", "Z"][axis]);
             let confirm = if gesture.drag {
                 "Отпустите ЛКМ"
             } else {
                 "ЛКМ или Enter"
             };
             state.status = format!(
-                "Экструдирование · {:.3} · {confirm} — применить · Esc — отменить",
+                "Экструдирование · {axis} · {:.3} · {confirm} — применить · Esc — отменить",
                 extrusion.distance
             );
             state.gesture = Some(gesture);
@@ -1176,20 +1193,7 @@ pub(in crate::editor) fn draw(
         let Some(rendered) = state.render_objects.get(&object.id) else {
             continue;
         };
-        if state.xray && !(doc.mode == Mode::Edit && doc.active == Some(object.id)) {
-            for e in rendered.edges.keys() {
-                overlay.line(
-                    object
-                        .transform
-                        .transform_point(object.geometry.positions[e.0]),
-                    object
-                        .transform
-                        .transform_point(object.geometry.positions[e.1]),
-                    gray,
-                );
-            }
-        }
-        if doc.mode == Mode::Edit && doc.active == Some(object.id) {
+        if !state.xray && doc.mode == Mode::Edit && doc.active == Some(object.id) {
             let chosen = doc.selection.selected_vertices(&object.geometry);
             for (e, faces) in rendered.edges.iter() {
                 let selected = selection::highlighted(&doc.selection, *e, faces);

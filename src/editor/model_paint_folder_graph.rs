@@ -703,6 +703,7 @@ pub(super) fn can_edit(stack: &Stack, graph: &Graph, edit: material_graph::Edit)
     };
     match edit {
         Edit::Batch(..) => true,
+        #[cfg(test)]
         Edit::Move(id, _) => graph.node(id).is_some(),
         Edit::Add(index, _) | Edit::AddConnected(index, _, _) => {
             graph.nodes.len() < 256

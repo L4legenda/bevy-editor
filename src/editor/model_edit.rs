@@ -326,6 +326,14 @@ impl State {
             EditAction::Element(kind) => doc.is_some_and(|d| d.selection.kind == kind),
             EditAction::Tool(tool) => !self.extrude_tool && self.tool == tool,
             EditAction::ExtrudeTool => self.extrude_tool && self.mode(index) == Mode::Edit,
+            EditAction::BeginBevel { vertices: false } => self
+                .gesture
+                .as_ref()
+                .is_some_and(input::Gesture::is_beveling),
+            EditAction::BeginLoopCut => self
+                .gesture
+                .as_ref()
+                .is_some_and(input::Gesture::is_loop_cutting),
             EditAction::SelectObject(id) => doc.is_some_and(|d| d.selected.contains(&id)),
             EditAction::Xray => self.xray,
             EditAction::Wireframe => doc.is_some_and(|d| d.paint_uv.show_wire_3d),
