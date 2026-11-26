@@ -170,6 +170,19 @@ struct Request {
     settings: Settings,
 }
 
+impl Request {
+    fn same_frame(&self, other: &Self) -> bool {
+        self.output == other.output
+            && self.geometry.key == other.geometry.key
+            && self.layers == other.layers
+            && self.hdr.0 == other.hdr.0
+            && self.camera == other.camera
+            && self.lighting == other.lighting
+            && self.grade == other.grade
+            && self.settings == other.settings
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pause {
     Stroke,
@@ -223,7 +236,7 @@ enum Report {
 }
 
 #[derive(Resource, Default)]
-struct Main {
+pub(in crate::editor::ui::model_viewer::paint) struct Main {
     display: Display,
     motion: CameraMotion,
     output: Option<(usize, UVec2, Handle<Image>)>,
@@ -235,6 +248,53 @@ struct Main {
     bypass_camera_pause: bool,
     #[cfg(test)]
     dispatches: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "mcp")]
+impl Main {
+    pub(in crate::editor::ui::model_viewer::paint) fn progress(
+        &self,
+        index: usize,
+        doc: &crate::editor::model_document::Document,
+        session: &super::super::Session,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        let settings = session.trace_settings;
+        let mut reason = None;
+        let (status, samples) = if !session.path_trace || doc.mode != Mode::Paint || session.diagnostic_3d() {
+            ("off", None)
+        } else if session.view == View::Two {
+            reason = Some("uv_only");
+            ("paused", None)
+        } else {
+            match &self.display {
+                Display::Paused(pause) if self.motion.previous.is_some_and(|stamp| stamp.model == index) => {
+                    reason = Some(match pause {
+                        Pause::Stroke => "stroke",
+                        Pause::Camera => "camera",
+                    });
+                    ("paused", None)
+                }
+                Display::Trace(request) if request.geometry.key == (index, doc.revision, session.set_appearance.visibility.revision)
+                    && (request.settings.samples, request.settings.bounces, request.settings.ground)
+                        == (settings.samples, settings.bounces, settings.ground) =>
+                {
+                    match *self.report.lock().unwrap() {
+                        Report::Shown(serial, count) if serial == request.serial => (
+                            if count >= settings.samples { "complete" } else { "rendering" },
+                            Some(count.min(settings.samples)),
+                        ),
+                        Report::Unavailable(serial) if serial == request.serial => ("unavailable", None),
+                        _ => ("preparing", None),
+                    }
+                }
+                _ => ("preparing", None),
+            }
+        };
+        json!({
+            "status": status, "reason": reason, "samples": samples, "target_samples": settings.samples,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -418,7 +478,7 @@ fn capture(
         let view = pose.to_matrix().inverse();
         let (lighting, _, curve) = env.trace_light(key_light.single().ok());
         let post = env.paint_post(Some(doc));
-        Some(Arc::new(Request {
+        let mut request = Request {
             serial: main.serial,
             output: main.output.as_ref()?.2.id(),
             size,
@@ -440,7 +500,15 @@ fn capture(
                 emission_strength: doc.paint_preview.emission_strength,
                 ..session.trace_settings
             },
-        }))
+        };
+        if let Display::Trace(previous) = &main.display
+            && previous.serial == request.serial
+            && !previous.same_frame(&request)
+        {
+            main.serial = main.serial.wrapping_add(1);
+            request.serial = main.serial;
+        }
+        Some(Arc::new(request))
     })();
     let next = if let Some(request) = request {
         Display::Trace(request)

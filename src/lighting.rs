@@ -416,6 +416,7 @@ pub(crate) fn valid_hdri_id(id: &str) -> bool {
 /// Built-in Poly Haven environments. The maps are distributed under CC0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
 pub enum EnvironmentPreset {
     SmallStudio,
     PhotoStudio,

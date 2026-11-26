@@ -100,7 +100,8 @@ impl Bridge {
     async fn request(&self, command: Command) -> Reply {
         let timeout = if matches!(
             command,
-            Command::PaintSave(_) | Command::PaintExport(_) | Command::PaintReplaceMesh(_) | Command::PaintImport(_)
+            Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_)
+                | Command::PaintExport(_) | Command::PaintReplaceMesh(_) | Command::PaintImport(_)
         ) {
             Duration::from_secs(300)
         } else {
@@ -266,7 +267,7 @@ fn process(
             } else {
                 model_editing.as_deref_mut().zip(paint.as_deref_mut())
                     .ok_or_else(|| "This editor has no model paint workspace".into())
-                    .and_then(|(editing, paint)| mcp_state::prepare_edit(&editor, editing, paint, args))
+                    .and_then(|(editing, paint)| mcp_state::prepare_edit(&editor, editing, paint, &paint_io.p2(), args))
             };
             match result {
                 Ok(work) => *pending_paint = Some(PendingPaintEdit { job, work }),
@@ -286,13 +287,18 @@ fn process(
             }
             continue;
         }
-        if matches!(job.command, Command::PaintSave(_) | Command::PaintExport(_)) {
+        if matches!(job.command, Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_)
+            | Command::PaintPresetExport(_) | Command::PaintExport(_))
+        {
             let reply: mcp_state::OutputReply = Box::new(move |result| {
                 let _ = job.reply.send(result.map(Payload::Json));
             });
-            if let Some((editing, paint)) = model_editing.as_deref_mut().zip(paint.as_deref()) {
+            if let Some((editing, paint)) = model_editing.as_deref_mut().zip(paint.as_deref_mut()) {
                 match job.command {
                     Command::PaintSave(args) => mcp_state::save_model(&mut paint_io.p1(), &mut editor, editing, paint, args, reply),
+                    Command::PaintPresetSave(args) => mcp_state::save_preset(&editor, editing, paint, args, reply),
+                    Command::PaintPresetImport(args) => mcp_state::import_preset(paint, args, reply),
+                    Command::PaintPresetExport(args) => mcp_state::export_preset(&editor, editing, paint, args, reply),
                     Command::PaintExport(args) => mcp_state::export_textures(&mut paint_io.p1(), &editor, editing, paint, args, reply),
                     _ => unreachable!(),
                 }
@@ -366,7 +372,7 @@ fn process(
         let result = if matches!(job.command, Command::PaintState) {
             model_editing.as_deref().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
-                .and_then(|(editing, paint)| mcp_state::state(&editor, editing, paint))
+                .and_then(|(editing, paint)| mcp_state::state(&editor, editing, paint, &paint_io.p3()))
         } else if let Command::PaintOpen(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
@@ -411,7 +417,7 @@ fn process(
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::set_view(&mut paint_io.p3(), &editor, editing, paint, args))
         } else if let Command::CagePreview(args) = job.command {
-            model_editing.as_deref().zip(paint.as_deref_mut())
+            model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::cage(&paint_io.p3(), &editor, editing, paint, args))
         } else if matches!(job.command, Command::Save) {
@@ -803,7 +809,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }
-        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
+        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
             Err("This operation requires the live editor".into())
         }
     }

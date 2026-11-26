@@ -118,7 +118,6 @@ impl Scene {
         progress: &Progress,
         batch: Option<&mut rays_gpu::ProjectBatch>,
     ) -> Result<Arc<[Texel]>, String> {
-        use super::super::super::engine::uv_weights;
         let scene = &self.geometry;
         let high = scene.projection.as_ref().zip(self.high_parts.as_ref());
         let mut gpu = batch
@@ -143,10 +142,12 @@ impl Scene {
         let extent = Vec2::splat(size as f32);
         let mut covered = vec![false; (size * size) as usize];
         let mut texels = Vec::new();
+        let pattern = aa::SamplePattern::new(1);
         for triangle in &self.triangles {
             progress.check()?;
             let geo = scene.geometric[triangle.face];
             let uv = triangle.uv.map(|uv| uv * extent);
+            let raster = raster::Triangle::new(triangle.face, triangle.vertices, uv, size);
             let points = triangle.vertices.map(|vertex| scene.positions[vertex]);
             let cage = scene
                 .cage
@@ -156,8 +157,9 @@ impl Scene {
                 .projection
                 .as_ref()
                 .and_then(|_| project::tangent_axes(points, uv))
-                .map(|axes| aa::ProjectTriangle {
-                    uv,
+                .zip(raster.barycentric)
+                .map(|(axes, barycentric)| aa::ProjectTriangle {
+                    barycentric,
                     points,
                     normals: triangle.normals,
                     geometric: geo,
@@ -171,27 +173,15 @@ impl Scene {
                     cage: cage.as_ref(),
                 });
             let width = two_texel_width(points, uv);
-            let lo = uv[0]
-                .min(uv[1])
-                .min(uv[2])
-                .floor()
-                .clamp(Vec2::ZERO, extent)
-                .as_uvec2();
-            let hi = uv[0]
-                .max(uv[1])
-                .max(uv[2])
-                .ceil()
-                .clamp(Vec2::ZERO, extent)
-                .as_uvec2();
-            for y in lo.y..hi.y {
+            for y in raster.lo.y..raster.hi.y {
                 progress.check()?;
-                for x in lo.x..hi.x {
+                for x in raster.lo.x..raster.hi.x {
                     let index = (y * size + x) as usize;
                     if covered[index] {
                         continue;
                     }
                     let center = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-                    let Some(w) = uv_weights(center, uv).filter(|w| w.min_element() >= -1e-5)
+                    let Some(w) = raster.weights(center)
                     else {
                         continue;
                     };
@@ -206,7 +196,7 @@ impl Scene {
                         } else {
                             frame
                                 .as_ref()
-                                .and_then(|frame| frame.sample(projection, center, w, 1))
+                                .and_then(|frame| frame.sample(projection, center, w, &pattern))
                                 .map(|sample| {
                                     RaySurface::projected(projection.scene(), parts, sample.center)
                                 })

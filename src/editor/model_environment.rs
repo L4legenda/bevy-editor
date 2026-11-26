@@ -164,7 +164,86 @@ impl Default for Settings {
     }
 }
 
+#[cfg(feature = "mcp")]
+#[derive(Clone, Debug, Deserialize, Serialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreviewPatch {
+    preset: Option<crate::EnvironmentPreset>,
+    /// 0–4 times the default studio lighting scale.
+    intensity: Option<f32>,
+    /// -180–180 degrees.
+    rotation_degrees: Option<f32>,
+    show_background: Option<bool>,
+    /// 0–1, from sharp to fully blurred.
+    background_blur: Option<f32>,
+    /// 0–2 times the default background brightness.
+    background_brightness: Option<f32>,
+    key_light: Option<bool>,
+    /// 0–8 times the default studio lighting scale.
+    key_intensity: Option<f32>,
+    /// -180–180 degrees relative to the environment rotation.
+    key_azimuth_degrees: Option<f32>,
+    /// 5–90 degrees above the horizon.
+    key_elevation_degrees: Option<f32>,
+}
+
+#[cfg(feature = "mcp")]
+impl PreviewPatch {
+    pub(super) fn resolve(&self, previous: &Settings) -> Result<Settings, String> {
+        let mut next = previous.clone();
+        if let Some(preset) = self.preset {
+            next.lighting.hdri = Some(preset);
+        }
+        next.lighting.hdri_background = self.show_background.unwrap_or(next.lighting.hdri_background);
+        next.key_enabled = self.key_light.unwrap_or(next.key_enabled);
+        for (name, field, value) in [
+            ("intensity", Setting::Intensity, self.intensity),
+            ("rotation_degrees", Setting::Rotation, self.rotation_degrees),
+            ("background_blur", Setting::Blur, self.background_blur),
+            ("background_brightness", Setting::BackgroundBrightness, self.background_brightness),
+            ("key_intensity", Setting::KeyIntensity, self.key_intensity),
+            ("key_azimuth_degrees", Setting::KeyAzimuth, self.key_azimuth_degrees),
+            ("key_elevation_degrees", Setting::KeyElevation, self.key_elevation_degrees),
+        ] {
+            if let Some(value) = value {
+                let (min, max) = field.range();
+                if !(min..=max).contains(&value) {
+                    return Err(format!("{name} must be between {min} and {max}"));
+                }
+                field.set(&mut next, value);
+            }
+        }
+        Ok(next)
+    }
+}
+
 impl Settings {
+    pub(super) fn save(&self, root: &std::path::Path) -> std::io::Result<()> {
+        let path = root.join(SETTINGS_FILE);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)?;
+        std::fs::rename(temporary, path)
+    }
+
+    #[cfg(feature = "mcp")]
+    pub(super) fn mcp_preview(&self) -> serde_json::Value {
+        serde_json::json!({
+            "preset": self.lighting.hdri,
+            "intensity": Setting::Intensity.value(self),
+            "rotation_degrees": Setting::Rotation.value(self),
+            "show_background": self.lighting.hdri_background,
+            "background_blur": self.blur,
+            "background_brightness": self.background_brightness,
+            "key_light": self.key_enabled,
+            "key_intensity": self.key_intensity,
+            "key_azimuth_degrees": self.key_azimuth,
+            "key_elevation_degrees": self.key_elevation,
+        })
+    }
+
     pub(super) fn paint_post(&self, doc: Option<&crate::editor::model_document::Document>) -> DocumentPost {
         doc.and_then(|doc| doc.paint_post).unwrap_or(DocumentPost {
             exposure: Setting::Exposure.value(self),
@@ -693,18 +772,8 @@ pub(super) fn actions(
             EnvironmentAction::Reset => *settings = Settings::default(),
         }
     }
-    if save {
-        let path = editor.project.asset_root.join(SETTINGS_FILE);
-        let result = (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            let bytes = serde_json::to_vec_pretty(&*settings)?;
-            let temporary = path.with_extension("json.tmp");
-            std::fs::write(&temporary, bytes)?;
-            std::fs::rename(temporary, path)
-        })();
-        if let Err(error) = result {
-            warn!("Не удалось сохранить настройки просмотра: {error}");
-        }
+    if save && let Err(error) = settings.save(&editor.project.asset_root) {
+        warn!("Не удалось сохранить настройки просмотра: {error}");
     }
 }
 

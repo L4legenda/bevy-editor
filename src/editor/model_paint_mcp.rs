@@ -50,10 +50,60 @@ pub(in crate::editor) struct SaveArgs {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct SavePresetArgs {
+    workspace: PaintWorkspace,
+    layer: usize,
+    kind: presets::CaptureKind,
+    /// Defaults to the existing layer or group name.
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct ImportPresetArgs {
+    /// Absolute path to a local .mpsmart file or a Material Painter ZIP package.
+    source: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+enum PresetFormat {
+    #[default]
+    Mpsmart,
+    Zip,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct ExportPresetArgs {
+    workspace: PaintWorkspace,
+    layer: usize,
+    /// Absolute folder or a path relative to the project's asset folder.
+    folder: PathBuf,
+    #[serde(default)]
+    format: PresetFormat,
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum Edit {
     SelectSet {
         index: usize,
+    },
+    UpdateTextureSet {
+        /// Index from texture_sets in get_paint_state.
+        index: usize,
+        /// Resize the active set in the background to 512, 1024, 2048 or 4096.
+        resolution: Option<u32>,
+        visible: Option<bool>,
+        /// Pin or clear the set's highlight in the viewport.
+        highlighted: Option<bool>,
     },
     SelectLayer {
         index: usize,
@@ -62,9 +112,13 @@ enum Edit {
     },
     AddLayer {
         kind: LayerKind,
+        name: Option<String>,
+        target: Option<MaterialTarget>,
     },
     AddMaterial {
         preset: String,
+        name: Option<String>,
+        target: Option<MaterialTarget>,
     },
     AddTexture {
         preset: String,
@@ -75,6 +129,17 @@ enum Edit {
         preset: String,
         name: Option<String>,
         target: Option<MaterialTarget>,
+    },
+    AddLocalMaterial {
+        /// Index of a material in local_presets from list_paint_presets.
+        preset: usize,
+        name: Option<String>,
+        target: Option<MaterialTarget>,
+    },
+    ApplyLocalMask {
+        /// Index of a mask in local_presets from list_paint_presets.
+        preset: usize,
+        layer: usize,
     },
     UpdateLayer {
         index: usize,
@@ -178,6 +243,14 @@ impl MaterialTarget {
             Placement::Above => ShelfPlacement::Above(self.layer),
             Placement::Below => ShelfPlacement::Below(self.layer),
             Placement::Inside => ShelfPlacement::Inside(self.layer),
+        }
+    }
+
+    fn insertion(session: &Session, target: Option<Self>) -> Result<(usize, usize), String> {
+        match target {
+            Some(target) => session.shelf_insertion(target.shelf())
+                .ok_or_else(|| "Unknown layer or invalid layer placement".into()),
+            None => Ok(session.insertion()),
         }
     }
 }
@@ -642,6 +715,7 @@ pub(in crate::editor) struct PaintEditData(Prepared);
 
 enum Prepared {
     Images(FillImages),
+    Mask { layer: usize, mask: Arc<Mask> },
     Material {
         preset: ShelfMaterial,
         insertion: (usize, usize),
@@ -656,6 +730,7 @@ struct EditTarget {
     binding: Option<(usize, usize)>,
     size: u32,
     stack: Stack,
+    document_revision: u64,
 }
 
 impl EditTarget {
@@ -666,6 +741,7 @@ impl EditTarget {
         Ok(Self {
             root: editor.project.asset_root.clone(), source: doc.source.path.clone(),
             binding: session.binding, size: session.texture_size, stack: session.stack.clone(),
+            document_revision: doc.revision,
         })
     }
 }
@@ -710,7 +786,8 @@ impl PaintEditJob {
 impl EditArgs {
     pub(in crate::editor) fn needs_preparation(&self) -> bool {
         match &self.edit {
-            Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. } => true,
+            Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. }
+            | Edit::AddLocalMaterial { .. } | Edit::ApplyLocalMask { .. } => true,
             Edit::UpdateLayer { fill: Some(fill), .. } => fill.images.as_ref().is_some_and(|images| !images.is_empty()),
             _ => false,
         }
@@ -722,9 +799,9 @@ impl EditArgs {
 }
 
 pub(in crate::editor) fn prepare_edit(
-    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState, args: &EditArgs,
+    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState, bake: &McpBake, args: &EditArgs,
 ) -> Result<PaintEditJob, String> {
-    let (_, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace())?;
+    let (model, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace())?;
     let target = EditTarget::capture(editor, doc, session)?;
     let task = match &args.edit {
         Edit::UpdateLayer { index, fill: Some(fill), .. } => {
@@ -744,12 +821,42 @@ pub(in crate::editor) fn prepare_edit(
         }
         Edit::AddTexture { preset, name, target } => {
             let index = tips::texture_index(preset).ok_or("Unknown texture preset; use list_paint_presets")?;
-            prepare_material(session, ShelfMaterial::Texture(index), name.as_deref(), *target)?
+            prepare_material(session, ShelfMaterial::Texture(index), name.as_deref(), *target,
+                move |_| tips::texture_layer(index))?
         }
         Edit::AddSmartMaterial { preset, name, target } => {
             let index = SMART_MATERIALS.iter().position(|item| item.name.eq_ignore_ascii_case(preset))
                 .ok_or("Unknown smart material; use list_paint_presets")?;
-            prepare_material(session, ShelfMaterial::Smart(index), name.as_deref(), *target)?
+            prepare_material(session, ShelfMaterial::Smart(index), name.as_deref(), *target,
+                move |size| SMART_MATERIALS[index].prepare(size))?
+        }
+        Edit::AddLocalMaterial { preset, name, target } => {
+            let entry = paint.library.entry(*preset).ok_or("Unknown local preset; use list_paint_presets")?;
+            if !matches!(entry.kind, presets::Kind::Material { .. }) {
+                return Err("The local preset is a mask".into());
+            }
+            let path = entry.path.clone();
+            let preparation = if presets::is_mpsmart(&path) {
+                bake.material_preparation(model, doc, session)
+            } else {
+                presets::MaterialPreparation::default()
+            };
+            prepare_material(session, ShelfMaterial::User(*preset), name.as_deref(), *target,
+                move |size| preparation.load(&path, size))?
+        }
+        Edit::ApplyLocalMask { preset, layer } => {
+            check_layer(session, *layer)?;
+            let entry = paint.library.entry(*preset).ok_or("Unknown local preset; use list_paint_presets")?;
+            if !matches!(entry.kind, presets::Kind::Mask(_)) {
+                return Err("The local preset is a material".into());
+            }
+            let path = entry.path.clone();
+            let size = session.texture_size;
+            let layer = *layer;
+            bevy::tasks::IoTaskPool::get().spawn(async move {
+                let mask = presets::load_mask(&path, size)?;
+                Ok(PaintEditData(Prepared::Mask { layer, mask }))
+            })
         }
         _ => return Err("This paint edit does not require background preparation".into()),
     };
@@ -758,24 +865,17 @@ pub(in crate::editor) fn prepare_edit(
 
 fn prepare_material(
     session: &Session, preset: ShelfMaterial, name: Option<&str>, target: Option<MaterialTarget>,
+    load: impl FnOnce(u32) -> Result<Vec<Layer>, String> + Send + 'static,
 ) -> Result<bevy::tasks::Task<Result<PaintEditData, String>>, String> {
     let name = name.map(Session::valid_layer_name).transpose()?.map(str::to_owned);
-    let insertion = if let Some(target) = target {
-        session.shelf_insertion(target.shelf()).ok_or("Unknown layer or invalid material placement")?
-    } else {
-        session.insertion()
-    };
+    let insertion = MaterialTarget::insertion(session, target)?;
     if !session.can_insert_material(preset, Some(insertion)) {
         return Err("The material would exceed the layer count or group depth limit".into());
     }
     let selection = target.is_none().then_some(session.stack.selected);
     let size = session.texture_size;
     Ok(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-        let mut layers = match preset {
-            ShelfMaterial::Texture(index) => tips::texture_layer(index)?,
-            ShelfMaterial::Smart(index) => SMART_MATERIALS[index].prepare(size)?,
-            _ => return Err("Unsupported material preset".into()),
-        };
+        let mut layers = load(size)?;
         let root = layers.last_mut().ok_or("The material preset has no layers")?;
         if let Some(name) = name {
             root.name = name;
@@ -980,6 +1080,7 @@ pub(in crate::editor) fn state(
     editor: &Editor,
     editing: &editing::State,
     paint: &PaintState,
+    preview: &McpPreview,
 ) -> Result<Value, String> {
     let index = model_index(editor)?;
     let doc = editing
@@ -987,12 +1088,88 @@ pub(in crate::editor) fn state(
         .get(&index)
         .ok_or_else(|| editing.errors.get(&index).cloned()
             .unwrap_or_else(|| "Wait for the model to load".into()))?;
-    Ok(snapshot(
-        index,
-        doc,
-        paint.sessions.get(&index),
-        &paint.tips,
-    ))
+    let session = paint.sessions.get(&index);
+    let mut response = snapshot(index, doc, session, &paint.tips);
+    if let Some(session) = session {
+        response["view"]["trace_progress"] = preview.trace_progress(index, doc, session);
+    }
+    Ok(response)
+}
+
+pub(in crate::editor) fn save_preset(
+    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState,
+    args: SavePresetArgs, reply: OutputReply,
+) {
+    let capture = capture_preset(editor, editing, paint, args.workspace, args.layer, args.kind, args.name.as_deref());
+    match capture {
+        Ok(capture) => paint.library.save_with_reply(capture, Box::new(move |result| {
+            reply(result.map(|(index, entry, omitted)| json!({
+                "index": index, "name": entry.name, "kind": args.kind, "omitted": omitted,
+            })));
+        })),
+        Err(error) => reply(Err(error)),
+    }
+}
+
+pub(in crate::editor) fn import_preset(paint: &mut PaintState, args: ImportPresetArgs, reply: OutputReply) {
+    if !args.source.is_absolute() {
+        reply(Err("Use an absolute path to a Material Painter preset or ZIP package".into()));
+        return;
+    }
+    paint.library.import_with_reply(args.source, Box::new(move |result| {
+        reply(result.map(|(index, entry, omitted)| json!({
+            "index": index, "name": entry.name, "kind": "material", "omitted": omitted,
+        })));
+    }));
+}
+
+pub(in crate::editor) fn export_preset(
+    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState,
+    args: ExportPresetArgs, reply: OutputReply,
+) {
+    let prepared = (|| -> Result<_, String> {
+        let folder = export::output_folder(&editor.project.asset_root, &args.folder)?;
+        let capture = capture_preset(
+            editor, editing, paint, args.workspace, args.layer, presets::CaptureKind::Material, args.name.as_deref(),
+        )?;
+        Ok((folder, capture))
+    })();
+    match prepared {
+        Ok((folder, capture)) => paint.library.export_with_reply(
+            capture, matches!(args.format, PresetFormat::Zip), folder, Box::new(move |result| {
+                reply(result.map(|file| json!({"path": file.path, "format": args.format,
+                    "omitted": file.omitted, "adjusted": file.adjusted})));
+            }),
+        ),
+        Err(error) => reply(Err(error)),
+    }
+}
+
+fn capture_preset(
+    editor: &Editor, editing: &mut editing::State, paint: &mut PaintState,
+    workspace: PaintWorkspace, layer: usize, kind: presets::CaptureKind, name: Option<&str>,
+) -> Result<presets::Capture, String> {
+    let (_, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, workspace)?;
+    if doc.paint_pending || session.smart_loading {
+        return Err("Wait for the current paint operation to finish".into());
+    }
+    let name = name.map(Session::valid_layer_name).transpose()?;
+    Ok(session.capture_shelf_preset(layer, kind, name)?)
+}
+
+#[cfg(test)]
+pub(in crate::editor) fn seed_local_presets(paint: &mut PaintState, directory: &Path) {
+    std::fs::create_dir_all(directory).unwrap();
+    let source = directory.join("source.mpsmart");
+    presets::mpsmart_graph_fixture(&source);
+    let (entry, _) = presets::import_material(&directory.join("shelf"), &source).unwrap();
+    paint.library.upsert(entry);
+    let mask = Arc::new(Mask::new(crate::editor::model_paint_data::solid(16, [96, 96, 96, 255]), Vec::new()));
+    let (entry, _) = presets::save(
+        &directory.join("shelf"), presets::Capture::Mask { name: "Local gray mask".into(), mask },
+    ).unwrap();
+    paint.library.upsert(entry);
+    paint.library.root = Some(directory.join("shelf"));
 }
 
 #[cfg(test)]
@@ -1024,6 +1201,11 @@ pub(in crate::editor) fn apply_prepared(
             {
                 return Err("The paint workspace changed during preparation; call get_paint_state again".into());
             }
+            if matches!(data.0, Prepared::Material { preset: ShelfMaterial::User(_), .. })
+                && target.document_revision != doc.revision
+            {
+                return Err("The model changed during material preparation; call get_paint_state again".into());
+            }
             Some(data.0)
         }
         None if args.needs_preparation() => return Err("This paint edit has not been prepared".into()),
@@ -1031,11 +1213,18 @@ pub(in crate::editor) fn apply_prepared(
     };
     match prepared {
         Some(Prepared::Images(images)) => perform(doc, session, args.edit, now, images)?,
+        Some(Prepared::Mask { layer, mask }) => {
+            session.apply_shelf_mask(mask, Some(layer));
+            doc.paint_pending = true;
+        }
         Some(Prepared::Material { preset, insertion, selection, layers }) => {
             if selection.is_some_and(|index| session.stack.selected != index)
                 || !session.can_insert_material(preset, Some(insertion))
             {
                 return Err("The material destination changed; call get_paint_state again".into());
+            }
+            if !session.can_insert_layers(&layers, insertion) {
+                return Err("The material would exceed the layer count or group depth limit".into());
             }
             session.insert_smart_material(layers, insertion);
             doc.paint_pending = true;
@@ -1219,6 +1408,9 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
                 return Err("Unknown texture set index".into());
             }
         }
+        Edit::UpdateTextureSet { index, resolution, visible, highlighted } => {
+            update_texture_set(doc, session, index, resolution, visible, highlighted)?;
+        }
         Edit::SelectLayer { index, mask } => {
             check_layer(session, index)?;
             let action = if mask {
@@ -1228,15 +1420,32 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             };
             apply_action(session, action)?;
         }
-        Edit::AddLayer { kind } => apply_action(session, PaintAction::Add(kind))?,
-        Edit::AddMaterial { preset } => {
+        Edit::AddLayer { kind, name, target } => {
+            let name = name.as_deref().map(Session::valid_layer_name).transpose()?;
+            let insertion = MaterialTarget::insertion(session, target)?;
+            if !session.can_insert_layer(insertion) {
+                return Err("The layer would exceed the layer count or group depth limit".into());
+            }
+            session.checkpoint();
+            session.insert_new_layer(kind, name, insertion);
+            session.revision += 1;
+        }
+        Edit::AddMaterial { preset, name, target } => {
             let index = MATERIALS
                 .iter()
                 .position(|material| material.name.eq_ignore_ascii_case(&preset))
                 .ok_or("Unknown material preset; use list_paint_presets")?;
-            apply_action(session, PaintAction::AddMaterial(index))?;
+            let name = name.as_deref().map(Session::valid_layer_name).transpose()?;
+            let insertion = MaterialTarget::insertion(session, target)?;
+            if !session.can_insert_material(ShelfMaterial::Basic(index), Some(insertion)) {
+                return Err("The material would exceed the layer count or group depth limit".into());
+            }
+            session.checkpoint();
+            session.insert_basic_material(index, name, insertion);
+            session.revision += 1;
         }
-        Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. } => {
+        Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. }
+        | Edit::AddLocalMaterial { .. } | Edit::ApplyLocalMask { .. } => {
             return Err("The material preset has not been prepared".into());
         }
         Edit::UpdateLayer {
@@ -1415,6 +1624,53 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
 
 fn mask_palette(mask: Option<&Mask>) -> &[[u8; 3]] {
     mask.and_then(|mask| mask.context.as_deref()).map_or(&[], |context| context.id_palette())
+}
+
+fn update_texture_set(
+    doc: &mut Document, session: &mut Session, index: usize, resolution: Option<u32>,
+    visible: Option<bool>, highlighted: Option<bool>,
+) -> Result<(), String> {
+    use crate::editor::model_paint_data::RESOLUTIONS;
+    let (object, slot) = doc.paint_target(index).ok_or("Unknown texture set index")?;
+    let key = (object.id, slot);
+    let visibility_change = if let Some(visible) = visible {
+        if visible && object.hidden {
+            return Err("Show the parent object before showing its texture set".into());
+        }
+        !object.hidden && visible != session.set_appearance.visibility.shown(key.0, key.1)
+    } else {
+        false
+    };
+    let resize = if let Some(size) = resolution {
+        if !RESOLUTIONS.contains(&size) {
+            return Err("Texture set resolution must be 512, 1024, 2048 or 4096".into());
+        }
+        if index != session.set || session.binding != Some(key) {
+            return Err("Select the requested texture set before resizing it".into());
+        }
+        (size != session.texture_size).then_some(PaintAction::Resolution(size))
+    } else {
+        None
+    };
+    if resize.is_some_and(|action| doc.paint_pending || session.smart_loading || !session.available(action)) {
+        return Err("Wait for the current paint operation to finish".into());
+    }
+    if visibility_change {
+        session.set_appearance.count(doc);
+        if !session.available(PaintAction::SetHide(key.0, key.1)) {
+            return Err("At least one texture set must remain visible".into());
+        }
+        session.edit(PaintAction::SetHide(key.0, key.1));
+        session.set_appearance.count(doc);
+    }
+    if highlighted.is_some_and(|highlighted| highlighted != session.set_appearance.pinned.contains(&key)) {
+        session.edit(PaintAction::SetPin(key.0, key.1));
+    }
+    if let Some(action) = resize {
+        session.edit(action);
+        session.mark_resize_pending(doc);
+    }
+    Ok(())
 }
 
 fn new_generator(doc: &Document, kind: GeneratorKind) -> Result<Generator, String> {
@@ -1666,7 +1922,13 @@ pub(in crate::editor) fn catalog(paint: &PaintState, export_presets: Vec<Value>)
         "materials": MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "smart_materials": SMART_MATERIALS.iter().map(|preset| preset.name).collect::<Vec<_>>(),
         "textures": tips::texture_names(),
-        "local_presets": paint.library.entries().map(|(index, entry)| json!({"index": index, "name": entry.name})).collect::<Vec<_>>(),
+        "local_presets": paint.library.entries().map(|(index, entry)| {
+            let kind = match entry.kind {
+                presets::Kind::Material { .. } => "material",
+                presets::Kind::Mask(_) => "mask",
+            };
+            json!({"index": index, "name": entry.name, "kind": kind})
+        }).collect::<Vec<_>>(),
         "generators": GeneratorKind::ALL.map(|kind| {
             let generator = Generator::new(kind);
             json!({"id": kind, "label": kind.label(), "controls": generator.controls().iter().enumerate()
@@ -1686,6 +1948,7 @@ pub(in crate::editor) fn catalog(paint: &PaintState, export_presets: Vec<Value>)
         "brush_projections": [BrushProjection::Screen, BrushProjection::Surface, BrushProjection::Uv],
         "brush_symmetry": [Symmetry::Off, Symmetry::X, Symmetry::Y, Symmetry::Z],
         "fill_modes": FillMode::OPTIONS.map(|(label, mode)| json!({"id": mode, "label": label})),
+        "texture_set_resolutions": crate::editor::model_paint_data::RESOLUTIONS,
         "fill_projections": texture_fill::Projection::ALL,
         "fill_opacity_sources": texture_fill::OpacitySource::ALL,
         "paint_tone_maps": crate::ToneMap::ALL,
@@ -1846,6 +2109,98 @@ mod tests {
         })), 0., Vec::new()).is_err());
         assert_eq!(session.stack, textured);
         assert!(session.undo.is_empty());
+    }
+
+    #[test]
+    fn texture_set_updates_validate_before_changing_the_session() {
+        let (mut doc, mut session) = fixture();
+        let edit = |doc: &mut Document, session: &mut Session, data| {
+            perform(doc, session, serde_json::from_value(data).unwrap(), 0., Vec::new())
+        };
+        let active = (7, 1);
+        let other = (7, 0);
+        for data in [
+            json!({"operation":"update_texture_set", "index":1, "visible":false, "highlighted":false, "resolution":512}),
+            json!({"operation":"update_texture_set", "index":0, "visible":true, "resolution":512}),
+            json!({"operation":"update_texture_set", "index":1, "resolution":123, "highlighted":false}),
+        ] {
+            assert!(edit(&mut doc, &mut session, data).is_err());
+        }
+        assert!(session.set_appearance.visibility.shown(active.0, active.1));
+        assert!(!session.set_appearance.visibility.shown(other.0, other.1));
+        assert!(session.set_appearance.pinned.contains(&active));
+        assert_eq!(session.resize_request, None);
+        assert!(!doc.paint_busy);
+
+        edit(&mut doc, &mut session, json!({"operation":"update_texture_set", "index":0, "visible":true})).unwrap();
+        edit(&mut doc, &mut session, json!({
+            "operation":"update_texture_set", "index":1, "visible":false, "highlighted":false, "resolution":512
+        })).unwrap();
+        assert!(session.set_appearance.visibility.shown(other.0, other.1));
+        assert!(!session.set_appearance.visibility.shown(active.0, active.1));
+        assert!(!session.set_appearance.pinned.contains(&active));
+        assert_eq!(session.resize_request, Some(512));
+        assert_eq!(session.texture_size, 2048);
+        assert!(doc.paint_busy && doc.paint_pending);
+        assert!(session.undo.is_empty());
+    }
+
+    #[test]
+    fn layer_creation_names_and_places_each_layer_in_one_history_step() {
+        let (mut doc, mut session) = fixture();
+        session.texture_size = 16;
+        let edit = |doc: &mut Document, session: &mut Session, data| {
+            perform(doc, session, serde_json::from_value(data).unwrap(), 0., Vec::new())
+        };
+        let initial = session.stack.clone();
+        for data in [
+            json!({"operation":"add_layer", "kind":"Paint", "name":" "}),
+            json!({"operation":"add_layer", "kind":"Folder", "target":{"layer":0,"placement":"inside"}}),
+            json!({"operation":"add_material", "preset":MATERIALS[0].name, "target":{"layer":99,"placement":"above"}}),
+        ] {
+            assert!(edit(&mut doc, &mut session, data).is_err());
+        }
+        assert_eq!(session.stack, initial);
+        assert!(session.undo.is_empty());
+        assert!(!doc.paint_pending);
+
+        edit(&mut doc, &mut session, json!({
+            "operation":"add_layer", "kind":"Folder", "name":" Details ",
+            "target":{"layer":1,"placement":"above"}
+        })).unwrap();
+        assert_eq!(session.stack.layers[2].name, "Details");
+        assert_eq!(session.stack.layers[2].depth, 0);
+        assert_eq!(session.undo.len(), 1);
+
+        edit(&mut doc, &mut session, json!({
+            "operation":"add_material", "preset":MATERIALS[0].name, "name":"Metal",
+            "target":{"layer":2,"placement":"inside"}
+        })).unwrap();
+        let metal = &session.stack.layers[2];
+        assert_eq!(metal.name, "Metal");
+        assert_eq!(metal.depth, 1);
+        assert_eq!(metal.channels, MATERIALS[0].layer(session.texture_size).channels);
+        assert_eq!(session.stack.selected, 2);
+        assert_eq!(session.undo.len(), 2);
+
+        edit(&mut doc, &mut session, json!({
+            "operation":"add_layer", "kind":"Paint", "name":"Highlights",
+            "target":{"layer":1,"placement":"below"}
+        })).unwrap();
+        assert_eq!(session.stack.layers[0].name, "Highlights");
+        assert_eq!(session.stack.layers[0].depth, 0);
+        assert_eq!(session.stack.layers[1].name, "Live paint");
+        assert_eq!(session.undo.len(), 3);
+        assert!(doc.paint_pending);
+        let after = session.stack.clone();
+        for _ in 0..3 {
+            edit(&mut doc, &mut session, json!({"operation":"undo"})).unwrap();
+        }
+        assert_eq!(session.stack, initial);
+        for _ in 0..3 {
+            edit(&mut doc, &mut session, json!({"operation":"redo"})).unwrap();
+        }
+        assert_eq!(session.stack, after);
     }
 
     #[test]

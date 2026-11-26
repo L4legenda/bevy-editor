@@ -20,6 +20,8 @@ mod image_output;
 mod mcp_output;
 #[cfg(feature = "mcp")]
 pub(in crate::editor) use mcp_output::{ExportArgs, McpOutput, OutputReply};
+#[cfg(feature = "mcp")]
+pub(super) use mcp_output::output_folder;
 #[path = "model_paint_export_mesh.rs"]
 mod mesh;
 #[path = "model_paint_export_prefs.rs"]

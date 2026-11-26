@@ -1,10 +1,10 @@
 //! Supersamples projected normals and height inside the same UV triangle.
 use super::project::{CageRay, CageTriangle, Hit, Projection, Query, tangent_normal};
-use crate::editor::ui::model_viewer::paint::engine::uv_weights;
+use crate::editor::model_mesh::UvBarycentric;
 use bevy::prelude::*;
 
 pub(super) struct ProjectTriangle<'a> {
-    pub uv: [Vec2; 3],
+    pub barycentric: UvBarycentric,
     pub points: [Vec3; 3],
     pub normals: [Vec3; 3],
     pub directions: [Vec3; 3],
@@ -72,15 +72,31 @@ impl Group {
     }
 }
 
-fn subpixels(uv: [Vec2; 3], pixel: Vec2, grid: u32) -> impl Iterator<Item = (Vec2, Vec3)> {
-    (0..grid).flat_map(move |y| {
-        (0..grid).filter_map(move |x| {
-            let offset = (Vec2::new(x as f32, y as f32) + 0.5) / grid as f32 - 0.5;
-            uv_weights(pixel + offset, uv)
-                .filter(|w| w.min_element() >= -1e-5)
-                .map(|w| (offset, w))
-        })
-    })
+#[derive(Clone, Copy)]
+struct Subpixel {
+    offset: Vec2,
+    distance: f32,
+}
+
+pub(super) struct SamplePattern {
+    grid: u32,
+    samples: Vec<Subpixel>,
+}
+
+impl SamplePattern {
+    pub fn new(grid: u32) -> Self {
+        let samples = (0..grid).flat_map(|y| {
+            (0..grid).map(move |x| {
+                let offset = (Vec2::new(x as f32, y as f32) + 0.5) / grid as f32 - 0.5;
+                Subpixel { offset, distance: offset.length_squared() }
+            })
+        }).collect();
+        Self { grid, samples }
+    }
+
+    pub fn max_probes(&self) -> usize {
+        self.samples.len() + usize::from(self.grid % 2 == 0)
+    }
 }
 
 impl ProjectTriangle<'_> {
@@ -112,25 +128,30 @@ impl ProjectTriangle<'_> {
         projector: &Projection,
         pixel: Vec2,
         weights: Vec3,
-        grid: u32,
+        pattern: &SamplePattern,
         probes: &mut Vec<Probe>,
     ) -> Group {
         let start = probes.len();
         probes.push(self.center_probe(projector, weights));
-        for (offset, weights) in
-            subpixels(self.uv, pixel, grid).filter(|(offset, _)| *offset != Vec2::ZERO)
-        {
+        for sample in &pattern.samples {
+            if sample.offset == Vec2::ZERO {
+                continue;
+            }
+            let weights = self.barycentric.at(pixel + sample.offset);
+            if !(weights.min_element() >= -1e-5) {
+                continue;
+            }
             let (point, direction, normal, cage) = self.ray(weights);
             probes.push(Probe {
                 query: projector.query(point, direction, normal, cage, false),
-                distance: offset.length_squared(),
+                distance: sample.distance,
             });
         }
         Group {
             start,
             end: probes.len(),
             axes: self.axes,
-            include_center: grid % 2 == 1,
+            include_center: pattern.grid % 2 == 1,
         }
     }
 
@@ -139,7 +160,7 @@ impl ProjectTriangle<'_> {
         projector: &Projection,
         pixel: Vec2,
         weights: Vec3,
-        grid: u32,
+        pattern: &SamplePattern,
     ) -> Option<Texel> {
         let (point, direction, normal, cage) = self.ray(weights);
         let single = |hit: Hit| Texel {
@@ -147,7 +168,7 @@ impl ProjectTriangle<'_> {
             height: hit.height,
             center: hit,
         };
-        if grid == 1 {
+        if pattern.grid == 1 {
             return projector.sample(point, direction, normal, cage).map(single);
         }
         let center = projector.direct(point, direction, cage);
@@ -156,9 +177,13 @@ impl ProjectTriangle<'_> {
         let mut sum = Vec3::ZERO;
         let mut height = 0.;
         let mut count = 0;
-        for (offset, w) in subpixels(self.uv, pixel, grid) {
-            let (sample_point, sample_direction, sample_normal, sample_cage) = self.ray(w);
-            let result = if offset == Vec2::ZERO {
+        for sample in &pattern.samples {
+            let weights = self.barycentric.at(pixel + sample.offset);
+            if !(weights.min_element() >= -1e-5) {
+                continue;
+            }
+            let (sample_point, sample_direction, sample_normal, sample_cage) = self.ray(weights);
+            let result = if sample.offset == Vec2::ZERO {
                 center
             } else {
                 projector.direct(sample_point, sample_direction, sample_cage)
@@ -167,7 +192,7 @@ impl ProjectTriangle<'_> {
                 sum += tangent_normal(hit.normal, sample_normal, self.axes);
                 height += hit.height;
                 count += 1;
-                let distance = offset.length_squared();
+                let distance = sample.distance;
                 if distance < nearest {
                     nearest = distance;
                     representative = Some(hit);

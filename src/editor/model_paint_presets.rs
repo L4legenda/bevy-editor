@@ -1,8 +1,9 @@
 //! Self-contained presets for reuse on a different mesh or in a different project.
 use super::{
     Blend, Filter, Generator, Layer, LayerKind, MAX_FILTERS, MAX_LAYER_DEPTH, MAX_LAYERS,
-    MAX_MASK_LAYERS, Mask, MaskLayer, material_graph, shelf_preview, texture_fill,
+    MAX_MASK_LAYERS, Mask, MaskLayer, bake, material_graph, shelf_preview, texture_fill,
 };
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 use crate::editor::model_paint_data::{CHANNEL_COUNT, mask::GraphMask, solid};
 use material_graph::file::package;
 use serde::{Deserialize, Serialize};
@@ -237,6 +238,19 @@ pub(super) enum Capture {
     Material { name: String, layers: Vec<Layer> },
     Mask { name: String, mask: Arc<Mask> },
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "mcp", derive(rmcp::schemars::JsonSchema), schemars(crate = "rmcp::schemars"))]
+pub(super) enum CaptureKind {
+    Material,
+    Mask,
+}
+
+#[cfg(feature = "mcp")]
+type WriteReply = Box<dyn FnOnce(Result<(usize, Entry, usize), String>) + Send + Sync>;
+#[cfg(feature = "mcp")]
+type ExportReply = Box<dyn FnOnce(Result<Export, String>) + Send + Sync>;
 
 pub(in crate::editor::ui::model_viewer) fn directory() -> Option<PathBuf> {
     #[cfg(test)]
@@ -516,6 +530,28 @@ pub(super) fn load_material(path: &Path, size: u32) -> Result<Vec<Layer>, String
         return Err("В файле сохранена маска".into());
     };
     build_layers(&rows, size, archive_images(&mut archive))
+}
+
+#[derive(Default)]
+pub(super) struct MaterialPreparation {
+    pub maps: Option<Arc<bake::Maps>>,
+    pub surface: Option<Arc<material_graph::surface::Source>>,
+    pub renderer: Option<(RenderDevice, RenderQueue)>,
+}
+
+impl MaterialPreparation {
+    pub fn load(self, path: &Path, size: u32) -> Result<Vec<Layer>, String> {
+        let mut layers = load_material(path, size)?;
+        if is_mpsmart(path) {
+            let inputs = material_graph::Inputs {
+                maps: self.maps.as_deref(),
+                surface: self.surface.as_deref(),
+            };
+            material_graph::prepare_imported(&mut layers, size, inputs,
+                self.renderer.as_ref().map(|(device, queue)| (device, queue)))?;
+        }
+        Ok(layers)
+    }
 }
 
 pub(super) fn load_mask(path: &Path, size: u32) -> Result<Arc<Mask>, String> {
@@ -806,6 +842,7 @@ pub(super) fn save(directory: &Path, capture: Capture) -> Result<(Entry, usize),
     Ok((result, skipped))
 }
 
+#[cfg_attr(feature = "mcp", derive(Clone))]
 pub(super) struct Export {
     pub path: PathBuf,
     pub omitted: usize,
@@ -1088,7 +1125,11 @@ pub(super) struct Library {
     initialized: bool,
     scan: Option<bevy::tasks::Task<Result<Vec<Entry>, String>>>,
     write: Option<bevy::tasks::Task<Result<Option<(Entry, usize)>, String>>>,
+    #[cfg(feature = "mcp")]
+    write_reply: Option<WriteReply>,
     export: Option<bevy::tasks::Task<Result<Option<Export>, String>>>,
+    #[cfg(feature = "mcp")]
+    export_reply: Option<ExportReply>,
     delete: Option<(usize, bevy::tasks::Task<Result<(), String>>)>,
 }
 
@@ -1131,6 +1172,14 @@ impl Library {
         Ok(())
     }
 
+    #[cfg(feature = "mcp")]
+    pub fn save_with_reply(&mut self, capture: Capture, reply: WriteReply) {
+        match self.start_save(capture) {
+            Ok(()) => self.write_reply = Some(reply),
+            Err(error) => reply(Err(error)),
+        }
+    }
+
     pub fn start_import(
         &mut self,
         choose: impl FnOnce() -> Result<Option<PathBuf>, String> + Send + 'static,
@@ -1146,6 +1195,14 @@ impl Library {
                 .transpose()
         }));
         Ok(())
+    }
+
+    #[cfg(feature = "mcp")]
+    pub fn import_with_reply(&mut self, path: PathBuf, reply: WriteReply) {
+        match self.start_import(move || Ok(Some(path))) {
+            Ok(()) => self.write_reply = Some(reply),
+            Err(error) => reply(Err(error)),
+        }
     }
 
     pub fn start_export(
@@ -1171,6 +1228,14 @@ impl Library {
         Ok(())
     }
 
+    #[cfg(feature = "mcp")]
+    pub fn export_with_reply(&mut self, capture: Capture, package: bool, folder: PathBuf, reply: ExportReply) {
+        match self.start_export(capture, package, move || Ok(Some(folder))) {
+            Ok(()) => self.export_reply = Some(reply),
+            Err(error) => reply(Err(error)),
+        }
+    }
+
     pub fn poll_export(&mut self) -> Option<Result<Export, String>> {
         use bevy::tasks::{block_on, poll_once};
         let result = self
@@ -1178,7 +1243,12 @@ impl Library {
             .as_mut()
             .and_then(|job| block_on(poll_once(job)))?;
         self.export = None;
-        result.transpose()
+        let result = result.transpose();
+        #[cfg(feature = "mcp")]
+        if let Some(reply) = self.export_reply.take() {
+            reply(result.clone().unwrap_or_else(|| Err("The preset export was cancelled".into())));
+        }
+        result
     }
 
     pub fn start_delete(&mut self, index: usize) -> Result<(), String> {
@@ -1236,22 +1306,45 @@ impl Library {
         self.write = None;
         match result {
             Ok(Some((entry, omitted))) => {
-                self.upsert(entry.clone());
+                let _index = self.upsert(entry.clone());
+                #[cfg(feature = "mcp")]
+                if let Some(reply) = self.write_reply.take() {
+                    reply(Ok((_index, entry.clone(), omitted)));
+                }
                 Some(Ok((entry, omitted)))
             }
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
+            Ok(None) => {
+                #[cfg(feature = "mcp")]
+                if let Some(reply) = self.write_reply.take() {
+                    reply(Err("The preset operation was cancelled".into()));
+                }
+                None
+            }
+            Err(error) => {
+                #[cfg(feature = "mcp")]
+                if let Some(reply) = self.write_reply.take() {
+                    reply(Err(error.clone()));
+                }
+                Some(Err(error))
+            }
         }
     }
 
-    pub(super) fn upsert(&mut self, entry: Entry) {
+    pub(super) fn upsert(&mut self, entry: Entry) -> usize {
         // Keep indices stable for controls and drag payloads during asynchronous refresh.
-        if let Some(old) = self.entries.iter_mut().filter_map(Option::as_mut).find(|old| old.path == entry.path) {
+        let index = if let Some((index, old)) = self.entries.iter_mut().enumerate()
+            .filter_map(|(index, entry)| entry.as_mut().map(|entry| (index, entry)))
+            .find(|(_, old)| old.path == entry.path)
+        {
             *old = entry;
+            index
         } else {
+            let index = self.entries.len();
             self.entries.push(Some(entry));
-        }
+            index
+        };
         self.revision += 1;
+        index
     }
 }
 

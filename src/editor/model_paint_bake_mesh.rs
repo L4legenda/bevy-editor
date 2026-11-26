@@ -794,6 +794,7 @@ struct ProjectionPass<'a> {
     rays: &'a Rays<'a>,
     custom: &'a [custom::Prepared],
     bounds: Bounds,
+    pattern: aa::SamplePattern,
     batches: Option<rays_gpu::ProjectBatch>,
     work: ProjectionWork,
     pending: VecDeque<(rays_gpu::ProjectionReadback, ProjectionWork)>,
@@ -1175,6 +1176,7 @@ pub(super) fn bake_on_device(
     let mut projected_pass = projection.as_ref().zip(source_relief.as_ref()).zip(high_rays.as_ref())
         .map(|((projector, relief), rays)| ProjectionPass {
             projector, relief, rays, bounds, custom: &custom,
+            pattern: aa::SamplePattern::new(sampling.grid),
             batches: batch.as_ref().and_then(rays_gpu::Batch::project_batch),
             work: ProjectionWork::default(),
             pending: VecDeque::new(), spare: Vec::new(), hits: Vec::new(),
@@ -1254,8 +1256,8 @@ pub(super) fn bake_on_device(
         let axes = projection
             .as_ref()
             .and_then(|_| project::tangent_axes(points, uv));
-        let projection_frame = axes.map(|axes| aa::ProjectTriangle {
-            uv,
+        let projection_frame = axes.zip(triangle.barycentric).map(|(axes, barycentric)| aa::ProjectTriangle {
+            barycentric,
             points,
             normals,
             directions,
@@ -1307,13 +1309,13 @@ pub(super) fn bake_on_device(
                 if let Some(frame) = &projection_frame
                     && let Some(gpu) = &pass.batches
                 {
-                    if pass.work.probes.len() + (sampling.grid * sampling.grid + 1) as usize > gpu.capacity {
+                    if pass.work.probes.len() + pass.pattern.max_probes() > gpu.capacity {
                         pass.submit(&mut maps, &mut guides, &mut batch, progress)?;
                     }
-                    let group = frame.enqueue(pass.projector, center, w, sampling.grid, &mut pass.work.probes);
+                    let group = frame.enqueue(pass.projector, center, w, &pass.pattern, &mut pass.work.probes);
                     pass.work.pixels.push((item, group));
                 } else {
-                    let result = projection_frame.as_ref().and_then(|frame| frame.sample(pass.projector, center, w, sampling.grid));
+                    let result = projection_frame.as_ref().and_then(|frame| frame.sample(pass.projector, center, w, &pass.pattern));
                     pass.write(&item, result, &mut maps, &mut guides, &mut batch, progress)?;
                 }
                 maps.covered[pixel] = 1;
@@ -1632,6 +1634,11 @@ mod tests {
         assert!(!output.has_map(BakeMap::ProjectedNormal));
         assert!(output.projected_tangent_normals().is_none());
         assert_eq!(&output.projection.as_ref().unwrap()[8 * 16 + 8][..3], &[128, 128, 255]);
+        let back_faces = std::fs::read_to_string(&path).unwrap().replace("f 1 2 3 4", "f 4 3 2 1");
+        std::fs::write(&path, back_faces).unwrap();
+        let (fallback_hits, fallback_height) = compare(&settings);
+        assert_eq!(fallback_hits, hits);
+        assert_eq!(fallback_height, lid);
         let unaveraged = ProjectionSettings { average_normals: false, ..settings };
         assert_eq!(compare(&unaveraged).0, 0);
         let probe = probe::build(vec![low], 0, 0, &unaveraged, &progress).unwrap();
@@ -2219,6 +2226,28 @@ mod tests {
         assert!(plain.summary().contains("промахи 100%"));
         assert_ne!(plain.summary(), edited.summary());
         assert!(edited.points.iter().any(|point| point.y > 0.1));
+    }
+
+    #[test]
+    fn baked_cage_probe_draws_low_poly_shell_without_coverage() {
+        let settings = ProjectionSettings { front: 10, ..default() };
+        let progress = Progress::default();
+        let prepared = probe::prepare(vec![quad(0, 0.)], 0, &settings, &progress).unwrap();
+        let shell = prepared.sample(0, &settings, &progress).unwrap();
+        assert!(!shell.has_source);
+        assert_eq!(shell.indices.len(), 6);
+        let expected = 2_f32.sqrt() * 0.1;
+        assert!(shell.points.iter().all(|point| (point.y - expected).abs() < 1e-5));
+
+        let painted = ProjectionSettings {
+            manual: Some(super::super::cage_brush::Scales {
+                values: Arc::new(vec![2., 1., 1., 1.]),
+            }),
+            ..settings
+        };
+        let shell = prepared.sample(0, &painted, &progress).unwrap();
+        let corner = shell.points.iter().find(|point| point.x == 0. && point.z == 0.).unwrap();
+        assert!((corner.y - expected * 2.).abs() < 1e-5);
     }
 
     #[test]

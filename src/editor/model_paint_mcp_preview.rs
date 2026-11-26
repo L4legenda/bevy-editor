@@ -1,6 +1,6 @@
 //! MCP controls the current model viewport and reads its composed GPU image.
 use super::*;
-use crate::editor::model_document::{ModelCamera, PaintPreview, PaintUv};
+use crate::editor::model_document::{Document, ModelCamera, PaintPreview, PaintUv};
 use bevy::{
     ecs::system::SystemParam,
     render::{
@@ -31,15 +31,49 @@ pub(in crate::editor) struct ViewArgs {
     layout: Option<View>,
     preview: Option<MapPreview>,
     path_trace: Option<bool>,
+    /// Sampling and ground settings for the live path-traced viewport.
+    trace_settings: Option<TracePatch>,
     /// Show the model's 3D wireframe in the raster viewport.
     wireframe: Option<bool>,
     uv_overlay: Option<UvOverlayPatch>,
     material: Option<MaterialPreviewPatch>,
+    /// Edit the same shared model preview environment as the editor's lighting panel.
+    environment: Option<environment::PreviewPatch>,
     exposure_stops: Option<f32>,
     post: Option<PostPatch>,
     /// Remove the model's local grading override and start from the environment settings.
     #[serde(default)]
     reset_post: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct TracePatch {
+    /// Maximum samples per pixel, 16–4096.
+    samples: Option<u32>,
+    /// Maximum light bounces, 1–16.
+    bounces: Option<u32>,
+    /// Show the ground plane and its shadows.
+    ground: Option<bool>,
+}
+
+impl TracePatch {
+    fn resolve(&self, mut settings: pathtrace::Settings) -> Result<pathtrace::Settings, String> {
+        for (name, new, current, range) in [
+            ("samples", self.samples, &mut settings.samples, pathtrace::Settings::SAMPLE_RANGE),
+            ("bounces", self.bounces, &mut settings.bounces, pathtrace::Settings::BOUNCE_RANGE),
+        ] {
+            if let Some(value) = new {
+                if !range.contains(&value) {
+                    return Err(format!("{name} must be between {} and {}", range.start(), range.end()));
+                }
+                *current = value;
+            }
+        }
+        settings.ground = self.ground.unwrap_or(settings.ground);
+        Ok(settings)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -181,8 +215,16 @@ enum MapPreview {
 #[serde(deny_unknown_fields)]
 pub(in crate::editor) struct CageArgs {
     model_id: usize,
-    /// Omit to get the current report without changing the preview.
-    pub(in crate::editor) show: Option<bool>,
+    /// Defaults to showing the preview when changing projection settings.
+    show: Option<bool>,
+    /// Update projection settings without starting a texture bake.
+    projection: Option<bake::ProjectionPatch>,
+}
+
+impl CageArgs {
+    pub(in crate::editor) fn mutates(&self) -> bool {
+        self.show.is_some() || self.projection.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -196,8 +238,20 @@ pub(in crate::editor) struct CaptureArgs {
 pub(in crate::editor) struct McpPreview<'w> {
     viewer: Option<ResMut<'w, Viewer>>,
     cage: Option<Res<'w, bake::cage_preview::State>>,
-    env: Option<Res<'w, environment::Settings>>,
+    bake: Option<Res<'w, bake::State>>,
+    env: Option<ResMut<'w, environment::Settings>>,
     runtime: Option<Res<'w, engine::Runtime>>,
+    trace: Option<Res<'w, pathtrace::viewport::Main>>,
+}
+
+impl McpPreview<'_> {
+    pub(super) fn trace_progress(&self, index: usize, doc: &Document, session: &Session) -> Value {
+        self.trace.as_deref().map_or_else(
+            || json!({"status": "unavailable", "reason": null, "samples": null,
+                "target_samples": session.trace_settings.samples}),
+            |trace| trace.progress(index, doc, session),
+        )
+    }
 }
 
 fn active_model(editor: &Editor, model: usize) -> Result<usize, String> {
@@ -248,6 +302,7 @@ pub(in crate::editor) fn set_view(
     let camera = camera_patch(previous, &args)?;
     let uv = args.overlay_patch(doc.paint_uv)?;
     let material = args.material_patch(doc.paint_preview)?;
+    let trace = args.trace_settings.as_ref().map(|patch| patch.resolve(session.trace_settings)).transpose()?;
     if (uv, material) != (doc.paint_uv, doc.paint_preview) && !doc.can_store_paint_preview() {
         return Err("This model cannot store the requested preview settings".into());
     }
@@ -264,8 +319,10 @@ pub(in crate::editor) fn set_view(
         .env
         .as_deref()
         .ok_or("Model environment settings are unavailable")?;
-    let inherited = args.reset_post.then(|| env.paint_post(None));
-    let mut post = inherited.unwrap_or_else(|| env.paint_post(Some(doc)));
+    let next_env = args.environment.as_ref().map(|patch| patch.resolve(env)).transpose()?;
+    let effective_env = next_env.as_ref().unwrap_or(env);
+    let inherited = args.reset_post.then(|| effective_env.paint_post(None));
+    let mut post = inherited.unwrap_or_else(|| effective_env.paint_post(Some(doc)));
     let effects = args.post.as_ref().filter(|patch| **patch != PostPatch::default());
     if let Some(effects) = effects {
         effects.apply(&mut post.effects)?;
@@ -287,6 +344,13 @@ pub(in crate::editor) fn set_view(
     if next_post != doc.paint_post && (!doc.can_store_paint_preview() || !post.valid()) {
         return Err("This model cannot store the requested preview grading".into());
     }
+    let environment = effective_env.mcp_preview();
+    let tone_map = post.effects.curve.unwrap_or_else(|| effective_env.trace_light(None).2);
+    if let Some(next_env) = next_env.filter(|next| next != env) {
+        next_env.save(&editor.project.asset_root)
+            .map_err(|error| format!("Could not save the model preview environment: {error}"))?;
+        *input.env.as_deref_mut().unwrap() = next_env;
+    }
     if previous != camera {
         viewer.restore_camera(camera);
         doc.model_camera = Some(camera);
@@ -300,6 +364,13 @@ pub(in crate::editor) fn set_view(
     if let Some(layout) = args.layout.filter(|&layout| layout != session.view) {
         session.edit(PaintAction::View(layout));
     }
+    if let Some(trace) = trace
+        && (trace.samples, trace.bounces, trace.ground)
+            != (session.trace_settings.samples, session.trace_settings.bounces, session.trace_settings.ground)
+    {
+        session.trace_settings = trace;
+        session.revision += 1;
+    }
     if let Some(path_trace) = args
         .path_trace
         .filter(|&enable| enable != session.path_trace)
@@ -310,8 +381,10 @@ pub(in crate::editor) fn set_view(
     if let Some(mode) = preview {
         session.edit(PaintAction::Preview3d(mode));
     }
+    let trace = session.trace_settings;
     Ok(
         json!({"model_id": model, "layout": session.view, "path_trace": session.path_trace,
+        "trace_settings": {"samples": trace.samples, "bounces": trace.bounces, "ground": trace.ground},
         "exposure_stops": post.exposure, "camera": {"center": camera.center, "distance": camera.distance,
         "yaw_degrees": camera.yaw.to_degrees(), "pitch_degrees": camera.pitch.to_degrees(),
         "fov_degrees": camera.fov.to_degrees(), "orthographic": camera.orthographic},
@@ -320,8 +393,9 @@ pub(in crate::editor) fn set_view(
         "wireframe": uv.show_wire_3d, "uv_overlay": {"show_wire": uv.show_wire,
             "wire_opacity": uv.wire_opacity, "show_seams_2d": uv.show_seams_2d, "show_seams_3d": uv.show_seams_3d},
         "material": material,
+        "environment": environment,
         "post": {"overridden": doc.paint_post.is_some(), "effects": post.effects,
-            "tone_map": post.effects.curve.unwrap_or_else(|| env.trace_light(None).2)}}),
+            "tone_map": tone_map}}),
     )
 }
 
@@ -383,14 +457,14 @@ fn preview_mode(preview: &MapPreview) -> Result<Preview3d, String> {
 pub(in crate::editor) fn cage(
     input: &McpPreview,
     editor: &Editor,
-    editing: &editing::State,
+    editing: &mut editing::State,
     paint: &mut PaintState,
     args: CageArgs,
 ) -> Result<Value, String> {
     let model = active_model(editor, args.model_id)?;
     let doc = editing
         .documents
-        .get(&model)
+        .get_mut(&model)
         .filter(|doc| doc.mode == Mode::Paint)
         .ok_or("Switch the model to Painting mode first")?;
     let session = paint
@@ -404,8 +478,8 @@ pub(in crate::editor) fn cage(
     let binding = session
         .binding
         .ok_or("Wait for the active texture set to load")?;
-    if args.show.is_some()
-        && (doc.paint_busy
+    if args.mutates()
+        && (doc.paint_busy || doc.paint_pending || session.busy || session.resize_request.is_some()
             || input
                 .runtime
                 .as_deref()
@@ -413,42 +487,46 @@ pub(in crate::editor) fn cage(
     {
         return Err("Finish the current paint operation first".into());
     }
-    if args.show == Some(true) {
-        if !session.available(PaintAction::BakeInspectCage)
-            || !doc
-                .objects
-                .iter()
-                .any(|object| object.id == binding.0 && !object.hidden)
-            || !session
-                .set_appearance
-                .visibility
-                .shown(binding.0, binding.1)
-        {
-            return Err("Cage preview needs a high-poly source and a visible texture set".into());
+    let settings = if let Some(patch) = &args.projection {
+        if input.bake.as_deref().is_some_and(bake::State::configuration_busy) {
+            return Err("Wait for the current bake operation to finish".into());
         }
+        Some(patch.resolve(&editor.project.asset_root, &doc.bake_settings)?)
+    } else {
+        None
+    };
+    let show = args.show.or_else(|| settings.as_ref().map(|_| true));
+    let set_visible = session.set_appearance.visibility.shown(binding.0, binding.1)
+        && doc.objects.iter().any(|object| object.id == binding.0 && !object.hidden);
+    if show == Some(true) && !set_visible {
+        return Err("Cage preview needs a visible texture set".into());
+    }
+    if let Some(settings) = settings {
+        bake::apply_settings(doc, session, settings);
+    }
+    if show == Some(true) {
         if session.panel != Panel::Maps {
             session.edit(PaintAction::Panel(Panel::Maps));
         }
         if !session.bake_inspect_cage || session.view == View::Two {
             session.set_cage_inspection(true);
         }
-    } else if args.show == Some(false) && session.bake_inspect_cage {
+    } else if show == Some(false) && session.bake_inspect_cage {
         session.set_cage_inspection(false);
     }
     let visible = session.bake_inspect_cage
         && session.panel == Panel::Maps
         && session.view != View::Two
-        && session.bake_projection.path.is_some()
-        && session
-            .set_appearance
-            .visibility
-            .shown(binding.0, binding.1);
+        && set_visible;
     let report = if visible {
         state.report(model, doc, binding, session.cage_edit_version)
     } else {
         json!({"status": "hidden"})
     };
-    Ok(json!({"model_id": model, "set": session.set, "visible": visible, "report": report}))
+    Ok(json!({
+        "model_id": model, "set": session.set, "visible": visible, "report": report,
+        "settings": doc.bake_settings,
+    }))
 }
 
 pub(in crate::editor) type CaptureReply =

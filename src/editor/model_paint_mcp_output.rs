@@ -231,7 +231,7 @@ fn load_template(path: &Path, name: Option<&str>) -> Result<recipe::Recipe, Stri
     Ok(recipes.next().unwrap())
 }
 
-fn output_folder(root: &Path, path: &Path) -> Result<PathBuf, String> {
+pub(in crate::editor::ui::model_viewer::paint) fn output_folder(root: &Path, path: &Path) -> Result<PathBuf, String> {
     if path.as_os_str().is_empty() {
         return Err("Specify the destination folder".into());
     }

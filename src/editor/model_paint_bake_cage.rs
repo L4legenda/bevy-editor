@@ -131,7 +131,22 @@ impl Cage {
         Self::from_offsets(offsets, Some(scales))
     }
 
-    pub(super) fn painted(
+    pub(in crate::editor::ui::model_viewer::paint::bake::mesh) fn apply_paint(
+        base: Option<&Self>,
+        directions: &[Vec3],
+        overrides: &[f32],
+        [front, rear]: [f32; 2],
+        span: f32,
+        progress: &Progress,
+    ) -> Result<Option<Self>, String> {
+        if directions.len() != overrides.len() || overrides.iter().all(|&value| value == 1.) {
+            return Ok(None);
+        }
+        let limit = (span / front.max(rear)).min(8.);
+        Self::painted(base, directions, overrides, front, limit, progress).map(Some)
+    }
+
+    fn painted(
         base: Option<&Self>,
         directions: &[Vec3],
         overrides: &[f32],

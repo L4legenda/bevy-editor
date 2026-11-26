@@ -16,6 +16,7 @@ pub(in crate::editor::ui::model_viewer::paint) struct Diagnostic {
     pub edges: Vec<(usize, usize)>,
     counts: [usize; 4],
     pub sampled: bool,
+    pub has_source: bool,
 }
 
 impl Diagnostic {
@@ -25,6 +26,9 @@ impl Diagnostic {
     }
 
     pub fn summary(&self) -> String {
+        if !self.has_source {
+            return "Оболочка low-poly · выберите high-poly для проверки попаданий".into();
+        }
         let percent =
             |index: usize| self.counts[index] as f32 * 100. / self.points.len().max(1) as f32;
         format!(
@@ -56,8 +60,7 @@ pub(super) fn build(
 pub(in crate::editor::ui::model_viewer::paint::bake) struct Prepared {
     object: Object,
     span: f32,
-    projector: project::Projection,
-    parts: Vec<usize>,
+    source: Option<(project::Projection, Vec<usize>)>,
     positions: Vec<Vec3>,
     directions: Vec<Vec3>,
     corner_normals: Option<Vec<Vec<Vec3>>>,
@@ -74,7 +77,6 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         .iter()
         .find(|object| object.id == target && !object.hidden)
         .ok_or("Объект скрыт")?;
-    let path = settings.path.as_deref().ok_or("Выберите high-poly")?;
     let mut bounds = Bounds::default();
     for object in objects.iter().filter(|object| !object.hidden) {
         for face in &object.geometry.faces {
@@ -89,8 +91,6 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         }
     }
     let span = (bounds.max - bounds.min).length().max(1e-5);
-    let projector = project::Projection::load(path, &object.name, span, settings, progress)?;
-    let parts = projector.connected_parts(progress)?;
     let mesh = &object.geometry;
     let positions: Vec<_> = mesh
         .positions
@@ -101,24 +101,25 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         .then(|| mesh_normals(object, progress).map(|(_, normals)| normals))
         .transpose()?;
     let directions = projection_directions(
-        object, &positions, settings.cage.is_none(), corner_normals.as_deref(), progress,
+        object, &positions, settings.path.is_none() || settings.cage.is_none(),
+        corner_normals.as_deref(), progress,
     )?;
     let mut baseline = settings.clone();
     baseline.manual = None;
-    let (cage, _) = projection_cage(
-        &projector,
-        object,
-        &positions,
-        &directions,
-        span,
-        &baseline,
-        progress,
-    )?;
+    let (source, cage) = if let Some(path) = settings.path.as_deref() {
+        let projector = project::Projection::load(path, &object.name, span, settings, progress)?;
+        let parts = projector.connected_parts(progress)?;
+        let (cage, _) = projection_cage(
+            &projector, object, &positions, &directions, span, &baseline, progress,
+        )?;
+        (Some((projector, parts)), cage)
+    } else {
+        (None, None)
+    };
     Ok(Prepared {
         object: object.clone(),
         span,
-        projector,
-        parts,
+        source,
         positions,
         directions,
         corner_normals,
@@ -136,20 +137,20 @@ impl Prepared {
         let Self {
             object,
             span,
-            projector,
-            parts,
+            source,
             positions,
             directions,
             corner_normals,
             cage,
         } = self;
         let span = *span;
+        let distances = [settings.front, settings.rear].map(|percent| span * f32::from(percent) / 100.);
         let painted = settings
             .manual
             .as_ref()
-            .filter(|_| settings.cage.is_none())
+            .filter(|_| source.is_none() || settings.cage.is_none())
             .map(|manual| {
-                projector.paint_cage(cage.as_ref(), directions, &manual.values, span, progress)
+                project::Cage::apply_paint(cage.as_ref(), directions, &manual.values, distances, span, progress)
             })
             .transpose()?
             .flatten();
@@ -173,10 +174,12 @@ impl Prepared {
             Color::srgb(1., 0.73, 0.22),
             Color::srgb(1., 0.26, 0.31),
             Color::srgb(0.89, 0.38, 0.91),
+            Color::srgb(0.50, 0.77, 0.97),
         ]
         .map(|color| color.to_linear().to_f32_array());
         let mut output = Diagnostic {
             sampled: stride > 1,
+            has_source: source.is_some(),
             ..default()
         };
         let mut ordinal = 0;
@@ -203,33 +206,44 @@ impl Prepared {
                     .distance(points[1])
                     .max(points[1].distance(points[2]))
                     .max(points[2].distance(points[0]));
-                let grid = ((longest / span * 36.).ceil() as usize).clamp(1, grid_limit);
+                let grid = if source.is_some() {
+                    ((longest / span * 36.).ceil() as usize).clamp(1, grid_limit)
+                } else {
+                    1
+                };
                 let shell = cage.map(|cage| cage.triangle(vertices));
                 let start = output.points.len();
                 let vertex =
                     |i: usize, j: usize| start + i * (grid + 1) - i * i.saturating_sub(1) / 2 + j;
-                let segment_at = |w: Vec3| {
+                let ray_at = |w: Vec3| {
                     let blend = |[a, b, c]: [Vec3; 3]| a * w.x + b * w.y + c * w.z;
                     let point = blend(points);
                     let direction = blend(normals).try_normalize().unwrap_or(geo);
                     let cage = shell.as_ref().map(|shell| shell.ray(w));
-                    (point, projector.segment(point, direction, cage))
+                    (point, direction, cage)
                 };
                 for i in 0..=grid {
                     for j in 0..=grid - i {
                         let y = i as f32 / grid as f32;
                         let z = j as f32 / grid as f32;
                         let w = Vec3::new(1. - y - z, y, z);
+                        let (point, direction, cage) = ray_at(w);
+                        let Some((projector, parts)) = source else {
+                            let offset = cage.map_or(direction * distances[0], |ray| ray.offset);
+                            output.points.push(point + offset);
+                            output.colors.push(colors[4]);
+                            continue;
+                        };
+                        let edge = projector.segment(point, direction, cage);
                         let (point, segment, shell_point) = if i == 0 || j == 0 || i + j == grid {
                             // UV texels are sampled in the interior. Avoid numerical misses when
                             // a diagnostic vertex falls exactly on the edge of both meshes.
-                            let (_, edge) = segment_at(w);
-                            let (point, segment) = segment_at(w.lerp(Vec3::splat(1. / 3.), 1e-5));
+                            let (point, direction, cage) = ray_at(w.lerp(Vec3::splat(1. / 3.), 1e-5));
+                            let segment = projector.segment(point, direction, cage);
                             (point, segment, edge.origin)
                         } else {
-                            let (point, segment) = segment_at(w);
-                            let origin = segment.origin;
-                            (point, segment, origin)
+                            let origin = edge.origin;
+                            (point, edge, origin)
                         };
                         let status = match projector.cast(&segment) {
                             None => 2,

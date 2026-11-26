@@ -132,11 +132,7 @@ impl Projection {
         span: f32,
         progress: &Progress,
     ) -> Result<Option<Cage>, String> {
-        if directions.len() != overrides.len() || overrides.iter().all(|&value| value == 1.) {
-            return Ok(None);
-        }
-        let limit = (span / self.front.max(self.rear)).min(8.);
-        Cage::painted(base, directions, overrides, self.front, limit, progress).map(Some)
+        Cage::apply_paint(base, directions, overrides, [self.front, self.rear], span, progress)
     }
     pub(super) fn load(
         path: &Path,

@@ -2623,8 +2623,8 @@ fn gpu_paint_cage_stroke_saves_and_reopens() {
         let toggle = |app: &mut App, show: Option<bool>| {
             let args: mcp_state::CageArgs = serde_json::from_value(serde_json::json!({"model_id": 0, "show": show})).unwrap();
             app.world_mut().run_system_once(move |input: mcp_state::McpPreview, editor: Res<Editor>,
-                editing: Res<editing::State>, mut paint: ResMut<PaintState>| {
-                mcp_state::cage(&input, &editor, &editing, &mut paint, args.clone())
+                mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::cage(&input, &editor, &mut editing, &mut paint, args.clone())
             }).unwrap().unwrap()
         };
         assert_eq!(toggle(&mut app, Some(true))["visible"], true);

@@ -337,14 +337,14 @@ pub(super) struct MaterialMaps<'a> {
     pub resolution: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct Camera {
     pub inverse_view_projection: Mat4,
     pub eye: Vec3,
     pub orthographic: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::editor::ui::model_viewer) struct Lighting {
     pub environment_rotation: f32,
     pub environment_intensity: f32,
@@ -356,7 +356,7 @@ pub(in crate::editor::ui::model_viewer) struct Lighting {
     pub key_intensity: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct Settings {
     pub samples: u32,
     pub bounces: u32,
@@ -365,6 +365,11 @@ pub(super) struct Settings {
     pub height_strength: f32,
     pub emission_strength: f32,
     pub precomposed: bool,
+}
+
+impl Settings {
+    pub(super) const SAMPLE_RANGE: std::ops::RangeInclusive<u32> = 16..=4096;
+    pub(super) const BOUNCE_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
 }
 
 impl Default for Settings {

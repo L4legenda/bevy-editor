@@ -113,6 +113,9 @@ pub(super) enum Command {
     PaintFill(super::mcp_state::FillArgs),
     PaintSelectSurface(super::mcp_state::SurfaceArgs),
     PaintSave(super::mcp_state::SaveArgs),
+    PaintPresetSave(super::mcp_state::SavePresetArgs),
+    PaintPresetImport(super::mcp_state::ImportPresetArgs),
+    PaintPresetExport(super::mcp_state::ExportPresetArgs),
     PaintExport(super::mcp_state::ExportArgs),
     BakeStatus(super::mcp_state::BakeTarget),
     BakeStart(super::mcp_state::BakeArgs),
@@ -161,7 +164,7 @@ pub(super) struct PaintImportArgs {
 impl Command {
     pub fn mutates(&self) -> bool {
         if let Self::CagePreview(args) = self {
-            return args.show.is_some();
+            return args.mutates();
         }
         !matches!(
             self,

@@ -37,7 +37,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 36);
+    assert_eq!(tools.tools.len(), 39);
     for name in [
         "get_editor_state",
         "get_paint_state",
@@ -48,6 +48,9 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
         "poly_fill",
         "select_surface",
         "save_model",
+        "save_paint_preset",
+        "import_paint_preset",
+        "export_paint_preset",
         "export_textures",
         "bake_maps",
         "set_bake_levels",
@@ -737,6 +740,8 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         "bake_maps",
         json!({
             "target": {"model_id": 0, "set": 0}, "quality": "draft", "maps": ["part_random"],
+            "rays": {"occlusion_samples": 24}, "surface": {"grid": 2},
+            "prefer_front_faces": false, "average_normals": false,
         }),
     );
     assert_eq!(started["structuredContent"]["status"], "running");
@@ -745,6 +750,10 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         let report = client.tool(&mut app, "get_bake_state", json!({"model_id": 0, "set": 0}));
         let report = &report["structuredContent"];
         if report["status"] == "ready" {
+            assert_eq!(report["settings"]["rays"]["occlusion_samples"], 24);
+            assert_eq!(report["settings"]["surface"]["grid"], 2);
+            assert_eq!(report["settings"]["prefer_front_faces"], false);
+            assert_eq!(report["settings"]["average_normals"], false);
             assert!(
                 report["maps"]
                     .as_array()
@@ -1316,6 +1325,18 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     assert_eq!(removed_mask["layers_bottom_to_top"][folder_index]["mask"]["layer_count"], 1);
     let restored_mask = edit(&mut client, &mut app, json!({"operation":"undo"}));
     assert_eq!(restored_mask["layers_bottom_to_top"], updated_mask["layers_bottom_to_top"]);
+    let named_group = edit(&mut client, &mut app, json!({
+        "operation": "add_layer", "kind": "Folder", "name": "Surface details",
+        "target": {"layer": folder_index + 1, "placement": "above"}
+    }));
+    let group = folder_index + 2;
+    assert_eq!(named_group["layers_bottom_to_top"][group]["name"], "Surface details");
+    let named_fill = edit(&mut client, &mut app, json!({
+        "operation": "add_material", "preset": catalog["materials"][0], "name": "Base metal",
+        "target": {"layer": group, "placement": "inside"}
+    }));
+    assert_eq!(named_fill["layers_bottom_to_top"][group]["name"], "Base metal");
+    assert_eq!(named_fill["layers_bottom_to_top"][group]["folder"], group + 1);
     let saved = client.tool(&mut app, "save_model", json!({"model_id": 0, "copy_name": "stdio-materials.glb"}));
     let glb = Glb::load(Path::new(saved["structuredContent"]["path"].as_str().unwrap())).unwrap();
     let surface = glb.json["meshes"].as_array().unwrap().iter()
@@ -1323,6 +1344,9 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         .find_map(|primitive| glb.paint_surface(primitive).unwrap()).unwrap();
     assert_eq!(surface.stack.parents(folder_index).next(), Some(folder_index + 1));
     assert_eq!(surface.stack.layers[folder_index + 1].name, "Rust group");
+    assert_eq!(surface.stack.layers[group].name, "Base metal");
+    assert_eq!(surface.stack.layers[group + 1].name, "Surface details");
+    assert_eq!(surface.stack.parents(group).next(), Some(group + 1));
     let height = surface.stack.layers[folder_index].texture_fill.as_ref().unwrap().images[3].as_ref().unwrap();
     assert_eq!(height.name, format!("{texture}.png"));
     assert_eq!(height.pixels().dimensions(), (1024, 1024));
@@ -1377,6 +1401,22 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let imported_state = wait_for_paint(&mut client, &mut app);
     assert_eq!(imported_state["resolution"], 128);
     assert_eq!(imported_state["layers_bottom_to_top"][0]["name"], "Imported pigment");
+    let rejected = client.request(&mut app, "tools/call", json!({
+        "name":"edit_paint", "arguments":{"model_id":model,"set":0,
+            "edit":{"operation":"update_texture_set","index":0,"resolution":512,"visible":false,"highlighted":true}}
+    }));
+    assert_eq!(rejected["isError"], true, "{rejected}");
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["resolution"], 128);
+    assert_eq!(unchanged["texture_sets"][0]["highlighted"], false);
+    let resizing = client.tool(&mut app, "edit_paint", json!({
+        "model_id":model,"set":0,"edit":{"operation":"update_texture_set","index":0,"resolution":512,"highlighted":true}
+    }));
+    assert_eq!(resizing["structuredContent"]["paint_busy"], true);
+    let resized = wait_for_paint(&mut client, &mut app);
+    assert_eq!(resized["resolution"], 512);
+    assert_eq!(resized["texture_sets"][0]["highlighted"], true);
+    assert_eq!(resized["layers_bottom_to_top"][0]["name"], "Imported pigment");
     assert_eq!(fs::read(original_collision).unwrap(), block_bytes);
     assert!(fs::read_dir(&models).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".mpp-import-")));
 
@@ -1434,6 +1474,262 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     fill(&mut client, &mut app, "viewport", json!({"kind":"lasso","points":[[0,0],[1,0],[1,1],[0,1]],"through":true}), [40, 70, 160]);
     assert_eq!(read(&app, 0.25), [40, 70, 160, 255]);
     assert_eq!(read(&app, 0.75), [40, 70, 160, 255]);
+
+    fs::write(models.join("cage-source.obj"), concat!(
+        "v -2 -2 0.1\nv 2 -2 0.1\nv 2 2 0.1\nv -2 2 0.1\n",
+        "f 1 2 3 4\n",
+    )).unwrap();
+    let cage = |client: &mut StdioClient, app: &mut App, args: Value| {
+        client.tool(app, "cage_preview", args)["structuredContent"].clone()
+    };
+    let wait_for_cage = |client: &mut StdioClient, app: &mut App| {
+        let started = Instant::now();
+        loop {
+            let result = cage(client, app, json!({"model_id": model}));
+            if result["report"]["status"] == "ready" {
+                return result;
+            }
+            assert_eq!(result["report"]["status"], "pending", "{result}");
+            assert!(started.elapsed() < REQUEST_TIMEOUT, "Cage preview did not finish");
+        }
+    };
+    let initial = cage(&mut client, &mut app, json!({"model_id": model}));
+    assert_eq!(initial["visible"], false);
+    let shell = cage(&mut client, &mut app, json!({"model_id": model, "show": true}));
+    assert_eq!(shell["visible"], true);
+    let shell = wait_for_cage(&mut client, &mut app);
+    assert_eq!(shell["report"]["mode"], "shell");
+    assert!(shell["report"].get("missed").is_none());
+    let opened = cage(&mut client, &mut app, json!({
+        "model_id": model,
+        "projection": {"high_poly": "models/cage-source.obj", "front_percent": 20,
+            "match_names": false, "prefer_front_faces": false}
+    }));
+    assert_eq!(opened["visible"], true);
+    let wide = wait_for_cage(&mut client, &mut app);
+    assert_eq!(wide["settings"]["front"], 20);
+    assert!(wide["report"]["covered"].as_u64().unwrap() > 0, "{wide}");
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "cage_preview", "arguments": {"model_id": model, "show": false,
+            "projection": {"front_percent": 0, "match_names": true}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    assert_eq!(cage(&mut client, &mut app, json!({"model_id": model})), wide);
+
+    cage(&mut client, &mut app, json!({"model_id": model, "projection": {"front_percent": 1}}));
+    let narrow = wait_for_cage(&mut client, &mut app);
+    assert_eq!(narrow["settings"]["front"], 1);
+    assert_eq!(narrow["settings"]["high_poly"], wide["settings"]["high_poly"]);
+    assert!(
+        narrow["report"]["missed"].as_u64().unwrap() > wide["report"]["missed"].as_u64().unwrap(),
+        "{wide}\n{narrow}"
+    );
+    let bake = client.tool(&mut app, "get_bake_state", json!({"model_id": model}));
+    assert_eq!(bake["structuredContent"]["engine_busy"], false);
+    let hidden = cage(&mut client, &mut app, json!({
+        "model_id": model, "show": false, "projection": {"high_poly": ""}
+    }));
+    assert_eq!(hidden["report"]["status"], "hidden");
+    assert_eq!(hidden["settings"]["high_poly"], Value::Null);
+
+    let scene_light = app.world().resource::<Editor>().environment().clone();
+    let configured = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": model, "environment": {
+            "preset": "photo_studio", "intensity": 1.25, "rotation_degrees": 32.5,
+            "show_background": false, "background_blur": 0.5, "background_brightness": 0.75,
+            "key_light": true, "key_intensity": 3.0, "key_azimuth_degrees": 15.0,
+            "key_elevation_degrees": 60.0
+        }
+    }));
+    let configured = &configured["structuredContent"];
+    let profile = project.asset_root.join(".bevy-editor/model-preview.json");
+    let profile_bytes = fs::read(profile).unwrap();
+    let saved: Value = serde_json::from_slice(&profile_bytes).unwrap();
+    assert_eq!(saved["lighting"]["hdri"], "photo_studio");
+    assert_eq!(saved["lighting"]["hdri_brightness"], 1250.0);
+    assert_eq!(saved["lighting"]["hdri_rotation"], 32.5);
+    assert_eq!(saved["lighting"]["hdri_background"], false);
+    assert_eq!(saved["blur"], 0.5);
+    assert_eq!(configured["environment"]["key_elevation_degrees"], 60.0);
+    frame(&mut app);
+    let world = app.world_mut();
+    let mut lighting = world.query::<&bevy::light::DirectionalLight>();
+    assert!(lighting.iter(world).any(|light| light.illuminance == 3000.0));
+    assert_eq!(world.resource::<Editor>().environment(), &scene_light);
+
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "set_paint_view", "arguments": {"model_id": model, "distance": 8.0,
+            "environment": {"preset": "cloudy", "key_elevation_degrees": 91.0}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    let unchanged = client.tool(&mut app, "set_paint_view", json!({"model_id": model}));
+    assert_eq!(unchanged["structuredContent"]["environment"], configured["environment"]);
+    assert_eq!(unchanged["structuredContent"]["camera"], configured["camera"]);
+    assert_eq!(fs::read(project.asset_root.join(".bevy-editor/model-preview.json")).unwrap(), profile_bytes);
+
+    let trace = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": model, "path_trace": true, "trace_settings": {"samples": 16, "bounces": 2, "ground": true}
+    }));
+    assert_eq!(trace["structuredContent"]["path_trace"], true);
+    assert_eq!(trace["structuredContent"]["trace_settings"], json!({"samples": 16, "bounces": 2, "ground": true}));
+    let trace_progress = |client: &mut StdioClient, app: &mut App| {
+        client.tool(app, "get_paint_state", json!({}))["structuredContent"]["view"]["trace_progress"].clone()
+    };
+    let wait_for_trace = |client: &mut StdioClient, app: &mut App, limit| {
+        let started = Instant::now();
+        loop {
+            let progress = trace_progress(client, app);
+            assert_eq!(progress["target_samples"], limit);
+            if progress["status"] == "complete" {
+                assert_eq!(progress["samples"], limit);
+                break;
+            }
+            assert!(["preparing", "rendering"].contains(&progress["status"].as_str().unwrap()), "{progress}");
+            assert!(progress["samples"].as_u64().is_none_or(|count| count < limit), "{progress}");
+            assert!(started.elapsed() < REQUEST_TIMEOUT, "Trace stayed at {progress}");
+        }
+    };
+    wait_for_trace(&mut client, &mut app, 16);
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "set_paint_view", "arguments": {"model_id": model, "path_trace": false,
+            "trace_settings": {"samples": 4097, "ground": false}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    let unchanged = client.tool(&mut app, "set_paint_view", json!({"model_id": model}));
+    assert_eq!(unchanged["structuredContent"]["path_trace"], true);
+    assert_eq!(unchanged["structuredContent"]["trace_settings"], trace["structuredContent"]["trace_settings"]);
+    let raised = client.tool(&mut app, "set_paint_view", json!({
+        "model_id": model, "trace_settings": {"samples": 24}
+    }));
+    assert_eq!(raised["structuredContent"]["trace_settings"], json!({"samples": 24, "bounces": 2, "ground": true}));
+    wait_for_trace(&mut client, &mut app, 24);
+    client.tool(&mut app, "set_paint_view", json!({"model_id": model, "layout": "two"}));
+    let paused = trace_progress(&mut client, &mut app);
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["reason"], "uv_only");
+    assert_eq!(paused["samples"], Value::Null);
+    client.tool(&mut app, "set_paint_view", json!({"model_id": model, "path_trace": false}));
+    assert_eq!(trace_progress(&mut client, &mut app)["status"], "off");
+
+    mcp_state::seed_local_presets(&mut app.world_mut().resource_mut::<PaintState>(), &scratch.0.join("local-presets"));
+    let presets = client.tool(&mut app, "list_paint_presets", json!({}));
+    let local = presets["structuredContent"]["local_presets"].as_array().unwrap();
+    let preset_index = |kind| local.iter().find(|entry| entry["kind"] == kind).unwrap()["index"].clone();
+    let material = preset_index("material");
+    let mask = preset_index("mask");
+    let apply_local = |client: &mut StdioClient, app: &mut App, edit| {
+        client.tool(app, "edit_paint", json!({"model_id": model, "set": 0, "edit": edit}));
+        wait_for_paint(client, app)
+    };
+    let before = wait_for_paint(&mut client, &mut app);
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name": "edit_paint", "arguments": {"model_id": model, "set": 0,
+            "edit": {"operation": "add_local_material", "preset": mask}}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    assert_eq!(wait_for_paint(&mut client, &mut app)["undo_steps"], before["undo_steps"]);
+    let added = apply_local(&mut client, &mut app, json!({
+        "operation": "add_local_material", "preset": material, "name": "Imported from shelf",
+        "target": {"layer": layer, "placement": "above"}
+    }));
+    let new_row = &added["layers_bottom_to_top"][layer + 1];
+    assert_eq!(new_row["name"], "Imported from shelf");
+    assert_eq!(new_row["mask"]["has_graph"], true);
+    assert_eq!(added["undo_steps"].as_u64().unwrap(), before["undo_steps"].as_u64().unwrap() + 1);
+    let masked = apply_local(&mut client, &mut app, json!({
+        "operation": "apply_local_mask", "preset": mask, "layer": layer
+    }));
+    assert_eq!(masked["layers_bottom_to_top"][layer]["mask"]["has_graph"], false);
+    assert_eq!(masked["undo_steps"].as_u64().unwrap(), added["undo_steps"].as_u64().unwrap() + 1);
+    let undone = apply_local(&mut client, &mut app, json!({"operation":"undo"}));
+    assert_eq!(undone["layers_bottom_to_top"][layer]["mask"], Value::Null);
+    apply_local(&mut client, &mut app, json!({"operation":"redo"}));
+    let saved = client.tool(&mut app, "save_model", json!({
+        "model_id": model, "copy_name": "local-presets.glb"
+    }));
+    let saved = Glb::load(Path::new(saved["structuredContent"]["path"].as_str().unwrap())).unwrap();
+    let surface = saved.json["meshes"].as_array().unwrap().iter()
+        .flat_map(|mesh| mesh["primitives"].as_array().into_iter().flatten())
+        .filter_map(|primitive| saved.paint_surface(primitive).unwrap())
+        .find(|surface| surface.stack.layers.get(layer + 1)
+            .is_some_and(|layer| layer.name == "Imported from shelf"))
+        .expect("The saved model must contain the texture set with the applied preset");
+    assert_eq!(surface.size, 512);
+    assert!(surface.stack.layers[layer + 1].texture_fill.as_ref().unwrap().graph.is_some());
+    assert_eq!(surface.stack.layers[layer].mask.as_ref().unwrap().pixels[0], 96);
+
+    let invalid = client.request(&mut app, "tools/call", json!({
+        "name":"save_paint_preset", "arguments":{"workspace":{"model_id": model,"set":0},
+            "kind":"material", "name":"Invalid paint capture", "layer":layer}
+    }));
+    assert_eq!(invalid["isError"], true, "{invalid}");
+    let before_save = wait_for_paint(&mut client, &mut app);
+    let new_material = client.tool(&mut app, "save_paint_preset", json!({
+        "workspace":{"model_id":model,"set":0}, "kind":"material", "name":"Reusable graph fill", "layer":layer + 1
+    }));
+    let new_mask = client.tool(&mut app, "save_paint_preset", json!({
+        "workspace":{"model_id":model,"set":0}, "kind":"mask", "name":"Reusable mask", "layer":layer
+    }));
+    let [new_material, new_mask] = [&new_material["structuredContent"], &new_mask["structuredContent"]];
+    assert_eq!(new_material["kind"], "material");
+    assert_eq!(new_mask["kind"], "mask");
+    let library = client.tool(&mut app, "list_paint_presets", json!({}));
+    let local = library["structuredContent"]["local_presets"].as_array().unwrap();
+    for preset in [new_material, new_mask] {
+        assert!(local.iter().any(|item| item["index"] == preset["index"] && item["name"] == preset["name"]));
+    }
+    assert_eq!(local.len(), 4);
+    let unchanged = wait_for_paint(&mut client, &mut app);
+    assert_eq!(unchanged["undo_steps"], before_save["undo_steps"]);
+    assert_eq!(unchanged["layers_bottom_to_top"], before_save["layers_bottom_to_top"]);
+    assert_eq!(fs::read_dir(scratch.0.join("local-presets/shelf")).unwrap().count(), 4);
+
+    let invalid_import = client.request(&mut app, "tools/call", json!({
+        "name":"import_paint_preset", "arguments":{"source":"missing.mpsmart"}
+    }));
+    assert_eq!(invalid_import["isError"], true, "{invalid_import}");
+    let transferred = [("mpsmart", "Shared graph fill"), ("zip", "Shared graph fill 2")].map(|(format, expected_name)| {
+        let output = client.tool(&mut app, "export_paint_preset", json!({
+            "workspace":{"model_id":model,"set":0}, "layer":layer + 1,
+            "folder":"material-exchange", "name":"Shared graph fill", "format":format
+        }));
+        let output = &output["structuredContent"];
+        let path = Path::new(output["path"].as_str().unwrap());
+        assert_eq!(output["format"], format);
+        assert_eq!(path.extension().unwrap(), format);
+        assert!(path.is_file() && path.starts_with(project.asset_root.join("material-exchange")));
+        let reimport = client.tool(&mut app, "import_paint_preset", json!({"source":path}));
+        let reimport = &reimport["structuredContent"];
+        assert_eq!(reimport["name"], expected_name);
+        assert_eq!(reimport["kind"], "material");
+        reimport["index"].clone()
+    });
+    assert_ne!(transferred[0], transferred[1]);
+    assert_eq!(fs::read_dir(scratch.0.join("local-presets/shelf")).unwrap().count(), 6);
+    assert_eq!(wait_for_paint(&mut client, &mut app)["layers_bottom_to_top"], before_save["layers_bottom_to_top"]);
+
+    open(&mut client, &mut app, "models/block.glb", 0);
+    let destination = wait_for_paint(&mut client, &mut app);
+    let set = destination["active_set"].as_u64().unwrap();
+    for (preset, name) in [
+        (&new_material["index"], "Reused on block"),
+        (&transferred[0], "Imported MPSMART"),
+        (&transferred[1], "Imported ZIP"),
+    ] {
+        client.tool(&mut app, "edit_paint", json!({"model_id":0,"set":set,
+            "edit":{"operation":"add_local_material","preset":preset,"name":name}
+        }));
+        let ready = wait_for_paint(&mut client, &mut app);
+        let added = ready["layers_bottom_to_top"].as_array().unwrap().iter()
+            .find(|row| row["name"] == name).unwrap();
+        assert_eq!(added["mask"]["has_graph"], true);
+    }
+    let layer = wait_for_paint(&mut client, &mut app)["layers_bottom_to_top"].as_array().unwrap()
+        .iter().position(|row| row["name"] == "Imported ZIP").unwrap();
+    client.tool(&mut app, "edit_paint", json!({"model_id":0,"set":set,
+        "edit":{"operation":"apply_local_mask","preset":new_mask["index"],"layer":layer}
+    }));
+    assert_eq!(wait_for_paint(&mut client, &mut app)["layers_bottom_to_top"][layer]["mask"]["has_graph"], false);
     client.close();
     drop(server);
 }

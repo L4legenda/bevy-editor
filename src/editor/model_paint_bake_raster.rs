@@ -1,6 +1,6 @@
 //! UV triangle ownership. Keep the CPU barycentric interpolation for exact map values.
 use super::{Progress, RayDevice};
-use crate::editor::ui::model_viewer::paint::engine::uv_weights;
+use crate::editor::model_mesh::UvBarycentric;
 use bevy::{
     log::warn,
     prelude::*,
@@ -25,6 +25,7 @@ pub(super) struct Triangle {
     pub uv: [Vec2; 3],
     pub lo: UVec2,
     pub hi: UVec2,
+    pub barycentric: Option<UvBarycentric>,
 }
 
 impl Triangle {
@@ -34,6 +35,7 @@ impl Triangle {
             face,
             corners,
             uv,
+            barycentric: UvBarycentric::new(uv),
             lo: uv[0]
                 .min(uv[1])
                 .min(uv[2])
@@ -50,7 +52,8 @@ impl Triangle {
     }
 
     pub fn weights(&self, center: Vec2) -> Option<Vec3> {
-        uv_weights(center, self.uv).filter(|w| w.min_element() >= -1e-5)
+        let weights = self.barycentric?.at(center);
+        (weights.min_element() >= -1e-5).then_some(weights)
     }
 
     fn tiles(&self, pitch: u32) -> impl Iterator<Item = usize> {

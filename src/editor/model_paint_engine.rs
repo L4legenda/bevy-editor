@@ -241,7 +241,6 @@ mod path_editor;
 #[path = "model_paint_projection.rs"]
 pub(super) mod projection;
 use projection::*;
-pub(super) use projection::weights as uv_weights;
 #[path = "model_paint_import_uv.rs"]
 mod import_uv;
 #[path = "model_paint_stroke.rs"]

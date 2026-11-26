@@ -3726,11 +3726,16 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     );
                 }
                 button(&mut commands, stack, font, "Выбрать high-poly…", PaintAction::BakePickHigh);
+                button(&mut commands, stack, font, "Предпросмотр оболочки", PaintAction::BakeInspectCage);
+                if session.bake_inspect_cage {
+                    let label = text(&mut commands, stack, font, &session.bake_cage_status, 11., MUTED);
+                    commands.entity(label).insert((TextLayout::default(), Node { max_width: percent(100.), min_width: px(0.), ..default() }));
+                }
+                button(&mut commands, stack, font, "Усреднять нормали лучей", PaintAction::BakeAverageNormals);
                 if let Some(path) = &session.bake_projection.path {
                     let filename = path.file_name().unwrap_or_default().to_string_lossy();
                     text(&mut commands, stack, font, filename.as_ref(), 11., MUTED);
                     button(&mut commands, stack, font, "Убрать high-poly", PaintAction::BakeClearHigh);
-                    button(&mut commands, stack, font, "Предпросмотр оболочки", PaintAction::BakeInspectCage);
                     if session.bake_projection.cage.is_none() {
                         button(&mut commands, stack, font, "Кисть оболочки", PaintAction::BakePaintCage);
                         if session.bake_paint_cage {
@@ -3740,15 +3745,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         }
                     }
                     if session.bake_inspect_cage {
-                        for label in [session.bake_cage_status.as_str(), "Зелёный — попадание · жёлтый — предел\nКрасный — промах · фиолетовый — чужая часть"] {
-                            let label = text(&mut commands, stack, font, label, 11., MUTED);
-                            commands.entity(label).insert((TextLayout::default(), Node { max_width: percent(100.), min_width: px(0.), ..default() }));
-                        }
+                        let legend = "Зелёный — попадание · жёлтый — предел\nКрасный — промах · фиолетовый — чужая часть";
+                        let label = text(&mut commands, stack, font, legend, 11., MUTED);
+                        commands.entity(label).insert((TextLayout::default(), Node { max_width: percent(100.), min_width: px(0.), ..default() }));
                     }
                     button(&mut commands, stack, font, "Сопоставлять по именам", PaintAction::BakeMatchNames);
                     button(&mut commands, stack, font, "Заполнять промахи", PaintAction::BakeFillMisses);
                     button(&mut commands, stack, font, "Приоритет лицевых сторон", PaintAction::BakePreferFrontFaces);
-                    button(&mut commands, stack, font, "Усреднять нормали лучей", PaintAction::BakeAverageNormals);
                     button(&mut commands, stack, font, "Выбрать оболочку…", PaintAction::BakePickCage);
                     if let Some(path) = &session.bake_projection.cage {
                         let filename = path.file_name().unwrap_or_default().to_string_lossy();
@@ -3757,19 +3760,20 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     } else {
                         button(&mut commands, stack, font, "Подгонять оболочку", PaintAction::BakeAutoFitCage);
                     }
-                    for (title, front) in [("Снаружи", true), ("Изнутри", false)] {
-                        if front && session.bake_projection.cage.is_some() {
-                            continue;
-                        }
-                        text(&mut commands, stack, font, title, 11., MUTED);
-                        let distances = node(&mut commands, stack, Node {
-                            flex_wrap: FlexWrap::Wrap,
-                            row_gap: px(3.),
-                            ..row(4.)
-                        });
-                        for percent in [1, 5, 10, 25, 50] {
-                            button(&mut commands, distances, font, &format!("{percent}%"), PaintAction::BakeRange { front, percent });
-                        }
+                }
+                let has_source = session.bake_projection.path.is_some();
+                for (title, front) in [("Снаружи", true), ("Изнутри", false)] {
+                    if (front && has_source && session.bake_projection.cage.is_some()) || (!front && !has_source) {
+                        continue;
+                    }
+                    text(&mut commands, stack, font, title, 11., MUTED);
+                    let distances = node(&mut commands, stack, Node {
+                        flex_wrap: FlexWrap::Wrap,
+                        row_gap: px(3.),
+                        ..row(4.)
+                    });
+                    for percent in [1, 5, 10, 25, 50] {
+                        button(&mut commands, distances, font, &format!("{percent}%"), PaintAction::BakeRange { front, percent });
                     }
                 }
                 button(&mut commands, stack, font, "Текстура материала", PaintAction::BakePreview(None));

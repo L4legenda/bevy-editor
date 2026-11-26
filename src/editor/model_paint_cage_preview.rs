@@ -70,6 +70,9 @@ impl State {
             return json!({"status": "failed", "error": error});
         }
         self.ready.as_ref().map_or_else(|| json!({"status": "pending"}), |diagnostic| {
+            if !diagnostic.has_source {
+                return json!({"status": "ready", "mode": "shell", "sampled": diagnostic.sampled});
+            }
             let [covered, tight, missed, overlapping] = diagnostic.counts();
             json!({"status": "ready", "covered": covered, "tight": tight, "missed": missed,
                 "overlapping": overlapping, "sampled": diagnostic.sampled})
@@ -96,7 +99,6 @@ pub(in crate::editor::ui::model_viewer) fn draw(
             || session.panel != Panel::Maps
             || session.view == View::Two
             || !session.bake_inspect_cage
-            || session.bake_projection.path.is_none()
             || editor.pending.is_some()
             || editor.viewing_image.is_some()
             || editor.browser_popup

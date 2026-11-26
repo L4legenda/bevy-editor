@@ -36,6 +36,8 @@ mod mesh;
 mod mcp_bake;
 #[cfg(feature = "mcp")]
 pub(in crate::editor) use mcp_bake::{BakeArgs, BakeLevelsArgs, BakeTarget, McpBake};
+#[cfg(feature = "mcp")]
+pub(super) use mcp_bake::{ProjectionPatch, apply_settings};
 #[path = "model_paint_bake_levels.rs"]
 pub(super) mod levels;
 pub(in crate::editor) use levels::import_levels;
@@ -608,6 +610,8 @@ struct Progress {
     #[cfg(test)]
     projection_wait_ns: std::sync::atomic::AtomicU64,
     #[cfg(test)]
+    projection_readback_bytes: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     stage_ms: std::sync::OnceLock<[f64; 4]>,
 }
 impl Progress {
@@ -755,6 +759,11 @@ pub(super) struct FixPreview {
     pub fixes: Arc<Fixes>,
 }
 impl State {
+    #[cfg(feature = "mcp")]
+    pub(super) fn configuration_busy(&self) -> bool {
+        self.running.is_some() || self.picking.is_some() || self.clearing_cache.is_some()
+    }
+
     fn start_manual(
         &mut self,
         model: usize,
@@ -1500,7 +1509,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     session.revision += 1;
                 }
             }
-            PaintAction::BakeInspectCage if session.bake_projection.path.is_some() => {
+            PaintAction::BakeInspectCage if session.binding.is_some() => {
                 session.set_cage_inspection(!session.bake_inspect_cage);
             }
             PaintAction::BakePickHigh | PaintAction::BakePickCage
@@ -1535,6 +1544,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 match action {
                     PaintAction::BakeClearHigh => {
                         session.bake_projection.path = None;
+                        session.bake_projection.cage = None;
+                        session.bake_paint_cage = false;
                         session.bake_view = None;
                     }
                     PaintAction::BakeClearCage => session.bake_projection.cage = None,

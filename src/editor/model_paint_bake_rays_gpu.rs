@@ -14,6 +14,8 @@ use std::{collections::VecDeque, sync::mpsc, time::Duration};
 
 const NODE_BYTES: usize = 48;
 const TEXEL_BYTES: usize = 64;
+const PROJECTION_REPLY_BYTES: usize = 20;
+const DIRECT_PROJECTION: u32 = 1 << 31;
 const HEADER_BYTES: usize = 64;
 const CONFIG_BYTES: usize = HEADER_BYTES + crate::editor::model_paint_data::custom::MAX_MAPS * 48;
 const BASE_WORDS: usize = 2;
@@ -126,7 +128,7 @@ impl Batch {
                 gpu,
                 &self.scene,
                 capacity,
-                24,
+                PROJECTION_REPLY_BYTES,
                 MAX_IN_FLIGHT,
                 "project_queries",
                 None,
@@ -185,6 +187,10 @@ impl Batch {
         }
         let mut triangle_data = Vec::with_capacity(triangle_capacity);
         for (index, triangle) in triangles {
+            let face = u32::try_from(triangle.face).ok()?;
+            if matches!(parts, PartsOfScene::High(..)) && face >= DIRECT_PROJECTION - 1 {
+                return None;
+            }
             for point in triangle.points {
                 vector(&mut triangle_data, point);
             }
@@ -199,7 +205,7 @@ impl Batch {
                 &mut triangle_data,
                 [
                     u32::try_from(triangle.object).ok()?,
-                    u32::try_from(triangle.face).ok()?,
+                    face,
                     part as u32,
                     u32::from(
                         matches!(&parts, PartsOfScene::High(_, projector) if projector.accepts_projection(triangle)),
@@ -568,7 +574,7 @@ impl ProjectBatch {
             &self.input,
             config.as_flattened(),
             probes.len() as u32,
-            24,
+            PROJECTION_REPLY_BYTES,
         )))
     }
 
@@ -583,15 +589,18 @@ impl ProjectBatch {
         results.clear();
         #[cfg(test)]
         let started = progress.profile.then(std::time::Instant::now);
+        #[cfg(test)]
+        progress.projection_readback_bytes.fetch_add(readback.0.bytes, Ordering::Relaxed);
         self.dispatch.read(readback.0, |readback| {
-            for reply in readback.chunks_exact(24) {
+            for reply in readback.chunks_exact(PROJECTION_REPLY_BYTES) {
                 let word = |index: usize| {
                     u32::from_le_bytes(reply[index * 4..index * 4 + 4].try_into().unwrap())
                 };
-                let face = word(0);
-                results.push((face != u32::MAX).then(|| {
+                let tag = word(0);
+                results.push((tag != u32::MAX).then(|| {
                     let point = Vec3::from_array([word(1), word(2), word(3)].map(f32::from_bits));
-                    projector.hit(face as usize, point, f32::from_bits(word(4)), word(5) != 0)
+                    projector.hit((tag & !DIRECT_PROJECTION) as usize, point, f32::from_bits(word(4)),
+                        tag & DIRECT_PROJECTION != 0)
                 }));
             }
         })?;

@@ -175,6 +175,7 @@ fn gpu_compare_mesh_bake() {
                         "denoise_ms": denoise_ms, "padding_ms": padding_ms,
                         "visibility_read_ms": progress.ray_wait_ns.load(Ordering::Relaxed) as f64 / 1e6,
                         "projection_read_ms": progress.projection_wait_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                        "projection_readback_bytes": progress.projection_readback_bytes.load(Ordering::Relaxed),
                         "digest": digest.to_hex().as_str(),
                     })
                 );

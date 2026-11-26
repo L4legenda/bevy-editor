@@ -106,6 +106,8 @@ fn trace_hit(origin: vec3<f32>, direction: vec3<f32>, limit: f32, ids: vec4<u32>
     var closest = limit;
     var hit = NONE;
     var hit_leaf = 0u;
+    var back = RayHit(limit, NONE);
+    var back_leaf = 0u;
     while (len != 0u) {
         len -= 1u;
         let pending = stack[len];
@@ -140,12 +142,25 @@ fn trace_hit(origin: vec3<f32>, direction: vec3<f32>, limit: f32, ids: vec4<u32>
                 if ((part_filter < 3u && same_face) || (part_filter == 1u && !same_part) || (part_filter == 2u && same_part)) {
                     continue;
                 }
-                if (part_filter >= 4u && (triangle.ids.w == 0u || (part_filter == 4u
-                    && dot(cross(triangle.b.xyz - triangle.a.xyz, triangle.c.xyz - triangle.a.xyz), direction) >= 0.0))) {
+                if (part_filter >= 4u && triangle.ids.w == 0u) {
+                    continue;
+                }
+                let back_facing = part_filter == 4u
+                    && dot(cross(triangle.b.xyz - triangle.a.xyz, triangle.c.xyz - triangle.a.xyz), direction) >= 0.0;
+                if (back_facing && hit != NONE) {
                     continue;
                 }
                 let distance = intersect_triangle(origin, direction, triangle);
                 // Node IDs grow left-to-right. Use the original right-first tie break.
+                if (back_facing) {
+                    // Retain a fallback hit without pruning any candidate front face.
+                    let wins_back_tie = distance == back.distance && (back.triangle == NONE || pending.x > back_leaf);
+                    if (distance >= 0.0 && (distance < back.distance || wins_back_tie)) {
+                        back = RayHit(distance, i);
+                        back_leaf = pending.x;
+                    }
+                    continue;
+                }
                 let wins_tie = distance == closest && (hit == NONE || pending.x > hit_leaf);
                 if (distance >= 0.0 && (distance < closest || wins_tie)) {
                     if (distance <= exit_at) {
@@ -157,6 +172,9 @@ fn trace_hit(origin: vec3<f32>, direction: vec3<f32>, limit: f32, ids: vec4<u32>
                 }
             }
         }
+    }
+    if (hit == NONE && back.triangle != NONE) {
+        return back;
     }
     return RayHit(select(OPEN, closest, hit != NONE), hit);
 }
@@ -584,10 +602,7 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
     let origin = probe.geo.xyz;
     let limit = front + probe.geo.w;
     let prefer_front_faces = (probe.ids.w & 2u) != 0u;
-    var hit = trace_hit(origin, direction, limit, vec4<u32>(0u), select(5u, 4u, prefer_front_faces), -1.0);
-    if (prefer_front_faces && hit.triangle == NONE) {
-        hit = trace_hit(origin, direction, limit, vec4<u32>(0u), 5u, -1.0);
-    }
+    let hit = trace_hit(origin, direction, limit, vec4<u32>(0u), select(5u, 4u, prefer_front_faces), -1.0);
     var face = NONE;
     var position = vec3<f32>(0.0);
     var height = 0.0;
@@ -604,11 +619,11 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
             height = dot(position - low, bitcast<vec3<f32>>(probe.ids.xyz)) / range;
         }
     }
-    let offset = global.x * 6u;
-    output_texels[offset] = face;
+    let offset = global.x * 5u;
+    // The host reserves bit 31 and keeps all ones for a missed projection.
+    output_texels[offset] = face | (u32(direct) << 31u);
     output_texels[offset + 1u] = bitcast<u32>(position.x);
     output_texels[offset + 2u] = bitcast<u32>(position.y);
     output_texels[offset + 3u] = bitcast<u32>(position.z);
     output_texels[offset + 4u] = bitcast<u32>(height);
-    output_texels[offset + 5u] = u32(direct);
 }

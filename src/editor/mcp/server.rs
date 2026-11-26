@@ -216,6 +216,42 @@ impl EditorServer {
     }
 
     #[tool(
+        description = "Save a fill layer, group, or layer mask as a reusable local paint preset. Returns the catalog index after writing",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn save_paint_preset(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::SavePresetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintPresetSave(args), context).await
+    }
+
+    #[tool(
+        description = "Import a local Material Painter .mpsmart preset or ZIP package to the paint shelf",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn import_paint_preset(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::ImportPresetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintPresetImport(args), context).await
+    }
+
+    #[tool(
+        description = "Export a fill or group to Material Painter .mpsmart or ZIP with resources, returning the written file path",
+        annotations(destructive_hint = false, open_world_hint = false)
+    )]
+    async fn export_paint_preset(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::ExportPresetArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintPresetExport(args), context).await
+    }
+
+    #[tool(
         description = "Export composed maps for the active or all texture sets into a new folder, using the editor's export settings with optional overrides. Returns the written paths",
         annotations(destructive_hint = false, open_world_hint = false)
     )]
@@ -276,7 +312,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Set the live paint viewport's camera, layout, channel or baked-map preview, path tracing, exposure and post-processing",
+        description = "Set the paint viewport camera, layout, map preview, lighting, path-tracing quality and post-processing",
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn set_paint_view(
@@ -288,7 +324,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Show or hide the high-poly projection cage, or read its coverage report when show is omitted",
+        description = "Show or hide the projection cage, tune it before baking, or read its status by omitting both show and projection",
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn cage_preview(

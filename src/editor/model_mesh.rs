@@ -14,17 +14,37 @@ pub(super) use loop_cut::{LoopCut, LoopCutOptions};
 mod knife;
 pub(super) use knife::KnifeSegment;
 
-pub(super) fn uv_weights(p: Vec2, t: [Vec2; 3]) -> Option<Vec3> {
-    let a = t[1] - t[0];
-    let b = t[2] - t[0];
-    let d = a.perp_dot(b);
-    if d.abs() < 1.0e-10 {
-        return None;
+#[derive(Clone, Copy)]
+pub(super) struct UvBarycentric {
+    origin: Vec2,
+    a: Vec2,
+    b: Vec2,
+    determinant: f32,
+}
+
+impl UvBarycentric {
+    #[inline]
+    pub fn new(t: [Vec2; 3]) -> Option<Self> {
+        let a = t[1] - t[0];
+        let b = t[2] - t[0];
+        let determinant = a.perp_dot(b);
+        if determinant.abs() < 1.0e-10 {
+            return None;
+        }
+        Some(Self { origin: t[0], a, b, determinant })
     }
-    let q = p - t[0];
-    let u = q.perp_dot(b) / d;
-    let v = a.perp_dot(q) / d;
-    Some(Vec3::new(1. - u - v, u, v))
+
+    #[inline]
+    pub fn at(self, point: Vec2) -> Vec3 {
+        let q = point - self.origin;
+        let u = q.perp_dot(self.b) / self.determinant;
+        let v = self.a.perp_dot(q) / self.determinant;
+        Vec3::new(1. - u - v, u, v)
+    }
+}
+
+pub(super) fn uv_weights(p: Vec2, t: [Vec2; 3]) -> Option<Vec3> {
+    Some(UvBarycentric::new(t)?.at(p))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

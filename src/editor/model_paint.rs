@@ -1397,10 +1397,7 @@ impl Session {
             PaintAction::Preset(i) => return i < MATERIALS.len(),
             PaintAction::SaveShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage
             | PaintAction::ShareCommunityMaterial => {
-                return !self.busy && self.stack.layers.get(self.stack.selected).is_some_and(|layer| {
-                    layer.kind == LayerKind::Fill || (layer.kind == LayerKind::Folder
-                        && self.stack.layers[self.stack.block(self.stack.selected)].iter().any(|l| l.kind == LayerKind::Fill))
-                });
+                return !self.busy && self.can_capture_material(self.stack.selected);
             }
             PaintAction::SaveShelfMask => return !self.busy && self.has_mask(),
             PaintAction::ApplyShelfMaterial(i) => {
@@ -1520,7 +1517,7 @@ impl Session {
             PaintAction::BakePickCage => return self.bake_projection.path.is_some() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeClearCage => return self.bake_projection.cage.is_some() && !self.bake_busy && !self.bake_picking,
             PaintAction::BakeAutoFitCage => return self.bake_projection.path.is_some() && self.bake_projection.cage.is_none() && !self.bake_busy && !self.bake_picking,
-            PaintAction::BakeInspectCage => return self.bake_projection.path.is_some(),
+            PaintAction::BakeInspectCage => return self.binding.is_some(),
             PaintAction::BakeQuality(_) | PaintAction::BakeIdSource(_) | PaintAction::BakeRayOptions(_)
             | PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
             | PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_) => {
@@ -1543,8 +1540,11 @@ impl Session {
             }
             PaintAction::BakeResetCagePaint => return !self.bake_busy && self.binding.is_some_and(|(object, _)| self.cage_edits.contains_key(&object)),
             PaintAction::BakeClearHigh | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses
-            | PaintAction::BakePreferFrontFaces | PaintAction::BakeAverageNormals | PaintAction::BakeRange { .. } => {
+            | PaintAction::BakePreferFrontFaces => {
                 return self.bake_projection.path.is_some() && !self.bake_busy && !self.bake_picking;
+            }
+            PaintAction::BakeAverageNormals | PaintAction::BakeRange { .. } => {
+                return self.binding.is_some() && !self.bake_busy && !self.bake_picking;
             }
             PaintAction::BakePreview(map) => return map.is_none_or(|map| {
                 (self.bake_live && matches!(map, bake::BakeMap::Custom(_)))
@@ -1717,16 +1717,7 @@ impl Session {
                 .is_some_and(|layer| layer.kind != LayerKind::Folder),
             PaintAction::Undo => !self.undo.is_empty(),
             PaintAction::Redo => !self.redo.is_empty(),
-            PaintAction::Add(_) => {
-                self.stack.layers.len() < MAX_LAYERS
-                    && self
-                        .stack
-                        .layers
-                        .get(self.stack.selected)
-                        .is_none_or(|layer| {
-                            layer.kind != LayerKind::Folder || layer.depth < MAX_LAYER_DEPTH
-                        })
-            }
+            PaintAction::Add(_) => self.can_insert_layer(self.insertion()),
             PaintAction::Remove => !self.stack.layers.is_empty(),
             PaintAction::RenameLayer(_) => self.stack.selected < self.stack.layers.len(),
             PaintAction::CollapseFolder(index) => self.stack.listed(index)
@@ -1815,6 +1806,31 @@ impl Session {
             .and_then(|layer| layer.mask.as_ref())
             .and_then(|mask| mask.context.as_ref())
             .map_or(0, |context| context.disabled_inputs())
+    }
+
+    fn can_capture_material(&self, index: usize) -> bool {
+        self.stack.layers.get(index).is_some_and(|layer| {
+            layer.kind == LayerKind::Fill || (layer.kind == LayerKind::Folder
+                && self.stack.layers[self.stack.block(index)].iter().any(|layer| layer.kind == LayerKind::Fill))
+        })
+    }
+
+    fn capture_shelf_preset(
+        &self, index: usize, kind: presets::CaptureKind, name: Option<&str>,
+    ) -> Result<presets::Capture, &'static str> {
+        let layer = self.stack.layers.get(index).ok_or("Выберите слой")?;
+        let name = name.unwrap_or(&layer.name).to_owned();
+        match kind {
+            presets::CaptureKind::Mask => {
+                let mask = layer.mask.clone().ok_or("У слоя нет маски")?;
+                Ok(presets::Capture::Mask { name, mask })
+            }
+            presets::CaptureKind::Material if self.can_capture_material(index) => {
+                let layers = self.stack.layers[self.stack.block(index)].to_vec();
+                Ok(presets::Capture::Material { name, layers })
+            }
+            presets::CaptureKind::Material => Err("Выберите заливку или группу с заливкой"),
+        }
     }
 
     fn apply_shelf_mask(&mut self, mask: Arc<Mask>, target: Option<usize>) {
@@ -2264,30 +2280,7 @@ impl Session {
                 }
             }
             PaintAction::Add(kind) => {
-                let name = match kind {
-                    LayerKind::Paint => "Слой",
-                    LayerKind::Fill => "Заливка",
-                    LayerKind::Folder => "Группа",
-                };
-                let mut layer = Layer::new(format!("{name} {}", self.stack.layers.len() + 1), kind);
-                if kind == LayerKind::Fill {
-                    let color = self.brush_color();
-                    layer.channels[0] = Some(crate::editor::model_paint_data::solid(
-                        self.texture_size,
-                        [color[0], color[1], color[2], 255],
-                    ));
-                    let r = (self.roughness * 2.55).round() as u8;
-                    let m = (self.metallic * 2.55).round() as u8;
-                    layer.channels[1] = Some(crate::editor::model_paint_data::solid(
-                        self.texture_size,
-                        [r, r, r, 255],
-                    ));
-                    layer.channels[2] = Some(crate::editor::model_paint_data::solid(
-                        self.texture_size,
-                        [m, m, m, 255],
-                    ));
-                }
-                self.insert_layer(layer);
+                self.insert_new_layer(kind, None, self.insertion());
             }
             PaintAction::Visible(i) => {
                 if let Some(layer) = self.stack.layers.get_mut(i) {
@@ -2396,11 +2389,12 @@ impl Session {
             PaintAction::TraceSamples(direction) => {
                 let samples = self.trace_settings.samples;
                 self.trace_settings.samples = if direction < 0 { samples / 2 } else { samples * 2 }
-                    .clamp(16, 2048);
+                    .clamp(*pathtrace::Settings::SAMPLE_RANGE.start(), *pathtrace::Settings::SAMPLE_RANGE.end());
             }
             PaintAction::TraceBounces(direction) => {
                 self.trace_settings.bounces = self.trace_settings.bounces
-                    .saturating_add_signed(i32::from(direction)).clamp(1, 16);
+                    .saturating_add_signed(i32::from(direction))
+                    .clamp(*pathtrace::Settings::BOUNCE_RANGE.start(), *pathtrace::Settings::BOUNCE_RANGE.end());
             }
             PaintAction::TraceGround => self.trace_settings.ground = !self.trace_settings.ground,
             PaintAction::PreviewShader(value) => {
@@ -2631,10 +2625,7 @@ impl Session {
                     PaintAction::DropMaterial(_, target) => self.shelf_insertion(target).unwrap(),
                     _ => self.insertion(),
                 };
-                self.insert_layer_at(MATERIALS[value].layer(self.texture_size), insertion);
-                self.panel = Panel::Layers;
-                self.editing_mask = false;
-                self.show_mask = false;
+                self.insert_basic_material(value, None, insertion);
             }
             PaintAction::Reset => {
                 self.view = View::Split;
@@ -2701,12 +2692,11 @@ impl Session {
         if self.binding.is_none() || self.busy || self.resize_request.is_some() {
             return false;
         }
-        let Some((_, depth)) = insertion else {
+        let Some((at, depth)) = insertion else {
             return false;
         };
         match material {
-            ShelfMaterial::Basic(index) => index < MATERIALS.len() && depth <= MAX_LAYER_DEPTH
-                && self.stack.layers.len() < MAX_LAYERS,
+            ShelfMaterial::Basic(index) => index < MATERIALS.len() && self.can_insert_layer((at, depth)),
             ShelfMaterial::User(_) | ShelfMaterial::Downloaded(_) | ShelfMaterial::Graph(_) | ShelfMaterial::CommunityGraph(_) => !self.smart_loading && depth <= MAX_LAYER_DEPTH
                 && self.stack.layers.len() < MAX_LAYERS,
             ShelfMaterial::Texture(index) => tips::has_texture(index) && !self.smart_loading
@@ -2716,6 +2706,53 @@ impl Session {
         }
     }
 
+    fn can_insert_layer(&self, (at, depth): (usize, usize)) -> bool {
+        at <= self.stack.layers.len() && depth <= MAX_LAYER_DEPTH && self.stack.layers.len() < MAX_LAYERS
+    }
+
+    fn can_insert_layers(&self, layers: &[Layer], insertion: (usize, usize)) -> bool {
+        self.can_insert_layer(insertion)
+            && !layers.is_empty()
+            && self.stack.layers.len() + layers.len() <= MAX_LAYERS
+            && layers.iter().all(|layer| layer.depth + insertion.1 <= MAX_LAYER_DEPTH)
+    }
+
+    fn insert_new_layer(&mut self, kind: LayerKind, name: Option<&str>, insertion: (usize, usize)) {
+        let name = name.map_or_else(|| {
+            let label = match kind {
+                LayerKind::Paint => "Слой",
+                LayerKind::Fill => "Заливка",
+                LayerKind::Folder => "Группа",
+            };
+            format!("{label} {}", self.stack.layers.len() + 1)
+        }, str::to_owned);
+        let mut layer = Layer::new(name, kind);
+        if kind == LayerKind::Fill {
+            use crate::editor::model_paint_data::solid;
+            let [r, g, b] = self.brush_color();
+            let roughness = (self.roughness * 2.55).round() as u8;
+            let metallic = (self.metallic * 2.55).round() as u8;
+            layer.channels[0] = Some(solid(self.texture_size, [r, g, b, 255]));
+            layer.channels[1] = Some(solid(self.texture_size, [roughness, roughness, roughness, 255]));
+            layer.channels[2] = Some(solid(self.texture_size, [metallic, metallic, metallic, 255]));
+        }
+        self.insert_layer_at(layer, insertion);
+        self.editing_mask = false;
+        self.show_mask = false;
+    }
+
+    fn insert_basic_material(&mut self, preset: usize, name: Option<&str>, insertion: (usize, usize)) {
+        let mut layer = MATERIALS[preset].layer(self.texture_size);
+        if let Some(name) = name {
+            layer.name = name.to_owned();
+        }
+        self.insert_layer_at(layer, insertion);
+        self.panel = Panel::Layers;
+        self.editing_mask = false;
+        self.show_mask = false;
+    }
+
+    #[cfg(test)]
     fn insert_layer(&mut self, layer: Layer) {
         self.insert_layer_at(layer, self.insertion());
     }
@@ -3152,6 +3189,13 @@ impl Session {
             self.revision += 1;
         }
         Ok(())
+    }
+
+    fn mark_resize_pending(&self, doc: &mut crate::editor::model_document::Document) {
+        if self.resize_request.is_some() {
+            doc.paint_busy = true;
+            doc.paint_pending = true;
+        }
     }
 
     fn choose_set(&mut self, doc: &mut crate::editor::model_document::Document, set: usize, now: f64) -> bool {
@@ -3757,9 +3801,7 @@ pub(super) fn actions(
                             session.select_graph_batch(kind, last);
                         }
                     }
-                    Ok(layers) if !layers.is_empty()
-                        && session.stack.layers.len() + layers.len() <= MAX_LAYERS
-                        && layers.iter().all(|layer| layer.depth + job.insertion.1 <= MAX_LAYER_DEPTH) =>
+                    Ok(layers) if session.can_insert_layers(&layers, job.insertion) =>
                     {
                         session.insert_smart_material(layers, job.insertion);
                         if matches!(job.action, PaintAction::OpenSavedGraph(_))
@@ -4249,14 +4291,13 @@ pub(super) fn actions(
                 }
                 PaintAction::SaveShelfMaterial | PaintAction::SaveShelfMask | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage => {
                     if session.available(action) {
-                        let selected = &session.stack.layers[session.stack.selected];
-                        let capture = if action == PaintAction::SaveShelfMask {
-                            presets::Capture::Mask { name: selected.name.clone(), mask: selected.mask.as_ref().unwrap().clone() }
+                        let kind = if action == PaintAction::SaveShelfMask {
+                            presets::CaptureKind::Mask
                         } else {
-                            presets::Capture::Material {
-                                name: selected.name.clone(),
-                                layers: session.stack.layers[session.stack.block(session.stack.selected)].to_vec(),
-                            }
+                            presets::CaptureKind::Material
+                        };
+                        let Ok(capture) = session.capture_shelf_preset(session.stack.selected, kind, None) else {
+                            continue;
                         };
                         if matches!(action, PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage) {
                             let package = action == PaintAction::ExportShelfPackage;
@@ -4334,23 +4375,17 @@ pub(super) fn actions(
                             } else {
                                 (None, None)
                             };
+                            let preparation = presets::MaterialPreparation {
+                                maps: maps.clone(), surface: surface.clone(), renderer,
+                            };
                             session.smart_loading = true;
                             session.revision += 1;
                             paint.smart_import = Some(SmartImport {
                                 model: index, binding, set: session.set, stack: session.stack.clone(),
                                 action, mask: false, folder_graph: false, insertion, size,
                                 maps: maps.clone(), surface: surface.clone(),
-                                task: bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                                    let mut layers = presets::load_material(&path, size)?;
-                                    if foreign {
-                                        let inputs = material_graph::Inputs {
-                                            maps: maps.as_deref(), surface: surface.as_deref(),
-                                        };
-                                        material_graph::prepare_imported(&mut layers, size, inputs,
-                                            renderer.as_ref().map(|(device, queue)| (device, queue)))?;
-                                    }
-                                    Ok(layers)
-                                }),
+                                task: bevy::tasks::AsyncComputeTaskPool::get()
+                                    .spawn(async move { preparation.load(&path, size) }),
                             });
                         } else {
                             editor.status = "Материал не помещается в стек слоёв".into();
@@ -5051,8 +5086,7 @@ pub(super) fn actions(
             if session.resize_request.is_some()
                 && let Some(doc) = editing.documents.get_mut(&index)
             {
-                doc.paint_busy = true;
-                doc.paint_pending = true;
+                session.mark_resize_pending(doc);
             }
         }
     }
