@@ -399,16 +399,14 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_baked_denoise_matches_cpu_across_band_boundaries() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app
+        let device = RayDevice::new(
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderDevice>()
-                .clone(),
-            queue: app
+                .resource::<bevy::render::renderer::RenderDevice>(),
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderQueue>()
-                .clone(),
-        };
+                .resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let size = 96;
         let (mut cpu, guides) = fixture(size);
         let (mut actual, _) = fixture(size);
@@ -516,16 +514,14 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device and a 4096 × 4096 bake atlas"]
     fn gpu_baked_denoise_handles_a_4096_atlas() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app
+        let device = RayDevice::new(
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderDevice>()
-                .clone(),
-            queue: app
+                .resource::<bevy::render::renderer::RenderDevice>(),
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderQueue>()
-                .clone(),
-        };
+                .resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let size = 4096;
         let mut maps = maps_with_values(size, vec![[0; super::super::COMPONENTS]; size * size]);
         let mut guides = vec![Guide::default(); size * size];

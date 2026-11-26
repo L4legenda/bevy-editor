@@ -539,6 +539,10 @@ fn graph_payloads(layer: &Layer) -> [Option<&serde_json::Value>; 2] {
     [fill, mask]
 }
 
+pub(super) fn has_graph_layers(stack: &Stack) -> bool {
+    stack.layers.iter().flat_map(graph_payloads).any(|payload| payload.is_some())
+}
+
 fn pending_import(payload: &serde_json::Value) -> bool {
     payload[MPP_GRAPH_PENDING].as_bool() == Some(true)
 }
@@ -725,6 +729,7 @@ fn step(kind: &ParamKind, value: &Value, component: usize, direction: i8) -> Opt
 pub(super) struct Inputs<'a> {
     pub maps: Option<&'a bake::Maps>,
     pub surface: Option<&'a surface::Source>,
+    pub live: Option<&'a crate::editor::model_paint_data::custom::LivePlane>,
 }
 
 pub(super) fn prepare_graph(
@@ -848,9 +853,10 @@ fn evaluate(
     graph.res = resolution.clamp(16, render_limit(device));
     let mut runtime = Runtime::new(device.wgpu_device(), queue, assets());
     let images = file::bind_images(graph, images, &mut runtime, device, queue)?;
-    let mesh = mesh_maps::Textures::new(
+    let mesh = mesh_maps::Textures::with_live(
         &mesh_maps::used(graph),
         inputs.maps,
+        inputs.live,
         graph.res,
         device,
         queue,

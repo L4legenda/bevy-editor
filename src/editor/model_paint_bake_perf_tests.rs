@@ -47,11 +47,15 @@ fn gpu_compare_mesh_bake() {
     }];
     let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
     let world = app.world();
-    let gpu = RayDevice {
-        device: world.resource::<RenderDevice>().clone(),
-        queue: world.resource::<RenderQueue>().clone(),
-    };
+    let gpu = RayDevice::new(
+        world.resource::<RenderDevice>(),
+        world.resource::<RenderQueue>(),
+    );
     let info = world.resource::<RenderAdapterInfo>();
+    if std::env::var("PAINT_BAKE_COMPARE_LIVE_PROJECTION").as_deref() == Ok("1") {
+        compare_live_projection(objects, root.join("bake-high.obj"), &gpu, info);
+        return;
+    }
     let serial_gpu = std::env::var("PAINT_BAKE_SERIAL").as_deref() == Ok("1");
     let compare_raster = std::env::var("PAINT_BAKE_COMPARE_RASTER").as_deref() == Ok("1");
     let compare_visibility = std::env::var("PAINT_BAKE_COMPARE_VISIBILITY").as_deref() == Ok("1");
@@ -179,6 +183,77 @@ fn gpu_compare_mesh_bake() {
                         "digest": digest.to_hex().as_str(),
                     })
                 );
+            }
+        }
+    }
+}
+
+fn compare_live_projection(
+    objects: Vec<Object>, high: PathBuf, gpu: &RayDevice, info: &RenderAdapterInfo,
+) {
+    use crate::editor::model_paint_data::custom::{Kind, Recipe};
+
+    let compare_pipelines = std::env::var("PAINT_BAKE_COMPARE_LIVE_PIPELINES").as_deref() == Ok("1");
+    let compare_scene_buffers = std::env::var("PAINT_BAKE_COMPARE_LIVE_SCENE").as_deref() == Ok("1");
+    assert!(!(compare_pipelines && compare_scene_buffers));
+    let recipe = Recipe::new(Kind::Exposure, &[]);
+    let adjusted = Recipe { azimuth: 45, ..recipe.clone() };
+    let settings = ProjectionSettings {
+        path: Some(high),
+        match_names: false,
+        ..Default::default()
+    };
+    for size in [96, 256] {
+        let mut expected = None;
+        let mut expected_adjusted = None;
+        for round in 0..5 {
+            for alternate in [round % 2 == 0, round % 2 != 0] {
+                let serial = !(compare_pipelines || compare_scene_buffers) && alternate;
+                let fresh_pipelines = compare_pipelines && alternate;
+                let fresh_scene_buffers = !compare_scene_buffers || alternate;
+                let fresh_gpu = if fresh_pipelines {
+                    Some(RayDevice::new(&gpu.device, &gpu.queue))
+                } else {
+                    fresh_scene_buffers.then(|| gpu.with_fresh_scene_cache())
+                };
+                let gpu = fresh_gpu.as_ref().unwrap_or(gpu);
+                let progress = Progress { serial_projection: serial, profile: true, ..default() };
+                let scene = live::Scene::prepare(objects.clone(), 0, 0, &settings, &progress).unwrap();
+                let started = Instant::now();
+                let (pixels, used_gpu) = scene.shade_on_device(
+                    &recipe, size, super::super::Quality::Draft, &progress, Some(gpu),
+                ).unwrap();
+                let total_ms = started.elapsed().as_secs_f64() * 1000.;
+                assert!(used_gpu && scene.has_gpu_raster(size));
+                let digest = blake3::hash(&pixels);
+                assert_eq!(*expected.get_or_insert(digest), digest);
+                let peak = progress.projection_peak.load(Ordering::Relaxed);
+                assert_eq!(peak, if serial { 1 } else if size == 96 { 2 } else { 3 });
+                let adjusted_progress = Progress { serial_gpu: serial, profile: true, ..default() };
+                let started = Instant::now();
+                let (pixels, used_gpu) = scene.shade_on_device(
+                    &adjusted, size, super::super::Quality::Draft, &adjusted_progress, Some(gpu),
+                ).unwrap();
+                let adjusted_ms = started.elapsed().as_secs_f64() * 1000.;
+                assert!(used_gpu);
+                assert_eq!(adjusted_progress.projection_peak.load(Ordering::Relaxed), 0);
+                let adjusted_digest = blake3::hash(&pixels);
+                assert_ne!(digest, adjusted_digest);
+                assert_eq!(*expected_adjusted.get_or_insert(adjusted_digest), adjusted_digest);
+                if round > 0 {
+                    println!("LIVE_PROJECTION_COMPARE {}", serde_json::json!({
+                        "app": "Bevy Editor",
+                        "adapter": info.name, "backend": format!("{:?}", info.backend),
+                        "size": size, "run": round, "serial": serial, "projection_peak": peak,
+                        "fresh_pipelines": fresh_pipelines,
+                        "fresh_scene_buffers": fresh_scene_buffers,
+                        "total_ms": total_ms,
+                        "projection_read_ms": progress.projection_wait_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                        "adjusted_ms": adjusted_ms,
+                        "adjusted_read_ms": adjusted_progress.ray_wait_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                        "digest": digest.to_hex().as_str(),
+                    }));
+                }
             }
         }
     }

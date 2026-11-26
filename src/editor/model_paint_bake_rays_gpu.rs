@@ -2,15 +2,15 @@
 use super::*;
 use bevy::render::{
     render_resource::{
-        BindGroup, BindGroupEntry, BindGroupLayoutEntry, BindingType, Buffer, BufferAsyncError,
+        BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry, BindingType, Buffer, BufferAsyncError,
         BufferBindingType, BufferDescriptor, BufferInitDescriptor, BufferUsages,
         CommandEncoderDescriptor, ComputePassDescriptor, ComputePipeline, MapMode,
-        PipelineLayoutDescriptor, PollType, RawComputePipelineDescriptor, ShaderModuleDescriptor,
+        PipelineLayoutDescriptor, PollType, RawComputePipelineDescriptor, ShaderModule, ShaderModuleDescriptor,
         ShaderSource, ShaderStages,
     },
     renderer::{RenderDevice, RenderQueue},
 };
-use std::{collections::VecDeque, sync::mpsc, time::Duration};
+use std::{collections::VecDeque, sync::{Mutex, Weak, mpsc}, time::Duration};
 
 const NODE_BYTES: usize = 48;
 const TEXEL_BYTES: usize = 64;
@@ -20,12 +20,106 @@ const HEADER_BYTES: usize = 64;
 const CONFIG_BYTES: usize = HEADER_BYTES + crate::editor::model_paint_data::custom::MAX_MAPS * 48;
 const BASE_WORDS: usize = 2;
 const MAX_IN_FLIGHT: usize = 3;
+const CACHED_SCENES: usize = 2;
+const CACHED_SCENE_BYTES: usize = 96 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(in crate::editor::ui::model_viewer::paint::bake) struct Device {
     pub device: RenderDevice,
     pub queue: RenderQueue,
+    pipelines: Arc<Pipelines>,
+    scenes: Arc<Mutex<VecDeque<CachedScene>>>,
+}
+
+impl Device {
+    pub fn new(device: &RenderDevice, queue: &RenderQueue) -> Self {
+        Self {
+            device: device.clone(), queue: queue.clone(), pipelines: Arc::default(), scenes: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_fresh_scene_cache(&self) -> Self {
+        Self { scenes: Arc::default(), ..self.clone() }
+    }
+}
+
+struct CachedScene {
+    relief: Weak<project::HighRelief>,
+    triangle_vectors: usize,
+    buffers: [Buffer; 2],
+    bytes: usize,
+}
+
+impl Device {
+    fn scene_buffers(
+        &self, parts: &PartsOfScene, triangle_vectors: usize, bytes: usize,
+        create: impl FnOnce() -> Option<[Buffer; 2]>,
+    ) -> Option<[Buffer; 2]> {
+        let PartsOfScene::High(relief, _) = parts else { return create() };
+        if bytes > CACHED_SCENE_BYTES {
+            return create();
+        }
+        // Relief belongs to one immutable source and supplies the part IDs in the buffers.
+        let relief = Arc::downgrade(relief);
+        let mut cache = self.scenes.lock().unwrap();
+        cache.retain(|scene| scene.relief.strong_count() != 0);
+        if let Some(index) = cache.iter().position(|scene| {
+            scene.triangle_vectors == triangle_vectors && scene.relief.ptr_eq(&relief)
+        }) {
+            let scene = cache.remove(index).unwrap();
+            let buffers = scene.buffers.clone();
+            cache.push_back(scene);
+            return Some(buffers);
+        }
+        let buffers = create()?;
+        let mut stored_bytes: usize = cache.iter().map(|scene| scene.bytes).sum();
+        while cache.len() == CACHED_SCENES || stored_bytes + bytes > CACHED_SCENE_BYTES {
+            stored_bytes -= cache.pop_front().unwrap().bytes;
+        }
+        cache.push_back(CachedScene { relief, triangle_vectors, buffers: buffers.clone(), bytes });
+        Some(buffers)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Pass {
+    Maps,
+    ResidentMaps,
+    Projection,
+}
+
+#[derive(Default)]
+struct Pipelines {
+    shader: OnceLock<ShaderModule>,
+    maps: OnceLock<Pipeline>,
+    resident_maps: OnceLock<Pipeline>,
+    projection: OnceLock<Pipeline>,
+}
+
+struct Pipeline {
+    layout: BindGroupLayout,
+    compute: ComputePipeline,
+}
+
+impl Pipelines {
+    fn get(&self, device: &RenderDevice, pass: Pass) -> &Pipeline {
+        let (slot, entry) = match pass {
+            Pass::Maps => (&self.maps, "trace_maps"),
+            Pass::ResidentMaps => (&self.resident_maps, "trace_resident_maps"),
+            Pass::Projection => (&self.projection, "project_queries"),
+        };
+        slot.get_or_init(|| {
+            let shader = self.shader.get_or_init(|| {
+                device.create_and_validate_shader_module(ShaderModuleDescriptor {
+                    label: Some("Bake visibility"),
+                    source: ShaderSource::Wgsl(include_str!("model_paint_bake_rays.wgsl").into()),
+                })
+            });
+            Pipeline::new(device, shader, entry, matches!(pass, Pass::ResidentMaps))
+        })
+    }
 }
 
 struct Dispatch {
@@ -77,8 +171,8 @@ fn words(data: &mut Vec<u8>, values: [u32; 4]) {
     }
 }
 
-fn vector(data: &mut Vec<u8>, v: Vec3) {
-    words(data, [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), 0]);
+fn packed_vector(v: Vec3) -> [[u8; 4]; 4] {
+    [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), 0].map(u32::to_le_bytes)
 }
 
 fn batch_limit(recipes: &[custom::Prepared], rays: &Rays, visibility: bool) -> usize {
@@ -109,10 +203,14 @@ fn batch_limit(recipes: &[custom::Prepared], rays: &Rays, visibility: bool) -> u
 
 pub(super) enum PartsOfScene<'a> {
     Low(&'a Parts, usize),
-    High(&'a project::HighRelief, &'a project::Projection),
+    High(&'a Arc<project::HighRelief>, &'a project::Projection),
 }
 
 impl Batch {
+    pub fn has_flow_normals(&self) -> bool {
+        self.triangle_vectors == 7
+    }
+
     pub fn project_batch(&self) -> Option<ProjectBatch> {
         let gpu = &self.dispatch.gpu;
         let caps = gpu.device.limits();
@@ -130,7 +228,7 @@ impl Batch {
                 capacity,
                 PROJECTION_REPLY_BYTES,
                 MAX_IN_FLIGHT,
-                "project_queries",
+                Pass::Projection,
                 None,
             ),
             triangle_vectors: self.triangle_vectors,
@@ -179,63 +277,13 @@ impl Batch {
         {
             return None;
         }
-        let mut node_data = Vec::with_capacity(node_capacity);
-        for ([lo, hi], links) in nodes {
-            vector(&mut node_data, lo);
-            vector(&mut node_data, hi);
-            words(&mut node_data, links);
-        }
-        let mut triangle_data = Vec::with_capacity(triangle_capacity);
-        for (index, triangle) in triangles {
-            let face = u32::try_from(triangle.face).ok()?;
-            if matches!(parts, PartsOfScene::High(..)) && face >= DIRECT_PROJECTION - 1 {
-                return None;
-            }
-            for point in triangle.points {
-                vector(&mut triangle_data, point);
-            }
-            let part = match &parts {
-                PartsOfScene::Low(parts, target) if triangle.object == *target => {
-                    parts.faces[triangle.face]
-                }
-                PartsOfScene::Low(..) => 0,
-                PartsOfScene::High(parts, _) => parts.part(triangle.face),
-            };
-            words(
-                &mut triangle_data,
-                [
-                    u32::try_from(triangle.object).ok()?,
-                    face,
-                    part as u32,
-                    u32::from(
-                        matches!(&parts, PartsOfScene::High(_, projector) if projector.accepts_projection(triangle)),
-                    ),
-                ],
-            );
-            if let Some(normals) = &rays.flow_normals {
-                for normal in normals.corners(index) {
-                    vector(&mut triangle_data, normal);
-                }
-            }
-        }
-        let storage = BufferUsages::STORAGE;
-        let from_bytes = |label, contents: &[u8]| {
-            device.create_buffer_with_data(&BufferInitDescriptor {
-                label: Some(label),
-                contents,
-                usage: storage,
-            })
-        };
-        let nodes = from_bytes("Bake BVH nodes", &node_data);
-        let triangles = from_bytes("Bake BVH triangles", &triangle_data);
-        let scene = [nodes, triangles];
-        let slots = if visibility { MAX_IN_FLIGHT } else { 1 };
-        let entry = if resident {
-            "trace_resident_maps"
-        } else {
-            "trace_maps"
-        };
-        let dispatch = Dispatch::new(gpu, &scene, limit, stride, slots, entry, atlas);
+        let scene_bytes = node_capacity.checked_add(triangle_capacity)?;
+        let scene = gpu.scene_buffers(&parts, triangle_vectors, scene_bytes, || {
+            Self::upload_scene(device, rays, &parts, node_capacity, triangle_capacity)
+        })?;
+        let slots = if visibility || recipe_count > 0 { MAX_IN_FLIGHT } else { 1 };
+        let pass = if resident { Pass::ResidentMaps } else { Pass::Maps };
+        let dispatch = Dispatch::new(gpu, &scene, limit, stride, slots, pass, atlas);
         let mut batch = Self {
             scene,
             dispatch,
@@ -258,6 +306,54 @@ impl Batch {
         };
         batch.configure(recipes, rays);
         Some(batch)
+    }
+
+    fn upload_scene(
+        device: &RenderDevice, rays: &Rays, parts: &PartsOfScene,
+        node_capacity: usize, triangle_capacity: usize,
+    ) -> Option<[Buffer; 2]> {
+        let mut node_data = Vec::with_capacity(node_capacity / NODE_BYTES);
+        for ([lo, hi], links) in rays.scene.compute_nodes() {
+            node_data.push([packed_vector(lo), packed_vector(hi), links.map(u32::to_le_bytes)]);
+        }
+        let mut triangle_data = Vec::with_capacity(triangle_capacity / 16);
+        for (index, triangle) in rays.scene.compute_triangles() {
+            let face = u32::try_from(triangle.face).ok()?;
+            if matches!(parts, PartsOfScene::High(..)) && face >= DIRECT_PROJECTION - 1 {
+                return None;
+            }
+            let part = match parts {
+                PartsOfScene::Low(parts, target) if triangle.object == *target => {
+                    parts.faces[triangle.face]
+                }
+                PartsOfScene::Low(..) => 0,
+                PartsOfScene::High(parts, _) => parts.part(triangle.face),
+            };
+            let ids = [
+                u32::try_from(triangle.object).ok()?,
+                face,
+                part as u32,
+                u32::from(
+                    matches!(parts, PartsOfScene::High(_, projector) if projector.accepts_projection(triangle)),
+                ),
+            ];
+            let [a, b, c] = triangle.points.map(packed_vector);
+            triangle_data.extend_from_slice(&[a, b, c, ids.map(u32::to_le_bytes)]);
+            if let Some(normals) = &rays.flow_normals {
+                triangle_data.extend_from_slice(&normals.corners(index).map(packed_vector));
+            }
+        }
+        let storage = BufferUsages::STORAGE;
+        let from_bytes = |label, contents: &[u8]| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage: storage,
+            })
+        };
+        let nodes = from_bytes("Bake BVH nodes", node_data.as_flattened().as_flattened().as_flattened());
+        let triangles = from_bytes("Bake BVH triangles", triangle_data.as_flattened().as_flattened());
+        Some([nodes, triangles])
     }
 
     pub fn configure(&mut self, recipes: &[custom::Prepared], rays: &Rays) {
@@ -322,8 +418,9 @@ impl Batch {
             &mut self.encoded,
             [p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), width.to_bits()],
         );
-        vector(&mut self.encoded, surface.normal);
-        vector(&mut self.encoded, surface.geometric);
+        for v in [surface.normal, surface.geometric] {
+            words(&mut self.encoded, [v.x.to_bits(), v.y.to_bits(), v.z.to_bits(), 0]);
+        }
         words(
             &mut self.encoded,
             [
@@ -461,8 +558,9 @@ impl Batch {
         &mut self,
         pixels: &mut [[u8; 4]],
         progress: &Progress,
+        drain: bool,
     ) -> Result<(), String> {
-        self.read(progress, true, |pixel, result| {
+        self.read(progress, drain, |pixel, result| {
             let value = result[8];
             pixels[pixel] = [value, value, value, 255];
         })?;
@@ -486,21 +584,6 @@ impl ProjectBatch {
             return 1;
         }
         self.dispatch.staging.len()
-    }
-
-    pub fn run(
-        &mut self,
-        projector: &project::Projection,
-        probes: &[aa::Probe],
-        progress: &Progress,
-    ) -> Result<Vec<Option<project::Hit>>, String> {
-        if probes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let readback = self.submit(probes, 0, progress)?;
-        let mut results = Vec::with_capacity(probes.len());
-        self.resolve(projector, readback, &mut results, progress)?;
-        Ok(results)
     }
 
     pub fn submit(
@@ -615,6 +698,44 @@ impl ProjectBatch {
     }
 }
 
+impl Pipeline {
+    fn new(device: &RenderDevice, shader: &ShaderModule, entry: &str, resident: bool) -> Self {
+        let layout_entries: Vec<_> = (0..5 + u32::from(resident))
+            .map(|binding| BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: if binding == 4 {
+                        BufferBindingType::Uniform
+                    } else {
+                        BufferBindingType::Storage {
+                            read_only: binding < 3,
+                        }
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let layout = device.create_bind_group_layout("Bake rays layout", &layout_entries);
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bake ray pipeline layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let compute = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+            label: Some("Bake visibility"),
+            layout: Some(&pipeline_layout),
+            module: shader,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { layout, compute }
+    }
+}
+
 impl Dispatch {
     fn new(
         gpu: &Device,
@@ -622,7 +743,7 @@ impl Dispatch {
         limit: usize,
         stride: usize,
         slots: usize,
-        entry: &'static str,
+        pass: Pass,
         atlas: Option<&Buffer>,
     ) -> Self {
         let device = &gpu.device;
@@ -659,28 +780,10 @@ impl Dispatch {
             CONFIG_BYTES as u64,
             BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         );
-        let layout_entries: Vec<_> = (0..5 + u32::from(atlas.is_some()))
-            .map(|binding| BindGroupLayoutEntry {
-                binding: binding as u32,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: if binding == 4 {
-                        BufferBindingType::Uniform
-                    } else {
-                        BufferBindingType::Storage {
-                            read_only: binding < 3,
-                        }
-                    },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            })
-            .collect();
-        let layout = device.create_bind_group_layout("Bake rays layout", &layout_entries);
+        let pipeline = gpu.pipelines.get(device, pass);
         let bindings = device.create_bind_group(
             "Bake rays bindings",
-            &layout,
+            &pipeline.layout,
             &[&scene[0], &scene[1], &input, &output, &uniform]
                 .into_iter()
                 .chain(atlas)
@@ -691,26 +794,9 @@ impl Dispatch {
                 })
                 .collect::<Vec<_>>(),
         );
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("Bake ray pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_and_validate_shader_module(ShaderModuleDescriptor {
-            label: Some("Bake visibility"),
-            source: ShaderSource::Wgsl(include_str!("model_paint_bake_rays.wgsl").into()),
-        });
-        let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
-            label: Some("Bake visibility"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        });
         Self {
             gpu: gpu.clone(),
-            pipeline,
+            pipeline: pipeline.compute.clone(),
             bindings,
             input,
             output,

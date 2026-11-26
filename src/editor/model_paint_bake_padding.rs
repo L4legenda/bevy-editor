@@ -259,16 +259,14 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_baked_padding_matches_cpu_on_islands_and_band_boundaries() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let gpu = RayDevice {
-            device: app
+        let gpu = RayDevice::new(
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderDevice>()
-                .clone(),
-            queue: app
+                .resource::<bevy::render::renderer::RenderDevice>(),
+            app
                 .world()
-                .resource::<bevy::render::renderer::RenderQueue>()
-                .clone(),
-        };
+                .resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let size: usize = 97;
         let original: Vec<_> = (0..size * size)
             .map(|i| {

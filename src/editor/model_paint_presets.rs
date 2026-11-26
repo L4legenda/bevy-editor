@@ -546,6 +546,7 @@ impl MaterialPreparation {
             let inputs = material_graph::Inputs {
                 maps: self.maps.as_deref(),
                 surface: self.surface.as_deref(),
+                live: None,
             };
             material_graph::prepare_imported(&mut layers, size, inputs,
                 self.renderer.as_ref().map(|(device, queue)| (device, queue)))?;

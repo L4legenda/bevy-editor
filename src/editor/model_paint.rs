@@ -1295,6 +1295,11 @@ impl Session {
         self.panel == Panel::Maps && self.bake_view.is_some()
     }
 
+    fn live_mask_map(&self) -> Option<bake::BakeMap> {
+        (self.panel == Panel::Maps && self.bake_live_masks && self.bake_live)
+            .then(|| self.bake_view.unwrap_or(bake::BakeMap::WorldNormal))
+    }
+
     fn set_cage_inspection(&mut self, enabled: bool) {
         self.bake_inspect_cage = enabled;
         if !enabled {
@@ -1337,7 +1342,7 @@ impl Session {
 
     fn diagnostic_3d(&self) -> bool {
         self.diagnostic_channel().is_some() || self.diagnostic_bake().is_some()
-            || (self.bake_live_masks && self.view != View::Two)
+            || (self.live_mask_map().is_some() && self.view != View::Two)
     }
 
     fn paint_blocked_by_bake(&self) -> bool {
@@ -1547,12 +1552,12 @@ impl Session {
                 return self.binding.is_some() && !self.bake_busy && !self.bake_picking;
             }
             PaintAction::BakePreview(map) => return map.is_none_or(|map| {
-                (self.bake_live && matches!(map, bake::BakeMap::Custom(_)))
-                    || (self.bake_ready && self.bake_projection.maps.contains(map)
-                        && (!map.requires_high_poly() || self.bake_projection.path.is_some()))
+                (self.bake_ready || (self.bake_live && self.binding.is_some()))
+                    && self.bake_projection.maps.contains(map)
+                    && (!map.requires_high_poly() || self.bake_projection.path.is_some())
             }),
             PaintAction::BakeLiveMasks => return self.bake_live_masks
-                || (self.bake_live && matches!(self.bake_view, Some(bake::BakeMap::Custom(_)))),
+                || (self.bake_live && self.binding.is_some()),
             PaintAction::SetHide(object, slot) => return !self.busy && self.resize_request.is_none()
                 && self.set_appearance.can_toggle((object, slot)),
             PaintAction::Resolution(size) => return !self.busy && self.binding.is_some()
@@ -4107,7 +4112,7 @@ pub(super) fn actions(
                             Arc::make_mut(&mut images).extend(folder.folder_images.iter()
                                 .map(|(path, bitmap)| (path.clone(), bitmap.clone())));
                         }
-                        let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: surface.as_deref() };
+                        let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: surface.as_deref(), live: None };
                         for (index, graph) in masks {
                             let layer = &mut stack.layers[index];
                             if let Some(graph) = graph {
@@ -4707,6 +4712,7 @@ pub(super) fn actions(
                         let inputs = material_graph::Inputs {
                             maps: maps.as_deref(),
                             surface: surface.as_ref(),
+                            live: None,
                         };
                         material_graph::export_outputs(&directory, &data, &images, size, inputs, &device, &queue)
                             .map(Some)
@@ -4891,7 +4897,7 @@ pub(super) fn actions(
                             maps: maps.clone(),
                             surface: surface.clone(),
                             task: bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                                let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: surface.as_deref() };
+                                let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: surface.as_deref(), live: None };
                                 let prepare_layer = |graph, images: &texture_fill::GraphImages| {
                                     if let Some(mut layer) = mask_layer {
                                         material_graph::apply_mask(&mut layer, graph, images, size, inputs, &device, &queue)?;
@@ -5140,7 +5146,7 @@ pub(super) fn actions(
                 action: PaintAction::GraphRebake, mask: false, folder_graph: false, insertion: session.insertion(), size,
                 maps: maps.clone(), surface: Some(surface.clone()),
                 task: bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
-                    let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: Some(&surface) };
+                    let inputs = material_graph::Inputs { maps: maps.as_deref(), surface: Some(&surface), live: None };
                     for (index, is_mask, graph) in graphs {
                         material_graph::refresh_layer(
                             &mut layers[index], is_mask, graph, size, inputs, &device, &queue,

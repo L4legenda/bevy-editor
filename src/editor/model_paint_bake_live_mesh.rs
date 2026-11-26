@@ -1,7 +1,7 @@
 //! Raster and ray data reused between previews of the same texture set.
 use super::*;
 use crate::editor::model_paint_data::custom::Recipe;
-use std::sync::Mutex;
+use std::{collections::VecDeque, sync::Mutex};
 
 struct UvTriangle {
     face: usize,
@@ -30,17 +30,51 @@ struct PreviewProjection<'a> {
     source: &'a project::Projection,
     parts: &'a project::HighRelief,
     probes: Vec<aa::Probe>,
-    pending: Vec<usize>,
+    indices: Vec<usize>,
+    pending: VecDeque<(rays_gpu::ProjectionReadback, Vec<usize>)>,
+    spare_indices: Vec<Vec<usize>>,
+    hits: Vec<Option<project::Hit>>,
+    next_slot: usize,
 }
 
 impl PreviewProjection<'_> {
-    fn flush(&mut self, texels: &mut [Texel], progress: &Progress) -> Result<(), String> {
-        let hits = self.batch.run(self.source, &self.probes, progress)?;
-        for (index, hit) in self.pending.drain(..).zip(hits) {
+    fn submit(&mut self, texels: &mut [Texel], progress: &Progress) -> Result<(), String> {
+        if self.probes.is_empty() {
+            return Ok(());
+        }
+        let slots = self.batch.slots(progress);
+        if self.pending.len() == slots {
+            self.retire(texels, progress)?;
+        }
+        let readback = self.batch.submit(&self.probes, self.next_slot, progress)?;
+        self.next_slot = (self.next_slot + 1) % slots;
+        let indices = std::mem::replace(&mut self.indices, self.spare_indices.pop().unwrap_or_default());
+        self.pending.push_back((readback, indices));
+        self.probes.clear();
+        #[cfg(test)]
+        progress.projection_peak.fetch_max(self.pending.len() as u32, Ordering::Relaxed);
+        if slots == 1 {
+            self.retire(texels, progress)?;
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self, texels: &mut [Texel], progress: &Progress) -> Result<(), String> {
+        let (readback, mut indices) = self.pending.pop_front().unwrap();
+        self.batch.resolve(self.source, readback, &mut self.hits, progress)?;
+        for (index, hit) in indices.drain(..).zip(self.hits.drain(..)) {
             texels[index].surface =
                 hit.map(|hit| RaySurface::projected(self.source.scene(), self.parts, hit));
         }
-        self.probes.clear();
+        self.spare_indices.push(indices);
+        Ok(())
+    }
+
+    fn finish(&mut self, texels: &mut [Texel], progress: &Progress) -> Result<(), String> {
+        self.submit(texels, progress)?;
+        while !self.pending.is_empty() {
+            self.retire(texels, progress)?;
+        }
         Ok(())
     }
 }
@@ -127,7 +161,11 @@ impl Scene {
                 source,
                 parts,
                 probes: Vec::new(),
-                pending: Vec::new(),
+                indices: Vec::new(),
+                pending: VecDeque::new(),
+                spare_indices: Vec::new(),
+                hits: Vec::new(),
+                next_slot: 0,
             });
         let projected_on_gpu = gpu.is_some();
         if let Some((_, _, raster)) = self
@@ -189,7 +227,7 @@ impl Scene {
                     let surface = if let Some((projection, parts)) = high {
                         if let Some(gpu) = gpu.as_mut() {
                             if let Some(frame) = &frame {
-                                gpu.pending.push(texels.len());
+                                gpu.indices.push(texels.len());
                                 gpu.probes.push(frame.center_probe(projection, w));
                             }
                             None
@@ -224,7 +262,7 @@ impl Scene {
                     if let Some(gpu) = gpu.as_mut()
                         && gpu.probes.len() == gpu.batch.capacity
                     {
-                        gpu.flush(&mut texels, progress)?;
+                        gpu.submit(&mut texels, progress)?;
                     }
                 }
             }
@@ -233,7 +271,7 @@ impl Scene {
             return Err("UV-развёртка набора не покрывает карту".into());
         }
         if let Some(gpu) = gpu.as_mut() {
-            gpu.flush(&mut texels, progress)?;
+            gpu.finish(&mut texels, progress)?;
         }
         let raster: Arc<[Texel]> = texels.into();
         let mut cache = self.rasters.lock().unwrap();
@@ -283,7 +321,7 @@ impl Scene {
                 sampling,
                 maps: MapSelection::ALL,
                 resolution: size,
-                flow_normals: Some(custom::FlowNormals::High(projection)),
+                flow_normals: prepared.is_flow().then_some(custom::FlowNormals::High(projection)),
             }
         } else {
             Rays {
@@ -292,7 +330,7 @@ impl Scene {
                 sampling,
                 maps: MapSelection::ALL,
                 resolution: size,
-                flow_normals: Some(custom::FlowNormals::Mesh(&scene.triangle_normals)),
+                flow_normals: prepared.is_flow().then_some(custom::FlowNormals::Mesh(&scene.triangle_normals)),
             }
         };
         let mut pixels = vec![[0; 4]; (size * size) as usize];
@@ -388,7 +426,7 @@ impl Scene {
         let mut gpu = self.gpu.lock().unwrap();
         progress.check()?;
         let recipes = std::slice::from_ref(recipe);
-        if gpu.is_none() {
+        if gpu.as_ref().is_none_or(|gpu| recipe.is_flow() && !gpu.rays.has_flow_normals()) {
             let labels = if let (Some(parts), Some(projection)) =
                 (&self.high_parts, &self.geometry.projection)
             {
@@ -396,7 +434,10 @@ impl Scene {
             } else {
                 rays_gpu::PartsOfScene::Low(self.geometry.parts.as_ref().unwrap(), self.target)
             };
-            *gpu = rays_gpu::Batch::new(device, rays, labels, recipes, false, None).map(|batch| Gpu {
+            let Some(batch) = rays_gpu::Batch::new(device, rays, labels, recipes, false, None) else {
+                return Ok(None);
+            };
+            *gpu = Some(Gpu {
                 projection: self.high_parts.as_ref().and_then(|_| batch.project_batch()),
                 rays: batch,
             });
@@ -417,11 +458,11 @@ impl Scene {
                 if let Some(surface) = texel.surface {
                     batch.push(surface, texel.index, texel.width);
                     if batch.full() {
-                        batch.flush_preview(pixels, progress)?;
+                        batch.flush_preview(pixels, progress, false)?;
                     }
                 }
             }
-            batch.flush_preview(pixels, progress)?;
+            batch.flush_preview(pixels, progress, true)?;
             Ok(Some(raster))
         })();
         if result.is_err() {

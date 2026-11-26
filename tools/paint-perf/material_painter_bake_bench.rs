@@ -1,6 +1,6 @@
 //! Benchmark-only addition to the disposable Material Painter checkout.
 use crate::{
-    bake::{self, BakeSettings, GpuBaker, Quality},
+    bake::{self, BakeSettings, CustomKind, GpuBaker, Quality},
     gpu::{GpuMesh, read_texture},
     mesh::{Mesh, Vertex},
 };
@@ -39,6 +39,47 @@ fn compare_mesh_bake() {
     let baker = GpuBaker::new(&device);
     let gpu_mesh = GpuMesh::new(&device, &mesh);
     let context = eframe::egui::Context::default();
+    if std::env::var("PAINT_BAKE_COMPARE_LIVE_PROJECTION").as_deref() == Ok("1") {
+        let mut settings = BakeSettings {
+            high_poly: Some(root.join("bake-high.obj")),
+            match_by_name: false,
+            front: 0.05 * diagonal,
+            rear: 0.05 * diagonal,
+            maps: 0,
+            ..BakeSettings::default()
+        };
+        settings.apply_quality(Quality::Draft);
+        settings.add_custom(CustomKind::Exposure);
+        settings.custom[0].distance = 2. * (mesh.bounds_max - mesh.bounds_min).max_element();
+        let scene = bake::prepare(&mesh, &settings, 0).unwrap();
+        for size in [96, 256] {
+            for round in 0..5 {
+                for azimuth in [0., 45.] {
+                    settings.custom[0].azimuth = azimuth;
+                    let started = Instant::now();
+                    let mut run = baker.start(&device, &queue, &gpu_mesh, &scene, &settings.preview(), size);
+                    let maps = loop {
+                        if let Some(maps) = baker.pump(&mut run, &device, &queue, &context) {
+                            break maps;
+                        }
+                        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                    };
+                    let pixels = read_texture(&device, &queue, &maps.custom[0]);
+                    let total_ms = started.elapsed().as_secs_f64() * 1000.;
+                    assert!(run.report.finished() && pixels.iter().any(|&v| v != 0));
+                    assert!(run.report.missed_percent().unwrap() < 5.);
+                    if round > 0 {
+                        println!("LIVE_PROJECTION_COMPARE {}", serde_json::json!({
+                            "app": "Material Painter", "adapter": info.name,
+                            "backend": format!("{:?}", info.backend),
+                            "size": size, "run": round, "azimuth": azimuth, "total_ms": total_ms,
+                        }));
+                    }
+                }
+            }
+        }
+        return;
+    }
     for (size, high) in [(512, false), (1024, false), (512, true)] {
         let mut settings = BakeSettings {
             high_poly: high.then(|| root.join("bake-high.obj")),

@@ -16,7 +16,7 @@ impl Overlay {
         materials: &mut Assets<StandardMaterial>,
     ) -> Option<(sets::SetKey, Handle<StandardMaterial>)> {
         let session = paint.sessions.get(&model)?;
-        if session.bake_live_masks && session.view != View::Two {
+        if session.live_mask_map().is_some() && session.view != View::Two {
             return Some((session.binding?, baked.masks.material(model, doc, session)?));
         }
         let map = session.diagnostic_bake()?;

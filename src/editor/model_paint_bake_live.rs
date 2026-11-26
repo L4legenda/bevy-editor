@@ -1,9 +1,10 @@
-//! Cancellable previews for the selected custom bake map.
+//! Cancellable previews for the selected bake map.
 use super::*;
 use std::time::{Duration, Instant};
 
 const QUICK: u32 = 96;
 const REFINED: u32 = 256;
+const BUILTIN_SETTLE: Duration = Duration::from_millis(60);
 const SETTLE: Duration = Duration::from_millis(180);
 
 struct Work<T> {
@@ -304,6 +305,149 @@ struct Request {
     projection: ProjectionSettings,
 }
 
+pub(super) struct BuiltinPreview {
+    key: Key,
+    map: BakeMap,
+    settings: ProjectionSettings,
+    include_inputs: bool,
+    changed: Instant,
+    running: Option<(u32, Work<BuiltinFrame>)>,
+    shown: Option<(u32, Handle<Image>, Option<Arc<Maps>>)>,
+    shown_current: bool,
+    error: Option<String>,
+}
+
+struct BuiltinFrame {
+    map: BakeMap,
+    pixels: Vec<u8>,
+    inputs: Option<Arc<Maps>>,
+}
+
+impl BuiltinPreview {
+    fn image(size: u32, pixels: Vec<u8>, images: &mut Assets<Image>) -> Handle<Image> {
+        let image = image::RgbaImage::from_raw(size, size, pixels).unwrap();
+        images.add(Image::from_dynamic(
+            image::DynamicImage::ImageRgba8(image), true, RenderAssetUsages::default(),
+        ))
+    }
+
+    fn select(&mut self, map: BakeMap, images: &mut Assets<Image>) {
+        if self.map != map {
+            self.map = map;
+            if let Some((size, image, Some(inputs))) = &mut self.shown {
+                *image = Self::image(*size, inputs.rgba(map), images);
+            }
+        }
+    }
+
+    fn keep_image(
+        mut self, model: usize, doc: &Document, binding: (usize, usize), map: BakeMap,
+        include_inputs: bool, images: &mut Assets<Image>,
+    ) -> Option<(u32, Handle<Image>, Option<Arc<Maps>>)> {
+        if !self.matches_target(model, doc, binding) || self.include_inputs != include_inputs
+            || (self.map != map && !self.shown.as_ref().and_then(|(_, _, inputs)| inputs.as_ref())
+                .is_some_and(|maps| maps.has_map(map)))
+        {
+            return None;
+        }
+        self.select(map, images);
+        self.shown.take()
+    }
+
+    pub(super) fn image_for(
+        &self, model: usize, doc: &Document, binding: (usize, usize), map: BakeMap,
+    ) -> Option<&Handle<Image>> {
+        if self.map != map || !self.matches_target(model, doc, binding) {
+            return None;
+        }
+        self.shown.as_ref().map(|(_, image, _)| image)
+    }
+
+    pub(super) fn inputs_for(
+        &self, model: usize, doc: &Document, binding: (usize, usize), map: BakeMap,
+    ) -> Option<&Arc<Maps>> {
+        if self.map != map || !self.matches_target(model, doc, binding) {
+            return None;
+        }
+        self.shown.as_ref()?.2.as_ref()
+    }
+
+    pub(super) fn status(&self, map: BakeMap) -> Option<String> {
+        (self.map == map).then(|| {
+            if let Some(error) = &self.error {
+                if self.shown.is_some() {
+                    format!("Не удалось обновить предпросмотр · {error}")
+                } else {
+                    format!("Предпросмотр недоступен · {error}")
+                }
+            } else if !self.shown_current && self.shown.is_some() {
+                format!("Обновление предпросмотра… · {}", map.label())
+            } else if let Some((size, ..)) = &self.shown {
+                format!("Предпросмотр {size} × {size} · {}", map.label())
+            } else {
+                "Расчёт предпросмотра…".into()
+            }
+        })
+    }
+
+    fn matches_target(&self, model: usize, doc: &Document, binding: (usize, usize)) -> bool {
+        (self.key.model, self.key.object, self.key.slot) == (model, binding.0, binding.1)
+            && self.key.matches_geometry(doc)
+    }
+
+    fn tick(&mut self, doc: &Document, images: &mut Assets<Image>, device: Option<mesh::RayDevice>) {
+        if let Some((size, work)) = &mut self.running
+            && let Some(result) = work.poll()
+        {
+            match result {
+                Ok(BuiltinFrame { map, pixels, inputs }) => {
+                    let pixels = if map != self.map && let Some(inputs) = &inputs {
+                        inputs.rgba(self.map)
+                    } else {
+                        pixels
+                    };
+                    self.shown = Some((*size, Self::image(*size, pixels, images), inputs));
+                    self.shown_current = true;
+                }
+                Err(error) => self.error = Some(error),
+            }
+            self.running = None;
+        }
+        if self.running.is_some() || self.error.is_some() {
+            return;
+        }
+        let quick = QUICK.min(self.key.size);
+        let refined = REFINED.min(self.key.size);
+        let size = if !self.shown_current && self.changed.elapsed() >= BUILTIN_SETTLE {
+            quick
+        } else if self.shown_current && self.shown.as_ref().is_some_and(|(size, ..)| *size < refined)
+            && self.changed.elapsed() >= SETTLE
+        {
+            refined
+        } else {
+            return;
+        };
+        let mut settings = self.settings.clone();
+        if size == quick {
+            settings.quality = Quality::Draft;
+        }
+        let objects = doc.objects.clone();
+        let (object, slot, map) = (self.key.object, self.key.slot, self.map);
+        let include_inputs = self.include_inputs;
+        self.running = Some((size, Work::spawn(move |progress| {
+            let maps = mesh::bake_on_device(objects, object, slot, size, &settings, progress, device.as_ref())?;
+            if !maps.has_map(map) {
+                return Err(format!("Карта «{}» недоступна для этой модели", map.label()));
+            }
+            Ok(BuiltinFrame {
+                map,
+                pixels: maps.rgba(map),
+                inputs: include_inputs.then(|| Arc::new(Maps::new(Arc::new(maps), None))),
+            })
+        })));
+    }
+}
+
 pub(in crate::editor::ui::model_viewer) fn update(
     editor: Res<Editor>,
     editing: Res<editing::State>,
@@ -321,9 +465,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         let model = editor.viewing_model?;
         let doc = editing.documents.get(&model)?;
         let session = paint.sessions.get(&model)?;
-        let Some(BakeMap::Custom(id)) = session.bake_view else {
-            return None;
-        };
+        let map = session.bake_view.or_else(|| session.live_mask_map())?;
         if doc.mode != Mode::Paint
             || session.panel != Panel::Maps
             || (session.view == View::Three && !session.bake_on_model && !session.bake_live_masks)
@@ -332,38 +474,73 @@ pub(in crate::editor::ui::model_viewer) fn update(
         {
             return None;
         }
-        let recipe = doc.custom_bakes.iter().find(|recipe| recipe.id == id)?;
         let (object, slot) = session.binding?;
         let target = doc
             .objects
             .iter()
             .find(|candidate| candidate.id == object && !candidate.hidden)?;
-        let draft = gizmo.draft_for(model, id, doc.revision).unwrap_or(recipe);
-        let full = draft.same_bake(recipe)
-            && baked
-                .maps(model, doc, (object, slot), session.texture_size)
-                .is_some_and(|maps| maps.has_map(BakeMap::Custom(id)));
-        let mut projection = projection_for(session, target);
-        let quality = projection.quality;
-        projection.quality = Quality::Draft;
-        projection.maps = MapSelection::ALL;
-        Some((
-            doc,
-            full,
-            Request {
-                model,
-                object,
-                slot,
-                size: session.texture_size,
-                recipe: draft.clone(),
-                quality,
-                projection,
-            },
-        ))
+        Some((model, doc, session, map, (object, slot), projection_for(session, target)))
     })();
-    let Some((doc, full, request)) = active else {
+    let Some((model, doc, session, map, binding, mut projection)) = active else {
+        baked.live = State::default();
+        baked.builtin_live = None;
+        return;
+    };
+    let full = baked.maps(model, doc, binding, session.texture_size).is_some_and(|maps| maps.has_map(map));
+    let BakeMap::Custom(id) = map else {
+        baked.live = State::default();
+        if full || !session.bake_projection.maps.contains(map)
+            || (map.requires_high_poly() && projection.path.is_none())
+        {
+            baked.builtin_live = None;
+            return;
+        }
+        let include_inputs = session.live_mask_map().is_some();
+        if include_inputs {
+            projection.custom = doc.custom_bakes.clone();
+        } else {
+            projection.maps = MapSelection::MINIMUM.toggle(map);
+            projection.custom = Arc::default();
+        }
+        if baked.builtin_live.as_ref().is_none_or(|preview| {
+            (!include_inputs && preview.map != map) || preview.key.size != session.texture_size || preview.settings != projection
+                || preview.include_inputs != include_inputs
+                || !preview.matches_target(model, doc, binding)
+        }) {
+            let shown = baked.builtin_live.take().and_then(|preview| {
+                preview.keep_image(model, doc, binding, map, include_inputs, &mut images)
+            });
+            baked.builtin_live = Key::new(model, doc, binding, session.texture_size).map(|key| BuiltinPreview {
+                key, map, settings: projection, include_inputs, changed: Instant::now(),
+                running: None, shown, shown_current: false, error: None,
+            });
+        }
+        if baked.running.is_some() {
+            if let Some(preview) = &mut baked.builtin_live {
+                preview.running = None;
+            }
+        } else {
+            let gpu = baked.ray_device(device.as_deref(), queue.as_deref());
+            if let Some(preview) = &mut baked.builtin_live {
+                preview.select(map, &mut images);
+                preview.tick(doc, &mut images, gpu);
+            }
+        }
+        return;
+    };
+    baked.builtin_live = None;
+    let Some(recipe) = doc.custom_bakes.iter().find(|recipe| recipe.id == id) else {
         baked.live = State::default();
         return;
+    };
+    let draft = gizmo.draft_for(model, id, doc.revision).unwrap_or(recipe);
+    let full = full && draft.same_bake(recipe);
+    let quality = projection.quality;
+    projection.quality = Quality::Draft;
+    projection.maps = MapSelection::ALL;
+    let request = Request {
+        model, object: binding.0, slot: binding.1, size: session.texture_size,
+        recipe: draft.clone(), quality, projection,
     };
     if full || baked.running.is_some() {
         let id = request.recipe.id;
@@ -381,13 +558,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             baked.live.hide();
         }
     } else {
-        let gpu = device
-            .as_deref()
-            .zip(queue.as_deref())
-            .map(|(device, queue)| mesh::RayDevice {
-                device: device.clone(),
-                queue: queue.clone(),
-            });
+        let gpu = baked.ray_device(device.as_deref(), queue.as_deref());
         baked.live.tick(request, doc, &mut images, gpu);
     }
 }

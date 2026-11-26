@@ -3830,6 +3830,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     }
                     button(&mut commands, stack, font, "Сбросить уровни", PaintAction::BakeResetLevels(map));
                 }
+                button(&mut commands, stack, font, "Живой предпросмотр", PaintAction::BakeLivePreview);
                 for map in bake::BakeMap::ALL.into_iter().filter(|map| {
                     session.bake_projection.maps.contains(*map)
                         && (!map.requires_high_poly() || session.bake_projection.path.is_some())
@@ -3837,7 +3838,6 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     button(&mut commands, stack, font, map.label(), PaintAction::BakePreview(Some(map)));
                 }
                 title(&mut commands, stack, font, "Пользовательские карты");
-                button(&mut commands, stack, font, "Живой предпросмотр", PaintAction::BakeLivePreview);
                 let add = node(&mut commands, stack, Node {
                     flex_wrap: FlexWrap::Wrap,
                     row_gap: px(4.),
@@ -4620,8 +4620,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     if let Some((object, slot)) = selected {
         if let Ok(mut image) = texture_nodes.get_mut(ui.uv_canvas) {
             let bake_view = (session.panel == Panel::Maps).then_some(session.bake_view).flatten();
-            let live_mask = session.bake_live_masks && session.show_mask && session.has_mask()
-                && matches!(bake_view, Some(bake::BakeMap::Custom(_)));
+            let live_mask = session.live_mask_map().is_some() && session.show_mask && session.has_mask();
             let handle = if live_mask {
                 baked.masks.mask(index, doc, session).or_else(|| runtime.preview(
                     index, object.id, slot, crate::editor::model_paint_data::MASK_TARGET,
@@ -4700,12 +4699,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     if session.panel == Panel::Maps && let Ok(mut info) = labels.get_mut(ui.uv_info) {
         let summary = if let Some(progress) = baked.progress() {
             format!("Запекание · {:.0}%", progress * 100.)
-        } else if session.bake_live_masks && session.show_mask && session.has_mask()
-            && matches!(session.bake_view, Some(bake::BakeMap::Custom(_)))
+        } else if session.live_mask_map().is_some() && session.show_mask && session.has_mask()
         {
             "Итоговая маска слоя".into()
         } else if let Some(map) = session.bake_view {
-            if let bake::BakeMap::Custom(id) = map && let Some(status) = baked.live.status(id) {
+            if let Some(status) = baked.live_status(map) {
                 status
             } else if session.bake_ready {
                 let label = match map {
@@ -4717,6 +4715,8 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             } else {
                 "Запеките выбранный набор".into()
             }
+        } else if let Some(status) = session.live_mask_map().and_then(|map| baked.live_status(map)) {
+            status
         } else {
             format!("{} × {} · Материал", session.texture_size, session.texture_size)
         };

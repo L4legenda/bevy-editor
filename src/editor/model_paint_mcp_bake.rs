@@ -244,14 +244,7 @@ impl McpBake<'_> {
         }
         let settings = settings(&editor.project.asset_root, &doc.bake_settings, &args)?;
         apply_settings(doc, session, settings);
-        let gpu = self
-            .device
-            .as_deref()
-            .zip(self.queue.as_deref())
-            .map(|(device, queue)| mesh::RayDevice {
-                device: device.clone(),
-                queue: queue.clone(),
-            });
+        let gpu = state.ray_device(self.device.as_deref(), self.queue.as_deref());
         editor.status = state
             .start_manual(model, doc, session, gpu, args.preview)?
             .into();

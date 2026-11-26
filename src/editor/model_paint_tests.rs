@@ -2449,6 +2449,356 @@ fn gpu_paint_imported_camera_uses_its_fov_and_reopens_after_a_camera_only_save()
 }
 
 #[test]
+#[ignore = "requires GPU; previews built-in mesh maps before a full bake"]
+fn gpu_builtin_maps_preview_without_full_bake() {
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, _, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let started = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 12);
+    }
+    {
+        let mut state = app.world_mut().resource_mut::<editing::State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        let corners = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().enumerate()
+            .map(|(index, uv)| {
+                let mut corner = Corner::new(index);
+                corner.uv = uv;
+                corner
+            }).collect();
+        doc.objects[0].geometry = Geometry {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+            faces: vec![Face { corners, material: 0, smooth: false }],
+            ..default()
+        }.into();
+        doc.objects[0].transform = Transform::IDENTITY;
+        doc.revision += 1;
+    }
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Paint))));
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::Resolution(512));
+    paint_message(&mut app, PaintAction::View(View::Split));
+    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+    let image_for = |world: &World, map| {
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let baked = world.resource::<bake::State>();
+        assert!(!session.bake_ready);
+        assert!(baked.maps(0, doc, session.binding.unwrap(), session.texture_size).is_none());
+        baked.preview_for(0, doc, session, map).cloned()
+    };
+    let wait_image = |app: &mut App, map| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            let world = app.world();
+            if let Some(handle) = image_for(world, map)
+                && let Some(image) = world.resource::<Assets<Image>>().get(&handle)
+                && image.width() == 256
+            {
+                return (handle, image.data.clone().unwrap());
+            }
+            let status = world.resource::<bake::State>().live_status(map);
+            assert!(started.elapsed().as_secs() < 15, "{}: {status:?}", map.label());
+        }
+    };
+    let ao = bake::BakeMap::Occlusion;
+    paint_message(&mut app, PaintAction::BakePreview(Some(ao)));
+    let (ao_image, ao_pixels) = wait_image(&mut app, ao);
+    assert!(ao_pixels.chunks_exact(4).any(|p| p[3] == 255 && p[0] > 0));
+    let normal = bake::BakeMap::WorldNormal;
+    paint_message(&mut app, PaintAction::BakePreview(Some(normal)));
+    let (normal_image, normal_pixels) = wait_image(&mut app, normal);
+    assert_ne!(ao_image, normal_image);
+    assert!(normal_pixels.chunks_exact(4).any(|p| p[3] == 255 && p[0] != p[2]));
+    assert!(image_for(app.world(), ao).is_none());
+    paint_message(&mut app, PaintAction::BakeLivePreview);
+    assert!(image_for(app.world(), normal).is_none());
+    paint_message(&mut app, PaintAction::BakeLivePreview);
+    assert_ne!(wait_image(&mut app, normal).0, normal_image);
+
+    paint_message(&mut app, PaintAction::AddMask(true));
+    paint_message(&mut app, PaintAction::Generator(None, GeneratorEdit::Set(GeneratorKind::CustomMap)));
+    paint_message(&mut app, PaintAction::Generator(None, GeneratorEdit::Weight(GeneratorInput::Sky, 100)));
+    let paint_surface = |app: &App| {
+        let world = app.world();
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let (object, slot) = world.resource::<PaintState>().sessions[&0].binding.unwrap();
+        doc.objects.iter().find(|item| item.id == object).unwrap().materials[slot].paint.as_ref().unwrap().clone()
+    };
+    let persisted = paint_surface(&app);
+    assert!(persisted.baked.is_none());
+    paint_message(&mut app, PaintAction::BakePreview(None));
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    let started = std::time::Instant::now();
+    let (maps, mask_image, material) = loop {
+        frame(&mut app);
+        let world = app.world();
+        let baked = world.resource::<bake::State>();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        if let Some((256, _)) = baked.masks.mask_digest()
+            && let Some(handle) = baked.masks.mask(0, doc, session)
+        {
+            let images = world.resource::<Assets<Image>>();
+            let pixels = images.get(&handle).unwrap().data.as_ref().unwrap();
+            assert!(pixels.chunks_exact(4).any(|p| p[0] > 0));
+            let material = baked.masks.material(0, doc, session).unwrap();
+            let maps = baked.live_inputs_for(0, doc, session.binding.unwrap(), normal).unwrap().clone();
+            assert_eq!(session.bake_view, None);
+            break (maps, handle, material);
+        }
+        assert!(started.elapsed().as_secs() < 20, "{:?}", baked.live_status(normal));
+    };
+    for map in [Some(ao), Some(normal), None] {
+        paint_message(&mut app, PaintAction::BakePreview(map));
+        let world = app.world();
+        let baked = world.resource::<bake::State>();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let displayed = baked.live_inputs_for(0, doc, session.binding.unwrap(), map.unwrap_or(normal)).unwrap();
+        assert!(Arc::ptr_eq(&maps, displayed));
+        assert_eq!(baked.masks.mask(0, doc, session), Some(mask_image.clone()));
+        assert_eq!(baked.masks.material(0, doc, session), Some(material.clone()));
+    }
+    let rays = bake::RayOptions { sky_cone: 250, ..default() };
+    app.world_mut().write_message(Action::ModelView(ModelViewAction::Paint(PaintAction::BakeRayOptions(rays))));
+    frame(&mut app);
+    {
+        let world = app.world();
+        let baked = world.resource::<bake::State>();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let displayed = baked.live_inputs_for(0, doc, session.binding.unwrap(), normal).unwrap();
+        assert!(Arc::ptr_eq(&maps, displayed));
+        assert_eq!(baked.masks.mask(0, doc, session), Some(mask_image));
+        assert_eq!(baked.masks.material(0, doc, session), Some(material));
+        assert!(baked.live_status(normal).unwrap().starts_with("Обновление"));
+    }
+    let revision_started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world();
+        let baked = world.resource::<bake::State>();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        if let Some(next) = baked.live_inputs_for(0, doc, session.binding.unwrap(), normal)
+            && next.size == 256 && !Arc::ptr_eq(&maps, next)
+        {
+            break;
+        }
+        assert!(revision_started.elapsed().as_secs() < 20, "{:?}", baked.live_status(normal));
+    }
+    assert!(Arc::ptr_eq(&persisted, &paint_surface(&app)));
+    assert!(persisted.baked.is_none());
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    assert!(app.world().resource::<bake::State>().masks.mask_digest().is_none());
+
+    let insert_map_graph = |app: &mut App, map_value| {
+        use bevy::render::renderer::{RenderDevice, RenderQueue};
+        let world = app.world();
+        let device = world.resource::<RenderDevice>();
+        let queue = world.resource::<RenderQueue>();
+        let mut graph = material_painter_graph::Graph::new("Живой градиент части");
+        graph.match_set = true;
+        let input = graph.add("mesh_map", [0., 0.]);
+        graph.node_mut(input).unwrap().params.insert("map".into(), material_painter_graph::Value::MeshMap(map_value));
+        let output = graph.add("output", [200., 0.]);
+        assert!(graph.connect(input, output, "input"));
+        let mut layer = material_graph::prepare_graph(
+            graph.clone(), &Default::default(), 512, Default::default(), device, queue,
+        ).unwrap();
+        graph.node_mut(output).unwrap().params.insert(
+            "usage".into(), material_painter_graph::Value::Enum(material_painter_graph::MASK_USAGE),
+        );
+        material_graph::apply_mask(
+            &mut layer, graph, &Default::default(), 512, Default::default(), device, queue,
+        ).unwrap();
+        let mut paint = app.world_mut().resource_mut::<PaintState>();
+        let session = paint.sessions.get_mut(&0).unwrap();
+        session.insert_smart_material(vec![layer], session.insertion());
+    };
+    insert_map_graph(&mut app, 8);
+    warm(&mut app, 8);
+    paint_ready(&mut app);
+    let saved_graph_surface = paint_surface(&app);
+    assert!(saved_graph_surface.stack.layers.iter().any(|layer| layer.mask.as_ref().is_some_and(|mask| mask.graph.is_some())));
+    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+    paint_message(&mut app, PaintAction::BakePreview(Some(normal)));
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let baked = world.resource::<bake::State>();
+        if let Some((256, _)) = baked.masks.mask_digest()
+            && let Some(mask) = baked.masks.mask(0, doc, session)
+            && let Some(material) = baked.masks.material(0, doc, session)
+        {
+            let images = world.resource::<Assets<Image>>();
+            let materials = world.resource::<Assets<StandardMaterial>>();
+            let color = materials.get(&material).unwrap().base_color_texture.as_ref().unwrap();
+            let live = baked.live_inputs_for(0, doc, session.binding.unwrap(), normal).unwrap();
+            let sample = live.graph_plane(bake::BakeMap::PartGradient).unwrap();
+            let expected = (sample(64 * 256 + 128), sample(192 * 256 + 128));
+            assert!(expected.0.abs_diff(expected.1) > 80, "baked gradient: {expected:?}");
+            let sample_rows = |handle: &Handle<Image>| {
+                let image = images.get(handle).unwrap();
+                let pixels = image.data.as_ref().unwrap();
+                let at = |y: usize| pixels[(y * 256 + 128) * 4];
+                (at(64), at(192))
+            };
+            let mask = sample_rows(&mask);
+            let color = sample_rows(color);
+            assert!(mask.0.abs_diff(mask.1) > 80, "live graph mask: {mask:?}, baked: {expected:?}");
+            // The gradient is blended through its graph mask over the underlying material.
+            assert!(color.1.saturating_sub(color.0) > 10, "live graph color: {color:?}, baked: {expected:?}");
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 25, "{:?}", baked.live_status(normal));
+    }
+    assert!(Arc::ptr_eq(&saved_graph_surface, &paint_surface(&app)));
+    assert!(saved_graph_surface.baked.is_none());
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+
+    paint_message(&mut app, PaintAction::BakeCustomAdd(custom::Kind::Point));
+    let point = app.world().resource::<editing::State>().documents[&0].custom_bakes.last().unwrap().id;
+    insert_map_graph(&mut app, material_painter_graph::CUSTOM_MAP_VALUE + usize::try_from(point).unwrap());
+    warm(&mut app, 8);
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+    paint_message(&mut app, PaintAction::BakePreview(Some(bake::BakeMap::Custom(point))));
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    let wait_live_graph = |app: &mut App, prior| {
+        let started = std::time::Instant::now();
+        loop {
+            frame(app);
+            let world = app.world();
+            let baked = world.resource::<bake::State>();
+            if let Some((256, digest)) = baked.masks.mask_digest() && prior != Some(digest) {
+                return digest;
+            }
+            assert!(started.elapsed().as_secs() < 20, "{:?}", baked.live_status(bake::BakeMap::Custom(point)));
+        }
+    };
+    let digest = wait_live_graph(&mut app, None);
+    let original_graph = paint_surface(&app);
+    paint_message(&mut app, PaintAction::BakeCustomAdjust(point, custom::Field::X, 1));
+    assert_ne!(wait_live_graph(&mut app, Some(digest)), digest);
+    assert!(Arc::ptr_eq(&original_graph, &paint_surface(&app)));
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    paint_message(&mut app, PaintAction::BakeStart);
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        if app.world().resource::<PaintState>().sessions[&0].bake_ready {
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 25, "{}", app.world().resource::<Editor>().status);
+    }
+    paint_message(&mut app, PaintAction::BakePreview(Some(normal)));
+    let started = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world();
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let baked = world.resource::<bake::State>();
+        if let Some(handle) = baked.preview_for(0, doc, session, normal)
+            && let Some(image) = world.resource::<Assets<Image>>().get(handle)
+        {
+            assert_eq!(image.width(), 512);
+            assert!(baked.live_status(normal).is_none());
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 12);
+    }
+}
+
+#[test]
+#[ignore = "requires GPU; uses live AO and high-poly normals on an unpainted model"]
+fn gpu_live_bake_lights_the_unpainted_material() {
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let high = dir.path().join("tilted.obj");
+    std::fs::write(&high, "v 0 0 -0.05\nv 1 0 0.05\nv 1 1 0.05\nv 0 1 -0.05\nf 1 2 3 4\n").unwrap();
+    let (mut app, _, _) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let start = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(start.elapsed().as_secs() < 12);
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let corners = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().enumerate()
+            .map(|(index, uv)| {
+                let mut corner = Corner::new(index);
+                corner.uv = uv;
+                corner
+            }).collect();
+        doc.objects[0].geometry = Geometry {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+            faces: vec![Face { corners, material: 0, smooth: false }],
+            ..default()
+        }.into();
+        doc.objects[0].transform = Transform::IDENTITY;
+        doc.bake_settings.high_poly = Some(high);
+        doc.bake_settings.match_names = false;
+        doc.paint_preview.use_baked_normal = true;
+        doc.paint_preview.ao_strength = 0.5;
+        doc.mode = Mode::Paint;
+        doc.revision += 1;
+    }
+    warm(&mut app, 12);
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let world = app.world();
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let session = &world.resource::<PaintState>().sessions[&0];
+        let baked = world.resource::<bake::State>();
+        if let Some((256, _)) = baked.masks.mask_digest()
+            && let Some(overlay) = baked.masks.material(0, doc, session)
+        {
+            let material = world.resource::<Assets<StandardMaterial>>().get(&overlay).unwrap();
+            let images = world.resource::<Assets<Image>>();
+            let normal = images.get(material.normal_map_texture.as_ref().unwrap()).unwrap();
+            let ao = images.get(material.occlusion_texture.as_ref().unwrap()).unwrap();
+            let maps = baked.live_inputs_for(0, doc, session.binding.unwrap(), bake::BakeMap::WorldNormal).unwrap();
+            let center = 128 * 256 + 128;
+            let baked_normal = maps.projected_tangent_normals().unwrap()(center).unwrap();
+            assert!(baked_normal[0].abs_diff(128) >= 5);
+            assert_eq!(&normal.data.as_ref().unwrap()[center * 4..center * 4 + 3], &baked_normal);
+            let baked_ao = maps.rgba(bake::BakeMap::Occlusion)[center * 4];
+            assert_eq!(ao.data.as_ref().unwrap()[center], ((255. + f32::from(baked_ao)) * 0.5).round() as u8);
+            assert!(!session.bake_ready && doc.objects[0].materials[0].paint.is_none());
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 25, "{:?}", baked.live_status(bake::BakeMap::WorldNormal));
+    }
+    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    assert!(app.world().resource::<bake::State>().masks.mask_digest().is_none());
+}
+
+#[test]
 #[ignore = "requires GPU; saves bake settings through the editor and restores them after reopening"]
 fn gpu_paint_bake_settings_save_and_reopen() {
     use crate::editor::model_document::glb::Glb;
@@ -2776,6 +3126,7 @@ fn gpu_surface_graph_follows_model_geometry_without_baking() {
             material_graph::Inputs {
                 maps: None,
                 surface: Some(&source),
+                live: None,
             },
             world.resource::<RenderDevice>(),
             world.resource::<RenderQueue>(),
@@ -5076,7 +5427,7 @@ fn gpu_shader_maker_updates_texture_and_reports_source_errors() {
     let queue = app.world().resource::<bevy::render::renderer::RenderQueue>();
     let layer = material_graph::prepare_graph(
         reopened_graph, &Default::default(), 64,
-        material_graph::Inputs { maps: None, surface: None }, device, queue,
+        material_graph::Inputs::default(), device, queue,
     ).unwrap();
     assert_eq!(layer.texture_fill.as_ref().unwrap().images[0].as_ref().unwrap()
         .pixels().get_pixel(20, 20).0, [255, 0, 0, 255]);

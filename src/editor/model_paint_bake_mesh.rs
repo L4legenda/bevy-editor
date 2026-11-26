@@ -1480,10 +1480,10 @@ mod tests {
     fn gpu_projected_id_uses_glb_colors_without_changing_visible_vertex_colors() {
         use crate::editor::model_document::glb::Glb;
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
-            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
-        };
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let path = std::env::temp_dir().join(format!("bevy-bake-vertex-id-{}.glb", bevy::asset::uuid::Uuid::new_v4()));
         let piece = |id, color| {
             let mut object = quad(id, 0.02);
@@ -1536,10 +1536,10 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_projected_id_map_uses_high_poly_material_assignments() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
-            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
-        };
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let path = std::env::temp_dir().join(format!(
             "bevy-bake-material-ids-{}.obj",
             bevy::asset::uuid::Uuid::new_v4(),
@@ -1580,10 +1580,10 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_baked_projection_uses_face_priority_and_authored_directions() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
-            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
-        };
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let path = std::env::temp_dir().join(format!(
             "bevy-bake-ray-options-{}.obj",
             bevy::asset::uuid::Uuid::new_v4(),
@@ -1652,10 +1652,10 @@ mod tests {
         use std::fmt::Write;
 
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
-            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
-        };
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
         let path = std::env::temp_dir().join(format!(
             "bevy-bake-bvh-tie-{}.obj", bevy::asset::uuid::Uuid::new_v4(),
         ));
@@ -1767,10 +1767,10 @@ mod tests {
     #[ignore = "requires Bevy's native GPU device"]
     fn gpu_baked_visibility_matches_cpu_on_connected_and_separate_parts() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let device = RayDevice {
-            device: app.world().resource::<bevy::render::renderer::RenderDevice>().clone(),
-            queue: app.world().resource::<bevy::render::renderer::RenderQueue>().clone(),
-        };
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
         check_bake_ray_options(Some(&device));
         let selected = ProjectionSettings {
             maps: MapSelection::MINIMUM.toggle(BakeMap::Cavity),
@@ -1892,6 +1892,19 @@ mod tests {
                 .map(|(a, b)| u32::from(a[0].abs_diff(b[0]))).sum();
             assert!(difference < 2 * 32 * 32, "high-poly custom map {:?}", recipe.kind);
         }
+        let serial_scene = live::Scene::prepare(low.clone(), 0, 0, &settings, &Progress::default()).unwrap();
+        let serial = Progress { serial_projection: true, ..default() };
+        let queued = Progress::default();
+        let preview = |scene: &live::Scene, progress: &Progress| {
+            let (pixels, used_gpu) = scene.shade_on_device(
+                &recipes[4], 256, super::super::Quality::Draft, progress, Some(&device),
+            ).unwrap();
+            assert!(used_gpu && scene.has_gpu_raster(256));
+            pixels
+        };
+        assert_eq!(preview(&serial_scene, &serial), preview(&scene, &queued));
+        assert_eq!(serial.projection_peak.load(Ordering::Relaxed), 1);
+        assert_eq!(queued.projection_peak.load(Ordering::Relaxed), 3);
         let settings = ProjectionSettings { front: 1, fill_misses: true, ..settings };
         let cpu = bake_with_projection(low.clone(), 0, 0, 32, &settings, &Progress::default()).unwrap();
         let scene = live::Scene::prepare(low.clone(), 0, 0, &settings, &Progress::default()).unwrap();
@@ -1954,7 +1967,7 @@ mod tests {
             ).unwrap();
             batch.push(texel, 0, 0.02);
             let mut pixels = [[0; 4]];
-            batch.flush_preview(&mut pixels, &Progress::default()).unwrap();
+            batch.flush_preview(&mut pixels, &Progress::default(), true).unwrap();
             let cpu = prepared.sample(&rays, texel, 0.02, &|_| true);
             assert!(pixels[0][0].abs_diff(cpu) <= 2, "folded flow: GPU {:?}, CPU {cpu}", pixels[0]);
             pixels[0][0]

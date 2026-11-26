@@ -739,6 +739,7 @@ pub(in crate::editor::ui::model_viewer) struct State {
     #[cfg(feature = "mcp")]
     outcomes: HashMap<(usize, usize, usize), mcp_bake::Outcome>,
     automatic: HashMap<usize, VecDeque<(usize, usize)>>,
+    gpu: Option<mesh::RayDevice>,
     picking: Option<(usize, BakeInput, Task<std::io::Result<Option<PathBuf>>>)>,
     cache: VecDeque<(Key, Arc<Maps>)>,
     disk: disk::Cache,
@@ -747,6 +748,7 @@ pub(in crate::editor::ui::model_viewer) struct State {
     preview: Option<(Arc<Maps>, BakeMap, Handle<Image>)>,
     pub(super) fix_preview: Option<FixPreview>,
     pub(super) live: live::State,
+    builtin_live: Option<live::BuiltinPreview>,
     pub(super) masks: engine::live_mask::State,
 }
 
@@ -759,6 +761,16 @@ pub(super) struct FixPreview {
     pub fixes: Arc<Fixes>,
 }
 impl State {
+    fn ray_device(
+        &mut self, device: Option<&RenderDevice>, queue: Option<&RenderQueue>,
+    ) -> Option<mesh::RayDevice> {
+        let (device, queue) = device.zip(queue)?;
+        if self.gpu.as_ref().is_none_or(|gpu| gpu.device.wgpu_device() != device.wgpu_device()) {
+            self.gpu = Some(mesh::RayDevice::new(device, queue));
+        }
+        self.gpu.clone()
+    }
+
     #[cfg(feature = "mcp")]
     pub(super) fn configuration_busy(&self) -> bool {
         self.running.is_some() || self.picking.is_some() || self.clearing_cache.is_some()
@@ -958,7 +970,10 @@ impl State {
         {
             return Some(image);
         }
-        let maps = self.maps(model, doc, binding, session.texture_size)?;
+        let Some(maps) = self.maps(model, doc, binding, session.texture_size).filter(|maps| maps.has_map(map)) else {
+            return session.bake_live.then_some(self.builtin_live.as_ref()).flatten()
+                .and_then(|preview| preview.image_for(model, doc, binding, map));
+        };
         if let Some(live) = &self.fix_preview
             && live.model == model && live.binding == binding && live.map == map
             && maps.same_background(&live.source)
@@ -972,6 +987,19 @@ impl State {
             .as_ref()
             .filter(|(source, kind, _)| *kind == map && Arc::ptr_eq(source, maps))
             .map(|(_, _, image)| image)
+    }
+
+    pub(super) fn live_status(&self, map: BakeMap) -> Option<String> {
+        match map {
+            BakeMap::Custom(id) => self.live.status(id),
+            _ => self.builtin_live.as_ref()?.status(map),
+        }
+    }
+
+    pub(super) fn live_inputs_for(
+        &self, model: usize, doc: &Document, binding: (usize, usize), map: BakeMap,
+    ) -> Option<&Arc<Maps>> {
+        self.builtin_live.as_ref()?.inputs_for(model, doc, binding, map)
     }
 
     fn apply_levels(
@@ -1077,9 +1105,6 @@ pub(in crate::editor::ui::model_viewer) fn update(
     device: Option<Res<RenderDevice>>,
     queue: Option<Res<RenderQueue>>,
 ) {
-    let ray_device = || device.as_deref().zip(queue.as_deref()).map(|(device, queue)| {
-        mesh::RayDevice { device: device.clone(), queue: queue.clone() }
-    });
     state.automatic.retain(|model, _| editing.documents.contains_key(model));
     #[cfg(feature = "mcp")]
     state.outcomes.retain(|(model, _, _), _| editing.documents.contains_key(model));
@@ -1598,7 +1623,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 if state.running.is_none() && state.picking.is_none()
                     && state.clearing_cache.is_none() && !doc.paint_busy =>
             {
-                if let Ok(status) = state.start_manual(index, doc, session, ray_device(), true) {
+                let gpu = state.ray_device(device.as_deref(), queue.as_deref());
+                if let Ok(status) = state.start_manual(index, doc, session, gpu, true) {
                     editor.status = status.into();
                 }
             }
@@ -1634,7 +1660,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
     {
         let mut projection = ProjectionSettings::default();
         projection.restore(&doc.bake_settings);
-        state.begin(key, doc, projection, ray_device());
+        let gpu = state.ray_device(device.as_deref(), queue.as_deref());
+        state.begin(key, doc, projection, gpu);
         editor.status = "Автозапекание карт меша…".into();
     }
     let maps = session

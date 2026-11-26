@@ -1,5 +1,6 @@
 //! Maps from the active texture set, packed for Material Painter's graph runtime.
 use super::{Graph, Value, library};
+use crate::editor::model_paint_data::custom::LivePlane;
 use crate::editor::ui::model_viewer::paint::bake::{BakeMap, Maps};
 use bevy::render::{
     render_resource::{TexelCopyBufferLayout, TextureFormat, TextureUsages},
@@ -87,10 +88,33 @@ impl Textures {
         device: &RenderDevice,
         queue: &RenderQueue,
     ) -> Self {
+        Self::with_live(requested, maps, None, resolution, device, queue)
+    }
+
+    pub(super) fn with_live(
+        requested: &BTreeSet<usize>,
+        maps: Option<&Maps>,
+        live: Option<&LivePlane>,
+        resolution: u32,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+    ) -> Self {
         let mut textures = Self::default();
+        let live_value = live.and_then(|plane| {
+            let value = CUSTOM_MAP_VALUE.checked_add(usize::try_from(plane.id).ok()?)?;
+            requested.contains(&value).then_some((value, plane))
+        });
+        if let Some((value, plane)) = live_value {
+            let texture = upload(
+                device, queue, "Live custom mesh map", plane.size, TextureFormat::R8Unorm, &plane.values,
+            );
+            textures.channels.insert(value, (0, 0));
+            textures.images.push(texture);
+        }
         let (normal, unsigned): (Vec<_>, Vec<_>) = requested
             .iter()
             .copied()
+            .filter(|value| live_value.is_none_or(|(live, _)| *value != live))
             .partition(|&value| kind(value) == Some(BakeMap::ProjectedNormal));
         for values in unsigned.chunks(4).chain(normal.chunks(4)) {
             let signed = kind(values[0]) == Some(BakeMap::ProjectedNormal);

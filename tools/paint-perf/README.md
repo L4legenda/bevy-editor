@@ -90,6 +90,30 @@ comparison variable unset and set `PAINT_BAKE_SERIAL=0` to keep visibility
 queueing fixed. The test reports `projection_peak` and checks the output digest
 across both schedules.
 
+`PAINT_BAKE_COMPARE_LIVE_PROJECTION=1` runs the headless live-preview comparison
+on the shared high-poly fixture. After preparing the benchmark checkout with
+`--bake`, run `gpu_compare_mesh_bake` in Bevy Editor and `compare_mesh_bake` in
+Material Painter with this variable set. Use the same GPU backend and
+`opt-level=1` for both. The tests print `LIVE_PROJECTION_COMPARE` rows for a
+directional exposure map in Draft quality at 96 and 256 pixels after a warm-up.
+Bevy reports the first render (`total_ms`), including creation of the scene's
+GPU resources, and a 45° azimuth edit (`adjusted_ms`) on the same raster.
+Material Painter initializes its baker once and reports both azimuths in
+separate rows, running its preview pipeline for each. Both tests include map
+readback and exclude preparation of the CPU scene, debounce, and UI
+presentation. The Material Painter runs use the comparison resolutions in
+place of the application's progressive preview sizes.
+
+With `PAINT_BAKE_COMPARE_LIVE_PROJECTION=1`, also set
+`PAINT_BAKE_COMPARE_LIVE_PIPELINES=1` for Bevy's pipeline cache comparison.
+Both cases use GPU queues. Each sample creates a new scene, and
+`fresh_pipelines` marks runs with a new cache on the same device. The test
+checks identical output across fresh and reused pipelines.
+
+Set `PAINT_BAKE_COMPARE_LIVE_SCENE=1` instead of the pipeline comparison flag
+to measure high-poly GPU buffer reuse. Both cases share the same compiled
+pipelines. `fresh_scene_buffers` marks runs that upload their own geometry.
+
 `PAINT_BAKE_COMPARE_HIGH_SOURCE=1` selects the same high-poly case and compares
 fresh high-poly preparation with reuse of the parsed mesh, BVH and relief.
 Change only this comparison variable and leave the result cache disabled.

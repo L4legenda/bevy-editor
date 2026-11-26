@@ -337,10 +337,10 @@ mod tests {
     #[ignore = "requires a GPU; compares per-texel ownership with CPU coverage"]
     fn gpu_baked_uv_raster_matches_cpu_at_seams_and_overlaps() {
         let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
-        let gpu = RayDevice {
-            device: app.world().resource::<RenderDevice>().clone(),
-            queue: app.world().resource::<RenderQueue>().clone(),
-        };
+        let gpu = RayDevice::new(
+            app.world().resource::<RenderDevice>(),
+            app.world().resource::<RenderQueue>(),
+        );
         let size = 79;
         let triangles: Vec<_> = [
             [[0., 0.], [64., 0.], [64., 64.]],
