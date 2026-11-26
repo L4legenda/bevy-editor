@@ -302,6 +302,8 @@ fn description(action: Action, editor: &Editor, browser: &Browser) -> Option<Str
         Action::ModelView(ModelViewAction::Edit(ModelEditAction::Menu)) =>
             "Выберите режим: объект, редактирование сетки, UV-развёртка или рисование. Tab возвращает к объекту.".into(),
         Action::ModelView(ModelViewAction::Paint(action)) => action.hint().into(),
+        Action::ModelView(ModelViewAction::ExportGame) =>
+            "Сохранить игровой GLB с готовыми материалами и анимациями.".into(),
         Action::ModelView(ModelViewAction::Uv(action)) => {
             use super::model_viewer::editing::uv::UvAction;
             match action {

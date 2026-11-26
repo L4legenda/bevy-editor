@@ -250,6 +250,15 @@ pub(super) fn encode(
         }
         primitive["extras"]["bevy_editor_paint"]["baked_inputs"] = data;
     }
+    encode_material(root, bin, primitive, surface)
+}
+
+pub(super) fn encode_material(
+    root: &mut Value,
+    bin: &mut Vec<u8>,
+    primitive: &mut Value,
+    surface: &Surface,
+) -> Result<(), String> {
     let maps = surface.composites();
     let mut color = maps[0].clone();
     for (p, a) in color.chunks_exact_mut(4).zip(maps[4].chunks_exact(4)) {

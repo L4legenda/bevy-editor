@@ -34,6 +34,7 @@ pub(in crate::editor) enum ModelViewAction {
     Close,
     Fit,
     Retry,
+    ExportGame,
     Environment(environment::EnvironmentAction),
     SpaceMouse(space_mouse::Setting),
     Shading(shading::ShadingAction),
@@ -138,6 +139,7 @@ impl Plugin for ModelViewerPlugin {
             .init_resource::<paint::PaintState>()
             .init_resource::<paint::mesh_tools::Requests>()
             .init_resource::<paint::save_copy::State>()
+            .init_resource::<paint::game_export::State>()
             .init_resource::<paint::sets::ShelfPick>()
             .init_resource::<paint::export::prefs::Store>()
             .init_resource::<paint::export::Activity>()
@@ -169,6 +171,7 @@ impl Plugin for ModelViewerPlugin {
             .add_systems(Update, paint::mesh_tools::update.after(paint::actions)
                 .before(paint::engine::update).before(paint::refresh))
             .add_systems(Update, paint::save_copy::update.after(paint::engine::update))
+            .add_systems(Update, paint::game_export::update.after(paint::engine::input))
             .add_systems(
                 Update,
                 paint::refresh
@@ -492,7 +495,7 @@ fn actions(
                             retry = true;
                         }
                     }
-                    ModelViewAction::Environment(_) | ModelViewAction::SpaceMouse(_) => {}
+                    ModelViewAction::Environment(_) | ModelViewAction::SpaceMouse(_) | ModelViewAction::ExportGame => {}
                     ModelViewAction::Shading(action)
                         if editor.viewing_image.is_none()
                             && !editor.browser_popup && !editor.hdri_library_open =>

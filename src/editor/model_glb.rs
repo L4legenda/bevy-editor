@@ -12,6 +12,8 @@ use std::{
 };
 #[path = "model_paint_io.rs"]
 mod paint_io;
+#[path = "model_glb_game.rs"]
+mod game_export;
 
 const ID_COLORS: &str = "bevy_editor_id_colors";
 const SOURCE_PARTS: &str = "bevy_editor_source_parts";
@@ -297,6 +299,71 @@ impl Glb {
         original: &[Object],
         cage_edits: Option<&crate::editor::model_cage_data::Edits>,
     ) -> Result<Vec<u8>, String> {
+        self.encode_model(objects, original, cage_edits, false)
+    }
+
+    pub(in crate::editor) fn game_export_to(&self, folder: &Path) -> Result<Vec<u8>, String> {
+        self.check_game_export_folder(folder)?;
+        self.game_export_bytes()
+    }
+
+    pub(in crate::editor) fn game_export_bytes(&self) -> Result<Vec<u8>, String> {
+        self.serialize_game(self.json.clone(), &self.bin)
+    }
+
+    pub(super) fn game_export_saved_to(&self, folder: &Path) -> Result<Vec<u8>, String> {
+        // After a save, expected is the published GLB; json and bin still describe
+        // the document's original geometry and material slots.
+        let published = Self::parse(self.path.clone(), self.expected.as_ref().clone())?;
+        published.game_export_to(folder)
+    }
+
+    pub(super) fn encode_game(
+        &self,
+        objects: &[Object],
+        original: &[Object],
+        folder: &Path,
+    ) -> Result<Vec<u8>, String> {
+        self.check_game_export_folder(folder)?;
+        self.encode_model(objects, original, None, true)
+    }
+
+    fn check_game_export_folder(&self, folder: &Path) -> Result<(), String> {
+        let external = ["buffers", "images"].into_iter().any(|key| {
+            self.json[key].as_array().into_iter().flatten().any(|item| {
+                item["uri"].as_str().is_some_and(|uri| {
+                    !uri.as_bytes().get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:"))
+                })
+            })
+        });
+        if external {
+            let source_folder = self.path.parent().ok_or("У исходной модели нет папки")?;
+            let source_folder = source_folder.canonicalize().map_err(|error| error.to_string())?;
+            if folder != source_folder {
+                return Err("GLB с внешними ресурсами нужно экспортировать в папку исходной модели".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn serialize_game(&self, mut root: Value, bin: &[u8]) -> Result<Vec<u8>, String> {
+        if self.extra.is_empty() {
+            let bin = game_export::compact(&mut root, bin)?;
+            serialize_glb(&root, bin, &self.extra)
+        } else {
+            // Opaque chunks can reference the original offsets and table indices.
+            game_export::strip_editor_extras(&mut root);
+            serialize_glb(&root, bin.to_vec(), &self.extra)
+        }
+    }
+
+    fn encode_model(
+        &self,
+        objects: &[Object],
+        original: &[Object],
+        cage_edits: Option<&crate::editor::model_cage_data::Edits>,
+        game: bool,
+    ) -> Result<Vec<u8>, String> {
         let mut root = self.json.clone();
         let mut bin = self.bin.as_ref().clone();
         for name in ["nodes", "meshes", "bufferViews", "accessors"] {
@@ -349,11 +416,17 @@ impl Glb {
         for old in original {
             if let Some(node) = old.source_node {
                 if !objects.iter().any(|o| o.source_node == Some(node)) {
+                    if game && deformed_mesh(&root, node) {
+                        return Err("Нельзя удалять анимированную сетку при игровом экспорте".into());
+                    }
                     root["nodes"][node].as_object_mut().unwrap().remove("mesh");
                 }
             }
         }
         for object in objects {
+            let previous = object.source_node.and_then(|node| {
+                original.iter().find(|old| old.source_node == Some(node))
+            });
             let node = if let Some(node) = object.source_node {
                 node
             } else {
@@ -384,45 +457,56 @@ impl Glb {
                 return Err("Невозможно сохранить вырожденную матрицу родителя".into());
             }
             let transform = Transform::from_matrix(local);
-            let difference = transform
-                .to_matrix()
-                .to_cols_array()
-                .into_iter()
-                .zip(local.to_cols_array())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f32::max);
+            let uses_trs = matrix_difference(transform.to_matrix(), local) < 0.0001;
+            let update_transform = !game || object.source_node.is_none()
+                || matrix_difference(local, node_matrix(&self.json["nodes"][node])?) >= 0.0001;
+            if game && update_transform && !uses_trs && targets_node(&root, node) {
+                return Err("Преобразование анимированного узла нельзя сохранить без потери анимации".into());
+            }
+            let protected = game && deformed_mesh(&root, node);
             let node_value = &mut root["nodes"][node];
             let map = node_value.as_object_mut().ok_or("Некорректный узел GLB")?;
             if let Some(edits) = cage_edits {
                 crate::editor::model_cage_data::write(map, object, edits.get(&object.id))?;
             }
-            map.insert("name".into(), json!(object.name));
-            map.remove("matrix");
-            map.remove("translation");
-            map.remove("rotation");
-            map.remove("scale");
-            if difference < 0.0001 {
-                map.insert(
-                    "translation".into(),
-                    json!(transform.translation.to_array()),
-                );
-                map.insert("rotation".into(), json!(transform.rotation.to_array()));
-                map.insert("scale".into(), json!(transform.scale.to_array()));
-            } else {
-                map.insert("matrix".into(), json!(local.to_cols_array()));
+            if !game || previous.is_none_or(|old| old.name != object.name) {
+                map.insert("name".into(), json!(object.name));
+            }
+            if update_transform {
+                map.remove("matrix");
+                map.remove("translation");
+                map.remove("rotation");
+                map.remove("scale");
+                if uses_trs {
+                    map.insert("translation".into(), json!(transform.translation.to_array()));
+                    map.insert("rotation".into(), json!(transform.rotation.to_array()));
+                    map.insert("scale".into(), json!(transform.scale.to_array()));
+                } else {
+                    map.insert("matrix".into(), json!(local.to_cols_array()));
+                }
             }
             if object.geometry.faces.is_empty() && object.geometry.loose_edges.is_empty() {
+                if protected {
+                    return Err("Нельзя заменить деформируемую сетку пустой геометрией".into());
+                }
                 map.remove("mesh");
                 continue;
             }
-            if object.source_node.is_some()
-                && original.iter().any(|old| {
-                    old.source_node == object.source_node
-                        && old.geometry == object.geometry
-                        && old.materials == object.materials
-                })
-            {
+            if previous.is_some_and(|old| old.geometry == object.geometry && old.materials == object.materials) {
                 continue;
+            }
+            if game && let Some(old) = previous.filter(|old| old.geometry == object.geometry) {
+                let source_mesh = self.json["nodes"][node]["mesh"].as_u64()
+                    .and_then(|index| self.json["meshes"].get(index as usize));
+                if let Some(mesh) = source_mesh
+                    && let Some(updated) = game_materials(&mut root, &mut bin, mesh, object, old)?
+                {
+                    set_mesh(&mut root, node, updated);
+                    continue;
+                }
+            }
+            if protected {
+                return Err("Правки этой сетки несовместимы с сохранением скелета или морф-целей".into());
             }
             let mut primitives = Vec::new();
             let mut topology = Vec::new();
@@ -451,30 +535,14 @@ impl Glb {
                     .materials
                     .get(slot)
                     .map_or_else(|| json!({}), |slot| slot.source.clone());
-                if let Some(definition) = object.materials.get(slot).and_then(|m| m.authored.as_deref()) {
-                    if root["materials"].is_null() {
-                        root["materials"] = json!([]);
+                write_material(&mut root, &mut bin, &mut primitive, object, slot, game)?;
+                if !game {
+                    if let Some(material) = object.materials.get(slot) {
+                        paint_io::encode_fixes(&mut root, &mut bin, &mut primitive, &material.bake_fixes)?;
                     }
-                    let materials = root["materials"].as_array_mut()
-                        .ok_or("Некорректная таблица материалов GLB")?;
-                    let index = materials.iter().position(|material| material == definition)
-                        .unwrap_or_else(|| {
-                            materials.push(definition.clone());
-                            materials.len() - 1
-                        });
-                    primitive["material"] = json!(index);
+                    write_id_colors(&mut root, &mut bin, &mut primitive, &buffers.id_colors)?;
+                    write_source_parts(&mut root, &mut bin, &mut primitive, &buffers.source_parts, &buffers.source_part_ids)?;
                 }
-                if let Some(surface) = object.materials.get(slot).and_then(|m| m.paint.as_deref()) {
-                    let mut surface = surface.clone();
-                    surface.bind_texture_fills(&object.geometry, slot, object.uv_offset(slot), object.transform);
-                    surface.bind_generators(&object.geometry, slot, object.uv_offset(slot), object.transform);
-                    paint_io::encode(&mut root, &mut bin, &mut primitive, &surface)?;
-                }
-                if let Some(material) = object.materials.get(slot) {
-                    paint_io::encode_fixes(&mut root, &mut bin, &mut primitive, &material.bake_fixes)?;
-                }
-                write_id_colors(&mut root, &mut bin, &mut primitive, &buffers.id_colors)?;
-                write_source_parts(&mut root, &mut bin, &mut primitive, &buffers.source_parts, &buffers.source_part_ids)?;
                 let map = primitive
                     .as_object_mut()
                     .ok_or("Некорректный примитив GLB")?;
@@ -486,55 +554,41 @@ impl Glb {
                 map.insert("indices".into(), json!(indices));
                 map.insert("mode".into(), json!(4));
                 primitives.push(primitive);
-                topology.push(buffers.polygons);
+                if !game {
+                    topology.push(buffers.polygons);
+                }
             }
             if !object.geometry.loose_edges.is_empty() {
                 let lines = object.geometry.line_positions();
                 let position = append_vec::<3>(&mut root, &mut bin, &lines, "VEC3", true);
                 primitives.push(json!({"attributes":{"POSITION":position},"mode":1}));
-                topology.push(Vec::new());
+                if !game {
+                    topology.push(Vec::new());
+                }
             }
             if primitives.is_empty() {
                 root["nodes"][node].as_object_mut().unwrap().remove("mesh");
                 continue;
             }
-            let mesh = root["meshes"].as_array().unwrap().len();
-            let mut saved_topology = json!({"version":1,"primitives":topology});
-            if !object.geometry.uv_seams.is_empty() {
-                saved_topology["uv_seams"] = json!(object.geometry.uv_seam_positions());
+            let mut mesh_value = json!({"name": object.name, "primitives": primitives});
+            if !game {
+                let mut saved_topology = json!({"version":1,"primitives":topology});
+                if !object.geometry.uv_seams.is_empty() {
+                    saved_topology["uv_seams"] = json!(object.geometry.uv_seam_positions());
+                }
+                mesh_value["extras"] = json!({"bevy_editor_topology": saved_topology});
             }
-            root["meshes"].as_array_mut().unwrap().push(json!({
-                "name":object.name,"primitives":primitives,
-                "extras":{"bevy_editor_topology":saved_topology}
-            }));
-            root["nodes"][node]["mesh"] = json!(mesh);
+            set_mesh(&mut root, node, mesh_value);
         }
         if root["buffers"].as_array().is_none_or(|v| v.is_empty()) {
             root["buffers"] = json!([{}]);
         }
         root["buffers"][0]["byteLength"] = json!(bin.len());
-        let mut json = serde_json::to_vec(&root).map_err(|e| e.to_string())?;
-        align(&mut json, b' ');
-        align(&mut bin, 0);
-        let length = 12
-            + 8
-            + json.len()
-            + 8
-            + bin.len()
-            + self.extra.iter().map(|(_, b)| 8 + b.len()).sum::<usize>();
-        if length > u32::MAX as usize {
-            return Err("GLB превышает 4 ГБ".into());
+        if game {
+            self.serialize_game(root, &bin)
+        } else {
+            serialize_glb(&root, bin, &self.extra)
         }
-        let mut output = Vec::with_capacity(length);
-        for v in [0x46546c67, 2, length as u32] {
-            output.extend_from_slice(&v.to_le_bytes());
-        }
-        chunk(&mut output, 0x4e4f534a, &json);
-        chunk(&mut output, 0x004e4942, &bin);
-        for (kind, bytes) in self.extra.iter() {
-            chunk(&mut output, *kind, bytes);
-        }
-        Ok(output)
     }
     #[cfg(test)]
     pub fn save(&mut self, objects: &[Object], original: &[Object]) -> Result<(), String> {
@@ -578,6 +632,123 @@ impl Glb {
         self.expected = Arc::new(bytes);
         Ok(())
     }
+}
+
+fn set_mesh(root: &mut Value, node: usize, mesh: Value) {
+    let meshes = root["meshes"].as_array_mut().unwrap();
+    let index = meshes.len();
+    meshes.push(mesh);
+    root["nodes"][node]["mesh"] = json!(index);
+}
+
+fn matrix_difference(left: Mat4, right: Mat4) -> f32 {
+    left.to_cols_array().into_iter().zip(right.to_cols_array())
+        .map(|(a, b)| (a - b).abs()).fold(0.0, f32::max)
+}
+
+fn targets_node(root: &Value, node: usize) -> bool {
+    root["animations"].as_array().into_iter().flatten()
+        .flat_map(|animation| animation["channels"].as_array().into_iter().flatten())
+        .any(|channel| channel["target"]["node"].as_u64() == Some(node as u64))
+}
+
+fn deformed_mesh(root: &Value, node: usize) -> bool {
+    let node = &root["nodes"][node];
+    !node["skin"].is_null()
+        || node["mesh"].as_u64().is_some_and(|mesh| {
+            root["meshes"][mesh as usize]["primitives"].as_array().into_iter().flatten()
+                .any(|primitive| !primitive["targets"].is_null())
+        })
+}
+
+fn game_materials(
+    root: &mut Value,
+    bin: &mut Vec<u8>,
+    mesh: &Value,
+    object: &Object,
+    old: &Object,
+) -> Result<Option<Value>, String> {
+    let Some(primitives) = mesh["primitives"].as_array() else { return Ok(None) };
+    if primitives.len() != object.materials.len() || primitives.len() != old.materials.len()
+        || primitives.iter().zip(&object.materials).any(|(primitive, material)| {
+            // Newly detected UDIM layouts must normalize UVs while rebuilding.
+            primitive["extras"]["bevy_editor_udim"] != material.source["extras"]["bevy_editor_udim"]
+        })
+    {
+        return Ok(None);
+    }
+    let mut mesh = mesh.clone();
+    for (slot, primitive) in mesh["primitives"].as_array_mut().unwrap().iter_mut().enumerate() {
+        let material = &object.materials[slot];
+        if material == &old.materials[slot] {
+            continue;
+        }
+        if let Some(value) = material.source.get("material") {
+            primitive["material"] = value.clone();
+        } else if let Some(properties) = primitive.as_object_mut() {
+            properties.remove("material");
+        }
+        write_material(root, bin, primitive, object, slot, true)?;
+    }
+    Ok(Some(mesh))
+}
+
+fn write_material(
+    root: &mut Value,
+    bin: &mut Vec<u8>,
+    primitive: &mut Value,
+    object: &Object,
+    slot: usize,
+    game: bool,
+) -> Result<(), String> {
+    let Some(material) = object.materials.get(slot) else { return Ok(()) };
+    if let Some(definition) = material.authored.as_deref() {
+        if root["materials"].is_null() {
+            root["materials"] = json!([]);
+        }
+        let materials = root["materials"].as_array_mut().ok_or("Некорректная таблица материалов GLB")?;
+        let index = materials.iter().position(|material| material == definition).unwrap_or_else(|| {
+            materials.push(definition.clone());
+            materials.len() - 1
+        });
+        primitive["material"] = json!(index);
+    }
+    if let Some(surface) = material.paint.as_deref() {
+        let mut surface = surface.clone();
+        let offset = object.uv_offset(slot);
+        surface.bind_texture_fills(&object.geometry, slot, offset, object.transform);
+        surface.bind_generators(&object.geometry, slot, offset, object.transform);
+        if game {
+            paint_io::encode_material(root, bin, primitive, &surface)?;
+        } else {
+            paint_io::encode(root, bin, primitive, &surface)?;
+        }
+    }
+    Ok(())
+}
+
+fn serialize_glb(root: &Value, mut bin: Vec<u8>, extra: &[(u32, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let mut json = serde_json::to_vec(root).map_err(|error| error.to_string())?;
+    align(&mut json, b' ');
+    align(&mut bin, 0);
+    let bin_length = if bin.is_empty() { 0 } else { 8 + bin.len() };
+    let length = 12 + 8 + json.len() + bin_length
+        + extra.iter().map(|(_, bytes)| 8 + bytes.len()).sum::<usize>();
+    if length > u32::MAX as usize {
+        return Err("GLB превышает 4 ГБ".into());
+    }
+    let mut output = Vec::with_capacity(length);
+    for word in [0x46546c67, 2, length as u32] {
+        output.extend_from_slice(&word.to_le_bytes());
+    }
+    chunk(&mut output, 0x4e4f534a, &json);
+    if !bin.is_empty() {
+        chunk(&mut output, 0x004e4942, &bin);
+    }
+    for (kind, bytes) in extra {
+        chunk(&mut output, *kind, bytes);
+    }
+    Ok(output)
 }
 pub(in crate::editor) fn node_matrix(value: &Value) -> Result<Mat4, String> {
     fn array<const N: usize>(v: &Value, default: [f32; N]) -> Result<[f32; N], String> {

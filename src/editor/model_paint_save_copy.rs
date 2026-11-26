@@ -111,7 +111,7 @@ pub(super) fn prepare_copy(doc: &Document, root: &Path, name: &str) -> Result<im
     Ok(move || snapshot.write(&root, &path).map(|relative| root.join(relative)))
 }
 
-fn publish(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn publish(destination: &Path, bytes: &[u8]) -> io::Result<()> {
     let staged = destination.with_file_name(format!(
         ".bevy-editor-model-{}.tmp",
         bevy::asset::uuid::Uuid::new_v4()
@@ -137,21 +137,25 @@ fn choose_path(source: &Path) -> io::Result<Option<PathBuf>> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("Модель");
-    let filename = format!("{stem} — копия.glb");
+    choose_glb_path(folder, &format!("{stem} — копия.glb"), "Сохранить копию в папке модели")
+}
+
+pub(super) fn choose_glb_path(folder: &Path, filename: &str, title: &str) -> io::Result<Option<PathBuf>> {
     #[cfg(windows)]
     let output = {
         use std::os::windows::process::CommandExt;
         Command::new("powershell.exe")
             .creation_flags(0x08000000)
             .current_dir(folder)
-            .env("BEVY_EDITOR_MODEL_COPY_NAME", &filename)
+            .env("BEVY_EDITOR_GLB_EXPORT_NAME", filename)
+            .env("BEVY_EDITOR_GLB_EXPORT_TITLE", title)
             .args(["-NoProfile", "-STA", "-Command", concat!(
                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; ",
                 "Add-Type -AssemblyName System.Windows.Forms; ",
                 "$d=New-Object Windows.Forms.SaveFileDialog; ",
-                "$d.Title='Сохранить копию в папке модели'; $d.InitialDirectory=(Get-Location).Path; ",
+                "$d.Title=$env:BEVY_EDITOR_GLB_EXPORT_TITLE; $d.InitialDirectory=(Get-Location).Path; ",
                 "$d.Filter='GLB (*.glb)|*.glb'; $d.DefaultExt='glb'; $d.OverwritePrompt=$false; ",
-                "$d.FileName=$env:BEVY_EDITOR_MODEL_COPY_NAME; ",
+                "$d.FileName=$env:BEVY_EDITOR_GLB_EXPORT_NAME; ",
                 "if($d.ShowDialog() -eq 'OK'){[Console]::Write($d.FileName)}; $d.Dispose()",
             )])
             .output()?
@@ -159,25 +163,26 @@ fn choose_path(source: &Path) -> io::Result<Option<PathBuf>> {
     #[cfg(target_os = "macos")]
     let output = Command::new("osascript").args(["-e", concat!(
         "on run argv\ntry\n",
-        "return POSIX path of (choose file name with prompt \"Save a copy in the model folder\" ",
+        "return POSIX path of (choose file name with prompt (item 3 of argv) ",
         "default name (item 1 of argv) default location (POSIX file (item 2 of argv)))\n",
         "on error number -128\nreturn \"\"\nend try\nend run",
-    ), &filename]).arg(folder).output()?;
+    ), filename]).arg(folder).arg(title).output()?;
     #[cfg(not(any(windows, target_os = "macos")))]
     let output = Command::new("zenity")
         .args([
             "--file-selection",
             "--save",
-            "--title=Сохранить копию в папке модели",
             "--file-filter=GLB | *.glb",
         ])
-        .arg(format!("--filename={}", folder.join(&filename).display()))
+        .arg(format!("--title={title}"))
+        .arg(format!("--filename={}", folder.join(filename).display()))
         .output()
         .or_else(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 Command::new("kdialog")
+                    .args(["--title", title])
                     .arg("--getsavefilename")
-                    .arg(folder.join(&filename))
+                    .arg(folder.join(filename))
                     .arg("*.glb")
                     .output()
             } else {

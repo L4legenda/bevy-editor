@@ -297,6 +297,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         icons::themed(&mut commands, button, glyph, 20.0);
     }
     super::super::shading::setup(&mut commands, toolbar);
+    super::super::paint::game_export::setup(&mut commands, toolbar, &interface.font);
     let bevel_panel = node(
         &mut commands,
         interface.inspector,

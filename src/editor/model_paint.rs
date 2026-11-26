@@ -19,6 +19,8 @@ mod brush_defaults;
 pub(in crate::editor) mod mesh_tools;
 #[path = "model_paint_save_copy.rs"]
 pub(super) mod save_copy;
+#[path = "model_game_export.rs"]
+pub(super) mod game_export;
 #[path = "model_paint_history.rs"]
 mod history;
 #[path = "model_paint_diagnostics.rs"]

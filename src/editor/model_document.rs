@@ -469,6 +469,25 @@ impl Document {
         source
     }
 
+    pub(super) fn prepare_game_export(
+        &self,
+    ) -> Result<impl FnOnce(&std::path::Path) -> Result<Vec<u8>, String> + Send + 'static + use<>, String> {
+        if self.paint_busy || self.paint_pending {
+            return Err("Дождитесь завершения изменений материала".into());
+        }
+        let source = self.source.clone();
+        let edits = if self.objects == self.saved {
+            None
+        } else {
+            self.validate()?;
+            Some((self.objects.clone(), self.original.clone()))
+        };
+        Ok(move |folder: &std::path::Path| match edits {
+            Some((objects, original)) => source.encode_game(&objects, &original, folder),
+            None => source.game_export_saved_to(folder),
+        })
+    }
+
     pub(super) fn paint_set_index(&self) -> usize {
         let count: usize = self.objects.iter().map(|object| object.materials.len()).sum();
         self.paint_set.unwrap_or(0).min(count.saturating_sub(1))

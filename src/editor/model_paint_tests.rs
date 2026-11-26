@@ -769,6 +769,48 @@ fn gpu_paint_mesh_replacement_menu_restores_the_previous_model() {
 }
 
 #[test]
+#[ignore = "requires GPU; verifies game export from the common model toolbar"]
+fn gpu_game_glb_export_preserves_source_and_uses_open_model() {
+    use crate::editor::model_document::glb::{Glb, node_matrix};
+
+    let project = crate::EditorProject::load(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, window, _) = fixture_project(project);
+    let output = tempfile::tempdir().unwrap();
+    let destination = output.path().join("block.game.glb");
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    let started = std::time::Instant::now();
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "The model did not load");
+    }
+    let source = {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        assert_eq!(doc.mode, Mode::Object);
+        doc.objects[0].transform.translation.x = 11.0;
+        doc.revision += 1;
+        doc.source.path.clone()
+    };
+    let original = std::fs::read(&source).unwrap();
+    app.world_mut().resource_mut::<game_export::State>().test_path = Some(destination.clone());
+    click(&mut app, window, |action| matches!(action, Action::ModelView(ModelViewAction::ExportGame)));
+    let started = std::time::Instant::now();
+    while !destination.is_file() {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 30, "{}", app.world().resource::<Editor>().status);
+    }
+    let result = Glb::load(&destination).unwrap();
+    assert!(result.json["nodes"].as_array().unwrap().iter().any(|node| {
+        node_matrix(node).is_ok_and(|matrix| (matrix.w_axis.x - 11.0).abs() < 0.0001)
+    }));
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    assert!(app.world().resource::<editing::State>().documents[&0].dirty());
+}
+
+#[test]
 #[ignore = "requires GPU; exercises Save As in the paint workspace and opens the new model tab"]
 fn gpu_paint_save_copy_opens_a_separate_editable_tab() {
     let directory = std::env::temp_dir().join(format!("bevy-paint-save-copy-{}", bevy::asset::uuid::Uuid::new_v4()));

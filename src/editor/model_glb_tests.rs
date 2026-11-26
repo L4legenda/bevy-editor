@@ -1265,3 +1265,234 @@ fn model_glb_rejects_polygon_metadata_that_does_not_match_the_rendered_surface()
     }
     fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
+
+fn game_export_pbr_images(asset: &gltf::Gltf) -> Vec<(&'static str, &[u8])> {
+    let mut result = Vec::new();
+    for mesh in asset.nodes().filter_map(|node| node.mesh()) {
+        for primitive in mesh.primitives() {
+            let material = primitive.material();
+            let pbr = material.pbr_metallic_roughness();
+            let specular = material.specular();
+            let slots = [
+                ("base color", pbr.base_color_texture().map(|info| info.texture())),
+                ("metallic/roughness", pbr.metallic_roughness_texture().map(|info| info.texture())),
+                ("normal", material.normal_texture().map(|info| info.texture())),
+                ("occlusion", material.occlusion_texture().map(|info| info.texture())),
+                ("emissive", material.emissive_texture().map(|info| info.texture())),
+                ("specular", specular.and_then(|extension| extension.specular_texture()).map(|info| info.texture())),
+            ];
+            for (name, texture) in slots {
+                let Some(texture) = texture else { continue };
+                let gltf::image::Source::View { view, .. } = texture.source().source() else {
+                    panic!("'{name}' must be embedded in the test GLB");
+                };
+                assert_eq!(view.buffer().index(), 0);
+                let bytes = &asset.blob.as_deref().unwrap()[view.offset()..view.offset() + view.length()];
+                result.push((name, bytes));
+            }
+        }
+    }
+    result
+}
+
+fn game_export_paint_surface() -> Arc<crate::editor::model_paint_data::Surface> {
+    use crate::editor::model_paint_data::{Layer, LayerKind, Stack, Surface, mask::Mask, solid};
+
+    let mut layer = Layer::new("Painted details".into(), LayerKind::Paint);
+    layer.channels[0] = Some(solid(16, [210, 30, 50, 255]));
+    layer.channels[5] = Some(solid(16, [10, 30, 80, 255]));
+    layer.channels[6] = Some(solid(16, [128, 128, 255, 255]));
+    layer.channels[7] = Some(solid(16, [120; 4]));
+    layer.mask = Some(Mask::new(solid(16, [255; 4]), Vec::new()).into());
+    Arc::new(Surface {
+        size: 16,
+        base: std::array::from_fn(|_| solid(16, [255; 4])),
+        stack: Stack { selected: 0, layers: vec![layer] },
+        material: json!({"name":"Painted tile 1013","extras":{"surface_type":"metal"}}),
+        baked: None,
+    })
+}
+
+#[test]
+fn game_export_preserves_animation_and_pbr_and_removes_editor_payload() {
+    use gltf::animation::util::ReadOutputs;
+
+    let (source, mut object) = fixture();
+    let folder = source.path.parent().unwrap().to_owned();
+    let path = source.path.clone();
+    let local_uvs = [[0.125, 0.125], [0.875, 0.125], [0.125, 0.875]];
+    let uv_offset = Vec2::new(2., -1.);
+    for (corner, uv) in object.geometry.faces[0].corners.iter_mut().zip(local_uvs) {
+        corner.uv = Vec2::from(uv) + uv_offset;
+    }
+    object.materials[0].source["extras"]["bevy_editor_udim"] = json!(1013);
+    object.materials[0].paint = Some(game_export_paint_surface());
+    let first = Glb::parse(path.clone(), source.encode(&[object.clone()], &[]).unwrap()).unwrap();
+    let mut source = Glb::parse(path.clone(), first.encode(&[object], &[]).unwrap()).unwrap();
+    let node_mesh = source.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    assert_eq!(source.json["meshes"].as_array().unwrap().len(), 2);
+
+    let binary = Arc::make_mut(&mut source.bin);
+    let root = &mut source.json;
+    root["extras"] = json!({"project_tag":"engine", "bevy_editor_active_paint_set":0});
+    root["nodes"].as_array_mut().unwrap().push(json!({"name":"Joint"}));
+    root["nodes"][0]["children"] = json!([1]);
+    root["nodes"][0]["skin"] = json!(0);
+    let inverse_bind = append_vec(root, binary, &[Mat4::IDENTITY.to_cols_array()], "MAT4", false);
+    root["skins"] = json!([{"joints":[1], "inverseBindMatrices":inverse_bind, "skeleton":1}]);
+    align(binary, 0);
+    let offset = binary.len();
+    binary.extend_from_slice(&[0; 12]);
+    let joint_view = append_view(root, offset, 12, 34962);
+    let joints = append_accessor(root, json!({
+        "bufferView":joint_view,"componentType":5121,"count":3,"type":"VEC4"
+    }));
+    let weights = append_vec(root, binary, &[[1., 0., 0., 0.]; 3], "VEC4", false);
+    let morph_positions = [[0., 0., 0.5]; 3];
+    let morph = append_vec(root, binary, &morph_positions, "VEC3", true);
+    let primitive = &mut root["meshes"][node_mesh]["primitives"][0];
+    primitive["attributes"]["JOINTS_0"] = json!(joints);
+    primitive["attributes"]["WEIGHTS_0"] = json!(weights);
+    primitive["targets"] = json!([{"POSITION":morph}]);
+    let material = primitive["material"].as_u64().unwrap() as usize;
+    let pbr = &mut root["materials"][material];
+    pbr["occlusionTexture"] = pbr["pbrMetallicRoughness"]["metallicRoughnessTexture"].clone();
+    root["meshes"][node_mesh]["weights"] = json!([0.]);
+    let times = append_vec(root, binary, &[[0.], [1.]], "SCALAR", true);
+    let translations = [[0., 0., 0.], [1., 2., 3.]];
+    let poses = append_vec(root, binary, &translations, "VEC3", false);
+    root["animations"] = json!([{
+        "name":"Bend",
+        "samplers":[{"input":times,"output":poses,"interpolation":"LINEAR"}],
+        "channels":[{"sampler":0,"target":{"node":1,"path":"translation"}}]
+    }]);
+    align(binary, 0);
+    let dead_view = binary.len();
+    binary.extend_from_slice(&[0xDB; 768]);
+    append_view(root, dead_view, 768, 34962);
+    root["buffers"][0]["byteLength"] = json!(binary.len());
+
+    // Refresh the file bytes without editing the prepared animation or the painted mesh.
+    let original_bytes = source.encode(&[], &[]).unwrap();
+    fs::write(&path, &original_bytes).unwrap();
+    let source = Glb::load(&path).unwrap();
+    let active_primitive = &source.json["meshes"][node_mesh]["primitives"][0];
+    let surface = source.paint_surface(active_primitive).unwrap().unwrap();
+    assert_eq!(surface.stack.layers[0].name, "Painted details");
+    assert!(surface.stack.layers[0].mask.is_some());
+    let source_gltf = gltf::Gltf::from_slice(source.data()).unwrap();
+    let game = source.game_export_bytes().unwrap();
+    assert!(game.len() + 768 < original_bytes.len());
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert!(!game.windows(768).any(|bytes| bytes == [0xDB; 768]));
+
+    let exported = Glb::parse(folder.join("game.glb"), game).unwrap();
+    assert_eq!(exported.json["extras"], json!({"project_tag":"engine"}));
+    assert_eq!(exported.json["asset"]["extras"]["preserve"], "yes");
+    assert_eq!(exported.json["nodes"][0]["extras"]["script"], 42);
+    assert_eq!(exported.json["meshes"].as_array().unwrap().len(), 1);
+    assert_eq!(exported.json["materials"].as_array().unwrap().len(), 1);
+    let active_mesh = exported.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let primitive = &exported.json["meshes"][active_mesh]["primitives"][0];
+    assert_eq!(primitive["extras"], json!({"keep":true}));
+    assert!(exported.paint_surface(primitive).unwrap().is_none());
+    assert_eq!(exported.json["materials"][0]["extras"]["surface_type"], "metal");
+
+    let parsed = gltf::Gltf::from_slice(exported.data()).unwrap();
+    let source_images = game_export_pbr_images(&source_gltf);
+    let images = game_export_pbr_images(&parsed);
+    assert_eq!(images.len(), 6);
+    assert_eq!(images, source_images);
+    let rgba = image::load_from_memory(images[0].1).unwrap().into_rgba8();
+    assert_eq!(rgba.get_pixel(8, 8).0, [210, 30, 50, 255]);
+
+    let mesh_node = parsed.nodes().find(|node| node.mesh().is_some()).unwrap();
+    let skin = mesh_node.skin().unwrap();
+    assert_eq!(skin.joints().next().unwrap().name(), Some("Joint"));
+    let reader = skin.reader(|_| parsed.blob.as_deref());
+    let bind = reader.read_inverse_bind_matrices().unwrap().next().unwrap();
+    assert_eq!(bind, Mat4::IDENTITY.to_cols_array_2d());
+    let mesh = mesh_node.mesh().unwrap();
+    let primitive = mesh.primitives().next().unwrap();
+    let reader = primitive.reader(|_| parsed.blob.as_deref());
+    assert_eq!(reader.read_tex_coords(0).unwrap().into_f32().collect::<Vec<_>>(), local_uvs);
+    assert_eq!(reader.read_joints(0).unwrap().into_u16().collect::<Vec<_>>(), [[0; 4]; 3]);
+    let (positions, _, _) = reader.read_morph_targets().next().unwrap();
+    assert_eq!(positions.unwrap().collect::<Vec<_>>(), morph_positions);
+
+    let animation = parsed.animations().next().unwrap();
+    assert_eq!(animation.name(), Some("Bend"));
+    let channel = animation.channels().next().unwrap();
+    assert_eq!(channel.target().node().name(), Some("Joint"));
+    let reader = channel.reader(|_| parsed.blob.as_deref());
+    assert_eq!(reader.read_inputs().unwrap().collect::<Vec<_>>(), [0., 1.]);
+    let ReadOutputs::Translations(values) = reader.read_outputs().unwrap() else {
+        panic!("the animation must keep its translation channel");
+    };
+    assert_eq!(values.collect::<Vec<_>>(), translations);
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+fn game_export_uses_unsaved_document_changes_without_saving_the_source() {
+    let (mut source, object) = fixture();
+    let path = source.path.clone();
+    let folder = path.parent().unwrap().to_owned();
+    source.save(&[object.clone()], &[]).unwrap();
+    let source = Glb::load(&path).unwrap();
+    let original_bytes = source.data().to_vec();
+    let mut document = Document::new(source, vec![object]);
+    let object = &mut document.objects[0];
+    object.transform.translation.x = 5.;
+    object.geometry.positions[1].x = 2.;
+    object.materials[0].paint = Some(game_export_paint_surface());
+    assert!(document.dirty());
+
+    let bytes = document.prepare_game_export().unwrap()(&folder).unwrap();
+    let exported = gltf::Gltf::from_slice(&bytes).unwrap();
+    let node = exported.nodes().next().unwrap();
+    assert_eq!(node.transform().decomposed().0, [5., 2., 3.]);
+    let mesh = node.mesh().unwrap();
+    let primitive = mesh.primitives().next().unwrap();
+    let reader = primitive.reader(|_| exported.blob.as_deref());
+    assert!(reader.read_positions().unwrap().any(|position| position == [2., 0., 0.]));
+    let images = game_export_pbr_images(&exported);
+    let color = image::load_from_memory(images[0].1).unwrap().into_rgba8();
+    assert_eq!(color.get_pixel(8, 8).0, [210, 30, 50, 255]);
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert!(document.dirty());
+    assert!(document.objects[0].materials[0].paint.is_some());
+
+    document.save().unwrap();
+    let saved = Glb::load(&path).unwrap();
+    let mesh = saved.json["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+    let primitive = &saved.json["meshes"][mesh]["primitives"][0];
+    let paint = saved.paint_surface(primitive).unwrap().unwrap();
+    assert!(paint.stack.layers[0].mask.is_some());
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
+#[ignore = "uses an existing model chosen by BEVY_EDITOR_GAME_EXPORT_SOURCE and BEVY_EDITOR_GAME_EXPORT_DESTINATION"]
+fn game_export_audit_asset() {
+    let input = PathBuf::from(std::env::var_os("BEVY_EDITOR_GAME_EXPORT_SOURCE").unwrap());
+    let destination = PathBuf::from(std::env::var_os("BEVY_EDITOR_GAME_EXPORT_DESTINATION").unwrap());
+    let original = Glb::load(&input).unwrap();
+    let bytes = original.game_export_bytes().unwrap();
+    let before = gltf::Gltf::from_slice(original.data()).unwrap();
+    let after = gltf::Gltf::from_slice(&bytes).unwrap();
+    let images = game_export_pbr_images(&before);
+    assert!(!images.is_empty());
+    assert_eq!(game_export_pbr_images(&after), images);
+    assert_eq!(after.animations().count(), before.animations().count());
+    assert_eq!(fs::read(&input).unwrap(), original.data());
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&destination).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    println!(
+        "{} → {} bytes, {:.1}% smaller; {} PBR texture slots and {} animations; {}",
+        original.data().len(), bytes.len(),
+        100. * (1. - bytes.len() as f64 / original.data().len() as f64),
+        images.len(), before.animations().count(), destination.display(),
+    );
+}
