@@ -40,6 +40,13 @@ impl Format {
         }
     }
 
+    pub(super) fn encoded_channels(self, channels: usize) -> usize {
+        match (self, channels) {
+            (Self::Jpeg, 4) | (Self::Exr, 1) => 3,
+            _ => channels,
+        }
+    }
+
     pub(super) fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
@@ -290,7 +297,7 @@ fn write_resampled<T: CompositeSample>(
             write_u16(writer, out_size, values, channels, image_format)
         }
         Depth::Float => {
-            if channels == 4 {
+            if options.format.encoded_channels(channels) == 4 {
                 DynamicImage::ImageRgba32F(rgba).write_to(writer, image_format)
             } else {
                 DynamicImage::ImageRgb32F(ImageBuffer::from_fn(out_size, out_size, |x, y| {
@@ -326,7 +333,7 @@ fn write_u8(
     mut channels: usize,
     format: Format,
 ) -> ImageResult<()> {
-    if format == Format::Jpeg && channels == 4 {
+    if channels == 4 && format.encoded_channels(channels) == 3 {
         let mut index = 0;
         bytes.retain(|_| {
             index += 1;
@@ -389,6 +396,7 @@ mod tests {
             for &depth in format.depths() {
                 let rgba = encode(format, depth, Samples::Color, 4, &[128, 64, 32, 96]);
                 assert_eq!(rgba.dimensions(), (2, 2));
+                assert_eq!(usize::from(rgba.color().channel_count()), format.encoded_channels(4));
                 match depth {
                     Depth::U8 if format == Format::Jpeg => {
                         assert!(!rgba.color().has_alpha());
@@ -413,6 +421,7 @@ mod tests {
                     }
                 }
                 let gray = encode(format, depth, Samples::Data, 1, &[128]);
+                assert_eq!(usize::from(gray.color().channel_count()), format.encoded_channels(1));
                 if depth == Depth::Float {
                     assert_eq!(gray.to_rgb32f().get_pixel(0, 0).0, [128. / 255.; 3]);
                 } else {

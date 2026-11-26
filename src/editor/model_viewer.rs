@@ -139,6 +139,7 @@ impl Plugin for ModelViewerPlugin {
             .init_resource::<paint::save_copy::State>()
             .init_resource::<paint::sets::ShelfPick>()
             .init_resource::<paint::export::prefs::Store>()
+            .init_resource::<paint::export::Activity>()
             .init_resource::<paint::engine::Runtime>()
             .init_resource::<paint::bake::State>()
             .init_resource::<paint::bake::custom_gizmo::Gizmo>()

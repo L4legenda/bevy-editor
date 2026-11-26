@@ -1,5 +1,5 @@
 use super::{
-    Depth, ExportDirectory, Padding, Samples, bake, image_output, material_normal,
+    Depth, ExportDirectory, GeometryMaps, Padding, Samples, bake, image_output, material_normal,
     material_normal_rows, pad,
 };
 use crate::editor::model_paint_data::{CHANNEL_COUNT, CompositeSample, Surface};
@@ -199,6 +199,8 @@ pub(super) enum Component {
     Layer(usize, usize),
     Normal(usize, bool),
     Baked(BakeMap, usize),
+    SurfaceNormal(usize),
+    SurfacePosition(usize),
     Smoothness,
     Diffuse(usize),
     Specular(usize),
@@ -211,7 +213,7 @@ use self::Component::*;
 pub(super) struct Map<'a> {
     pub name: &'a str,
     pub components: &'a [Component],
-    pub skip_if_default: Option<(usize, u8)>,
+    pub skip_if_default: &'static [(usize, u8)],
     pub inverted: u8,
 }
 
@@ -225,7 +227,7 @@ const fn packed(name: &'static str, components: &'static [Component]) -> Map<'st
     Map {
         name,
         components,
-        skip_if_default: None,
+        skip_if_default: &[],
         inverted: 0,
     }
 }
@@ -250,12 +252,14 @@ const NORMAL_DX: Map = packed(
     "Normal",
     &[Normal(0, false), Normal(1, true), Normal(2, false)],
 );
+const DEFAULT_EMISSION: (usize, u8) = (5, 0);
+const DEFAULT_SPECULAR: (usize, u8) = (7, 128);
 const EMISSIVE: Map = Map {
-    skip_if_default: Some((5, 0)),
+    skip_if_default: &[DEFAULT_EMISSION],
     ..packed("Emissive", &[Layer(5, 0), Layer(5, 1), Layer(5, 2)])
 };
 const SPEC_LEVEL: Map = Map {
-    skip_if_default: Some((7, 128)),
+    skip_if_default: &[DEFAULT_SPECULAR],
     ..packed("Specular", &[Layer(7, 0)])
 };
 
@@ -276,6 +280,7 @@ pub(super) fn write(
             *map,
             surface,
             baked,
+            None,
             sources,
             padding,
             map.samples(template),
@@ -286,6 +291,32 @@ pub(super) fn write(
 }
 
 impl Map<'_> {
+    pub(super) fn optional_defaults(components: &[Component]) -> &'static [(usize, u8)] {
+        let mut layers = 0;
+        for component in components {
+            layers |= match component {
+                Layer(5, _) => 1,
+                Layer(7, _) => 2,
+                Zero | One => 0,
+                _ => return &[],
+            };
+        }
+        match layers {
+            1 => &[DEFAULT_EMISSION],
+            2 => &[DEFAULT_SPECULAR],
+            3 => &[DEFAULT_EMISSION, DEFAULT_SPECULAR],
+            _ => &[],
+        }
+    }
+
+    pub(super) fn can_drop_alpha(self, padding: Padding, allow_opaque_rgb: bool) -> bool {
+        allow_opaque_rgb
+            && self.components.len() == 4
+            && padding != Padding::Transparent
+            && self.inverted & 8 == 0
+            && matches!(self.components.last(), Some(Layer(4, 0)))
+    }
+
     pub(super) fn samples(self, template: Template) -> Samples {
         match self.components {
             [Normal(..), ..] => Samples::Normal,
@@ -302,6 +333,7 @@ pub(super) fn write_map(
     map: Map<'_>,
     surface: &Surface,
     baked: Option<&bake::Maps>,
+    geometry: Option<&GeometryMaps>,
     sources: &[u32],
     padding: Padding,
     samples: Samples,
@@ -313,6 +345,7 @@ pub(super) fn write_map(
             map,
             surface,
             baked,
+            geometry,
             padding,
             allow_opaque_rgb,
             surface.size,
@@ -331,7 +364,7 @@ pub(super) fn write_map(
             output.image(name, surface.size, pixels, channels, samples)?;
         }
     } else if let Some(mut pixels) =
-        evaluate(map, surface, baked, padding, allow_opaque_rgb, 64, |rect| {
+        evaluate(map, surface, baked, geometry, padding, allow_opaque_rgb, 64, |rect| {
             material_normal_rows(surface, rect, baked, normal_options)
         })
     {
@@ -346,6 +379,7 @@ fn evaluate<T: CompositeSample>(
     map: Map<'_>,
     surface: &Surface,
     baked: Option<&bake::Maps>,
+    geometry: Option<&GeometryMaps>,
     padding: Padding,
     allow_opaque_rgb: bool,
     stripe_height: u32,
@@ -373,18 +407,14 @@ fn evaluate<T: CompositeSample>(
             required[layer] = true;
         }
     }
-    if let Some((layer, _)) = map.skip_if_default {
+    for &(layer, _) in map.skip_if_default {
         required[layer] = true;
     }
     let has_normal = map
         .components
         .iter()
         .any(|component| matches!(component, Normal(..)));
-    let can_drop_alpha = allow_opaque_rgb
-        && map.components.len() == 4
-        && padding != Padding::Transparent
-        && map.inverted & 8 == 0
-        && matches!(map.components.last(), Some(Layer(4, 0)));
+    let can_drop_alpha = map.can_drop_alpha(padding, allow_opaque_rgb);
     let components: Vec<_> = map
         .components
         .iter()
@@ -403,7 +433,7 @@ fn evaluate<T: CompositeSample>(
     let side = baked.map_or(1, |baked| baked.size as usize);
     let count = components.len();
     let mut pixels = Vec::with_capacity(size * size * count);
-    let mut default_only = map.skip_if_default.is_some();
+    let mut default_only = !map.skip_if_default.is_empty();
     let mut opaque = can_drop_alpha;
     for first in (0..surface.size).step_by(stripe_height as usize) {
         let rect = URect {
@@ -414,12 +444,14 @@ fn evaluate<T: CompositeSample>(
             required[layer].then(|| surface.composite_samples(layer, rect))
         });
         let normal = has_normal.then(|| read_normal(rect));
-        if let Some((layer, default)) = map.skip_if_default.filter(|_| default_only) {
-            default_only = layers[layer]
-                .as_ref()
-                .unwrap()
-                .chunks_exact(4)
-                .all(|rgba| rgba[..3] == [T::from_byte(default); 3]);
+        if default_only {
+            default_only = map.skip_if_default.iter().all(|&(layer, default)| {
+                layers[layer]
+                    .as_ref()
+                    .unwrap()
+                    .chunks_exact(4)
+                    .all(|rgba| rgba[..3] == [T::from_byte(default); 3])
+            });
         }
         if opaque {
             opaque = layers[4]
@@ -456,6 +488,12 @@ fn evaluate<T: CompositeSample>(
                                 ),
                         )
                     }
+                    SurfaceNormal(channel) => T::from_unit(
+                        f32::from(geometry.unwrap().normal[pixel][channel]) / 65535.,
+                    ),
+                    SurfacePosition(channel) => T::from_unit(
+                        f32::from(geometry.unwrap().position[pixel][channel]) / 65535.,
+                    ),
                     Smoothness => T::from_unit(1. - value(1, 0).unit()),
                     Diffuse(channel) | Specular(channel) => {
                         let base =

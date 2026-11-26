@@ -17,7 +17,10 @@ impl Snapshot {
     pub(super) fn capture(doc: &Document) -> Self {
         Self {
             objects: doc.objects.clone(),
-            sets: set_names(doc),
+            sets: set_names(doc, None)
+                .into_iter()
+                .map(|(object, slot, name)| ((object.id, slot), name))
+                .collect(),
         }
     }
 

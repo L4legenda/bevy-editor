@@ -1469,12 +1469,15 @@ fn graph_label(
         PaintAction::GraphEdit(material_graph::Edit::LabelParameter(index, group)));
 }
 
-fn export_recipe_name(
+#[derive(Component)]
+struct ExportTextSubmit(PaintAction);
+
+fn export_text_input(
     commands: &mut Commands,
     parent: Entity,
     font: &Handle<Font>,
     label: &str,
-    field: export::RecipeName,
+    field: impl Component,
     value: &str,
     action: PaintAction,
 ) {
@@ -1482,6 +1485,7 @@ fn export_recipe_name(
     let line = node(commands, parent, row(4.));
     commands.spawn((
         TextInput, EditableText::new(value), SelectAllOnFocus, TabIndex(0), field,
+        ExportTextSubmit(action),
         AccessibleLabel(label.into()), crate::ui_theme::text_cursor_style(),
         TextFont { font: font.clone().into(), font_size: FontSize::Px(12.), ..default() },
         TextColor(TEXT),
@@ -1491,8 +1495,23 @@ fn export_recipe_name(
             overflow: Overflow::clip(), ..default()
         },
         BackgroundColor(WELL), BorderColor::all(EDGE), ChildOf(line),
-    ));
+    )).observe(export_text_key);
     icon(commands, line, icons::Glyph::Check, &format!("Применить · {label}"), action);
+}
+
+fn export_text_key(
+    mut event: On<FocusedInput<KeyboardInput>>,
+    fields: Query<&ExportTextSubmit>,
+    mut actions: MessageWriter<Action>,
+) {
+    if event.input.state == ButtonState::Pressed
+        && !event.input.repeat
+        && matches!(event.input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
+        && let Ok(submit) = fields.get(event.focused_entity)
+    {
+        actions.write(Action::ModelView(ModelViewAction::Paint(submit.0)));
+        event.propagate(false);
+    }
 }
 
 fn layer_name(
@@ -1574,7 +1593,7 @@ fn export_recipe_editor(
     let map = &recipe.maps[output];
     let channel = session.export_component.min(map.layout.len() - 1);
     let edit = |edit| PaintAction::EditExportTemplate { recipe: index, output, channel, edit };
-    export_recipe_name(commands, parent, font, "Имя шаблона",
+    export_text_input(commands, parent, font, "Имя шаблона",
         export::RecipeName { recipe: index, output: None }, &recipe.name, edit(Edit::RenameTemplate));
     text(commands, parent, font, "Выходные карты", 11., MUTED);
     let outputs = node(commands, parent, Node {
@@ -1592,7 +1611,7 @@ fn export_recipe_editor(
     }
     if output > 0 { button(commands, operations, font, "↑", edit(Edit::Move(true))); }
     if output + 1 < recipe.maps.len() { button(commands, operations, font, "↓", edit(Edit::Move(false))); }
-    export_recipe_name(commands, parent, font, "Имя файла",
+    export_text_input(commands, parent, font, "Имя файла",
         export::RecipeName { recipe: index, output: Some(output) }, &map.name, edit(Edit::RenameOutput));
     text(commands, parent, font, "Переменные $mesh, $set, $project, $udim", 11., MUTED);
     let formats = node(commands, parent, row(4.));
@@ -2441,7 +2460,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     >,
     mut images: ResMut<Assets<Image>>,
     rendering: (Res<engine::Runtime>, Res<ShaderMaker>, Res<environment::Settings>, Res<export::prefs::Store>, Res<space_mouse::State>, Res<sidebar::State>, Query<&ChildOf>, Query<&sidebar::PanelBody>, Query<&GraphLabel>, Res<editing::recovery::Preferences>, Res<ButtonInput<KeyCode>>, Res<engine::gpu::Queue>, Res<Time<bevy::time::Real>>, Query<(&LayerMemoryHint, &mut Help)>),
-    (baked, mut preview_edits): (Res<bake::State>, MessageWriter<Action>),
+    (baked, mut preview_edits, export_activity): (Res<bake::State>, MessageWriter<Action>, Res<export::Activity>),
     mut texture_nodes: Query<&mut ImageNode, Or<(With<engine::TextureCanvas>, With<UvWire>, With<UvSeams2d>)>>,
 ) {
     let (runtime, maker, environment_settings, export_preferences, space_mouse, sidebar, parents, pane_bodies, graph_labels, recovery_preferences, keys, gpu_queue, time, mut layer_hints) = rendering;
@@ -2825,6 +2844,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
         let available = match button.0 {
             PaintAction::PreviewMaterial(_) => doc.can_store_paint_preview(),
+            PaintAction::Undo | PaintAction::Redo if session.editing_shader().is_none() => {
+                !session.busy && session.resize_request.is_none() && !session.smart_loading
+                    && session.history_step_set(doc, button.0).is_some()
+            }
+            PaintAction::ExportMaps(_) | PaintAction::ExportMesh => {
+                !export_activity.exporting() && session.available(button.0)
+            }
             action => session.available(action),
         };
         if available && disabled.is_some() {
@@ -2906,7 +2932,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         paint.tips.entries.len(),
         match panel {
             Panel::Shader => node_library::revision(),
-            Panel::Sets => export_preferences.revision(),
+            Panel::Sets => export_preferences.revision().wrapping_add(export_activity.revision),
             Panel::Preview => space_mouse.revision(),
             _ => 0,
         },
@@ -2998,20 +3024,20 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     "Удалить слой",
                     PaintAction::Remove,
                 );
-                icon(
-                    &mut commands,
-                    tools,
-                    icons::Glyph::Undo,
-                    "Отменить изменение слоёв",
-                    PaintAction::Undo,
-                );
-                icon(
-                    &mut commands,
-                    tools,
-                    icons::Glyph::Redo,
-                    "Повторить изменение слоёв",
-                    PaintAction::Redo,
-                );
+                for (action, glyph, verb, shortcut) in [
+                    (PaintAction::Undo, icons::Glyph::Undo, "Отменить", "Ctrl+Z"),
+                    (PaintAction::Redo, icons::Glyph::Redo, "Повторить", "Ctrl+Shift+Z"),
+                ] {
+                    let hint = session.history_step_set(doc, action)
+                        .and_then(|step| doc.paint_target(step.set).map(|(object, slot)| {
+                            let (_, label) = step.label.names();
+                            format!("{shortcut} · {verb} · {label} · {}", texture_set_label(doc, object, slot))
+                        }));
+                    let button = icon(&mut commands, tools, glyph, hint.as_deref().unwrap_or(verb), action);
+                    if let Some(hint) = hint {
+                        commands.entity(button).insert(Help(hint));
+                    }
+                }
                 icon(
                     &mut commands, tools, icons::Glyph::Plus,
                     "Сохранить материал в библиотеке", PaintAction::SaveShelfMaterial,
@@ -3662,6 +3688,18 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     &mut commands, export_actions, font,
                     &format!("{} ⌄", session.export_settings.file.format.label()), PaintAction::ExportFileMenu,
                 );
+                match &export_activity.state {
+                    export::ActivityState::Idle => {}
+                    export::ActivityState::Exporting => {
+                        text(&mut commands, stack, font, "Экспорт карт…", 12., MUTED);
+                    }
+                    export::ActivityState::Finished { message, folder, failed } => {
+                        text(&mut commands, stack, font, message.as_str(), 12., if *failed { ERROR } else { TEXT });
+                        if folder.is_some() {
+                            button(&mut commands, stack, font, "Открыть папку с картами", PaintAction::RevealExportResult);
+                        }
+                    }
+                }
                 if session.export_template_menu {
                     let panel = node(&mut commands, stack, Node { flex_shrink: 0., ..column(5.) });
                     let templates = node(&mut commands, panel, Node {
@@ -3677,6 +3715,16 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     export_recipe_editor(&mut commands, panel, font, &export_preferences, session);
                 }
                 if session.export_file_menu {
+                    let destination = export_preferences.destination()
+                        .map(|path| path.to_string_lossy()).unwrap_or_default();
+                    export_text_input(
+                        &mut commands, stack, font, "Папка экспорта карт",
+                        export::DestinationField, &destination, PaintAction::ApplyExportDestination,
+                    );
+                    button(&mut commands, stack, font, "Выбрать папку…", PaintAction::BrowseExportDestination);
+                    if destination.is_empty() {
+                        text(&mut commands, stack, font, "Папка выбирается при экспорте", 11., MUTED);
+                    }
                     text(&mut commands, stack, font, "Формат файла", 11., MUTED);
                     let formats = node(&mut commands, stack, Node {
                         flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
@@ -3703,18 +3751,47 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     button(&mut commands, stack, font, "Учитывать нормали high-poly", PaintAction::ExportBakedNormal);
                     number(&mut commands, stack, font, Parameter::ExportHeightStrength, false);
                     button(&mut commands, stack, font, "Открывать папку после экспорта", PaintAction::ExportRevealFolder);
-                    if let Some(binding) = session.binding {
-                        let recipe = match session.export_settings.template {
-                            export::Template::Custom(id) => export_preferences.recipe(id),
-                            _ => None,
+                    export_text_input(
+                        &mut commands, stack, font, "Имя модели · $mesh",
+                        export::MeshExportName, export::texture_model_name(doc, session),
+                        PaintAction::ApplyExportMeshName,
+                    );
+                    text(&mut commands, stack, font, "Предпросмотр имён файлов", 11., MUTED);
+                    let scopes = node(&mut commands, stack, Node {
+                        flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
+                    });
+                    button(&mut commands, scopes, font, "Текущий набор", PaintAction::ExportPreviewScope(false));
+                    button(&mut commands, scopes, font, "Все наборы", PaintAction::ExportPreviewScope(true));
+                    let recipe = match session.export_settings.template {
+                        export::Template::Custom(id) => export_preferences.recipe(id),
+                        _ => None,
+                    };
+                    let files = export::preview_files(doc, session, &editor.project.title, recipe, (&baked, index));
+                    let has_next = files.len() > export::PREVIEW_PAGE_SIZE;
+                    if files.is_empty() {
+                        text(&mut commands, stack, font, "Нет файлов для предпросмотра", 11., MUTED);
+                    }
+                    for file in files.into_iter().take(export::PREVIEW_PAGE_SIZE) {
+                        let optional = if file.conditional { " · если канал изменён" } else { "" };
+                        let upscale = if file.size > file.source_size {
+                            format!(" · увеличение с {0} × {0}", file.source_size)
+                        } else {
+                            String::new()
                         };
-                        let maps = baked.maps(index, doc, binding, session.texture_size).map(Arc::as_ref);
-                        let files = export::preview_files(doc, binding, &editor.project.title, session.export_settings, recipe, maps);
-                        text(&mut commands, stack, font, "Файлы выбранного набора", 11., MUTED);
-                        for file in files {
-                            let optional = if file.conditional { " · если канал изменён" } else { "" };
-                            text(&mut commands, stack, font,
-                                format!("{} · {}{optional}", file.name, file.depth.label()), 12., TEXT);
+                        text(&mut commands, stack, font,
+                            format!("{} · {} · {} × {} · {}{upscale}{optional}",
+                                file.name, file.layout, file.size, file.size, file.depth.label()),
+                            12., TEXT);
+                    }
+                    let page = session.export_preview_page;
+                    if page > 0 || has_next {
+                        let pages = node(&mut commands, stack, row(4.));
+                        if page > 0 {
+                            button(&mut commands, pages, font, "Назад", PaintAction::ExportPreviewPage(page - 1));
+                        }
+                        text(&mut commands, pages, font, format!("Страница {}", page + 1), 11., MUTED);
+                        if has_next {
+                            button(&mut commands, pages, font, "Далее", PaintAction::ExportPreviewPage(page + 1));
                         }
                     }
                 }

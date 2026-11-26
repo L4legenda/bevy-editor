@@ -141,7 +141,8 @@ impl Work {
 struct Batch {
     work: Work,
     maps: Option<Updates>,
-    history: Vec<Stack>,
+    history: Vec<(super::history::Label, Stack)>,
+    resized_bake: Option<bake::ResizedBake>,
     #[cfg(feature = "mcp")]
     surface_selection: Option<Result<super::surface_selection::Report, String>>,
 }
@@ -157,6 +158,7 @@ struct Gpu {
 #[cfg(test)]
 struct Stroke {
     brush: Brush,
+    label: super::history::Label,
     original: Option<Arc<Vec<u8>>>,
     coverage: Vec<f32>,
     changed: bool,
@@ -190,6 +192,19 @@ struct BrushMaterial {
     colors: [[u8; 3]; data::CHANNEL_COUNT],
 }
 impl Brush {
+    fn history_label(self) -> super::history::Label {
+        use super::history::Label;
+        if self.fill {
+            Label::Fill
+        } else if self.erase {
+            Label::Erase
+        } else if self.channel == data::MASK_TARGET {
+            Label::MaskStroke
+        } else {
+            Label::Stroke
+        }
+    }
+
     fn channels(self) -> u16 {
         self.material.map_or(1 << self.channel, |material| u16::from(material.channels))
     }
@@ -221,10 +236,16 @@ struct BrushGrain {
     uv: bool,
 }
 enum Event {
-    Begin(Brush),
+    Begin(Brush, super::history::Label),
     Points(Vec<Stamp>, Arc<Mapping>),
     Region(fill_drag::Region, Arc<Mapping>),
     End,
+}
+
+impl Event {
+    fn begin(brush: Brush) -> Self {
+        Self::Begin(brush, brush.history_label())
+    }
 }
 #[path = "model_paint_fill_drag.rs"]
 mod fill_drag;
@@ -474,9 +495,10 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
     let mut events = events.into_iter().peekable();
     while let Some(event) = events.next() {
         match event {
-            Event::Begin(brush) => {
+            Event::Begin(brush, label) => {
                 work.stroke = Some(Stroke {
                     brush,
+                    label,
                     original: work
                         .surface
                         .stack
@@ -500,7 +522,7 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
                 let channel = work.stroke.as_ref().map_or(0, |s| s.brush.channel);
                 if let Some(rect) = paint_points(&mut work, &points, &map) {
                     if first {
-                        history.push(before.unwrap());
+                        history.push((work.stroke.as_ref().unwrap().label, before.unwrap()));
                     }
                     dirty[channel] = composite::union(dirty[channel], Some(rect));
                 }
@@ -530,6 +552,7 @@ fn batch(mut work: Work, events: Vec<Event>, force: bool) -> Batch {
         work,
         maps,
         history,
+        resized_bake: None,
         #[cfg(feature = "mcp")]
         surface_selection: None,
     }
@@ -567,6 +590,7 @@ fn compose(work: Work) -> Batch {
         work,
         maps: Some(maps),
         history: Vec::new(),
+        resized_bake: None,
         #[cfg(feature = "mcp")]
         surface_selection: None,
     }
@@ -652,6 +676,13 @@ pub(super) struct SurfaceImport {
 }
 
 impl SurfaceSource {
+    pub(super) fn size(&self) -> u32 {
+        match self {
+            Self::Saved(surface) => surface.size,
+            Self::Import(source) => source.size,
+        }
+    }
+
     pub(super) fn build(self) -> Surface {
         match self {
             Self::Saved(surface) => (*surface).clone(),
@@ -942,6 +973,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     mut gpu_queue: ResMut<gpu::Queue>,
     mut baked: ResMut<bake::State>,
     recovery: Res<editing::recovery::Preferences>,
+    time: Res<Time<bevy::time::Real>>,
     mut messages: ParamSet<(MessageReader<Action>, MessageWriter<Action>)>,
     #[cfg(feature = "mcp")] render_requests: Query<&mcp_preview::offscreen::RenderRequest>,
 ) {
@@ -1107,6 +1139,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 session.undo.clear();
                 session.redo.clear();
                 session.revision += 1;
+            } else {
+                session.histories.remove(&(object, slot));
             }
             live.ui_stack = stack;
             live.work = None;
@@ -1126,8 +1160,8 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     }
                     session.surface_selection = Some(((object, slot), selection));
                 }
-                for history in result.history {
-                    session.record_undo(history);
+                for (label, previous) in result.history {
+                    session.record_undo(previous, label);
                 }
                 if finished {
                     session.stack = result.work.surface.stack.clone();
@@ -1184,6 +1218,9 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     doc.revision += 1;
                 }
             }
+            if let Some(resized_bake) = result.resized_bake {
+                baked.publish_resized(doc, resized_bake);
+            }
             live.work = Some(result.work);
         }
         if live.task.is_none() {
@@ -1196,8 +1233,11 @@ pub(in crate::editor::ui::model_viewer) fn update(
         }
         if live.task.is_none() {
             if bound && live.queue.is_empty() && !live.controller.busy() {
-                if let Some(size) = session.resize_request.take() {
+                if !baked.baking_set(index, (object, slot))
+                    && let Some(size) = session.resize_request.take()
+                {
                     let mut work = live.work.take().unwrap();
+                    let bake = baked.resize_source(index, doc, (object, slot), work.surface.size);
                     let source = doc.objects.iter().find(|o| o.id == object).unwrap();
                     let mesh = source.geometry.clone();
                     let uv_offset = source.uv_offset(slot);
@@ -1211,15 +1251,24 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     session.busy = true;
                     live.task = Some(AsyncComputeTaskPool::get().spawn(async move {
                         work.surface.resize(size);
+                        let resized_bake = bake.map(|bake| bake.resample(size));
+                        if work.surface.needs_bake() && let Some(bake) = &resized_bake {
+                            work.surface.baked = Some(bake.maps.generator_inputs().clone());
+                        }
                         work.surface.bind_texture_fills(&mesh, slot, uv_offset, transform);
                         work.surface.bind_generators(&mesh, slot, uv_offset, transform);
-                        compose(work)
+                        let mut result = compose(work);
+                        result.resized_bake = resized_bake;
+                        result
                     }));
                     continue;
                 }
                 session.busy = false;
-                while let Some(action) = session.queued.pop_front() {
-                    session.edit(action);
+                while doc.mode == Mode::Paint && editor.viewing_model == Some(index)
+                    && let Some(&action) = session.queued.front()
+                    && session.run_history_step(doc, action, time.elapsed_secs_f64())
+                {
+                    session.queued.pop_front();
                 }
             }
             let work = live.work.as_mut().unwrap();
@@ -1299,6 +1348,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                     } else {
                         Batch {
                             work, maps: None, history: Vec::new(),
+                            resized_bake: None,
                             #[cfg(feature = "mcp")]
                             surface_selection: None,
                         }
@@ -1337,7 +1387,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
             }
         }
         if bound {
-            session.busy = live.task.is_some() || !live.queue.is_empty() || live.controller.busy();
+            session.busy = live.task.is_some() || !live.queue.is_empty() || live.controller.busy()
+                || doc.paint_target(session.set).is_some_and(|(target, slot)| {
+                    session.binding != Some((target.id, slot))
+                });
         }
     }
     runtime.fix.update(&mut state.documents, &mut baked, &mut images, &mut gpu_queue, &mut editor.status);
@@ -1347,7 +1400,10 @@ pub(in crate::editor::ui::model_viewer) fn update(
         if runtime.fix.busy(index) && let Some(session) = paint.sessions.get_mut(&index) {
             session.busy = true;
         }
-        doc.paint_busy = paint.sessions.get(&index).is_some_and(|s| s.resize_request.is_some())
+        doc.paint_busy = paint.sessions.get(&index).is_some_and(|s| {
+            s.resize_request.is_some() || (doc.mode == Mode::Paint && editor.viewing_model == Some(index)
+                && !s.queued.is_empty() && s.editing_shader().is_none())
+        })
             || runtime.fix.busy(index)
             || runtime.lives.iter().any(|((i, _, _), l)| {
             *i == index && (l.task.is_some() || !l.queue.is_empty() || l.controller.busy())
@@ -1975,7 +2031,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
         if fill_drag.is_none()
             && let Some(live) = runtime.lives.get_mut(&key)
         {
-            live.queue.push_back(Event::Begin(brush));
+            live.queue.push_back(Event::begin(brush));
             let mut points = vec![path.first()];
             if anchor.is_some() {
                 points.extend(path.line_to(cursor, pressure));
@@ -2063,7 +2119,7 @@ impl Runtime {
         let Some(gesture) = self.gesture.take() else { return false };
         let Some(drag) = gesture.fill_drag else { return false };
         let Some(live) = self.lives.get_mut(&gesture.key) else { return false };
-        live.queue.push_back(Event::Begin(drag.brush));
+        live.queue.push_back(Event::begin(drag.brush));
         if let Some(region) = drag.region() {
             live.queue.push_back(Event::Region(region, gesture.mapping));
         } else {
@@ -2364,7 +2420,7 @@ mod tests {
         let result = batch(
             work,
             vec![
-                Event::Begin(brush),
+                Event::begin(brush),
                 Event::Points(vec![Stamp::from(Vec2::splat(256.)); 8], map),
                 Event::End,
             ],
@@ -2389,7 +2445,7 @@ mod tests {
         let painted = batch(
             work,
             vec![
-                Event::Begin(b),
+                Event::begin(b),
                 Event::Points(vec![Stamp::from(Vec2::new(128., 256.))], map.clone()),
                 Event::End,
             ],
@@ -2408,7 +2464,7 @@ mod tests {
         let erased = batch(
             painted.work,
             vec![
-                Event::Begin(b),
+                Event::begin(b),
                 Event::Points(vec![Stamp::from(Vec2::new(128., 256.))], map),
                 Event::End,
             ],

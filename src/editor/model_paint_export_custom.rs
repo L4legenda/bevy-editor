@@ -179,8 +179,8 @@ impl Source {
             Self::ProjectedNormal => Baked(BakeMap::ProjectedNormal, component),
             Self::ProjectedHeight => Baked(BakeMap::ProjectedHeight, 0),
             Self::PartId => Baked(BakeMap::PartId, component),
-            Self::WorldNormal => Baked(BakeMap::WorldNormal, component),
-            Self::Position => Baked(BakeMap::Position, component),
+            Self::WorldNormal => Component::SurfaceNormal(component),
+            Self::Position => Component::SurfacePosition(component),
             Self::Zero => Component::Zero,
             Self::One => Component::One,
         }
@@ -225,6 +225,10 @@ pub(super) fn load(path: &Path) -> io::Result<Vec<Recipe>> {
 }
 
 impl Recipe {
+    pub(super) fn uses_source(&self, source: Source) -> bool {
+        self.maps.iter().any(|map| map.active_channels().iter().any(|channel| channel.src == source))
+    }
+
     pub(super) fn from_builtin(template: templates::Template) -> Option<Self> {
         use Source::*;
         use templates::Template;
@@ -504,6 +508,33 @@ pub(in crate::editor) enum Edit {
 }
 
 impl Output {
+    fn active_channels(&self) -> &[Channel] {
+        &self.channels[..self.layout.len()]
+    }
+
+    pub(super) fn components(&self) -> Vec<Component> {
+        self.active_channels()
+            .iter()
+            .map(|channel| channel.src.component(channel.comp))
+            .collect()
+    }
+
+    fn channel_flags(&self, predicate: impl Fn(&Channel) -> bool) -> u8 {
+        self.active_channels()
+            .iter()
+            .enumerate()
+            .fold(0, |flags, (index, channel)| flags | (u8::from(predicate(channel)) << index))
+    }
+
+    pub(super) fn export_map<'a>(&'a self, components: &'a [Component]) -> templates::Map<'a> {
+        templates::Map {
+            name: &self.name,
+            components,
+            skip_if_default: templates::Map::optional_defaults(components),
+            inverted: self.channel_flags(|channel| channel.invert),
+        }
+    }
+
     fn source(name: &str, layout: Layout, source: Source) -> Self {
         let channels = (0..layout.len())
             .map(|index| Channel {
@@ -576,36 +607,21 @@ pub(super) fn write(
     names: Names<'_>,
     surface: &Surface,
     baked: Option<&super::bake::Maps>,
+    geometry: &super::GeometryMaps,
     sources: &[u32],
     padding: Padding,
 ) -> io::Result<()> {
     for map in &recipe.maps {
-        let channels = &map.channels[..map.layout.len()];
-        let components: Vec<_> = channels
-            .iter()
-            .map(|channel| channel.src.component(channel.comp))
-            .collect();
-        let flag = |apply: fn(&Channel) -> bool| {
-            channels
-                .iter()
-                .enumerate()
-                .fold(0u8, |mask, (index, channel)| {
-                    mask | if apply(channel) { 1 << index } else { 0 }
-                })
-        };
-        let plan = templates::Map {
-            name: &map.name,
-            components: &components,
-            skip_if_default: None,
-            inverted: flag(|channel| channel.invert),
-        };
+        let channels = map.active_channels();
+        let components = map.components();
+        let plan = map.export_map(&components);
         let normal = channels.len() >= 3
             && channels[0].src.normal()
             && channels[..3].iter().enumerate().all(|(index, channel)| {
                 channel.src == channels[0].src && usize::from(channel.comp) == index
             });
         let samples = Samples::Packed {
-            srgb: flag(|channel| channel.src.color()),
+            srgb: map.channel_flags(|channel| channel.src.color()),
             normal,
             force_16: map.force_16,
         };
@@ -615,10 +631,11 @@ pub(super) fn write(
             plan,
             surface,
             baked,
+            Some(geometry),
             sources,
             padding,
             samples,
-            false,
+            true,
         )?;
     }
     Ok(())

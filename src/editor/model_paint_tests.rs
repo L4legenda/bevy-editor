@@ -135,10 +135,12 @@ fn paint_history_limit_keeps_latest_edits_in_active_and_parked_sets() {
     assert_eq!(session.stack.layers.len(), initial_layers + 10);
 
     let previous = session.stack.clone();
-    session.record_undo(previous);
+    session.record_undo(previous, history::Label::LayerProperties);
     assert_eq!(session.undo.len(), 8);
     assert_eq!(session.undo.last().unwrap().layer_count(), initial_layers + 10);
     assert!(session.redo.is_empty());
+    assert_eq!(session.histories[&(1, 2)].0.len(), 8);
+    assert!(session.histories[&(1, 2)].1.is_empty());
 }
 
 #[test]
@@ -6931,11 +6933,12 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         app.world().resource::<editing::State>().documents[&0].objects[0]
             .materials[slot].paint.as_ref().unwrap().clone()
     };
-    let alpha = |app: &App, slot, uv: Vec2| {
-        let surface = surface(app, slot);
+    let alpha = |app: &App, slot: usize, uv: Vec2| {
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        let Some(surface) = doc.objects[0].materials[slot].paint.as_deref() else { return 0 };
         let pixel = (uv * surface.size as f32).as_uvec2();
         let index = (pixel.y * surface.size + pixel.x) as usize * 4 + 3;
-        surface.stack.layers[0].channels[0].as_ref().unwrap()[index]
+        surface.stack.layers[0].channels[0].as_ref().map_or(0, |pixels| pixels[index])
     };
     dot(&mut app, Vec2::splat(0.5));
     assert_eq!(surface(&app, 0).size, 1024);
@@ -6952,6 +6955,27 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
     assert_eq!(surface(&app, 1).size, 1024);
     assert_eq!(alpha(&app, 1, Vec2::new(0.7, 0.5)), 255);
     assert_eq!(alpha(&app, 0, Vec2::new(0.7, 0.5)), 0);
+    paint_click(&mut app, window, PaintAction::Set(0));
+    paint_message(&mut app, PaintAction::Panel(Panel::Layers));
+    {
+        let world = app.world_mut();
+        let mut controls = world.query::<(&Control, &crate::editor::ui::control_hints::Help)>();
+        assert!(controls.iter(world).any(|(control, hint)| {
+            matches!(control.action, Action::ModelView(ModelViewAction::Paint(PaintAction::Undo)))
+                && hint.0.contains("Мазок кисти") && hint.0.contains("1013")
+        }));
+    }
+    for (action, set, at, wanted_alpha) in [
+        (PaintAction::Undo, 1, Vec2::new(0.7, 0.5), 0),
+        (PaintAction::Undo, 0, Vec2::new(0.3, 0.5), 0),
+        (PaintAction::Redo, 0, Vec2::new(0.3, 0.5), 255),
+        (PaintAction::Redo, 1, Vec2::new(0.7, 0.5), 255),
+    ] {
+        paint_click(&mut app, window, action);
+        assert_eq!(app.world().resource::<PaintState>().sessions[&0].set, set);
+        assert_eq!(alpha(&app, set, at), wanted_alpha);
+    }
+    paint_message(&mut app, PaintAction::Panel(Panel::Sets));
     let object = app.world().resource::<editing::State>().documents[&0].objects[0].id;
     let center = labelled(&mut app, "3D-вид модели").center();
     move_pointer(&mut app, window, center);
@@ -7058,6 +7082,29 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         assert_eq!(map.layout, Layout::Rgb);
         assert!(map.channels[1].invert && map.channels[1].src == Source::Roughness);
     }
+    for action in [PaintAction::ExportFileMenu, PaintAction::ExportPreviewScope(true)] {
+        scroll_to_paint_control(&mut app, action);
+        paint_click(&mut app, window, action);
+    }
+    scroll_to_paint_control(&mut app, PaintAction::ApplyExportMeshName);
+    {
+        let world = app.world_mut();
+        let mut fields = world.query_filtered::<&mut bevy::text::EditableText, With<export::MeshExportName>>();
+        fields.single_mut(world).unwrap().editor_mut().set_text("Hero Model");
+    }
+    paint_click(&mut app, window, PaintAction::ApplyExportMeshName);
+    {
+        let world = app.world_mut();
+        let mut labels = world.query::<&Text>();
+        for tile in [1001, 1013] {
+            assert!(labels.iter(world).any(|label|
+                label.0.starts_with(&format!("Hero_Model_Example_{tile}.")) && label.0.contains(" · RGB · ")));
+        }
+    }
+    for action in [PaintAction::ExportPreviewScope(false), PaintAction::ExportTemplateMenu] {
+        scroll_to_paint_control(&mut app, action);
+        paint_click(&mut app, window, action);
+    }
     scroll_to_paint_control(&mut app, godot);
     paint_click(&mut app, window, godot);
     {
@@ -7070,8 +7117,21 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         PaintAction::ExportFileMenu,
         PaintAction::ExportFormat(export::Format::Tiff),
         PaintAction::ExportDepth(export::Depth::U16),
-        PaintAction::ExportSize(Some(512)),
+        PaintAction::ExportSize(Some(2048)),
+        PaintAction::ExportPreviewScope(true),
     ] {
+        scroll_to_paint_control(&mut app, action);
+        paint_click(&mut app, window, action);
+    }
+    {
+        let world = app.world_mut();
+        let mut labels = world.query::<&Text>();
+        for (tile, source_size) in [(1001, 512), (1013, 1024)] {
+            let info = format!("_ORM.{tile}.tif · RGB · 2048 × 2048 · 16 бит · увеличение с {source_size} × {source_size}");
+            assert!(labels.iter(world).any(|label| label.0.ends_with(&info)), "{info}");
+        }
+    }
+    for action in [PaintAction::ExportPreviewScope(false), PaintAction::ExportSize(Some(512))] {
         scroll_to_paint_control(&mut app, action);
         paint_click(&mut app, window, action);
     }
@@ -7137,11 +7197,11 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         let world = app.world_mut();
         let mut labels = world.query::<&Text>();
         labels.iter(world).find_map(|label| {
-            let (name, depth) = label.0.rsplit_once(" · ")?;
-            (name.contains("_ORM.") && depth == "16 бит").then(|| name.to_owned())
+            let (name, info) = label.0.split_once(" · ")?;
+            (name.contains("_ORM.") && info == "RGB · 512 × 512 · 16 бит").then(|| name.to_owned())
         }).expect("The format panel previews the selected set's 16-bit ORM filename")
     };
-    assert!(tiff.path.join(preview).is_file());
+    assert!(tiff.path.join(&preview).is_file());
     for tile in [1001, 1013] {
         let orm = std::fs::read_dir(&tiff.path).unwrap().map(|entry| entry.unwrap().path())
             .find(|path| path.to_string_lossy().ends_with(&format!("_ORM.{tile}.tif"))).unwrap();
@@ -7149,6 +7209,69 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         assert_eq!((orm.width(), orm.height()), (512, 512));
         assert_eq!(orm.color(), image::ColorType::Rgb16);
     }
+    let destination = directory.join("Новые текстуры").join("Модель");
+    let set_destination_field = |app: &mut App, value: &str| {
+        let world = app.world_mut();
+        let mut fields = world.query_filtered::<&mut bevy::text::EditableText, With<export::DestinationField>>();
+        fields.single_mut(world).unwrap().editor_mut().set_text(value);
+    };
+    set_destination_field(&mut app, "relative");
+    paint_message(&mut app, PaintAction::ApplyExportDestination);
+    assert!(app.world().resource::<Editor>().status.contains("полный путь"));
+    assert!(app.world().resource::<export::prefs::Store>().destination().is_none());
+
+    let file_in_place_of_folder = tiff.path.join(&preview);
+    set_destination_field(&mut app, &file_in_place_of_folder.to_string_lossy());
+    paint_message(&mut app, PaintAction::ExportMaps(false));
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        if matches!(
+            app.world().resource::<export::Activity>().state,
+            export::ActivityState::Finished { failed: true, folder: None, .. }
+        ) {
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 10, "The invalid destination did not report a failure");
+    }
+    warm(&mut app, 2);
+    {
+        let world = app.world_mut();
+        let mut labels = world.query::<&Text>();
+        assert!(labels.iter(world).any(|label| label.0.starts_with("Не удалось завершить операцию")));
+    }
+
+    scroll_to_paint_control(&mut app, PaintAction::ApplyExportDestination);
+    set_destination_field(&mut app, &format!("\"{}\"", destination.display()));
+    paint_click(&mut app, window, PaintAction::ApplyExportDestination);
+    assert_eq!(app.world().resource::<export::prefs::Store>().destination(), Some(destination.as_path()));
+    assert!(!destination.exists());
+    paint_message(&mut app, PaintAction::ExportMaps(false));
+    let exported = destination.join("Hero_Model_textures").join(preview);
+    let start = std::time::Instant::now();
+    loop {
+        frame(&mut app);
+        let status = &app.world().resource::<Editor>().status;
+        if status.starts_with("Экспортировано карт:") {
+            assert!(exported.is_file());
+            break;
+        }
+        assert!(start.elapsed().as_secs() < 30, "{status}");
+    }
+    warm(&mut app, 2);
+    {
+        let world = app.world_mut();
+        let status = world.resource::<Editor>().status.clone();
+        let mut labels = world.query::<&Text>();
+        assert!(labels.iter(world).any(|label| label.0 == status));
+        let mut controls = world.query::<(&Control, Option<&bevy::ui::InteractionDisabled>)>();
+        assert!(controls.iter(world).any(|(control, disabled)| disabled.is_none()
+            && matches!(control.action, Action::ModelView(ModelViewAction::Paint(PaintAction::RevealExportResult)))));
+    }
+    set_destination_field(&mut app, "");
+    paint_message(&mut app, PaintAction::ApplyExportDestination);
+    assert!(app.world().resource::<export::prefs::Store>().destination().is_none());
+
     app.world_mut().resource_mut::<bake::State>().set_disk_cache(directory.join("bake-cache"));
     paint_click(&mut app, window, PaintAction::Panel(Panel::Maps));
     fn doc(app: &App) -> &crate::editor::model_document::Document {
@@ -7764,17 +7887,35 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         }
         assert!(started.elapsed().as_secs() < 60, "{status}");
     }
+    paint_message(&mut app, PaintAction::Panel(Panel::Sets));
+    let resize = PaintAction::Resolution(1024);
+    assert_eq!(surface(&app, 0).size, 512);
+    assert!(app.world().resource::<bake::State>().maps(0, doc(&app), (object, 0), 512).is_some());
+    scroll_to_paint_control(&mut app, resize);
+    paint_click(&mut app, window, resize);
+    assert_eq!(surface(&app, 0).size, 1024);
+    {
+        let world = app.world();
+        let resized = world.resource::<bake::State>().maps(0, doc(&app), (object, 0), 1024)
+            .expect("Changing the paint resolution must keep existing bakes");
+        assert_eq!(resized.size, 1024);
+        assert!(resized.has_map(bake::BakeMap::WorldNormal));
+        assert!(resized.has_map(bake::BakeMap::Custom(custom_id)));
+        assert_eq!(resized.rgba(bake::BakeMap::Custom(custom_id)).len(), 1024 * 1024 * 4);
+    }
     std::fs::remove_file(cage).unwrap();
     std::fs::remove_file(source).unwrap();
     for results in [
         report.path, rerun.path, godot.path, tiff.path, baked.path, packed.path, high.path, minimum.path,
-        directory.join("bake-cache"),
+        directory.join("bake-cache"), destination.join("Hero_Model_textures"),
     ] {
         for entry in std::fs::read_dir(&results).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
         std::fs::remove_dir(results).unwrap();
     }
+    std::fs::remove_dir(&destination).unwrap();
+    std::fs::remove_dir(directory.join("Новые текстуры")).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }
 

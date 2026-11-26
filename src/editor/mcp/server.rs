@@ -156,7 +156,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Edit the active 3D paint workspace: select a texture set or layer, add, change, duplicate, remove or move a layer, edit its mask, or undo or redo. Returns updated paint state",
+        description = "Edit the active 3D paint workspace: select a texture set or layer, add, change, duplicate, remove or move a layer, edit its mask, or undo or redo across the model's texture sets. Returns updated paint state",
         annotations(destructive_hint = true, open_world_hint = false)
     )]
     async fn edit_paint(

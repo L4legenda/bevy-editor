@@ -60,6 +60,93 @@ pub(in crate::editor::ui::model_viewer::paint) struct Maps {
 }
 
 impl Maps {
+    pub(super) fn resampled(&self, size: u32) -> Self {
+        let old_side = self.size as usize;
+        let side = size as usize;
+        let len = side * side;
+        let coordinates: Vec<_> = (0..side).map(|i| {
+            let sample = (((i as f32 + 0.5) * self.size as f32 / size as f32) - 0.5)
+                .clamp(0., (old_side - 1) as f32);
+            (sample as usize, sample.ceil() as usize, sample.fract(), sample.round() as usize)
+        }).collect();
+        let mut values = Vec::with_capacity(len);
+        let mut covered = Vec::with_capacity(len);
+        let mut projection = self.projection.as_ref().map(|_| Vec::with_capacity(len));
+        let mut custom: Vec<_> = self.custom.iter().map(|_| Vec::with_capacity(len)).collect();
+        for &(top, bottom, fy, nearest_y) in &coordinates {
+            for &(left, right, fx, nearest_x) in &coordinates {
+                let nearest = nearest_y * old_side + nearest_x;
+                let coverage = self.covered[nearest];
+                covered.push(coverage);
+                let indices = [
+                    top * old_side + left, top * old_side + right,
+                    bottom * old_side + left, bottom * old_side + right,
+                ];
+                let mut weights = [(1. - fx) * (1. - fy), fx * (1. - fy), (1. - fx) * fy, fx * fy];
+                for (weight, index) in weights.iter_mut().zip(indices) {
+                    if self.covered[index] == 0 {
+                        *weight = 0.;
+                    }
+                }
+                let total: f32 = weights.iter().sum();
+                if coverage != 0 && total > 0. {
+                    weights.iter_mut().for_each(|weight| *weight /= total);
+                } else {
+                    weights = [0.; 4];
+                }
+                let sample = |read: &dyn Fn(usize) -> u8| {
+                    if coverage == 0 || total <= 0. {
+                        return read(nearest);
+                    }
+                    indices.into_iter().zip(weights)
+                        .map(|(index, weight)| f32::from(read(index)) * weight)
+                        .sum::<f32>().round() as u8
+                };
+                let mut pixel = std::array::from_fn(|channel| sample(&|index| self.values[index][channel]));
+                // Part IDs and their per-part random value are discrete.
+                pixel[4] = self.values[nearest][4];
+                pixel[15..18].copy_from_slice(&self.values[nearest][15..18]);
+                for map in [BakeMap::BentNormal, BakeMap::WorldNormal] {
+                    if coverage != 0 && self.selection.contains(map) {
+                        let (start, _) = Self::component(map);
+                        normalize_encoded(&mut pixel[start..start + 3]);
+                    }
+                }
+                values.push(pixel);
+                if let Some((output, input)) = projection.as_mut().zip(self.projection.as_ref()) {
+                    let mut pixel: [u8; 5] = std::array::from_fn(|channel| sample(&|index| input[index][channel]));
+                    if coverage != 0 && self.selection.contains(BakeMap::ProjectedNormal) {
+                        normalize_encoded(&mut pixel[..3]);
+                    }
+                    output.push(pixel);
+                }
+                for (output, input) in custom.iter_mut().zip(&self.custom) {
+                    output.push(sample(&|index| input.values[index]));
+                }
+            }
+        }
+        Self {
+            size,
+            values,
+            covered,
+            projection,
+            custom: custom.into_iter().zip(&self.custom).map(|(values, plane)| Plane {
+                recipe: plane.recipe.clone(), values: Arc::new(values),
+            }).collect(),
+            filled: self.filled,
+            hits: self.hits,
+            filled_misses: self.filled_misses,
+            cage_fit: self.cage_fit.clone(),
+            gpu_rays: self.gpu_rays,
+            gpu_projection: self.gpu_projection,
+            gpu_denoise: self.gpu_denoise,
+            gpu_padding: self.gpu_padding,
+            selection: self.selection,
+            edge_reach: self.edge_reach,
+            inputs: OnceLock::new(),
+        }
+    }
+
     pub(in crate::editor::ui::model_viewer::paint) fn island_texels(&self) -> impl Iterator<Item = bool> + '_ {
         self.covered.iter().map(|&coverage| coverage == 1)
     }
@@ -556,6 +643,12 @@ fn byte(value: f32) -> u8 {
 
 fn rgb(vector: Vec3) -> [u8; 3] {
     vector.to_array().map(byte)
+}
+
+fn normalize_encoded(rgb_bytes: &mut [u8]) {
+    let direction = Vec3::new(rgb_bytes[0] as f32, rgb_bytes[1] as f32, rgb_bytes[2] as f32)
+        * (2. / 255.) - Vec3::ONE;
+    rgb_bytes.copy_from_slice(&rgb(direction.normalize_or(Vec3::Z) * 0.5 + 0.5));
 }
 
 fn triangle_id_color(colors: [Option<Vec3>; 3]) -> Option<[u8; 3]> {
@@ -1426,6 +1519,45 @@ mod perf_tests;
 mod tests {
     use super::*;
     use crate::editor::model_mesh::{Corner, Face, Geometry};
+
+    #[test]
+    fn resized_bakes_interpolate_data_and_keep_part_ids() {
+        use crate::editor::model_paint_data::custom::{Kind, Recipe};
+
+        let recipe = Recipe::new(Kind::Point, &[]);
+        let mut maps = Maps {
+            size: 2,
+            filled: 4,
+            values: [20, 60, 100, 140].map(|value| {
+                let mut packed = [value; COMPONENTS];
+                packed[9..12].copy_from_slice(&[128, 128, 255]);
+                packed
+            }).to_vec(),
+            covered: vec![1; 4],
+            projection: Some(vec![[128, 128, 255, 64, 255]; 4]),
+            hits: 4,
+            filled_misses: 0,
+            cage_fit: None,
+            gpu_rays: false,
+            gpu_projection: false,
+            gpu_denoise: false,
+            gpu_padding: false,
+            selection: MapSelection::ALL,
+            edge_reach: 1.,
+            inputs: OnceLock::new(),
+            custom: vec![Plane { recipe: recipe.clone(), values: Arc::new(vec![0, 32, 64, 96]) }],
+        };
+        let scaled = maps.resampled(1);
+        assert_eq!(scaled.size, 1);
+        assert_eq!(scaled.rgba(BakeMap::Occlusion), [80, 80, 80, 255]);
+        assert_eq!(scaled.rgba(BakeMap::PartId), [140, 140, 140, 255]);
+        assert_eq!(scaled.rgba(BakeMap::PartRandom), [140, 140, 140, 255]);
+        assert_eq!(scaled.rgba(BakeMap::WorldNormal), [128, 128, 255, 255]);
+        assert_eq!(scaled.rgba(BakeMap::ProjectedHeight), [64, 64, 64, 255]);
+        assert_eq!(scaled.rgba(BakeMap::Custom(recipe.id)), [48, 48, 48, 255]);
+        maps.covered[0] = 0;
+        assert_eq!(maps.resampled(1).rgba(BakeMap::Occlusion), [100, 100, 100, 255]);
+    }
 
     fn quad(id: usize, y: f32) -> Object {
         let mut mesh = Geometry::default();

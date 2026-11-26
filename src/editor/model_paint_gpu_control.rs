@@ -10,7 +10,7 @@ pub(super) struct Controller {
     trace: Option<(GeometryVersion, Arc<surface::SurfaceTrace>)>,
     prepare_trace: Option<(GeometryVersion, bool, Task<Arc<surface::SurfaceTrace>>)>,
     region: Option<Task<Vec<std::ops::Range<u32>>>>,
-    pending: Option<Brush>,
+    pending: Option<(Brush, super::super::history::Label)>,
     active: Option<u64>,
     inflight: VecDeque<StrokeRecord>,
     results: BTreeMap<u64, Result<Vec<Vec<u8>>, String>>,
@@ -20,6 +20,7 @@ struct StrokeRecord {
     id: u64,
     channels: u16,
     selected: usize,
+    label: super::super::history::Label,
 }
 impl Controller {
     pub fn context_id(&self) -> u64 {
@@ -118,7 +119,8 @@ impl Controller {
                     ),
                 }),
                 work,
-                history: if changed { vec![before] } else { Vec::new() },
+                history: if changed { vec![(stroke.label, before)] } else { Vec::new() },
+                resized_bake: None,
                 #[cfg(feature = "mcp")]
                 surface_selection: None,
             }
@@ -234,6 +236,7 @@ impl Controller {
     fn begin(
         &mut self,
         brush: Brush,
+        label: super::super::history::Label,
         map: &Mapping,
         trace: Option<Arc<surface::SurfaceTrace>>,
         queue: &mut gpu::Queue,
@@ -253,6 +256,7 @@ impl Controller {
             id: stroke,
             channels: brush.channels(),
             selected: self.key.unwrap().2,
+            label,
         });
         self.active = Some(stroke);
         self.pending = None;
@@ -267,9 +271,9 @@ impl Controller {
         let mut budget = 256;
         while let Some(event) = events.pop_front() {
             match event {
-                Event::Begin(brush) => self.pending = Some(brush),
+                Event::Begin(brush, label) => self.pending = Some((brush, label)),
                 Event::Points(mut points, map) => {
-                    if let Some(brush) = self.pending {
+                    if let Some((brush, label)) = self.pending {
                         let needs_trace = brush.fill || brush.projection != BrushProjection::Screen;
                         let trace = needs_trace
                             .then(|| {
@@ -282,7 +286,7 @@ impl Controller {
                             events.push_front(Event::Points(points, map));
                             break;
                         }
-                        self.begin(brush, &map, trace, queue);
+                        self.begin(brush, label, &map, trace, queue);
                     }
                     if self.active.is_some() {
                         if points.len() > budget {
@@ -301,7 +305,7 @@ impl Controller {
                     }
                 }
                 Event::Region(region, map) => {
-                    let Some(brush) = self.pending else { continue };
+                    let Some((brush, label)) = self.pending else { continue };
                     let Some(trace) = self.trace(map.revision, &map.visibility, &map.objects, true)
                     else {
                         events.push_front(Event::Region(region, map));
@@ -333,7 +337,7 @@ impl Controller {
                     };
                     self.region = None;
                     if !ranges.is_empty() {
-                        self.begin(brush, &map, Some(trace), queue);
+                        self.begin(brush, label, &map, Some(trace), queue);
                         queue.commands.push(gpu::Command::Points {
                             id: self.id,
                             points: Vec::new(),

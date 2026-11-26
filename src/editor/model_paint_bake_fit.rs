@@ -8,7 +8,7 @@ const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 8.;
 const MARGIN: f32 = 1.15;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::editor::ui::model_viewer::paint) struct FitReport {
     pub raised: usize,
     pub lowered: usize,

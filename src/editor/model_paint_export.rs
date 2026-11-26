@@ -1,6 +1,6 @@
 //! Flat map export from the same layer snapshots that are saved in the GLB.
 use super::*;
-use crate::editor::model_document::{Document, MeshData};
+use crate::editor::model_document::{Document, MeshData, Object};
 use crate::editor::model_paint_data::CompositeSample;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -158,11 +158,55 @@ pub(super) struct TextureSet {
     slot: usize,
     uv_offset: Vec2,
     transform: Transform,
+    model_bounds: (Vec3, Vec3),
     stem: String,
     tile: Option<u32>,
     source: engine::SurfaceSource,
     baked: Option<Arc<bake::Maps>>,
     custom_recipes: Arc<Vec<custom::Recipe>>,
+}
+
+#[derive(Default)]
+struct GeometryMaps {
+    position: Vec<[u16; 3]>,
+    normal: Vec<[u16; 3]>,
+}
+
+impl GeometryMaps {
+    fn bake(set: &TextureSet, recipe: &recipe::Recipe, size: u32) -> Self {
+        let position = recipe.uses_source(recipe::Source::Position);
+        let normal = recipe.uses_source(recipe::Source::WorldNormal);
+        let mut maps = Self::default();
+        if !position && !normal {
+            return maps;
+        }
+        let len = (size as usize).pow(2);
+        if position {
+            maps.position.resize(len, [0; 3]);
+        }
+        if normal {
+            maps.normal.resize(len, [32768, 32768, 65535]);
+        }
+        let world_positions: Vec<_> = set.mesh.positions.iter()
+            .map(|&position| set.transform.transform_point(position))
+            .collect();
+        let (min, max) = set.model_bounds;
+        let extent = (max - min).max(Vec3::splat(1e-4));
+        let encode = |value: Vec3| value.to_array().map(|c| (c.clamp(0., 1.) * 65535.).round() as u16);
+        let mut covered = vec![0; len];
+        texture_fill::raster(
+            &set.mesh, set.slot, size, set.uv_offset, set.transform, &world_positions, &mut covered,
+            |texel, _, point, direction, _, _| {
+                if position {
+                    maps.position[texel] = encode((point - min) / extent);
+                }
+                if normal {
+                    maps.normal[texel] = encode(direction * 0.5 + Vec3::splat(0.5));
+                }
+            },
+        );
+        maps
+    }
 }
 
 #[derive(Clone)]
@@ -171,9 +215,9 @@ struct SetName {
     tile: Option<u32>,
 }
 
-fn set_names(doc: &Document) -> HashMap<(usize, usize), SetName> {
+fn set_names(doc: &Document, selected: Option<(usize, usize)>) -> Vec<(&Object, usize, SetName)> {
     let mut names = HashSet::new();
-    let mut result = HashMap::new();
+    let mut result = Vec::new();
     for object in &doc.objects {
         let used: BTreeSet<_> = object
             .geometry
@@ -196,7 +240,9 @@ fn set_names(doc: &Document) -> HashMap<(usize, usize), SetName> {
                 stem = format!("{root}_{suffix}");
                 suffix += 1;
             }
-            result.insert((object.id, slot), SetName { stem, tile });
+            if selected.is_none_or(|key| key == (object.id, slot)) {
+                result.push((object, slot, SetName { stem, tile }));
+            }
         }
     }
     result
@@ -210,45 +256,35 @@ pub(super) fn capture(
     baked: Option<(&bake::State, usize)>,
 ) -> Vec<TextureSet> {
     let mut images_by_id = HashMap::new();
-    let mut names = set_names(doc);
     let mut sets = Vec::new();
+    let (mut min, mut max) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
     for object in &doc.objects {
-        for (slot, material) in object.materials.iter().enumerate() {
-            let key = (object.id, slot);
-            if selected.is_some_and(|selected| selected != key) {
-                continue;
-            }
-            let Some(SetName { stem, tile }) = names.remove(&key) else {
-                continue;
-            };
-            sets.push(TextureSet {
-                mesh: object.geometry.clone(),
-                slot,
-                uv_offset: object.uv_offset(slot),
-                transform: object.transform,
-                stem,
-                tile,
-                custom_recipes: doc.custom_bakes.clone(),
-                source: engine::surface_source(
-                    doc,
-                    object,
-                    slot,
-                    images,
-                    materials,
-                    &mut images_by_id,
-                ),
-                baked: baked
-                    .and_then(|(cache, model)| {
-                        cache.maps(
-                            model,
-                            doc,
-                            (object.id, slot),
-                            doc.paint_size(material),
-                        )
-                    })
-                    .cloned(),
-            });
+        for &position in &object.geometry.positions {
+            let point = object.transform.transform_point(position);
+            min = min.min(point);
+            max = max.max(point);
         }
+    }
+    for (object, slot, SetName { stem, tile }) in set_names(doc, selected) {
+        let material = &object.materials[slot];
+        sets.push(TextureSet {
+            mesh: object.geometry.clone(),
+            slot,
+            uv_offset: object.uv_offset(slot),
+            transform: object.transform,
+            model_bounds: (min, max),
+            stem,
+            tile,
+            custom_recipes: doc.custom_bakes.clone(),
+            source: engine::surface_source(
+                doc, object, slot, images, materials, &mut images_by_id,
+            ),
+            baked: baked
+                .and_then(|(cache, model)| {
+                    cache.maps(model, doc, (object.id, slot), doc.paint_size(material))
+                })
+                .cloned(),
+        });
     }
     sets
 }
@@ -292,41 +328,102 @@ fn custom_bake_stem(recipe: &custom::Recipe) -> String {
 pub(super) struct PreviewFile {
     pub name: String,
     pub depth: Depth,
+    pub layout: &'static str,
+    pub size: u32,
+    pub source_size: u32,
     pub conditional: bool,
+}
+
+pub(super) const PREVIEW_PAGE_SIZE: usize = 32;
+
+fn has_distinct_stems<'a>(mut stems: impl Iterator<Item = &'a str>) -> bool {
+    stems.next().is_some_and(|first| stems.any(|stem| stem != first))
 }
 
 pub(super) fn preview_files(
     doc: &Document,
-    selected: (usize, usize),
+    session: &Session,
     project: &str,
+    custom: Option<&recipe::Recipe>,
+    baked: (&bake::State, usize),
+) -> Vec<PreviewFile> {
+    let selected = if session.export_preview_all {
+        None
+    } else {
+        let Some(binding) = session.binding else { return Vec::new() };
+        Some(binding)
+    };
+    let sets = set_names(doc, selected);
+    let multiple_sets = has_distinct_stems(sets.iter().map(|(_, _, set)| set.stem.as_str()));
+    sets.iter()
+        .flat_map(|(object, slot, set)| {
+            let (cache, model) = baked;
+            let size = doc.paint_size(&object.materials[*slot]);
+            let maps = cache.maps(model, doc, (object.id, *slot), size);
+            let names = recipe::Names {
+                mesh: texture_model_name(doc, session),
+                project,
+                set: &set.stem,
+                tile: set.tile,
+                multiple_sets,
+            };
+            preview_set(doc, names, size, session.export_settings, custom, maps.map(Arc::as_ref))
+        })
+        .skip(session.export_preview_page.saturating_mul(PREVIEW_PAGE_SIZE))
+        .take(PREVIEW_PAGE_SIZE + 1)
+        .collect()
+}
+
+fn preview_set(
+    doc: &Document,
+    names: recipe::Names<'_>,
+    material_size: u32,
     settings: prefs::Settings,
     custom: Option<&recipe::Recipe>,
     baked: Option<&bake::Maps>,
 ) -> Vec<PreviewFile> {
-    let Some(SetName { stem, tile }) = set_names(doc).remove(&selected) else { return Vec::new() };
+    let stem = names.set;
+    let tile = names.tile;
     let template = settings.template;
-    let item = |stem: String, samples, conditional| PreviewFile {
-        name: file_name(&stem, settings.file.format),
-        depth: image_output::output_depth(samples, settings.file),
-        conditional,
+    let format = settings.file.format;
+    let item = |stem: String, samples, channels, optional_alpha, source_size, conditional| {
+        let layout = match (format.encoded_channels(channels), optional_alpha) {
+            (1, _) => recipe::Layout::Grayscale.label(),
+            (3, _) => recipe::Layout::Rgb.label(),
+            (4, true) => "RGB или RGBA",
+            (4, false) => recipe::Layout::Rgba.label(),
+            _ => unreachable!(),
+        };
+        PreviewFile {
+            name: file_name(&stem, format),
+            depth: image_output::output_depth(samples, settings.file),
+            layout,
+            size: settings.file.size.unwrap_or(source_size),
+            source_size,
+            conditional,
+        }
     };
     if let Some(custom) = custom {
-        let names = recipe::Names { mesh: model_name(doc), project, set: &stem, tile, multiple_sets: false };
         return custom.maps.iter().map(|map| {
-            item(names.stem(&map.name), Samples::Packed { srgb: 0, normal: false, force_16: map.force_16 }, false)
+            let components = map.components();
+            let output = map.export_map(&components);
+            item(names.stem(&map.name), Samples::Packed { srgb: 0, normal: false, force_16: map.force_16 },
+                components.len(), output.can_drop_alpha(settings.padding, true), material_size,
+                !output.skip_if_default.is_empty())
         }).collect();
     }
     let suffix = udim_suffix(tile);
     let mut files = template.maps().iter().map(|map| item(
-        format!("{}_{name}{suffix}", template_stem(&stem, template), name = map.name),
-        map.samples(template), map.skip_if_default.is_some(),
+        format!("{}_{name}{suffix}", template_stem(stem, template), name = map.name),
+        map.samples(template), map.components.len(), map.can_drop_alpha(settings.padding, template != Template::Separate),
+        material_size, !map.skip_if_default.is_empty(),
     )).collect::<Vec<_>>();
     if matches!(template, Template::Separate | Template::Baked) && let Some(baked) = baked {
         for map in bake::BakeMap::ALL.into_iter().filter(|&map| baked.has_map(map)) {
-            files.push(item(format!("{stem}_{}{suffix}", map.export_name()), Samples::Data, false));
+            files.push(item(format!("{stem}_{}{suffix}", map.export_name()), Samples::Data, 4, false, baked.size, false));
         }
         for recipe in doc.custom_bakes.iter().filter(|recipe| baked.has_map(bake::BakeMap::Custom(recipe.id))) {
-            files.push(item(format!("{stem}_{}{suffix}", custom_bake_stem(recipe)), Samples::Data, false));
+            files.push(item(format!("{stem}_{}{suffix}", custom_bake_stem(recipe)), Samples::Data, 4, false, baked.size, false));
         }
     }
     files
@@ -334,6 +431,10 @@ pub(super) fn preview_files(
 
 fn model_name(doc: &Document) -> &str {
     doc.source.path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Model")
+}
+
+pub(super) fn texture_model_name<'a>(doc: &'a Document, session: &'a Session) -> &'a str {
+    session.export_mesh_name.as_deref().unwrap_or_else(|| model_name(doc))
 }
 
 struct ExportDirectory {
@@ -642,14 +743,10 @@ fn write_textures(
     if matches!(template, Template::Custom(_)) && custom.is_none() {
         return Err(io::Error::other("Пользовательский шаблон не найден"));
     }
-    let multiple_sets = sets
-        .iter()
-        .map(|set| set.stem.as_str())
-        .collect::<HashSet<_>>()
-        .len()
-        > 1;
+    let multiple_sets = has_distinct_stems(sets.iter().map(|set| set.stem.as_str()));
     let mut output = ExportDirectory::create(parent, model, "textures", options)?;
     for set in sets {
+        let geometry = custom.map(|recipe| GeometryMaps::bake(&set, recipe, set.source.size()));
         let mut surface = set.source.build();
         if surface.needs_bake()
             && let Some(maps) = &set.baked
@@ -669,7 +766,7 @@ fn write_textures(
                 uv_coverage(&set.mesh, set.slot, set.uv_offset, surface.size).into_iter(),
             )
         };
-        if let Some(custom) = custom {
+        if let Some((custom, geometry)) = custom.zip(geometry.as_ref()) {
             recipe::write(
                 custom,
                 &mut output,
@@ -682,6 +779,7 @@ fn write_textures(
                 },
                 &surface,
                 set.baked.as_deref(),
+                geometry,
                 &sources,
                 padding,
             )?;
@@ -739,7 +837,12 @@ fn write_textures(
         }
     }
     if output.files.is_empty() {
-        return Err(io::Error::other("Сначала запеките карты выбранных наборов"));
+        let message = if template == Template::Baked {
+            "Сначала запеките карты выбранных наборов"
+        } else {
+            "В выбранных наборах нет карт, которые создаёт этот шаблон"
+        };
+        return Err(io::Error::other(message));
     }
     Ok(output.finish(ExportKind::Maps))
 }
@@ -748,6 +851,7 @@ enum Outcome {
     Written(Report),
     Imported(Vec<recipe::Recipe>),
     RecipeFile(PathBuf),
+    Destination(PathBuf),
 }
 
 type ExportResult = io::Result<Option<Outcome>>;
@@ -755,10 +859,65 @@ type ExportResult = io::Result<Option<Outcome>>;
 #[derive(Default)]
 pub(in crate::editor::ui::model_viewer) struct Pending(Option<Receiver<ExportResult>>);
 
+#[derive(Default)]
+pub(super) enum ActivityState {
+    #[default]
+    Idle,
+    Exporting,
+    Finished {
+        message: String,
+        folder: Option<PathBuf>,
+        failed: bool,
+    },
+}
+
+#[derive(Default, Resource)]
+pub(in crate::editor::ui::model_viewer) struct Activity {
+    pub(super) state: ActivityState,
+    pub(super) revision: usize,
+}
+
+impl Activity {
+    pub(super) fn exporting(&self) -> bool {
+        matches!(self.state, ActivityState::Exporting)
+    }
+
+    fn set(&mut self, state: ActivityState) {
+        self.state = state;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn finish(&mut self, message: &str, folder: Option<PathBuf>, failed: bool) {
+        self.set(ActivityState::Finished { message: message.into(), folder, failed });
+    }
+}
+
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct RecipeName {
     pub recipe: usize,
     pub output: Option<usize>,
+}
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct MeshExportName;
+
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct DestinationField;
+
+fn parse_destination(input: &str) -> io::Result<Option<PathBuf>> {
+    let input = input.trim();
+    let input = input
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap_or(input);
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(input);
+    if !path.is_absolute() || input.contains('\0') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Укажите полный путь к папке"));
+    }
+    Ok(Some(path))
 }
 
 enum Job {
@@ -853,6 +1012,7 @@ mod tests {
                     slot: 0,
                     uv_offset,
                     transform: Transform::IDENTITY,
+                    model_bounds: (Vec3::ZERO, Vec3::ONE),
                     stem: "Island".into(),
                     tile: Some(1013),
                     source: engine::SurfaceSource::Saved(source.clone()),
@@ -957,7 +1117,14 @@ mod tests {
               {"src":"Metallic","comp":0},{"src":"mesh:AmbientOcclusion","comp":0},
               {"src":"Zero","comp":0},{"src":"Roughness","comp":0,"invert":true}]},
             {"name":"Height","layout":"Grayscale","channels":[
-              {"src":"Height","comp":0},{"src":"Zero"},{"src":"Zero"},{"src":"One"}]}
+              {"src":"Height","comp":0},{"src":"Zero"},{"src":"Zero"},{"src":"One"}]},
+            {"name":"BodyColor","layout":"RGBA","channels":[
+              {"src":"BaseColor","comp":0},{"src":"BaseColor","comp":1},
+              {"src":"BaseColor","comp":2},{"src":"Opacity","comp":0}]},
+            {"name":"OptionalEffects","layout":"RGB","channels":[
+              {"src":"Emission","comp":0},{"src":"SpecularLevel","comp":0},{"src":"One"}]},
+            {"name":"Glow","layout":"Grayscale","channels":[{"src":"Emission","comp":0}]},
+            {"name":"Constant","layout":"Grayscale","channels":[{"src":"One"}]}
           ]
         }]"#,
         )
@@ -965,7 +1132,7 @@ mod tests {
         let mut items = recipe::load(&source).unwrap();
         let template = items.pop().unwrap();
         assert_eq!(template.name, "Packed Mask");
-        let surface = Arc::new(Surface {
+        let surface = Surface {
             size: 2,
             base: std::array::from_fn(|channel| {
                 let value = [235, 64, 192, 121, 255, 0, 128, 128][channel];
@@ -974,19 +1141,27 @@ mod tests {
             stack: Default::default(),
             material: serde_json::Value::Null,
             baked: None,
-        });
+        };
         let sets = [("Hull", 1002), ("Glass", 1013)]
             .into_iter()
-            .map(|(stem, tile)| TextureSet {
-                mesh: MeshData::from(Geometry::default()),
-                slot: 0,
-                uv_offset: Vec2::ZERO,
-                transform: Transform::IDENTITY,
-                stem: stem.into(),
-                tile: Some(tile),
-                source: engine::SurfaceSource::Saved(surface.clone()),
-                baked: None,
-                custom_recipes: Arc::default(),
+            .map(|(stem, tile)| {
+                let mut surface = surface.clone();
+                if stem == "Glass" {
+                    surface.base[4] = Arc::new([128; 4].repeat(4));
+                    surface.base[7] = Arc::new([154; 4].repeat(4));
+                }
+                TextureSet {
+                    mesh: MeshData::from(Geometry::default()),
+                    slot: 0,
+                    uv_offset: Vec2::ZERO,
+                    transform: Transform::IDENTITY,
+                    model_bounds: (Vec3::ZERO, Vec3::ONE),
+                    stem: stem.into(),
+                    tile: Some(tile),
+                    source: engine::SurfaceSource::Saved(Arc::new(surface)),
+                    baked: None,
+                    custom_recipes: Arc::default(),
+                }
             })
             .collect();
         let report = write_textures(
@@ -1002,7 +1177,7 @@ mod tests {
             Some(&template),
         )
         .unwrap();
-        assert_eq!(report.files, 4);
+        assert_eq!(report.files, 9);
         for (set, tile) in [("Hull", 1002), ("Glass", 1013)] {
             let packed =
                 image::open(report.path.join(format!("Demo_Ship_{set}_mask.{tile}.png"))).unwrap();
@@ -1013,9 +1188,89 @@ mod tests {
             );
             let height = image::open(report.path.join(format!("{set}_Height.{tile}.png"))).unwrap();
             assert_eq!(height.to_luma8().get_pixel(0, 0).0, [121]);
+            assert!(!report.path.join(format!("{set}_Glow.{tile}.png")).exists());
+            assert!(report.path.join(format!("{set}_Constant.{tile}.png")).is_file());
         }
+        assert!(!report.path.join("Hull_OptionalEffects.1002.png").exists());
+        let effects = image::open(report.path.join("Glass_OptionalEffects.1013.png")).unwrap();
+        assert_eq!(effects.to_rgb8().get_pixel(0, 0).0, [0, 154, 255]);
+        let hull = image::open(report.path.join("Hull_BodyColor.1002.png")).unwrap();
+        let glass = image::open(report.path.join("Glass_BodyColor.1013.png")).unwrap();
+        assert_eq!(hull.color(), image::ColorType::Rgb8);
+        assert_eq!(glass.color(), image::ColorType::Rgba8);
+        assert_eq!(glass.to_rgba8().get_pixel(0, 0).0[3], 128);
         fs::write(&source, br#"{"name":"Escape","maps":[{"name":"../outside","layout":"Grayscale","channels":[{"src":"One"}]}]}"#).unwrap();
         assert!(recipe::load(&source).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_geometry_sources_use_the_transformed_udim_without_mesh_bakes() {
+        let root = std::env::temp_dir().join(format!(
+            "bevy-export-geometry-{}",
+            bevy::asset::uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let recipe: recipe::Recipe = serde_json::from_value(serde_json::json!({
+            "name": "Geometry",
+            "maps": [
+                { "name": "Position", "layout": "RGB", "channels": [
+                    { "src": "Position", "comp": 0 }, { "src": "Position", "comp": 1 }, { "src": "Position", "comp": 2 }
+                ] },
+                { "name": "Normal", "layout": "RGB", "channels": [
+                    { "src": "WorldNormal", "comp": 0 }, { "src": "WorldNormal", "comp": 1 }, { "src": "WorldNormal", "comp": 2 }
+                ] }
+            ]
+        })).unwrap();
+        let offset = Vec2::new(1., -1.);
+        let mut geometry = Geometry::default();
+        geometry.positions = vec![Vec3::ZERO, Vec3::X * 2., Vec3::new(2., 4., 0.), Vec3::Y * 4.];
+        geometry.faces.push(Face {
+            corners: [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().enumerate()
+                .map(|(vertex, uv)| {
+                    let mut corner = Corner::new(vertex);
+                    corner.uv = uv + offset;
+                    corner
+                }).collect(),
+            material: 0,
+            smooth: false,
+        });
+        let set = TextureSet {
+            mesh: geometry.into(),
+            slot: 0,
+            uv_offset: offset,
+            transform: Transform::from_translation(Vec3::new(1., 2., 5.))
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+            model_bounds: (Vec3::ZERO, Vec3::new(2., 8., 10.)),
+            stem: "Hull".into(),
+            tile: Some(1012),
+            source: engine::SurfaceSource::Saved(Arc::new(Surface {
+                size: 2,
+                base: std::array::from_fn(|_| Arc::new([255; 16].to_vec())),
+                stack: Default::default(),
+                material: serde_json::Value::Null,
+                baked: None,
+            })),
+            baked: None,
+            custom_recipes: Arc::default(),
+        };
+        let report = write_textures(
+            &root, "Hull", "Test", vec![set],
+            prefs::Settings {
+                template: Template::Custom(0),
+                padding: Padding::None,
+                file: FileOptions { depth: Depth::U16, ..FileOptions::default() },
+                ..prefs::Settings::default()
+            },
+            Some(&recipe),
+        ).unwrap();
+        for (file, expected) in [
+            ("Position.1012.png", [32768, 24576, 29491]),
+            ("Normal.1012.png", [65535, 32768, 32768]),
+        ] {
+            let actual = image::open(report.path.join(file)).unwrap().into_rgb16().get_pixel(0, 0).0;
+            assert!(actual.into_iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1), "{file}: {actual:?}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1055,6 +1310,7 @@ mod tests {
                 slot: 0,
                 uv_offset: Vec2::ZERO,
                 transform: Transform::IDENTITY,
+                model_bounds: (Vec3::ZERO, Vec3::ONE),
                 stem: "Surface".into(),
                 tile: None,
                 source: engine::SurfaceSource::Saved(surface.clone()),
@@ -1178,6 +1434,7 @@ mod tests {
                 slot: 0,
                 uv_offset: Vec2::X,
                 transform: Transform::IDENTITY,
+                model_bounds: (Vec3::ZERO, Vec3::ONE),
                 stem: "Set".into(),
                 tile: Some(1002),
                 source: engine::SurfaceSource::Saved(surface.clone()),
@@ -1270,7 +1527,10 @@ pub(in crate::editor::ui::model_viewer) fn actions(
     images: Res<Assets<Image>>,
     materials: Res<Assets<StandardMaterial>>,
     mut preferences: ResMut<prefs::Store>,
+    mut activity: ResMut<Activity>,
     names: Query<(&RecipeName, &bevy::text::EditableText)>,
+    mesh_names: Query<&bevy::text::EditableText, With<MeshExportName>>,
+    destinations: Query<&bevy::text::EditableText, With<DestinationField>>,
 ) {
     let pending = &mut pending.0;
     if let Some(index) = editor.viewing_model
@@ -1297,6 +1557,11 @@ pub(in crate::editor::ui::model_viewer) fn actions(
             Ok(result) => result,
         };
         *pending = None;
+        let folder = match &result {
+            Ok(Some(Outcome::Written(report))) if activity.exporting() => Some(report.path.clone()),
+            _ => None,
+        };
+        let failed = result.is_err();
         editor.status = match result {
             Ok(Some(Outcome::Written(report))) => {
                 if let Some(parent) = report.path.parent() {
@@ -1326,14 +1591,26 @@ pub(in crate::editor::ui::model_viewer) fn actions(
                 Err(error) => format!("Не удалось добавить шаблоны · {error}"),
             },
             Ok(Some(Outcome::RecipeFile(path))) => format!("Шаблон сохранён · {}", path.display()),
+            Ok(Some(Outcome::Destination(path))) => {
+                let status = format!("Папка экспорта · {}", path.display());
+                preferences.set_destination(Some(path));
+                status
+            }
             Ok(None) => "Операция отменена".into(),
             Err(error) => format!("Не удалось завершить операцию · {error}"),
         };
+        if activity.exporting() {
+            activity.finish(&editor.status, folder, failed);
+        }
     }
     for action in messages.read() {
         let Action::ModelView(ModelViewAction::Paint(
             action @ (PaintAction::ExportMaps(_)
             | PaintAction::ExportMesh
+            | PaintAction::ApplyExportMeshName
+            | PaintAction::ApplyExportDestination
+            | PaintAction::BrowseExportDestination
+            | PaintAction::RevealExportResult
             | PaintAction::ImportExportTemplate
             | PaintAction::CopyExportTemplate
             | PaintAction::SaveExportTemplate
@@ -1353,6 +1630,69 @@ pub(in crate::editor::ui::model_viewer) fn actions(
             continue;
         };
         if editor.pending.is_some() || editor.viewing_image.is_some() {
+            continue;
+        }
+        if action == PaintAction::RevealExportResult {
+            if let ActivityState::Finished { folder: Some(folder), .. } = &activity.state
+                && let Err(error) = crate::project_manager::reveal_folder(folder)
+            {
+                editor.status = format!("Не удалось открыть папку · {error}");
+            }
+            continue;
+        }
+        if action == PaintAction::BrowseExportDestination {
+            let folder = preferences.destination().or_else(|| preferences.folder()).map(Path::to_owned);
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::Builder::new()
+                .name("paint-choose-export-folder".into())
+                .spawn(move || {
+                    let result = crate::project_manager::choose_folder_in(
+                        "Bevy Editor: папка для экспорта карт",
+                        folder.as_deref(),
+                    ).map(|path| path.map(Outcome::Destination));
+                    let _ = sender.send(result);
+                });
+            match worker {
+                Ok(_) => {
+                    *pending = Some(receiver);
+                    editor.status = "Выбор папки экспорта…".into();
+                }
+                Err(error) => editor.status = format!("Не удалось открыть выбор папки · {error}"),
+            }
+            messages.clear();
+            break;
+        }
+        if matches!(action, PaintAction::ApplyExportDestination | PaintAction::ExportMaps(_))
+            && let Ok(input) = destinations.single()
+        {
+            let current = preferences.destination().map(Path::to_string_lossy).unwrap_or_default();
+            if input.value() != current.as_ref() {
+                match parse_destination(&input.value().to_string()) {
+                    Ok(destination) => preferences.set_destination(destination),
+                    Err(error) => {
+                        editor.status = format!("Папка экспорта · {error}");
+                        if matches!(action, PaintAction::ExportMaps(_)) {
+                            activity.finish(&editor.status, None, true);
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        if action == PaintAction::ApplyExportDestination {
+            continue;
+        }
+        if matches!(action, PaintAction::ApplyExportMeshName | PaintAction::ExportMaps(_))
+            && let (Ok(input), Some(session)) = (mesh_names.single(), paint.sessions.get_mut(&index))
+            && input.value() != texture_model_name(doc, session)
+        {
+            let value = input.value().to_string();
+            let value = value.trim();
+            session.export_mesh_name =
+                (!value.is_empty() && value != model_name(doc)).then(|| safe_stem(value));
+            session.revision += 1;
+        }
+        if action == PaintAction::ApplyExportMeshName {
             continue;
         }
         if action == PaintAction::CopyExportTemplate {
@@ -1481,28 +1821,37 @@ pub(in crate::editor::ui::model_viewer) fn actions(
             let sets = capture(doc, selected, &images, &materials, Some((&baked, index)));
             if sets.is_empty() {
                 editor.status = "У модели нет наборов текстур для экспорта".into();
+                activity.finish(&editor.status, None, true);
                 continue;
             }
             Job::Maps(sets, preferences.settings(), preferences.selected_recipe())
         } else {
             Job::Mesh(mesh::Snapshot::capture(doc))
         };
-        let model = model_name(doc).to_owned();
+        let model = paint.sessions.get(&index)
+            .filter(|_| !mesh)
+            .map_or_else(|| model_name(doc), |session| texture_model_name(doc, session))
+            .to_owned();
         let start_directory = preferences.folder().map(Path::to_owned);
+        let destination = preferences.destination().filter(|_| !mesh).map(Path::to_owned);
         let project = editor.project.title.clone();
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("paint-export".into())
             .spawn(move || {
-                let result = crate::project_manager::choose_folder_in(
-                    if mesh {
-                        "Bevy Editor: папка для экспорта OBJ"
-                    } else {
-                        "Bevy Editor: папка для экспорта карт"
-                    },
-                    start_directory.as_deref(),
-                )
-                .and_then(|parent| {
+                let parent = if let Some(path) = destination {
+                    fs::create_dir_all(&path).map(|()| Some(path))
+                } else {
+                    crate::project_manager::choose_folder_in(
+                        if mesh {
+                            "Bevy Editor: папка для экспорта OBJ"
+                        } else {
+                            "Bevy Editor: папка для экспорта карт"
+                        },
+                        start_directory.as_deref(),
+                    )
+                };
+                let result = parent.and_then(|parent| {
                     parent
                         .map(|parent| job.write(&parent, &model, &project).map(Outcome::Written))
                         .transpose()
@@ -1512,6 +1861,9 @@ pub(in crate::editor::ui::model_viewer) fn actions(
         match worker {
             Ok(_) => {
                 *pending = Some(receiver);
+                if !mesh {
+                    activity.set(ActivityState::Exporting);
+                }
                 editor.status = if mesh {
                     "Экспорт сетки OBJ…"
                 } else {
@@ -1519,7 +1871,12 @@ pub(in crate::editor::ui::model_viewer) fn actions(
                 }
                 .into();
             }
-            Err(error) => editor.status = format!("Не удалось запустить экспорт · {error}"),
+            Err(error) => {
+                editor.status = format!("Не удалось запустить экспорт · {error}");
+                if !mesh {
+                    activity.finish(&editor.status, None, true);
+                }
+            }
         }
         messages.clear();
         break;

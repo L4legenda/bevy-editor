@@ -29,7 +29,7 @@ fn model_paint_noop_strokes_preserve_snapshot_identity() {
     let result = batch(
         work,
         vec![
-            Event::Begin(brush),
+            Event::begin(brush),
             Event::Points(vec![Stamp::from(Vec2::splat(256.))], map.clone()),
             Event::End,
         ],
@@ -50,7 +50,7 @@ fn model_paint_noop_strokes_preserve_snapshot_identity() {
     let result = batch(
         work,
         vec![
-            Event::Begin(eraser),
+            Event::begin(eraser),
             Event::Points(vec![Stamp::from(Vec2::splat(256.))], map),
             Event::End,
         ],
@@ -69,7 +69,7 @@ fn model_paint_bounded_batches_preserve_samples_and_stroke_boundaries() {
         .map(|i| Stamp::from(Vec2::splat(i as f32)))
         .collect::<Vec<_>>();
     let mut queue = VecDeque::from([
-        Event::Begin(super::tests::brush()),
+        Event::begin(super::tests::brush()),
         Event::Points(points.clone(), map),
         Event::End,
     ]);
@@ -89,7 +89,7 @@ fn model_paint_bounded_batches_preserve_samples_and_stroke_boundaries() {
         );
         all.extend(events);
     }
-    assert!(matches!(all.first(), Some(Event::Begin(_))));
+    assert!(matches!(all.first(), Some(Event::Begin(..))));
     assert!(matches!(all.last(), Some(Event::End)));
     let actual = all
         .into_iter()
@@ -152,7 +152,7 @@ fn model_paint_benchmark_40k_triangles() {
     let points = (0..20)
         .map(|i| Vec2::new(220. + i as f32 * 3., 250.))
         .collect::<Vec<_>>();
-    let mut legacy = batch(work, vec![Event::Begin(brush)], false).work;
+    let mut legacy = batch(work, vec![Event::begin(brush)], false).work;
     let start = std::time::Instant::now();
     assert!(legacy_points(&mut legacy, &points, &map));
     let flattened = legacy.surface.composites();
@@ -166,7 +166,7 @@ fn model_paint_benchmark_40k_triangles() {
             stroke: None,
         },
         vec![
-            Event::Begin(brush),
+            Event::begin(brush),
             Event::Points(points.into_iter().map(Stamp::from).collect(), map),
             Event::End,
         ],

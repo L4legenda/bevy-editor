@@ -623,6 +623,93 @@ fn stdio_paint_app() -> (Scratch, App, server::RunningServer, StdioClient) {
 }
 
 #[test]
+#[ignore = "requires GPU and a built bevy-editor-mcp binary; exercises undo and redo across sets"]
+fn gpu_stdio_history_switches_to_the_affected_texture_set() {
+    use crate::editor::{model_document::Mode, selection_outline::render_tests::frame};
+
+    let (_scratch, mut app, _server, mut client) = stdio_paint_app();
+    client.tool(&mut app, "open_paint_model", json!({"asset": "models/block.glb"}));
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    while !app.world().resource::<editing::State>().documents.contains_key(&0) {
+        assert!(Instant::now() < deadline);
+        frame(&mut app);
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let object = &mut doc.objects[0];
+        assert_eq!(object.materials.len(), 1);
+        object.materials.push(object.materials[0].clone());
+        object.geometry.faces[0].material = 1;
+        doc.paint_default_size = 512;
+        doc.auto_bake_pending = false;
+        doc.revision += 1;
+    }
+    let ready = |client: &mut StdioClient, app: &mut App| {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            frame(app);
+            if app.world().resource::<editing::State>().mode(Some(0)) == Mode::Paint {
+                let reply = client.tool(app, "get_paint_state", json!({}));
+                let state = &reply["structuredContent"];
+                if state["paint_busy"] == false && state["brush"].is_object() {
+                    return state.clone();
+                }
+            }
+            assert!(Instant::now() < deadline, "Painting workspace stayed busy");
+        }
+    };
+    let edit = |client: &mut StdioClient, app: &mut App, set, edit| {
+        client.tool(app, "edit_paint", json!({"model_id": 0, "set": set, "edit": edit}))
+            ["structuredContent"].clone()
+    };
+    assert_eq!(ready(&mut client, &mut app)["texture_sets"].as_array().unwrap().len(), 2);
+    edit(&mut client, &mut app, 0, json!({"operation":"add_layer", "kind":"Paint", "name":"First edit"}));
+    ready(&mut client, &mut app);
+    edit(&mut client, &mut app, 0, json!({"operation":"select_set", "index":1}));
+    ready(&mut client, &mut app);
+    edit(&mut client, &mut app, 1, json!({"operation":"add_layer", "kind":"Paint", "name":"Second edit"}));
+    ready(&mut client, &mut app);
+    edit(&mut client, &mut app, 1, json!({"operation":"select_set", "index":0}));
+    let history = ready(&mut client, &mut app);
+    assert_eq!(history["next_undo_set"], 1);
+    assert_eq!(history["undo_history"], json!([
+        {"set": 1, "operation": "add_layer", "label": "Добавление слоя"},
+        {"set": 0, "operation": "add_layer", "label": "Добавление слоя"}
+    ]));
+
+    for (from, operation, to, layer, restored) in [
+        (0, "undo", 1, "Second edit", false),
+        (1, "undo", 0, "First edit", false),
+        (0, "redo", 0, "First edit", true),
+        (0, "redo", 1, "Second edit", true),
+    ] {
+        let state = edit(&mut client, &mut app, from, json!({"operation": operation}));
+        assert_eq!(state["active_set"], to);
+        assert_eq!(state["layers_bottom_to_top"].as_array().unwrap().iter().any(|row| row["name"] == layer), restored);
+        ready(&mut client, &mut app);
+    }
+    let undone = edit(&mut client, &mut app, 1, json!({"operation": "undo", "steps": 3}));
+    assert_eq!(undone["history_steps_requested"], 3);
+    assert_eq!(undone["history_steps_applied"], 2);
+    assert_eq!(undone["active_set"], 0);
+    assert_eq!(undone["next_undo_set"], Value::Null);
+    assert_eq!(undone["redo_history"][0]["operation"], "add_layer");
+    assert_eq!(undone["redo_history"][0]["set"], 0);
+    assert!(!undone["layers_bottom_to_top"].as_array().unwrap().iter().any(|row| row["name"] == "First edit"));
+
+    let redone = edit(&mut client, &mut app, 0, json!({"operation": "redo", "steps": 2}));
+    assert_eq!(redone["history_steps_applied"], 2);
+    assert_eq!(redone["active_set"], 1);
+    assert_eq!(redone["next_redo_set"], Value::Null);
+    assert!(redone["layers_bottom_to_top"].as_array().unwrap().iter().any(|row| row["name"] == "Second edit"));
+    edit(&mut client, &mut app, 1, json!({"operation": "select_set", "index": 0}));
+    let first = ready(&mut client, &mut app);
+    assert!(first["layers_bottom_to_top"].as_array().unwrap().iter().any(|row| row["name"] == "First edit"));
+    client.close();
+}
+
+#[test]
 #[ignore = "requires GPU and a built bevy-editor-mcp binary; opens imported SPP and MPP projects"]
 fn gpu_stdio_imports_paint_projects_in_both_formats() {
     use crate::editor::{model_document::glb::Glb, model_paint_spp::fixture};

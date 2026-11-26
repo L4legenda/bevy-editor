@@ -216,8 +216,8 @@ enum Edit {
         index: usize,
         filter_index: usize,
     },
-    Undo,
-    Redo,
+    Undo { steps: Option<usize> },
+    Redo { steps: Option<usize> },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -829,6 +829,22 @@ impl PaintEditJob {
 }
 
 impl EditArgs {
+    pub(in crate::editor) fn is_history_edit(&self) -> bool {
+        self.history_request().is_some()
+    }
+
+    fn history_request(&self) -> Option<(PaintAction, usize)> {
+        match self.edit {
+            Edit::Undo { steps } => Some((PaintAction::Undo, steps.unwrap_or(1).max(1))),
+            Edit::Redo { steps } => Some((PaintAction::Redo, steps.unwrap_or(1).max(1))),
+            _ => None,
+        }
+    }
+
+    pub(in crate::editor) fn is_history_batch(&self) -> bool {
+        self.history_request().is_some_and(|(_, steps)| steps > 1)
+    }
+
     pub(in crate::editor) fn needs_preparation(&self) -> bool {
         match &self.edit {
             Edit::AddTexture { .. } | Edit::AddSmartMaterial { .. }
@@ -840,6 +856,90 @@ impl EditArgs {
 
     fn workspace(&self) -> PaintWorkspace {
         PaintWorkspace { model_id: self.model_id, set: self.set, revision: self.revision }
+    }
+}
+
+pub(in crate::editor) struct PaintHistoryEdit {
+    model: usize,
+    source: PathBuf,
+    active_set: usize,
+    binding: (usize, usize),
+    steps: Vec<HistoryStep>,
+    requested: usize,
+    applied: usize,
+    action: PaintAction,
+}
+
+impl PaintHistoryEdit {
+    pub(in crate::editor) fn start(
+        editor: &Editor,
+        editing: &mut editing::State,
+        paint: &mut PaintState,
+        args: &EditArgs,
+    ) -> Result<Self, String> {
+        let (model, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace())?;
+        if session.smart_loading || session.editing_shader().is_some() || !session.queued.is_empty() {
+            return Err("Wait for the active paint operation or close the shader editor".into());
+        }
+        let (action, requested) = args.history_request().ok_or("Expected undo or redo")?;
+        let steps = session.plan_history(doc, action, requested);
+        if steps.is_empty() {
+            return Err("There is no such history step for this model".into());
+        }
+        let binding = session.binding.ok_or("Wait for the active texture set to load")?;
+        Ok(Self {
+            model, source: doc.source.path.clone(), active_set: session.set,
+            binding, steps, requested, applied: 0, action,
+        })
+    }
+
+    pub(in crate::editor) fn poll(
+        &mut self,
+        editor: &Editor,
+        editing: &mut editing::State,
+        paint: &mut PaintState,
+        now: f64,
+    ) -> Option<Result<Value, String>> {
+        let applied = self.applied;
+        let changed = || Some(Err(format!("The paint workspace changed after {applied} history steps were applied")));
+        if editor.viewing_model != Some(self.model) || editor.viewing_image.is_some() {
+            return changed();
+        }
+        let Some(doc) = editing.documents.get_mut(&self.model) else { return changed() };
+        let Some(session) = paint.sessions.get_mut(&self.model) else { return changed() };
+        if doc.mode != Mode::Paint || doc.source.path != self.source || session.set != self.active_set
+            || doc.paint_set_index() != self.active_set || session.editing_shader().is_some()
+            || !doc.paint_target(self.active_set).is_some_and(|(object, slot)| (object.id, slot) == self.binding)
+        {
+            return changed();
+        }
+        if doc.paint_busy || doc.paint_pending || session.busy || session.binding != Some(self.binding)
+            || session.smart_loading || session.mesh_loading || session.resize_request.is_some()
+        {
+            return None;
+        }
+        let Some(&step) = self.steps.get(self.applied) else {
+            let mut state = snapshot(self.model, doc, Some(session), &paint.tips);
+            state["history_steps_applied"] = json!(self.applied);
+            state["history_steps_requested"] = json!(self.requested);
+            return Some(Ok(state));
+        };
+        if session.history_step_set(doc, self.action) != Some(step) {
+            return changed();
+        }
+        if step.binding != self.binding {
+            session.choose_set(doc, step.set, now);
+            session.busy = true;
+            self.binding = step.binding;
+            self.active_set = step.set;
+            return None;
+        }
+        if let Err(error) = apply_action(session, self.action) {
+            return Some(Err(error));
+        }
+        doc.paint_pending = true;
+        self.applied += 1;
+        None
     }
 }
 
@@ -1517,7 +1617,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             if !session.can_insert_layer(insertion) {
                 return Err("The layer would exceed the layer count or group depth limit".into());
             }
-            session.checkpoint();
+            session.checkpoint(history::Label::AddLayer);
             session.insert_new_layer(kind, name, insertion);
             session.revision += 1;
         }
@@ -1531,7 +1631,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             if !session.can_insert_material(ShelfMaterial::Basic(index), Some(insertion)) {
                 return Err("The material would exceed the layer count or group depth limit".into());
             }
-            session.checkpoint();
+            session.checkpoint(history::Label::AddMaterial);
             session.insert_basic_material(index, name, insertion);
             session.revision += 1;
         }
@@ -1573,7 +1673,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
                 fill.apply(&mut updated, session.texture_size, images)?;
             }
             if updated != *layer {
-                session.checkpoint();
+                session.checkpoint(history::Label::LayerProperties);
                 session.stack.layers[index] = updated;
                 session.revision += 1;
             }
@@ -1613,7 +1713,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             session.stack.reveal_selection();
         }
         Edit::UpdateGenerator { index, mask_layer, parameters } => {
-            edit_mask(session, index, false, |mask| {
+            edit_mask(session, index, false, history::Label::Mask, |mask| {
                 let previous = match mask_layer {
                     Some(index) => mask.layers.get(index).ok_or("Unknown mask layer index")?.generator,
                     None => mask.generator,
@@ -1627,7 +1727,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             })?;
         }
         Edit::AddMaskLayer { index, source, parameters } => {
-            edit_mask(session, index, true, |mask| {
+            edit_mask(session, index, true, history::Label::Mask, |mask| {
                 if mask.layers.len() >= MAX_MASK_LAYERS {
                     return Err("The mask already has the maximum number of layers".into());
                 }
@@ -1642,13 +1742,13 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             })?;
         }
         Edit::UpdateMaskLayer { index, mask_layer, parameters } => {
-            edit_mask(session, index, false, |mask| {
+            edit_mask(session, index, false, history::Label::Mask, |mask| {
                 let layer = mask.edit_layers().get_mut(mask_layer).ok_or("Unknown mask layer index")?;
                 parameters.apply(layer)
             })?;
         }
         Edit::MoveMaskLayer { index, from, to } => {
-            edit_mask(session, index, false, |mask| {
+            edit_mask(session, index, false, history::Label::Mask, |mask| {
                 let layers = mask.edit_layers();
                 if from >= layers.len() || to >= layers.len() {
                     return Err("Unknown mask layer index".into());
@@ -1659,7 +1759,7 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
             })?;
         }
         Edit::RemoveMaskLayer { index, mask_layer } => {
-            edit_mask(session, index, false, |mask| {
+            edit_mask(session, index, false, history::Label::Mask, |mask| {
                 let layers = mask.edit_layers();
                 if mask_layer >= layers.len() {
                     return Err("Unknown mask layer index".into());
@@ -1704,8 +1804,8 @@ fn perform(doc: &mut Document, session: &mut Session, edit: Edit, now: f64, imag
                 Ok(())
             })?;
         }
-        Edit::Undo => apply_action(session, PaintAction::Undo)?,
-        Edit::Redo => apply_action(session, PaintAction::Redo)?,
+        Edit::Undo { .. } => apply_action(session, PaintAction::Undo)?,
+        Edit::Redo { .. } => apply_action(session, PaintAction::Redo)?,
     }
     if !crate::editor::model_paint_data::same_layer_list(&before, &session.stack) {
         doc.paint_pending = true;
@@ -1779,13 +1879,14 @@ fn edit_mask_filters(
     select: bool,
     edit: impl FnOnce(&mut Vec<Filter>) -> Result<(), String>,
 ) -> Result<(), String> {
-    edit_mask(session, index, select, |mask| edit(mask.edit_filters()))
+    edit_mask(session, index, select, history::Label::Filter, |mask| edit(mask.edit_filters()))
 }
 
 fn edit_mask(
     session: &mut Session,
     index: usize,
     select: bool,
+    label: history::Label,
     edit: impl FnOnce(&mut Mask) -> Result<(), String>,
 ) -> Result<(), String> {
     check_layer(session, index)?;
@@ -1796,7 +1897,7 @@ fn edit_mask(
         if select && session.stack.selected != index {
             session.select_layer(index);
         }
-        session.checkpoint();
+        session.checkpoint(label);
         session.stack.layers[index].mask = Some(Arc::new(updated));
         session.revision += 1;
     }
@@ -1875,6 +1976,15 @@ fn snapshot(
         .flat_map(|o| o.geometry.faces.iter())
         .map(|face| face.corners.len().saturating_sub(2))
         .sum();
+    let history = |action| {
+        let steps = session.map_or_else(Vec::new, |session| session.plan_history(doc, action, 10));
+        steps.into_iter().map(|step| {
+            let (operation, label) = step.label.names();
+            json!({"set": step.set, "operation": operation, "label": label})
+        }).collect::<Vec<_>>()
+    };
+    let undo = history(PaintAction::Undo);
+    let redo = history(PaintAction::Redo);
     json!({
         "model_id": index,
         "revision": session.map(|s| s.revision),
@@ -1918,6 +2028,10 @@ fn snapshot(
         },
         "undo_steps": bound.map_or(0, |s| s.undo.len()),
         "redo_steps": bound.map_or(0, |s| s.redo.len()),
+        "next_undo_set": undo.first().map(|step| &step["set"]),
+        "next_redo_set": redo.first().map(|step| &step["set"]),
+        "undo_history": undo,
+        "redo_history": redo,
     })
 }
 
@@ -2188,7 +2302,7 @@ mod tests {
         assert_eq!(session.undo.len(), 1);
         perform(&mut doc, &mut session, edit(patch), 0., Vec::new()).unwrap();
         assert_eq!(session.undo.len(), 1);
-        perform(&mut doc, &mut session, Edit::Undo, 0., Vec::new()).unwrap();
+        perform(&mut doc, &mut session, Edit::Undo { steps: None }, 0., Vec::new()).unwrap();
         assert_eq!(session.stack, initial);
 
         let layer = &mut session.stack.layers[0];
@@ -2345,9 +2459,9 @@ mod tests {
         assert!(apply(&editor, &mut editing, &mut paint, stale, 0.).is_err());
         assert_eq!(paint.sessions[&0].stack.layers.len(), 2);
 
-        apply(&editor, &mut editing, &mut paint, request(Edit::Undo), 0.).unwrap();
+        apply(&editor, &mut editing, &mut paint, request(Edit::Undo { steps: None }), 0.).unwrap();
         assert_eq!(paint.sessions[&0].stack.layers[0].name, "Live paint");
-        apply(&editor, &mut editing, &mut paint, request(Edit::Redo), 0.).unwrap();
+        apply(&editor, &mut editing, &mut paint, request(Edit::Redo { steps: None }), 0.).unwrap();
         assert_eq!(paint.sessions[&0].stack.layers[0].name, "Polished");
         for edit in [
             Edit::SetMask {
@@ -2389,6 +2503,6 @@ mod tests {
         assert_eq!(changed["active_set"], 0);
         assert_eq!(editing.documents[&0].paint_set, Some(0));
         assert_eq!(changed["layers_bottom_to_top"][0]["name"], "Saved paint");
-        assert!(apply(&editor, &mut editing, &mut paint, request(Edit::Undo), 0.).is_err());
+        assert!(apply(&editor, &mut editing, &mut paint, request(Edit::Undo { steps: None }), 0.).is_err());
     }
 }

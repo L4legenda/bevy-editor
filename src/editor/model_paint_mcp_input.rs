@@ -107,10 +107,10 @@ impl McpPaintInput<'_, '_> {
             let mut batch = if changed || before.selected != work.surface.stack.selected {
                 compose(work)
             } else {
-                Batch { work, maps: None, history: Vec::new(), surface_selection: None }
+                Batch { work, maps: None, history: Vec::new(), resized_bake: None, surface_selection: None }
             };
             if changed {
-                batch.history.push(before);
+                batch.history.push((super::super::history::Label::SurfaceSelection, before));
             }
             batch.surface_selection = Some(result.map(|(report, _)| report));
             batch
@@ -315,7 +315,7 @@ fn queue_operation(
         uv,
         &session.set_appearance.visibility,
     ));
-    live.queue.push_back(Event::Begin(brush));
+    live.queue.push_back(Event::begin(brush));
     match points {
         RasterPoints::Stamps(stamps) => live.enqueue_stamps(stamps, map),
         RasterPoints::Region(region) => live.queue.push_back(Event::Region(region, map)),

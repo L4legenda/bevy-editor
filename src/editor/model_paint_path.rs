@@ -312,7 +312,7 @@ pub(super) fn edit(
         tip.follow |= session.path_align;
     }
     let map = Mapping::for_camera(input.doc, input.object, input.slot, view.camera, view.uv, input.visibility);
-    live.queue.push_back(Event::Begin(brush));
+    live.queue.push_back(Event::Begin(brush, super::super::history::Label::Path));
     live.enqueue_stamps(stamps, Arc::new(map));
     live.queue.push_back(Event::End);
     live.path.applied = true;

@@ -90,6 +90,11 @@ struct PendingPaintEdit {
     work: mcp_state::PaintEditJob,
 }
 
+struct PendingPaintHistory {
+    job: Job,
+    work: mcp_state::PaintHistoryEdit,
+}
+
 #[derive(Clone)]
 struct Bridge {
     sender: mpsc::SyncSender<Job>,
@@ -98,9 +103,10 @@ struct Bridge {
 
 impl Bridge {
     async fn request(&self, command: Command) -> Reply {
+        let history_batch = matches!(&command, Command::PaintEdit(args) if args.is_history_batch());
         let timeout = if matches!(command, Command::PaintImport(_)) {
             Duration::from_secs(30 * 60)
-        } else if matches!(
+        } else if history_batch || matches!(
             command,
             Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_)
                 | Command::PaintExport(_) | Command::PaintReplaceMesh(_)
@@ -114,7 +120,7 @@ impl Bridge {
             .try_send(Job {
                 command,
                 reply,
-                deadline: Instant::now() + REQUEST_TIMEOUT,
+                deadline: Instant::now() + if history_batch { timeout } else { REQUEST_TIMEOUT },
             })
             .map_err(|_| "The editor is busy or has closed; retry after it is ready".to_string())?;
         (self.wake)();
@@ -195,10 +201,10 @@ fn process(
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
     mut focus: Option<ResMut<InputFocus>>,
-    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint, mut importing, mut browser, mut previews): (
+    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint, mut pending_history, mut importing, mut browser, mut previews): (
         Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>,
         Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>,
-        Local<Option<PendingPaintEdit>>, Local<Option<paint_import::Pending>>,
+        Local<Option<PendingPaintEdit>>, Local<Option<PendingPaintHistory>>, Local<Option<paint_import::Pending>>,
         Option<ResMut<super::browser::Browser>>, Option<ResMut<super::thumbnails::Thumbnails>>,
     ),
 ) {
@@ -224,6 +230,17 @@ fn process(
     }
     if pending_paint.as_ref().is_some_and(|pending| pending.job.reply.is_closed() || Instant::now() >= pending.job.deadline) {
         *pending_paint = None;
+    }
+    if pending_history.as_ref().is_some_and(|pending| pending.job.reply.is_closed() || Instant::now() >= pending.job.deadline) {
+        *pending_history = None;
+    }
+    if !input_busy(&editor, &pointer)
+        && let Some(pending) = pending_history.as_mut()
+        && let Some((editing, paint)) = model_editing.as_deref_mut().zip(paint.as_deref_mut())
+        && let Some(result) = pending.work.poll(&editor, editing, paint, real_time.elapsed_secs_f64())
+    {
+        let pending = pending_history.take().unwrap();
+        let _ = pending.job.reply.send(result.map(Payload::Json));
     }
     let mut ready = None;
     if let Some(result) = pending_paint.as_mut().and_then(|pending| pending.work.poll()) {
@@ -257,6 +274,24 @@ fn process(
                 paint_import::start(&mut importing, &editor, args.clone(), job);
             } else {
                 let _ = job.reply.send(Err("Wait for the project asset browser and paint workspace to load".into()));
+            }
+            continue;
+        }
+        if let Command::PaintEdit(args) = &job.command
+            && args.is_history_edit()
+        {
+            let result = if pending_history.is_some() {
+                Err("Wait for the current paint history operation to finish".into())
+            } else {
+                model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                    .ok_or_else(|| "This editor has no model paint workspace".into())
+                    .and_then(|(editing, paint)| {
+                        mcp_state::PaintHistoryEdit::start(&editor, editing, paint, args)
+                    })
+            };
+            match result {
+                Ok(work) => *pending_history = Some(PendingPaintHistory { job, work }),
+                Err(error) => { let _ = job.reply.send(Err(error)); }
             }
             continue;
         }

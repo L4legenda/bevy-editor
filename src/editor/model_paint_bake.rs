@@ -733,6 +733,26 @@ impl Drop for Job {
     }
 }
 
+pub(super) struct BakeResize {
+    key: Key,
+    source: Arc<mesh::Maps>,
+    material: crate::editor::model_document::MaterialSlot,
+}
+
+pub(super) struct ResizedBake {
+    key: Key,
+    pub maps: Arc<Maps>,
+}
+
+impl BakeResize {
+    pub fn resample(self, size: u32) -> ResizedBake {
+        let mut key = self.key;
+        key.size = size;
+        let maps = Maps::new(Arc::new(self.source.resampled(size)), Some(&self.material));
+        ResizedBake { key, maps: Arc::new(maps) }
+    }
+}
+
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct State {
     running: Option<Job>,
@@ -960,6 +980,50 @@ impl State {
                     && entry.matches_scene(doc)
             })
             .map(|(_, maps)| maps)
+    }
+
+    pub(super) fn baking_set(&self, model: usize, binding: (usize, usize)) -> bool {
+        self.running.as_ref().is_some_and(|job| {
+            job.key.model == model && (job.key.object, job.key.slot) == binding
+        })
+    }
+
+    pub(super) fn resize_source(
+        &self, model: usize, doc: &Document, binding: (usize, usize), size: u32,
+    ) -> Option<BakeResize> {
+        let (key, maps) = self.cache.iter().rev().find(|(key, _)| {
+            key.model == model && (key.object, key.slot) == binding && key.size == size
+                && key.matches_scene(doc)
+        })?;
+        Some(BakeResize {
+            key: key.clone(),
+            source: maps.raw.clone(),
+            material: key.material(doc)?.clone(),
+        })
+    }
+
+    pub(super) fn publish_resized(&mut self, doc: &Document, bake: ResizedBake) {
+        let ResizedBake { key, mut maps } = bake;
+        if key.matches_scene(doc) {
+            let material = key.material(doc);
+            if !maps.matches(material) {
+                maps = Arc::new(Maps::new(maps.raw.clone(), material));
+            }
+            self.remember(key, maps);
+        }
+    }
+
+    fn remember(&mut self, key: Key, maps: Arc<Maps>) {
+        self.cache.retain(|(entry, _)| {
+            (entry.model, entry.object, entry.slot, entry.size) != (key.model, key.object, key.slot, key.size)
+        });
+        self.cache.push_back((key, maps));
+        while self.cache.len() > 1
+            && (self.cache.len() > 8
+                || self.cache.iter().map(|(_, maps)| maps.bytes()).sum::<usize>() > 192 * 1024 * 1024)
+        {
+            self.cache.pop_front();
+        }
     }
     pub(super) fn preview_for(
         &self, model: usize, doc: &Document, session: &Session, map: BakeMap,
@@ -1193,24 +1257,9 @@ pub(in crate::editor::ui::model_viewer) fn update(
                         fit.raised, fit.lowered, fit.unresolved,
                     ));
                 }
-                state.cache.retain(|(key, _)| {
-                    (key.model, key.object, key.slot, key.size)
-                        != (job.key.model, job.key.object, job.key.slot, job.key.size)
-                });
                 let material = editing.documents.get(&job.key.model)
                     .and_then(|doc| job.key.material(doc));
-                state.cache.push_back((job.key.clone(), Arc::new(Maps::new(Arc::new(maps), material))));
-                while state.cache.len() > 1
-                    && (state.cache.len() > 8
-                        || state
-                            .cache
-                            .iter()
-                            .map(|(_, maps)| maps.bytes())
-                            .sum::<usize>()
-                            > 192 * 1024 * 1024)
-                {
-                    state.cache.pop_front();
-                }
+                state.remember(job.key.clone(), Arc::new(Maps::new(Arc::new(maps), material)));
             }
             Err(error) => editor.status = format!("Не удалось запечь карты · {error}"),
         }

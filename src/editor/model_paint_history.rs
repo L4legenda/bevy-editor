@@ -14,8 +14,60 @@ type Pixels = Arc<Vec<u8>>;
 
 const MIN_PACKED_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Label {
+    #[default]
+    LayerProperties,
+    AddLayer,
+    AddMaterial,
+    Duplicate,
+    Remove,
+    Clear,
+    Group,
+    Move,
+    Rename,
+    Mask,
+    Filter,
+    Graph,
+    FillProperties,
+    Stroke,
+    Erase,
+    Fill,
+    Path,
+    MaskStroke,
+    SurfaceSelection,
+}
+
+impl Label {
+    pub(super) fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Self::LayerProperties => ("layer_properties", "Настройки слоя"),
+            Self::AddLayer => ("add_layer", "Добавление слоя"),
+            Self::AddMaterial => ("add_material", "Добавление материала"),
+            Self::Duplicate => ("duplicate_layer", "Копирование слоя"),
+            Self::Remove => ("remove_layer", "Удаление слоя"),
+            Self::Clear => ("clear_layer", "Очистка слоя"),
+            Self::Group => ("group_layers", "Группировка слоёв"),
+            Self::Move => ("move_layer", "Перемещение слоя"),
+            Self::Rename => ("rename_layer", "Переименование слоя"),
+            Self::Mask => ("mask", "Изменение маски"),
+            Self::Filter => ("mask_filter", "Изменение фильтра маски"),
+            Self::Graph => ("material_graph", "Изменение графа"),
+            Self::FillProperties => ("fill_properties", "Настройки заливки"),
+            Self::Stroke => ("stroke", "Мазок кисти"),
+            Self::Erase => ("erase", "Мазок ластиком"),
+            Self::Fill => ("fill", "Заливка области"),
+            Self::Path => ("path", "Мазок по контуру"),
+            Self::MaskStroke => ("mask_stroke", "Мазок по маске"),
+            Self::SurfaceSelection => ("surface_selection", "Маска из выделения поверхности"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Snapshot {
+    pub order: u64,
+    pub label: Label,
     stack: Stack,
     pixels: Vec<LayerPixels>,
 }
@@ -71,11 +123,11 @@ impl Cache {
                 LayerPixels { channels, mask }
             })
             .collect();
-        Snapshot { stack, pixels }
+        Snapshot { order: 0, label: Label::default(), stack, pixels }
     }
 
     pub fn restore(&mut self, snapshot: Snapshot) -> Stack {
-        let Snapshot { mut stack, pixels } = snapshot;
+        let Snapshot { mut stack, pixels, .. } = snapshot;
         for (layer, pixels) in stack.layers.iter_mut().zip(pixels) {
             self.restore_layer(layer, pixels);
         }

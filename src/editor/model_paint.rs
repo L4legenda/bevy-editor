@@ -548,6 +548,12 @@ pub(in crate::editor) enum PaintAction {
     FillVariationOptions,
     ExportPadding(export::Padding),
     ExportFileMenu,
+    ExportPreviewScope(bool),
+    ExportPreviewPage(usize),
+    ApplyExportMeshName,
+    ApplyExportDestination,
+    BrowseExportDestination,
+    RevealExportResult,
     ExportFormat(export::Format),
     ExportDepth(export::Depth),
     ExportSize(Option<u32>),
@@ -752,6 +758,13 @@ impl PaintAction {
             Self::EditExportTemplate { .. } => "Изменить пользовательский шаблон экспорта.",
             Self::ExportTemplate(_) => "Выбрать набор выходных карт и способ упаковки каналов.",
             Self::ExportFileMenu => "Настроить формат, глубину цвета и разрешение файлов.",
+            Self::ExportPreviewScope(false) => "Показать имена файлов текущего набора.",
+            Self::ExportPreviewScope(true) => "Показать имена файлов всех наборов и плиток UDIM.",
+            Self::ExportPreviewPage(_) => "Перейти к другой странице списка файлов.",
+            Self::ApplyExportMeshName => "Применить имя модели для экспорта текстур.",
+            Self::ApplyExportDestination => "Применить папку экспорта карт. Пустое поле вернёт выбор при экспорте.",
+            Self::BrowseExportDestination => "Выбрать папку экспорта карт в системном диалоге.",
+            Self::RevealExportResult => "Открыть папку последнего экспорта карт.",
             Self::ExportFormat(export::Format::Jpeg) => "Сохранить JPEG без альфа-канала.",
             Self::ExportFormat(_) => "Выбрать формат файлов текстур.",
             Self::ExportDepth(_) => "Выбрать глубину цвета выходных файлов.",
@@ -971,11 +984,20 @@ impl ProjectGraphTarget {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HistoryStep {
+    set: usize,
+    binding: (usize, usize),
+    order: u64,
+    label: history::Label,
+}
+
 struct Session {
     stack: Stack,
     undo: Vec<history::Snapshot>,
     redo: Vec<history::Snapshot>,
     history_cache: history::Cache,
+    history_order: u64,
     history_limit: usize,
     tool: PaintTool,
     panel: Panel,
@@ -1079,6 +1101,9 @@ struct Session {
     export_component: usize,
     export_source_menu: bool,
     export_file_menu: bool,
+    export_preview_all: bool,
+    export_preview_page: usize,
+    export_mesh_name: Option<String>,
     bake_busy: bool,
     bake_cache_clearing: bool,
     bake_map_options: bool,
@@ -1115,6 +1140,7 @@ impl Default for Session {
             undo: vec![],
             redo: vec![],
             history_cache: history::Cache::default(),
+            history_order: 0,
             history_limit: editing::recovery::DEFAULT_UNDO_STEPS,
             tool: PaintTool::Brush,
             panel: Panel::Layers,
@@ -1219,6 +1245,9 @@ impl Default for Session {
             export_component: 0,
             export_source_menu: false,
             export_file_menu: false,
+            export_preview_all: false,
+            export_preview_page: 0,
+            export_mesh_name: None,
             bake_cache_clearing: false,
             bake_map_options: false,
             bake_ready: false,
@@ -1839,7 +1868,7 @@ impl Session {
     }
 
     fn apply_shelf_mask(&mut self, mask: Arc<Mask>, target: Option<usize>) {
-        self.checkpoint();
+        self.checkpoint(history::Label::Mask);
         self.stack.selected = target.unwrap_or(self.stack.selected);
         if mask.graph.is_some() {
             self.graph_bake = None;
@@ -1872,7 +1901,7 @@ impl Session {
         if !self.available(PaintAction::ApplyGenerator(generator.kind, target)) {
             return;
         }
-        self.checkpoint();
+        self.checkpoint(history::Label::Mask);
         self.stack.selected = target.unwrap_or(self.stack.selected);
         let mask = Arc::make_mut(self.stack.layers[self.stack.selected].mask.get_or_insert_with(|| {
             Arc::new(Mask::new(crate::editor::model_paint_data::solid(
@@ -2041,7 +2070,7 @@ impl Session {
                 && kind.controls().get(slot).is_some()
                 && value.is_finite()
             {
-                self.checkpoint();
+                self.checkpoint(history::Label::Filter);
                 self.edit_filters()[i].set_value(slot, value);
                 self.revision += 1;
             }
@@ -2051,7 +2080,7 @@ impl Session {
             if self.busy {
                 return;
             }
-            self.checkpoint();
+            self.checkpoint(history::Label::LayerProperties);
         }
         let fill_channel = if !self.editing_mask
             && self.stack.layers.get(self.stack.selected).is_some_and(|l| l.kind == LayerKind::Fill)
@@ -2068,7 +2097,7 @@ impl Session {
             if self.busy {
                 return;
             }
-            self.checkpoint();
+            self.checkpoint(history::Label::FillProperties);
         }
         match parameter {
             Parameter::Size => self.size = value,
@@ -2120,33 +2149,25 @@ impl Session {
         if !self.available(action) {
             return;
         }
-        let edit = matches!(
-            action,
-            PaintAction::Add(_)
-                | PaintAction::AddMaterial(_)
-                | PaintAction::DropMaterial(ShelfMaterial::Basic(_), _)
-                | PaintAction::Visible(_)
-                | PaintAction::Remove
-                | PaintAction::Duplicate
-                | PaintAction::ClearLayer
-                | PaintAction::GroupLayer
-                | PaintAction::Move(_)
-                | PaintAction::MoveLayer(..)
-                | PaintAction::MoveInto(_)
-                | PaintAction::MoveOut
-                | PaintAction::AddMask(_)
-                | PaintAction::RemoveMask
-                | PaintAction::AddMaskLayer
-                | PaintAction::AddGeneratorLayer(_)
-                | PaintAction::Generator(..)
-                | PaintAction::MaskLayer(..)
-                | PaintAction::AddFilter(_)
-                | PaintAction::ToggleFilter(_)
-                | PaintAction::RemoveFilter(_)
-                | PaintAction::MoveFilter(_, _)
-        ) || matches!(action, PaintAction::Blend(mode) if self.stack.layers[self.stack.selected].blend != mode);
-        if edit {
-            self.checkpoint();
+        use history::Label;
+        let label = match action {
+            PaintAction::Add(_) => Some(Label::AddLayer),
+            PaintAction::AddMaterial(_) | PaintAction::DropMaterial(ShelfMaterial::Basic(_), _) => Some(Label::AddMaterial),
+            PaintAction::Visible(_) => Some(Label::LayerProperties),
+            PaintAction::Blend(mode) if self.stack.layers[self.stack.selected].blend != mode => Some(Label::LayerProperties),
+            PaintAction::Remove => Some(Label::Remove),
+            PaintAction::Duplicate => Some(Label::Duplicate),
+            PaintAction::ClearLayer => Some(Label::Clear),
+            PaintAction::GroupLayer => Some(Label::Group),
+            PaintAction::Move(_) | PaintAction::MoveLayer(..) | PaintAction::MoveInto(_) | PaintAction::MoveOut => Some(Label::Move),
+            PaintAction::AddMask(_) | PaintAction::RemoveMask | PaintAction::AddMaskLayer
+                | PaintAction::AddGeneratorLayer(_) | PaintAction::Generator(..) | PaintAction::MaskLayer(..) => Some(Label::Mask),
+            PaintAction::AddFilter(_) | PaintAction::ToggleFilter(_) | PaintAction::RemoveFilter(_)
+                | PaintAction::MoveFilter(_, _) => Some(Label::Filter),
+            _ => None,
+        };
+        if let Some(label) = label {
+            self.checkpoint(label);
         }
         let fill = self
             .stack
@@ -2159,7 +2180,7 @@ impl Session {
             if self.busy {
                 return;
             }
-            self.checkpoint();
+            self.checkpoint(Label::FillProperties);
         }
         match action {
             PaintAction::Tool(value) => self.tool = value,
@@ -2487,9 +2508,14 @@ impl Session {
             }
             PaintAction::Undo => {
                 if let Some(previous) = self.undo.pop() {
+                    let order = previous.order;
+                    let label = previous.label;
                     let stack = self.history_cache.restore(previous);
                     let current = std::mem::replace(&mut self.stack, stack);
-                    self.redo.push(self.history_cache.capture(current));
+                    let mut snapshot = self.history_cache.capture(current);
+                    snapshot.order = order;
+                    snapshot.label = label;
+                    self.redo.push(snapshot);
                     Self::trim_history(&mut self.redo, self.history_limit);
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
@@ -2499,9 +2525,14 @@ impl Session {
             }
             PaintAction::Redo => {
                 if let Some(next) = self.redo.pop() {
+                    let order = next.order;
+                    let label = next.label;
                     let stack = self.history_cache.restore(next);
                     let current = std::mem::replace(&mut self.stack, stack);
-                    self.undo.push(self.history_cache.capture(current));
+                    let mut snapshot = self.history_cache.capture(current);
+                    snapshot.order = order;
+                    snapshot.label = label;
+                    self.undo.push(snapshot);
                     Self::trim_history(&mut self.undo, self.history_limit);
                     self.graph_bake = None;
                     if let Some(binding) = self.binding {
@@ -2541,7 +2572,13 @@ impl Session {
             PaintAction::ExportFileMenu => {
                 self.export_file_menu = !self.export_file_menu;
                 self.export_template_menu = false;
+                self.export_preview_page = 0;
             }
+            PaintAction::ExportPreviewScope(all) => {
+                self.export_preview_all = all;
+                self.export_preview_page = 0;
+            }
+            PaintAction::ExportPreviewPage(page) => self.export_preview_page = page,
             PaintAction::ExportFormat(format) => self.export_settings.file.set_format(format),
             PaintAction::ExportDepth(depth) => {
                 if self.export_settings.file.format.depths().contains(&depth) {
@@ -2572,7 +2609,9 @@ impl Session {
             }
             PaintAction::ExportComponent(channel) => self.export_component = channel,
             PaintAction::ExportSourceMenu => self.export_source_menu = !self.export_source_menu,
-            PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
+            PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ApplyExportMeshName
+            | PaintAction::ApplyExportDestination | PaintAction::BrowseExportDestination | PaintAction::RevealExportResult
+            | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
             | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
             | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
             | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
@@ -2779,7 +2818,7 @@ impl Session {
         for layer in &mut layers {
             layer.depth += depth;
         }
-        self.checkpoint();
+        self.checkpoint(history::Label::AddMaterial);
         self.stack.layers.splice(at..at, layers);
         self.stack.selected = at + folder;
         self.stack.reveal_selection();
@@ -2978,7 +3017,7 @@ impl Session {
     }
 
     fn commit_folder_view(&mut self, stack: Stack, node: Option<u64>) {
-        self.checkpoint();
+        self.checkpoint(history::Label::Graph);
         self.stack = stack;
         self.graph_map_menu = None;
         self.graph_node = node.or(self.graph_node);
@@ -3139,18 +3178,105 @@ impl Session {
     }
 
     fn edit_texture_fill(&mut self, edit: impl FnOnce(&mut texture_fill::Fill)) {
-        self.checkpoint();
+        self.checkpoint(history::Label::FillProperties);
         self.stack.layers[self.stack.selected].edit_texture_fill(edit);
         self.revision += 1;
     }
-    fn checkpoint(&mut self) {
-        self.record_undo(self.stack.clone());
+    fn checkpoint(&mut self, label: history::Label) {
+        self.record_undo(self.stack.clone(), label);
     }
 
-    fn record_undo(&mut self, previous: Stack) {
-        self.undo.push(self.history_cache.capture(previous));
+    fn record_undo(&mut self, previous: Stack, label: history::Label) {
+        self.history_order += 1;
+        let mut snapshot = self.history_cache.capture(previous);
+        snapshot.order = self.history_order;
+        snapshot.label = label;
+        self.undo.push(snapshot);
         Self::trim_history(&mut self.undo, self.history_limit);
         self.redo.clear();
+        for (_, redo) in self.histories.values_mut() {
+            redo.clear();
+        }
+    }
+
+    fn history_step_set(
+        &self,
+        doc: &crate::editor::model_document::Document,
+        action: PaintAction,
+    ) -> Option<HistoryStep> {
+        self.history_sets(doc, action)
+            .filter_map(|(set, binding, steps)| {
+                let step = steps.last()?;
+                Some(HistoryStep { set, binding, order: step.order, label: step.label })
+            })
+            .max_by_key(|step| Self::history_priority(action, step.order))
+    }
+
+    fn history_priority(action: PaintAction, order: u64) -> u64 {
+        // Undo visits the latest edits first. Redo replays them in their original order.
+        if action == PaintAction::Redo { u64::MAX - order } else { order }
+    }
+
+    fn history_sets<'a>(
+        &'a self,
+        doc: &'a crate::editor::model_document::Document,
+        action: PaintAction,
+    ) -> impl Iterator<Item = (usize, (usize, usize), &'a [history::Snapshot])> + 'a {
+        let redo = action == PaintAction::Redo;
+        doc.objects.iter()
+            .flat_map(|object| (0..object.materials.len()).map(move |slot| (object.id, slot)))
+            .enumerate()
+            .filter_map(move |(set, key)| {
+                let (undo, redo_stack) = if self.binding == Some(key) {
+                    (&self.undo, &self.redo)
+                } else {
+                    let (undo, redo_stack) = self.histories.get(&key)?;
+                    (undo, redo_stack)
+                };
+                let steps = if redo { redo_stack } else { undo };
+                (!steps.is_empty()).then_some((set, key, steps.as_slice()))
+            })
+    }
+
+    #[cfg(feature = "mcp")]
+    fn plan_history(
+        &self,
+        doc: &crate::editor::model_document::Document,
+        action: PaintAction,
+        limit: usize,
+    ) -> Vec<HistoryStep> {
+        if limit == 1 {
+            return self.history_step_set(doc, action).into_iter().collect();
+        }
+        let mut steps: Vec<_> = self.history_sets(doc, action)
+            .flat_map(|(set, binding, steps)| steps.iter().map(move |step| HistoryStep {
+                set, binding, order: step.order, label: step.label,
+            }))
+            .collect();
+        steps.sort_unstable_by_key(|step| std::cmp::Reverse(Self::history_priority(action, step.order)));
+        steps.truncate(limit);
+        steps
+    }
+
+    fn run_history_step(
+        &mut self,
+        doc: &mut crate::editor::model_document::Document,
+        action: PaintAction,
+        now: f64,
+    ) -> bool {
+        if self.busy || self.resize_request.is_some() || self.smart_loading || self.mesh_loading
+            || self.editing_shader().is_some()
+        {
+            return false;
+        }
+        let Some(step) = self.history_step_set(doc, action) else { return true };
+        if self.set != step.set || self.binding != Some(step.binding) {
+            self.choose_set(doc, step.set, now);
+            self.busy = true;
+            return false;
+        }
+        self.edit(action);
+        true
     }
 
     fn trim_history(history: &mut Vec<history::Snapshot>, limit: usize) {
@@ -3189,7 +3315,7 @@ impl Session {
         let name = Self::valid_layer_name(name)?;
         let index = self.stack.selected;
         if self.stack.layers[index].name != name {
-            self.checkpoint();
+            self.checkpoint(history::Label::Rename);
             self.stack.layers[index].name = name.to_owned();
             self.revision += 1;
         }
@@ -3230,6 +3356,7 @@ impl Session {
             PaintAction::GraphSelectNode(node) => self.graph_node == Some(node),
             PaintAction::ExportPadding(padding) => self.export_settings.padding == padding,
             PaintAction::ExportFileMenu => self.export_file_menu,
+            PaintAction::ExportPreviewScope(all) => self.export_preview_all == all,
             PaintAction::ExportFormat(format) => self.export_settings.file.format == format,
             PaintAction::ExportDepth(depth) => self.export_settings.file.depth == depth,
             PaintAction::ExportSize(size) => self.export_settings.file.size == size,
@@ -3765,7 +3892,7 @@ pub(super) fn actions(
                     {
                         let selected = session.stack.selected;
                         let mut prepared = layers.remove(0);
-                        session.checkpoint();
+                        session.checkpoint(history::Label::Graph);
                         let layer = &mut session.stack.layers[selected];
                         if job.mask {
                             let new_mask = layer.mask.is_none();
@@ -4809,7 +4936,7 @@ pub(super) fn actions(
                                                 continue;
                                             }
                                             if !rebuilds {
-                                                session.checkpoint();
+                                                session.checkpoint(history::Label::Graph);
                                                 let layer = &mut session.stack.layers[session.stack.selected];
                                                 if mask {
                                                     let mask = Arc::make_mut(layer.mask.as_mut().unwrap());
@@ -5026,7 +5153,9 @@ pub(super) fn actions(
                     }
                     continue;
                 }
-                PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
+                PaintAction::ExportMaps(_) | PaintAction::ExportMesh | PaintAction::ApplyExportMeshName
+                | PaintAction::ApplyExportDestination | PaintAction::BrowseExportDestination | PaintAction::RevealExportResult
+                | PaintAction::ImportExportTemplate | PaintAction::CopyExportTemplate
                 | PaintAction::SaveExportTemplate | PaintAction::EditExportTemplate { .. } | PaintAction::BakeStart | PaintAction::BakeCancel | PaintAction::BakeClearDiskCache | PaintAction::BakePreview(_)
                 | PaintAction::BakePickHigh | PaintAction::BakeClearHigh | PaintAction::BakePickCage | PaintAction::BakeClearCage | PaintAction::BakeAutoFitCage
                 | PaintAction::BakeMatchNames | PaintAction::BakeFillMisses | PaintAction::BakePreferFrontFaces
@@ -5055,10 +5184,15 @@ pub(super) fn actions(
                     }) => continue,
                 _ => {}
             }
-            if !session.available(action) {
-                if matches!(action, PaintAction::Undo | PaintAction::Redo) {
+            if matches!(action, PaintAction::Undo | PaintAction::Redo) {
+                if let Some(doc) = editing.documents.get_mut(&index)
+                    && (!session.queued.is_empty() || !session.run_history_step(doc, action, time.elapsed_secs_f64()))
+                {
                     session.queued.push_back(action);
                 }
+                continue;
+            }
+            if !session.available(action) {
                 continue;
             }
             if let PaintAction::Set(set) = action {

@@ -39,6 +39,7 @@ impl Default for Settings {
 struct Preferences {
     settings: Settings,
     folder: Option<PathBuf>,
+    destination: Option<PathBuf>,
     recipes: Vec<Arc<recipe::Recipe>>,
 }
 
@@ -64,6 +65,7 @@ impl Preferences {
             .filter(|size| crate::editor::model_paint_data::RESOLUTIONS.contains(size));
         file.normal.height_strength = file.normal.height_strength.clamp(0., 8.);
         prefs.settings.width = prefs.settings.width.clamp(1, 256);
+        prefs.destination = prefs.destination.filter(|path| path.is_absolute());
         Ok(prefs)
     }
 
@@ -264,6 +266,17 @@ impl Store {
         self.current.folder = Some(folder.to_owned());
     }
 
+    pub(in crate::editor::ui::model_viewer::paint) fn destination(&self) -> Option<&Path> {
+        self.current.destination.as_deref()
+    }
+
+    pub(super) fn set_destination(&mut self, destination: Option<PathBuf>) {
+        if self.current.destination != destination {
+            self.current.destination = destination;
+            self.revision += 1;
+        }
+    }
+
     pub(super) fn schedule_save(&mut self) {
         if let Some(worker) = &mut self.worker {
             let Some(result) = block_on(poll_once(worker)) else {
@@ -325,6 +338,7 @@ mod tests {
         ));
         let path = root.join("paint-export.json");
         let folder = root.join("Текстуры");
+        let destination = root.join("Следующий экспорт");
         let mut prefs = Store::open(Some(path.clone()));
         let mut settings = Settings {
             template: Template::Godot,
@@ -339,14 +353,21 @@ mod tests {
         settings.file.normal.use_baked = false;
         prefs.set_settings(settings);
         prefs.set_folder(&folder);
+        prefs.set_destination(Some(destination.clone()));
         prefs.schedule_save();
         settings.file.size = Some(2048);
         prefs.set_settings(settings);
         prefs.flush().unwrap();
 
-        let reopened = Store::open(Some(path.clone()));
+        let mut reopened = Store::open(Some(path.clone()));
         assert_eq!(reopened.settings(), settings);
         assert_eq!(reopened.folder(), Some(folder.as_path()));
+        assert_eq!(reopened.destination(), Some(destination.as_path()));
+        reopened.set_destination(None);
+        reopened.flush().unwrap();
+        let cleared = Store::open(Some(path));
+        assert!(cleared.destination().is_none());
+        assert_eq!(cleared.folder(), Some(folder.as_path()));
         fs::remove_dir_all(root).unwrap();
     }
 
