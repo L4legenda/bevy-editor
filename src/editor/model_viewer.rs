@@ -72,6 +72,7 @@ struct Viewer {
     field_of_view: Option<f32>,
     orthographic: bool,
     gesture: Option<(navigation::Navigation, Vec2)>,
+    orbit_focus: Option<navigation::OrbitFocus>,
     return_focus: Option<Entity>,
     poses: std::collections::HashMap<usize, ModelCamera>,
     restore: Option<ModelCamera>,
@@ -348,7 +349,8 @@ fn setup(
     );
     commands
         .entity(canvas)
-        .insert((Canvas, AccessibleLabel("3D-вид модели".into())));
+        .insert((Canvas, AccessibleLabel("3D-вид модели".into())))
+        .observe(navigation::focus_orbit);
     commands.spawn((
         ImageNode::new(image.clone()),
         paint::pathtrace::viewport::CanvasImage,
@@ -734,7 +736,10 @@ fn navigate(
     meshes: Query<(&Aabb, &GlobalTransform), With<Mesh3d>>,
     prepared: Query<(), With<Prepared>>,
     mut images: ResMut<Assets<Image>>,
-    mut cameras: Query<(&mut Transform, &mut Projection), (With<ViewCamera>, Without<ModelGrid>)>,
+    mut cameras: Query<
+        (Entity, &mut Transform, &mut Projection),
+        (With<ViewCamera>, Without<ModelGrid>),
+    >,
     editing: Res<editing::State>,
     mut runtime: (
         Res<Time>,
@@ -750,6 +755,7 @@ fn navigate(
         Res<paint::engine::Runtime>,
         MessageWriter<bevy::window::RequestRedraw>,
         Res<super::image_viewer::paint_input::PointerFrame>,
+        Local<Option<(Entity, bool, f32, f32, f32)>>,
     ),
     mut grids: Query<(&mut Transform, &mut Visibility), (With<ModelGrid>, Without<ViewCamera>)>,
 ) {
@@ -761,6 +767,7 @@ fn navigate(
             gizmo.hide(super::navigation_gizmo::Workspace::Model(model));
         }
         viewer.gesture = None;
+        viewer.orbit_focus = None;
         return;
     }
     if editor.viewing_model.is_none()
@@ -770,13 +777,16 @@ fn navigate(
         || editor.hdri_library_open
     {
         viewer.gesture = None;
+        viewer.orbit_focus = None;
         return;
     }
     let Ok((computed, transform)) = canvas.single() else {
+        viewer.orbit_focus = None;
         return;
     };
     let size = computed.size() * computed.inverse_scale_factor();
     if size.min_element() < 1.0 {
+        viewer.orbit_focus = None;
         return;
     }
     let center = transform.affine().translation * computed.inverse_scale_factor();
@@ -904,6 +914,16 @@ fn navigate(
         rect,
         blocked || gizmo_blocked || pen_blocked,
         pen,
+        in_paint.then(|| runtime.7.navigation_settings()),
+    );
+    navigation::finish_orbit_focus(
+        &mut viewer,
+        editor.viewing_model,
+        &editing,
+        &runtime.7,
+        in_paint && !blocked && !gizmo_blocked && !runtime.10.stroke_active()
+            && !mouse.any_pressed([MouseButton::Left, MouseButton::Middle, MouseButton::Right]),
+        &mut runtime.11,
     );
     if !blocked
         && !gizmo_blocked
@@ -915,17 +935,34 @@ fn navigate(
     {
         runtime.11.write(bevy::window::RequestRedraw);
     }
+    let pose = view_pose(&viewer);
+    let grid_translation = crate::editor::viewport_grid::recenter(&pose);
+    let grid_visibility = if viewer.orthographic {
+        Visibility::Hidden
+    } else {
+        Visibility::Visible
+    };
     for (mut grid, mut visibility) in &mut grids {
-        grid.translation = crate::editor::viewport_grid::recenter(&view_pose(&viewer));
-        *visibility = if viewer.orthographic {
-            Visibility::Hidden
-        } else {
-            Visibility::Visible
-        };
+        if grid.translation != grid_translation {
+            grid.translation = grid_translation;
+        }
+        visibility.set_if_neq(grid_visibility);
     }
-    if let Ok((mut transform, mut projection)) = cameras.single_mut() {
-        *transform = view_pose(&viewer);
-        *projection = model_projection(viewer.camera(), viewer.radius);
+    if let Ok((entity, mut transform, mut projection)) = cameras.single_mut() {
+        transform.set_if_neq(pose);
+        let camera = viewer.camera();
+        let key = (
+            entity,
+            camera.orthographic,
+            camera.distance,
+            camera.fov,
+            viewer.radius,
+        );
+        // Bevy updates the aspect ratio and projection area when the target resizes.
+        if *runtime.13 != Some(key) {
+            *projection = model_projection(camera, viewer.radius);
+            *runtime.13 = Some(key);
+        }
     }
 }
 
@@ -991,14 +1028,17 @@ fn refresh(
     editing: Res<editing::State>,
 ) {
     if let Ok(mut overlay) = nodes.get_mut(ui.overlay) {
-        overlay.height = Val::Auto;
-        overlay.top = px(0);
-        overlay.bottom = px(0);
-        overlay.display = if editor.viewing_model.is_some() && editor.pending.is_none() {
+        let display = if editor.viewing_model.is_some() && editor.pending.is_none() {
             Display::Flex
         } else {
             Display::None
         };
+        if (overlay.height, overlay.top, overlay.bottom, overlay.display)
+            != (Val::Auto, px(0), px(0), display)
+        {
+            (overlay.height, overlay.top, overlay.bottom, overlay.display) =
+                (Val::Auto, px(0), px(0), display);
+        }
     }
     if editor
         .viewing_model
@@ -1006,7 +1046,7 @@ fn refresh(
         .is_some()
     {
         if let Ok(mut status) = labels.get_mut(ui.status) {
-            status.0 = viewer
+            let text = viewer
                 .error
                 .as_ref()
                 .map(|error| format!("Не удалось показать модель: {error}"))
@@ -1025,14 +1065,17 @@ fn refresh(
                         "Загрузка модели…".into()
                     }
                 });
+            if status.0 != text {
+                status.0 = text;
+            }
         }
         if let Ok(mut hint) = labels.get_mut(ui.hint) {
-            hint.0 = if matches!(viewer.source, Some(ModelSource::Fbx(_))) {
+            let text: String = if matches!(viewer.source, Some(ModelSource::Fbx(_))) {
                 "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · СКМ — панорама".into()
             } else if editing.mode(editor.viewing_model)
                 == crate::editor::model_document::Mode::Paint
             {
-                "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · [ / ] — размер кисти · Ctrl+ПКМ — размер и жёсткость".into()
+                "ПКМ + WASD — полёт · Alt+ЛКМ — орбита · Alt+двойной ЛКМ — центр орбиты · Alt+ПКМ — зум · [ / ] — размер кисти · Ctrl+ПКМ — размер и жёсткость".into()
             } else if editing.mode(editor.viewing_model) == crate::editor::model_document::Mode::Uv
             {
                 "Alt+ЛКМ — орбита · Ctrl+S — сохранить".into()
@@ -1063,6 +1106,9 @@ fn refresh(
             } else {
                 "ЛКМ — выбор / рамка · Shift — добавить · Ctrl — исключить · ПКМ + WASD / Q E — полёт · Alt+ЛКМ — орбита · G/R/S — трансформации".into()
             };
+            if hint.0 != text {
+                hint.0 = text;
+            }
         }
     }
 }

@@ -37,7 +37,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 40);
+    assert_eq!(tools.tools.len(), 41);
     for name in [
         "get_editor_state",
         "get_paint_state",
@@ -66,6 +66,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
         "save_scene",
         "undo",
         "capture_viewport",
+        "screenshot_app",
     ] {
         assert!(tools.tools.iter().any(|tool| tool.name == name));
     }
@@ -537,13 +538,14 @@ impl StdioClient {
         }
     }
 
+    #[track_caller]
     fn tool(&mut self, app: &mut App, name: &str, arguments: Value) -> Value {
         let reply = self.request(
             app,
             "tools/call",
-            json!({"name": name, "arguments": arguments}),
+            json!({"name": name, "arguments": &arguments}),
         );
-        assert_ne!(reply["isError"], true, "{name}: {reply}");
+        assert_ne!(reply["isError"], true, "{name} {arguments}: {reply}");
         reply
     }
 
@@ -886,38 +888,27 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         }),
     );
     assert_eq!(view["structuredContent"]["layout"], "three");
-    let started = client.tool(
+    let baked = client.tool(
         &mut app,
         "bake_maps",
         json!({
-            "target": {"model_id": 0, "set": 0}, "quality": "draft", "maps": ["part_random"],
+            "target": {"model_id": 0, "set": 0}, "quality": "draft", "maps": ["part_random"], "wait": true,
             "rays": {"occlusion_samples": 24}, "surface": {"grid": 2},
             "prefer_front_faces": false, "average_normals": false,
         }),
     );
-    assert_eq!(started["structuredContent"]["status"], "running");
-    let now = Instant::now();
-    loop {
-        let report = client.tool(&mut app, "get_bake_state", json!({"model_id": 0, "set": 0}));
-        let report = &report["structuredContent"];
-        if report["status"] == "ready" {
-            assert_eq!(report["settings"]["rays"]["occlusion_samples"], 24);
-            assert_eq!(report["settings"]["surface"]["grid"], 2);
-            assert_eq!(report["settings"]["prefer_front_faces"], false);
-            assert_eq!(report["settings"]["average_normals"], false);
-            assert!(
-                report["maps"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("part_random"))
-            );
-            break;
-        }
-        assert_eq!(report["status"], "running", "{report}");
-        assert!(now.elapsed() < REQUEST_TIMEOUT, "The bake did not complete");
-    }
+    let baked = &baked["structuredContent"];
+    assert_eq!(baked["status"], "ready");
+    assert_eq!(baked["settings"]["rays"]["occlusion_samples"], 24);
+    assert_eq!(baked["settings"]["surface"]["grid"], 2);
+    assert_eq!(baked["settings"]["prefer_front_faces"], false);
+    assert_eq!(baked["settings"]["average_normals"], false);
+    assert!(baked["maps"].as_array().unwrap().contains(&json!("part_random")));
 
     wait_for_paint(&mut client, &mut app);
+    let cached = client.tool(&mut app, "bake_maps", json!({"target": {"model_id": 0}, "wait": true}));
+    assert_eq!(cached["structuredContent"]["status"], "ready");
+    assert_eq!(cached["structuredContent"]["maps"], baked["maps"]);
     let export_baked = |client: &mut StdioClient, app: &mut App| {
         let reply = client.tool(app, "export_textures", json!({"model_id":0,"folder":".",
             "template":"baked","format":"png","bit_depth":8,"padding":"none","size":64
@@ -1133,10 +1124,21 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
         assert_eq!(reply["structuredContent"]["surface_selection"]["status"], "running");
         wait_for_paint(client, app)
     };
-    let selection = select(&mut client, &mut app, json!({"kind":"point","position":[0,0,0]}), "replace");
+    let selection = client.tool(&mut app, "select_surface", json!({
+        "workspace": {"model_id": 0, "set": 0}, "layer": layer,
+        "source": {"kind": "point", "position": [0, 0, 0]}, "mode": "replace", "wait": true,
+    }))["structuredContent"].clone();
+    assert_eq!(selection["paint_busy"], false);
     assert_eq!(selection["surface_selection"]["status"], "complete", "{selection}");
     assert_eq!(selection["surface_selection"]["triangles_selected"], 2);
     assert_eq!(selection["undo_steps"].as_u64().unwrap(), reopened["undo_steps"].as_u64().unwrap() + 1);
+    let waited_error = client.request(&mut app, "tools/call", json!({
+        "name": "select_surface", "arguments": {
+            "workspace": {"model_id": 0, "set": 0}, "layer": layer, "wait": true,
+            "source": {"kind": "parts", "indices": [1]}, "mode": "subtract",
+        },
+    }));
+    assert_eq!(waited_error["isError"], true, "{waited_error}");
     let invalid = select(&mut client, &mut app, json!({"kind":"parts","indices":[1]}), "subtract");
     assert_eq!(invalid["surface_selection"]["status"], "failed");
     assert_eq!(invalid["undo_steps"], selection["undo_steps"]);
@@ -1560,10 +1562,25 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     let unchanged = wait_for_paint(&mut client, &mut app);
     assert_eq!(unchanged["resolution"], 128);
     assert_eq!(unchanged["texture_sets"][0]["highlighted"], false);
-    let resizing = client.tool(&mut app, "edit_paint", json!({
-        "model_id":model,"set":0,"edit":{"operation":"update_texture_set","index":0,"resolution":512,"highlighted":true}
+    let invalid_resolution = client.request(&mut app, "tools/call", json!({
+        "name": "bake_maps", "arguments": {
+            "target": {"model_id": model, "set": 0}, "resolution": 500, "quality": "draft", "wait": true,
+        }
     }));
-    assert_eq!(resizing["structuredContent"]["paint_busy"], true);
+    assert_eq!(invalid_resolution["isError"], true);
+    assert_eq!(wait_for_paint(&mut client, &mut app)["resolution"], 128);
+    let baked_at_size = client.tool(&mut app, "bake_maps", json!({
+        "target": {"model_id": model, "set": 0}, "resolution": 512, "quality": "draft",
+        "maps": ["part_random"], "wait": true,
+    }));
+    let report = &baked_at_size["structuredContent"];
+    assert_eq!(report["status"], "ready");
+    assert_eq!(report["resolution"], 512);
+    assert!(report["report"]["uv_texels"].as_u64().unwrap() > 128 * 128);
+    assert!(report["maps"].as_array().unwrap().contains(&json!("part_random")));
+    client.tool(&mut app, "edit_paint", json!({
+        "model_id":model,"set":0,"edit":{"operation":"update_texture_set","index":0,"highlighted":true}
+    }));
     let resized = wait_for_paint(&mut client, &mut app);
     assert_eq!(resized["resolution"], 512);
     assert_eq!(resized["texture_sets"][0]["highlighted"], true);
@@ -1912,13 +1929,13 @@ fn capture_uses_the_camera_target_including_its_dpi_scale() {
 }
 
 #[test]
-#[ignore = "requires GPU; captures the real editor viewport through MCP at 200% DPI"]
+#[ignore = "requires GPU; captures the editor viewport and full interface through MCP at 200% DPI"]
 fn gpu_mcp_capture_renders_the_viewport_at_high_dpi() {
     use crate::editor::{
         selection_outline::render_tests::frame, tests::lighting_ui_render::fixture,
     };
 
-    let (mut app, window, _) = fixture();
+    let (mut app, window, app_target) = fixture();
     app.world_mut()
         .get_mut::<Window>(window)
         .unwrap()
@@ -2008,6 +2025,38 @@ fn gpu_mcp_capture_renders_the_viewport_at_high_dpi() {
         changed > (captures[0].width() * captures[0].height() / 50) as usize,
         "Capture must follow the changed live camera view"
     );
+    app.world_mut().spawn((
+        Node { position_type: PositionType::Absolute, left: px(0), top: px(0),
+            width: px(24), height: px(24), ..default() },
+        BackgroundColor(Color::srgb(1., 0., 1.)),
+        GlobalZIndex(2000),
+    ));
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    let mut first = enqueue(&bridge, Command::ScreenshotApp, Instant::now() + REQUEST_TIMEOUT);
+    let mut second = enqueue(&bridge, Command::ScreenshotApp, Instant::now() + REQUEST_TIMEOUT);
+    let read = |app: &mut App, pending: &mut oneshot::Receiver<Reply>| {
+        let payload = (0..240)
+            .find_map(|_| {
+                frame(app);
+                pending.try_recv().ok()
+            })
+            .expect("App screenshot did not complete")
+            .expect("App screenshot failed");
+        let Payload::Image { png, width, height } = payload else {
+            panic!("App screenshot must return an image");
+        };
+        let target = app.world().resource::<Assets<Image>>().get(&app_target).unwrap();
+        assert_eq!(UVec2::new(width, height), target.size());
+        png
+    };
+    let png = read(&mut app, &mut first);
+    assert_eq!(png, read(&mut app, &mut second));
+    let bytes = base64::engine::general_purpose::STANDARD.decode(png).unwrap();
+    let image = image::load_from_memory(&bytes).unwrap().into_rgb8();
+    let [r, g, b] = image.get_pixel(8, 8).0;
+    assert!(r > 230 && g < 20 && b > 230, "PNG must include the UI overlay");
 }
 
 #[test]

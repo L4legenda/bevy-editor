@@ -751,6 +751,7 @@ fn navigation_gizmo_model_pan_and_zoom_keep_orthographic_but_orbit_restores_pers
         rect,
         false,
         None,
+        Default::default(),
     );
     assert!(viewer.orthographic);
     mouse.release(MouseButton::Middle);
@@ -769,23 +770,54 @@ fn navigation_gizmo_model_pan_and_zoom_keep_orthographic_but_orbit_restores_pers
         rect,
         false,
         None,
+        Default::default(),
     );
     assert!(viewer.orthographic);
     mouse.press(MouseButton::Left);
     keys.press(KeyCode::AltLeft);
+    let profile = tempfile::tempdir().unwrap();
+    let path = profile.path().join("paint-navigation.json");
+    let mut preferences = navigation::Preferences::open(Some(path.clone()));
+    let settings = navigation::Settings {
+        orbit_speed: 2.,
+        zoom_speed: 3.,
+        invert_zoom: true,
+    };
+    preferences.save(settings).unwrap();
+    let loaded = navigation::Preferences::open(Some(path)).settings;
+    assert_eq!(loaded, settings);
+    let (yaw, pitch, distance) = (viewer.yaw, viewer.pitch, viewer.distance);
     navigation::drive(
         &mut viewer,
         &window,
         &mouse,
         &keys,
-        &scroll,
+        &AccumulatedMouseScroll {
+            unit: bevy::input::mouse::MouseScrollUnit::Line,
+            delta: Vec2::Y,
+        },
         0.016,
         Vec2::new(12.0, 2.0),
         rect,
         false,
         None,
+        Some(loaded),
     );
     assert!(!viewer.orthographic);
+    assert!((viewer.yaw - yaw + 0.144).abs() < 1e-6);
+    assert!((viewer.pitch - pitch - 0.024).abs() < 1e-6);
+    assert!((viewer.distance / distance - 0.39_f32.exp()).abs() < 1e-6);
+
+    mouse.release(MouseButton::Left);
+    mouse.press(MouseButton::Right);
+    let pose = viewer.camera();
+    navigation::drive(
+        &mut viewer, &window, &mouse, &keys, &scroll, 0.016,
+        Vec2::new(20., 10.), rect, false, None, Some(loaded),
+    );
+    assert_eq!(viewer.center.to_array(), pose.center);
+    assert_eq!(viewer.yaw, pose.yaw);
+    assert!((viewer.distance / pose.distance - 0.3_f32.exp()).abs() < 1e-6);
 }
 
 #[test]
@@ -806,7 +838,7 @@ fn pen_pan_stays_in_the_view_where_it_started() {
     let original = viewer.center;
     let drive = |viewer: &mut Viewer, pen, blocked| {
         navigation::drive(viewer, &window, &mouse, &keys, &scroll, 0.016,
-            Vec2::splat(100.0), rect, blocked, pen);
+            Vec2::splat(100.0), rect, blocked, pen, Default::default());
     };
     drive(&mut viewer, Some(PenPan {
         start: Some(Vec2::splat(650.0)), point: Vec2::splat(550.0),

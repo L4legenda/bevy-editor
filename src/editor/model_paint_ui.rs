@@ -314,7 +314,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     shelf_types: Entity,
     shelf_type_menu: Entity,
     shelf_type_label: Entity,
-    shelf_stamp: Option<((usize, u64, u64, usize, usize), Category, u64, u64)>,
+    shelf_stamp: Option<((usize, u64, u64, usize, usize), Category, u64, u64, u32)>,
     user_swatches: HashMap<usize, Handle<Image>>,
     graph_swatches: HashMap<usize, Handle<Image>>,
     requested_swatches: std::collections::HashSet<ShelfMaterial>,
@@ -897,13 +897,15 @@ fn alpha_card(
     font: &Handle<Font>,
     tip: &tips::Tip,
     action: PaintAction,
+    size: f32,
 ) -> Entity {
+    let preview = (size - 8.).max(ShelfSize::MIN as f32);
     let card = button(commands, parent, font, "", action);
     commands.entity(card).insert((
         AccessibleLabel(tip.name.clone()),
         Node {
-            width: px(106),
-            height: px(138),
+            width: px(preview + 30.),
+            height: px(preview + 62.),
             flex_shrink: 0.,
             padding: UiRect::all(px(5)),
             border: UiRect::all(px(1)),
@@ -915,8 +917,8 @@ fn alpha_card(
     commands.spawn((
         ImageNode::new(tip.image.clone()),
         Node {
-            width: px(76),
-            height: px(76),
+            width: px(preview),
+            height: px(preview),
             ..default()
         },
         Pickable::IGNORE,
@@ -1013,12 +1015,12 @@ fn material_group(
 
 fn material_card(
     commands: &mut Commands, parent: Entity, font: &Handle<Font>, name: &str,
-    swatch: Handle<Image>, action: PaintAction,
+    swatch: Handle<Image>, action: PaintAction, size: f32,
 ) -> Entity {
     let card = button(commands, parent, font, "", action);
     commands.entity(card).insert(Node {
-        width: px(112),
-        height: px(140),
+        width: px(size + 28.),
+        height: px(size + 56.),
         flex_shrink: 0.,
         padding: UiRect::all(px(5)),
         border: UiRect::all(px(1)),
@@ -1029,8 +1031,8 @@ fn material_card(
     commands.spawn((
         ImageNode::new(swatch),
         Node {
-            width: px(84),
-            height: px(84),
+            width: px(size),
+            height: px(size),
             ..default()
         },
         Pickable::IGNORE,
@@ -2010,6 +2012,14 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         node.width = px(22);
         node.height = px(22);
     });
+    let card_sizes = node(&mut commands, heading, row(2.));
+    for (label, name, increase) in [
+        ("−", "Уменьшить карточки библиотеки", false),
+        ("+", "Увеличить карточки библиотеки", true),
+    ] {
+        let control = button(&mut commands, card_sizes, font, label, PaintAction::ResizeShelf(increase));
+        commands.entity(control).insert(AccessibleLabel(name.into()));
+    }
     let shelf_types = node(&mut commands, heading, Node {
         height: px(24),
         min_width: px(0),
@@ -2546,6 +2556,14 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     let shelf_docked = sidebar.shelf_in_sidebar();
+    let shelf_size = paint.shelf_size.pixels as f32;
+    let shelf_height = SHELF_HEIGHT + (shelf_size - ShelfSize::DEFAULT as f32).max(0.);
+    if let Ok(mut home) = nodes.get_mut(ui.shelf_layout.home) {
+        let height = px(shelf_height);
+        if home.height != height {
+            home.height = height;
+        }
+    }
     if ui.shelf_layout.docked != shelf_docked {
         ui.shelf_stamp = None;
     }
@@ -2585,7 +2603,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             UiRect {
                 left: px(44),
                 top: px(TOOLBAR_BOTTOM + if show_path_options { PATH_TOOLBAR_HEIGHT } else { 0. }),
-                bottom: px(if shelf_docked { 0. } else { SHELF_HEIGHT }),
+                bottom: px(if shelf_docked { 0. } else { shelf_height }),
                 right: px(0),
             }
         } else {
@@ -2789,6 +2807,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             session.set_value(edit.parameter, edit.value);
         }
     }
+    let navigation = paint.navigation.settings;
     if let Some((model, entity)) = ui.preview_field
         && (model != index || focus.get() != Some(entity))
     {
@@ -2796,7 +2815,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         if model == index && !keys.just_pressed(KeyCode::Escape)
             && let Ok((_, field, input, _)) = fields.p4().get_mut(entity)
             && let Some(value) = field.parse(&input)
-            && value != field.display_value(doc)
+            && value != field.display_value(doc, navigation)
         {
             preview_edits.write(Action::ModelView(ModelViewAction::Paint(
                 PaintAction::PreviewMaterial(PreviewEdit::Value { model, parameter: field.0, value }),
@@ -2809,7 +2828,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             let valid = field.parse(&input).is_some();
             border.set_if_neq(BorderColor::all(if valid { FOCUS } else { ERROR }));
         } else {
-            let value = format!("{:.2}", field.display_value(doc));
+            let value = format!("{:.2}", field.display_value(doc, navigation));
             if input.value().to_string() != value {
                 input.editor_mut().set_text(&value);
             }
@@ -2843,6 +2862,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             session.panel = panel.0;
         }
         let available = match button.0 {
+            PaintAction::PreviewMaterial(PreviewEdit::InvertScrollZoom | PreviewEdit::ResetNavigation) => true,
             PaintAction::PreviewMaterial(_) => doc.can_store_paint_preview(),
             PaintAction::Undo | PaintAction::Redo if session.editing_shader().is_none() => {
                 !session.busy && session.resize_request.is_none() && !session.smart_loading
@@ -2868,6 +2888,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             PaintAction::ShelfTypeMenu => shelf_filter.menu,
             PaintAction::ToggleRecovery => recovery.enabled,
             PaintAction::PreviewMaterial(PreviewEdit::AutomaticHeight) => doc.paint_preview.height_strength.is_none(),
+            PaintAction::PreviewMaterial(PreviewEdit::InvertScrollZoom) => navigation.invert_zoom,
             PaintAction::PreviewMaterial(PreviewEdit::BakedNormal) => doc.paint_preview.use_baked_normal,
             PaintAction::PreviewMaterial(PreviewEdit::UvWire) => doc.paint_uv.show_wire,
             PaintAction::PreviewMaterial(PreviewEdit::UvSeams2d) => doc.paint_uv.show_seams_2d,
@@ -4104,6 +4125,13 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     button(&mut commands, stack, font, "UV-швы на 3D-модели",
                         PaintAction::PreviewMaterial(PreviewEdit::UvSeams3d));
                 }
+                text(&mut commands, stack, font, "Навигация мышью", 12., TEXT);
+                preview_number(&mut commands, stack, font, PreviewParameter::OrbitSpeed);
+                preview_number(&mut commands, stack, font, PreviewParameter::ZoomSpeed);
+                button(&mut commands, stack, font, "Инвертировать зум колесом",
+                    PaintAction::PreviewMaterial(PreviewEdit::InvertScrollZoom));
+                button(&mut commands, stack, font, "Сбросить навигацию мышью",
+                    PaintAction::PreviewMaterial(PreviewEdit::ResetNavigation));
                 space_mouse::controls(&mut commands, stack, font, &space_mouse);
                 let title = if session.post_panel { "− Обработка изображения" } else { "+ Обработка изображения" };
                 button(&mut commands, stack, font, title, PaintAction::PostPanel);
@@ -4190,9 +4218,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let shelf_stamp = (shelf_content_stamp, session.category, shelf_filter.revision,
         paint.library.revision.wrapping_add(paint.online.revision)
             .wrapping_add(paint.community.revision).wrapping_add(paint.downloaded.revision)
-            .wrapping_add(paint.graph_shelf.revision));
+            .wrapping_add(paint.graph_shelf.revision), paint.shelf_size.pixels);
     if ui.shelf_stamp != Some(shelf_stamp) {
-        if ui.shelf_stamp.is_none_or(|(previous, category, revision, _)| {
+        if ui.shelf_stamp.is_none_or(|(previous, category, revision, _, _)| {
             previous.0 != index || category != session.category || revision != shelf_filter.revision
         }) {
             commands.entity(ui.shelf).insert(ScrollPosition::default());
@@ -4261,12 +4289,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             let saved_material = matches!(action, PaintAction::ApplyShelfMaterial(_));
             let parent = if saved_material {
                 node(&mut commands, shelf, Node {
-                    width: px(112), height: px(140), flex_shrink: 0., ..default()
+                    width: px(shelf_size + 28.), height: px(shelf_size + 56.), flex_shrink: 0., ..default()
                 })
             } else {
                 shelf
             };
-            let card = material_card(&mut commands, parent, font, &entry.name, swatch, action);
+            let card = material_card(&mut commands, parent, font, &entry.name, swatch, action, shelf_size);
             text(&mut commands, card, font, "Мой пресет", 10., MUTED);
             commands.entity(card).insert(AccessibleLabel(format!("{label} · {}", entry.name)));
             if saved_material {
@@ -4352,7 +4380,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     let preview = ui.online_previews.image(online.provider, entry).unwrap_or_else(|| placeholder.clone());
                     if let Some(package) = &entry.community {
                         let card = material_card(&mut commands, results, font, &entry.name, preview,
-                            PaintAction::InstallCommunity(index));
+                            PaintAction::InstallCommunity(index), shelf_size);
                         let installed = paint.community.installed(&entry.id);
                         let status = if installed { "Установлено" } else { package.kind.label() };
                         text(&mut commands, card, font, status, 10., MUTED);
@@ -4360,10 +4388,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         commands.entity(card).insert(AccessibleLabel(format!("{label} · {}", entry.name)));
                     } else {
                         let tile = node(&mut commands, results, Node {
-                            width: px(112), flex_shrink: 0., ..column(3.)
+                            width: px(shelf_size + 28.), flex_shrink: 0., ..column(3.)
                         });
                         let card = material_card(&mut commands, tile, font, &entry.name, preview,
-                            PaintAction::OnlineMaterial(online.provider, index));
+                            PaintAction::OnlineMaterial(online.provider, index), shelf_size);
                         commands.entity(card).insert(AccessibleLabel(format!("Добавить сетевой материал · {}", entry.name)));
                         button(&mut commands, tile, font, "Скачать",
                             PaintAction::DownloadOnlineMaterial(online.provider, index));
@@ -4423,10 +4451,10 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 for (index, record) in records {
                     let preview = ui.online_previews.local_image(record).unwrap_or_else(|| placeholder.clone());
                     let tile = node(&mut commands, results, Node {
-                        width: px(112), flex_shrink: 0., ..column(3.)
+                        width: px(shelf_size + 28.), flex_shrink: 0., ..column(3.)
                     });
                     let card = material_card(&mut commands, tile, font, &record.asset.name, preview,
-                        PaintAction::ApplyDownloaded(index));
+                        PaintAction::ApplyDownloaded(index), shelf_size);
                     let label = format!("{} · {}K", record.provider.name(), record.resolution);
                     text(&mut commands, card, font, &label, 10., MUTED);
                     let menu_action = PaintAction::DownloadedMenu(Some(index));
@@ -4448,15 +4476,15 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     let preset = &MATERIALS[i];
                     let parent = material_group(&mut commands, ui.shelf, font, shelf_filter, &mut group, kind);
                     let tile = node(&mut commands, parent, Node {
-                        width: px(112),
-                        height: px(140),
+                        width: px(shelf_size + 28.),
+                        height: px(shelf_size + 56.),
                         flex_shrink: 0.,
                         position_type: PositionType::Relative,
                         ..default()
                     });
                     let card = material_card(
                         &mut commands, tile, font, preset.name,
-                        ui.swatches[i].clone(), PaintAction::Preset(i),
+                        ui.swatches[i].clone(), PaintAction::Preset(i), shelf_size,
                     );
                     commands.entity(card).insert(AccessibleLabel(format!(
                         "Использовать материал для кисти · {}", preset.name
@@ -4498,11 +4526,11 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     let preset = &SMART_MATERIALS[i];
                     let parent = material_group(&mut commands, ui.shelf, font, shelf_filter, &mut group, kind);
                     let tile = node(&mut commands, parent, Node {
-                        width: px(112), height: px(140), flex_shrink: 0., ..default()
+                        width: px(shelf_size + 28.), height: px(shelf_size + 56.), flex_shrink: 0., ..default()
                     });
                     let card = material_card(
                         &mut commands, tile, font, preset.name,
-                        ui.smart_swatches[i].clone(), PaintAction::AddSmartMaterial(i),
+                        ui.smart_swatches[i].clone(), PaintAction::AddSmartMaterial(i), shelf_size,
                     );
                     commands.entity(card).insert(AccessibleLabel(format!(
                         "Добавить умный материал · {}", preset.name
@@ -4537,7 +4565,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     shown += 1;
                     let card = material_card(
                         &mut commands, ui.shelf, font, kind.label(),
-                        ui.generator_swatches[i].clone(), PaintAction::ApplyGenerator(kind, None),
+                        ui.generator_swatches[i].clone(), PaintAction::ApplyGenerator(kind, None), shelf_size,
                     );
                     let generator = Generator::new(kind);
                     let missing = if kind == GeneratorKind::CustomMap {
@@ -4576,6 +4604,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         font,
                         tip,
                         PaintAction::BrushTip(Some(i)),
+                        shelf_size,
                     );
                 }
             }
@@ -4607,8 +4636,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         continue;
                     }
                     shown += 1;
+                    let preview = (shelf_size - 8.).max(ShelfSize::MIN as f32);
                     let tile = node(&mut commands, shelf, Node {
-                        width: px(106), height: px(138), flex_shrink: 0., ..default()
+                        width: px(preview + 30.),
+                        height: px(preview + 62.),
+                        flex_shrink: 0.,
+                        ..default()
                     });
                     let card = alpha_card(
                         &mut commands,
@@ -4616,6 +4649,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         font,
                         grain,
                         PaintAction::Grain(Some(i)),
+                        shelf_size,
                     );
                     let add = icon(
                         &mut commands, tile, icons::Glyph::Plus,
@@ -4663,9 +4697,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                             .or_insert_with(|| images.add(shelf_image(bitmap.pixels().clone()))).clone()
                     });
                     let tile = node(&mut commands, shelf, Node {
-                        width: px(112), height: px(140), flex_shrink: 0., ..default()
+                        width: px(shelf_size + 28.), height: px(shelf_size + 56.), flex_shrink: 0., ..default()
                     });
-                    let card = material_card(&mut commands, tile, font, &entry.name, swatch, PaintAction::ApplySavedGraph(index));
+                    let card = material_card(&mut commands, tile, font, &entry.name, swatch, PaintAction::ApplySavedGraph(index), shelf_size);
                     let action = PaintAction::SavedGraphMenu(Some(index));
                     let menu = button(&mut commands, tile, font, "⋯", action);
                     commands.entity(menu).insert(AccessibleLabel(format!("Действия · {}", entry.name)));
@@ -4684,7 +4718,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 for (i, record) in paint.community.records.iter().enumerate() {
                     if record.kind == online::community::Kind::Graph && shelf_filter.matches(&record.name) {
                         shown += 1;
-                        material_card(&mut commands, ui.shelf, font, &record.name, placeholder.clone(), PaintAction::CommunityGraph(i));
+                        material_card(&mut commands, ui.shelf, font, &record.name, placeholder.clone(), PaintAction::CommunityGraph(i), shelf_size);
                     }
                 }
                 for (i, recipe) in material_graph::PRESETS.iter().enumerate() {
@@ -4859,8 +4893,8 @@ impl PreviewValue {
             .filter(|value| (self.0.min()..=self.0.max()).contains(value))
     }
 
-    fn display_value(&self, doc: &crate::editor::model_document::Document) -> f32 {
-        (self.0.value(doc) * 100.).round() / 100.
+    fn display_value(&self, doc: &crate::editor::model_document::Document, navigation: navigation::Settings) -> f32 {
+        (self.0.value(doc, navigation) * 100.).round() / 100.
     }
 }
 

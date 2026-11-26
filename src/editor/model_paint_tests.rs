@@ -1782,26 +1782,35 @@ fn gpu_mesh_map_graph_updates_after_a_real_bake() {
     {
         use bevy::ecs::system::RunSystemOnce;
         use serde_json::json;
-        let start = |app: &mut App, front| {
+        let start = |app: &mut App, front, reply: Option<std::sync::mpsc::Sender<_>>| {
             let args: mcp_state::BakeArgs = serde_json::from_value(json!({
                 "target": {"model_id": 0, "set": 0}, "quality": "draft",
                 "maps": ["part_random"], "front_percent": front,
             })).unwrap();
             app.world_mut().run_system_once(move |mut input: mcp_state::McpBake,
                 mut editor: ResMut<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
-                mcp_state::start_bake(&mut input, &mut editor, &mut editing, &mut paint, args.clone())
+                let result = mcp_state::start_bake(&mut input, &mut editor, &mut editing, &mut paint, args.clone());
+                if let Some(reply) = reply.clone() {
+                    input.respond(true, result.clone(), Box::new(move |result| {
+                        reply.send(result).unwrap();
+                    }));
+                }
+                result.map(|(_, report)| report)
             }).unwrap()
         };
-        assert!(start(&mut app, 0).is_err());
-        let started = start(&mut app, 6).unwrap();
+        assert!(start(&mut app, 0, None).is_err());
+        let (reply, result) = std::sync::mpsc::channel();
+        let started = start(&mut app, 6, Some(reply)).unwrap();
         assert_eq!(started["status"], "running");
+        assert!(matches!(result.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
         let target = serde_json::from_value(json!({"model_id": 0, "set": 0})).unwrap();
         let cancelled = app.world_mut().run_system_once(move |mut input: mcp_state::McpBake,
             mut editor: ResMut<Editor>, mut editing: ResMut<editing::State>, paint: Res<PaintState>| {
             mcp_state::cancel_bake(&mut input, &mut editor, &mut editing, &paint, target)
         }).unwrap().unwrap();
         assert_eq!(cancelled["status"], "cancelled");
-        let started = start(&mut app, 7).unwrap();
+        assert_eq!(result.try_recv().unwrap().unwrap_err(), "Bake was cancelled before maps were published");
+        let started = start(&mut app, 7, None).unwrap();
         assert_eq!(started["status"], "running");
         assert_eq!(started["resolution"], 512);
     }
@@ -6842,6 +6851,27 @@ fn gpu_paint_uv_wire_overlay_tracks_udim_and_navigation() {
     });
     let zoomed = wire_ready(&mut app, second_top, first_top);
     assert!(zoomed.width() > second.width() * 1.5);
+    let invert = PaintAction::PreviewMaterial(PreviewEdit::InvertScrollZoom);
+    scroll_to_paint_control(&mut app, invert);
+    paint_click(&mut app, window, invert);
+    paint_message(&mut app, PaintAction::PreviewMaterial(PreviewEdit::Value {
+        model: 0, parameter: PreviewParameter::ZoomSpeed, value: 2.,
+    }));
+    move_pointer(&mut app, window, second.center());
+    app.world_mut().write_message(bevy::input::mouse::MouseWheel {
+        window, unit: bevy::input::mouse::MouseScrollUnit::Line, x: 0., y: 2.5,
+        phase: bevy::input::touch::TouchPhase::Moved,
+    });
+    let unzoomed = wire_ready(&mut app, second_top, first_top);
+    assert!((unzoomed.width() - second.width()).abs() < 1.5);
+    paint_message(&mut app, PaintAction::PreviewMaterial(PreviewEdit::ResetNavigation));
+    assert_eq!(app.world().resource::<PaintState>().navigation_settings(), navigation::Settings::default());
+    move_pointer(&mut app, window, second.center());
+    app.world_mut().write_message(bevy::input::mouse::MouseWheel {
+        window, unit: bevy::input::mouse::MouseScrollUnit::Line, x: 0., y: 5.,
+        phase: bevy::input::touch::TouchPhase::Moved,
+    });
+    let zoomed = wire_ready(&mut app, second_top, first_top);
     let press = |app: &mut App, state| {
         app.world_mut().write_message(bevy::input::mouse::MouseButtonInput {
             window, button: MouseButton::Middle, state,
@@ -9892,23 +9922,49 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
     warm(&mut app, 15);
     // Keeping the same UI values must not request text shaping/image extraction.
     let stable_labels = app.world().resource::<ui::PaintUi>().retained_labels();
-    let ticks = stable_labels.map(|e| {
+    let viewer_ui = app.world().resource::<ViewerUi>();
+    let overlay = viewer_ui.overlay;
+    let stable_labels: Vec<_> = stable_labels
+        .into_iter()
+        .chain([viewer_ui.status, viewer_ui.hint])
+        .collect();
+    let camera = app
+        .world_mut()
+        .query_filtered::<Entity, With<ViewCamera>>()
+        .single(app.world())
+        .unwrap();
+    let label_ticks = |app: &App| {
+        stable_labels
+            .iter()
+            .map(|&entity| {
+                app.world()
+                    .entity(entity)
+                    .get_ref::<Text>()
+                    .unwrap()
+                    .last_changed()
+            })
+            .collect::<Vec<_>>()
+    };
+    let layout_tick = |app: &App| {
         app.world()
-            .entity(e)
-            .get_ref::<Text>()
+            .entity(overlay)
+            .get_ref::<Node>()
             .unwrap()
             .last_changed()
-    });
+    };
+    let camera_ticks = |app: &App| {
+        let camera = app.world().entity(camera);
+        (
+            camera.get_ref::<Transform>().unwrap().last_changed(),
+            camera.get_ref::<Projection>().unwrap().last_changed(),
+        )
+    };
+    let ticks = (label_ticks(&app), layout_tick(&app), camera_ticks(&app));
     warm(&mut app, 3);
     assert_eq!(
         ticks,
-        stable_labels.map(|e| app
-            .world()
-            .entity(e)
-            .get_ref::<Text>()
-            .unwrap()
-            .last_changed()),
-        "idle paint labels must not be rewritten every frame"
+        (label_ticks(&app), layout_tick(&app), camera_ticks(&app)),
+        "idle paint workspace must keep viewer layout, labels and camera stable"
     );
     assert_eq!(
         app.world().resource::<editing::State>().mode(Some(0)),
@@ -9935,6 +9991,29 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
     );
     assert!(view.max.x <= uv.min.x + 2. && uv.max.x <= side.min.x + 2.);
     assert!(view.max.y <= shelf.min.y + 2. && uv.max.y <= shelf.min.y + 2.);
+    let point = view.center();
+    let (expected_focus, before_focus) = {
+        let world = app.world();
+        let viewer = world.resource::<Viewer>();
+        let doc = &world.resource::<editing::State>().documents[&0];
+        let (origin, direction) = editing::input::ray(viewer, view, point);
+        let (_, _, depth) = editing::input::Bvh::build(doc).cast(origin, direction, None).unwrap();
+        (origin + direction * depth, viewer.center)
+    };
+    assert!(before_focus.distance(expected_focus) > 0.01);
+    move_pointer(&mut app, window, point);
+    fill_modifier(&mut app, window, KeyCode::AltLeft, Key::Alt, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    assert_eq!(app.world().resource::<Viewer>().center, before_focus);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    let started = std::time::Instant::now();
+    while app.world().resource::<Viewer>().center.distance(expected_focus) > 0.001 {
+        frame(&mut app);
+        assert!(started.elapsed().as_secs() < 5, "double-click did not focus the mesh surface");
+    }
+    fill_modifier(&mut app, window, KeyCode::AltLeft, Key::Alt, ButtonState::Released);
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/model-paint-qa");
     std::fs::create_dir_all(&output).unwrap();
     capture_when(

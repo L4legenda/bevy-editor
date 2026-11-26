@@ -36,7 +36,7 @@ use tokio::sync::oneshot;
 use super::{Bridge, Command, Payload, types::*};
 use crate::project::EditorProject;
 
-const INSTRUCTIONS: &str = "Control the open Bevy Editor project. Read get_editor_state and list_objects first. Object IDs are qualified by scene; obtain new IDs after changing scenes. Mutations appear immediately and use the editor's undo/redo history. Scene edits remain unsaved until save_scene. Finish any active user edit before issuing mutations. capture_viewport returns the rendered 3D view as a PNG image.";
+const INSTRUCTIONS: &str = "Control the open Bevy Editor project. Read get_editor_state and list_objects first. Object IDs are qualified by scene; obtain new IDs after changing scenes. Mutations appear immediately and use the editor's undo/redo history. Scene edits remain unsaved until save_scene. Finish any active user edit before issuing mutations. capture_viewport returns the rendered 3D view as a PNG image. screenshot_app returns the full rendered editor window.";
 
 fn info() -> ServerConfig {
     ServerConfig::new(
@@ -578,6 +578,17 @@ impl EditorServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call(Command::Capture, context).await
+    }
+
+    #[tool(
+        description = "Capture the full rendered Bevy Editor window, including its interface, as PNG",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn screenshot_app(
+        &self,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::ScreenshotApp, context).await
     }
 }
 

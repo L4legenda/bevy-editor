@@ -473,6 +473,9 @@ pub(in crate::editor) struct SurfaceArgs {
     crease_angle: Option<f32>,
     /// Optional token returned by list_paint_surface_parts. Rejects stale part indices.
     topology: Option<SurfaceTopology>,
+    /// Wait for the mask and selection report to be published before replying.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -1088,7 +1091,7 @@ pub(in crate::editor) fn start_bake(
     editing: &mut editing::State,
     paint: &mut PaintState,
     args: BakeArgs,
-) -> Result<Value, String> {
+) -> Result<(usize, Value), String> {
     let index = bake_model_index(editor, args.target)?;
     let doc = editing
         .documents
@@ -1501,13 +1504,48 @@ pub(in crate::editor) fn fill(
     )
 }
 
+pub(in crate::editor) enum SurfaceResponse {
+    Running(Value),
+    Wait(SurfaceWait),
+}
+
+pub(in crate::editor) struct SurfaceWait {
+    model: usize,
+    set: usize,
+    binding: sets::SetKey,
+}
+
+impl SurfaceWait {
+    pub fn poll(&self, editor: &Editor, editing: &editing::State, paint: &PaintState) -> Option<Result<Value, String>> {
+        let workspace = editing.documents.get(&self.model).zip(paint.sessions.get(&self.model))
+            .filter(|(doc, session)| {
+                model_index(editor).ok() == Some(self.model) && doc.mode == Mode::Paint
+                    && session.set == self.set && session.binding == Some(self.binding)
+            });
+        let Some((doc, session)) = workspace else {
+            return Some(Err("The paint workspace changed while waiting for surface selection".into()));
+        };
+        if paint_work_pending(doc, Some(session)) {
+            return None;
+        }
+        let result = match session.surface_selection.as_ref() {
+            Some((binding, Ok(_))) if *binding == self.binding => {
+                Ok(snapshot(self.model, doc, Some(session), &paint.tips))
+            }
+            Some((binding, Err(error))) if *binding == self.binding => Err(error.clone()),
+            _ => Err("The surface selection was interrupted before publishing its result".into()),
+        };
+        Some(result)
+    }
+}
+
 pub(in crate::editor) fn select_surface(
     input: &mut McpPaintInput,
     editor: &Editor,
     editing: &mut editing::State,
     paint: &mut PaintState,
     args: SurfaceArgs,
-) -> Result<Value, String> {
+) -> Result<SurfaceResponse, String> {
     if editor.browser_popup || editor.hdri_library_open {
         return Err("Close the open editor overlay before selecting a surface".into());
     }
@@ -1516,6 +1554,7 @@ pub(in crate::editor) fn select_surface(
         return Err("The crease angle must be between 1 and 179 degrees".into());
     }
     let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace)?;
+    let binding = session.binding.ok_or("Wait for the active texture set to load")?;
     if args.topology.is_some_and(|topology| topology != SurfaceTopology::new(doc, session)) {
         return Err("The surface topology changed; call list_paint_surface_parts again".into());
     }
@@ -1526,9 +1565,13 @@ pub(in crate::editor) fn select_surface(
         stop_at: args.stop_at,
         mode: args.mode,
     })?;
-    let mut result = snapshot(index, doc, Some(session), &paint.tips);
-    result["surface_selection"] = json!({"status": "running"});
-    Ok(result)
+    if args.wait {
+        Ok(SurfaceResponse::Wait(SurfaceWait { model: index, set: args.workspace.set, binding }))
+    } else {
+        let mut result = snapshot(index, doc, Some(session), &paint.tips);
+        result["surface_selection"] = json!({"status": "running"});
+        Ok(SurfaceResponse::Running(result))
+    }
 }
 
 pub(in crate::editor) fn list_surface_parts(
@@ -1934,6 +1977,12 @@ fn apply_to_layer(session: &mut Session, layer: usize, action: PaintAction) -> R
     Ok(())
 }
 
+fn paint_work_pending(doc: &Document, session: Option<&Session>) -> bool {
+    doc.paint_busy || doc.paint_pending || session.is_some_and(|session| {
+        session.busy || session.smart_loading || session.mesh_loading || session.resize_request.is_some()
+    })
+}
+
 fn snapshot(
     index: usize,
     doc: &Document,
@@ -1997,7 +2046,7 @@ fn snapshot(
         },
         "mode": match doc.mode { Mode::Object => "object", Mode::Edit => "edit", Mode::Uv => "uv", Mode::Paint => "paint" },
         "dirty": doc.dirty(),
-        "paint_busy": doc.paint_busy,
+        "paint_busy": paint_work_pending(doc, session),
         "surface_selection": bound.and_then(|session| {
             let (binding, result) = session.surface_selection.as_ref()?;
             (session.binding == Some(*binding)).then(|| match result {

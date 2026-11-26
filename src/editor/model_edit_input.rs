@@ -11,7 +11,7 @@ use bevy::{
 
 #[path = "model_pick.rs"]
 mod picking;
-pub(in crate::editor) use picking::{Bvh, Triangle as PickTriangle};
+pub(in crate::editor) use picking::{Bvh, Triangle as PickTriangle, nearest_on_objects};
 #[path = "model_bevel_input.rs"]
 mod bevel;
 pub(super) use bevel::{BevelControl, LastBevel};

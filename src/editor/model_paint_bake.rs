@@ -726,10 +726,16 @@ struct Job {
     key: Key,
     progress: Arc<Progress>,
     task: Task<Result<(mesh::Maps, bool), String>>,
+    #[cfg(feature = "mcp")]
+    reply: Option<(usize, mcp_state::OutputReply)>,
 }
 impl Drop for Job {
     fn drop(&mut self) {
         self.progress.cancelled.store(true, Ordering::Relaxed);
+        #[cfg(feature = "mcp")]
+        if let Some((_, reply)) = self.reply.take() {
+            reply(Err("Bake was cancelled before maps were published".into()));
+        }
     }
 }
 
@@ -756,6 +762,8 @@ impl BakeResize {
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct State {
     running: Option<Job>,
+    #[cfg(feature = "mcp")]
+    after_resize: Option<mcp_bake::BakeAfterResize>,
     #[cfg(feature = "mcp")]
     outcomes: HashMap<(usize, usize, usize), mcp_bake::Outcome>,
     automatic: HashMap<usize, VecDeque<(usize, usize)>>,
@@ -791,9 +799,16 @@ impl State {
         self.gpu.clone()
     }
 
-    #[cfg(feature = "mcp")]
     pub(super) fn configuration_busy(&self) -> bool {
-        self.running.is_some() || self.picking.is_some() || self.clearing_cache.is_some()
+        self.bake_key().is_some() || self.picking.is_some() || self.clearing_cache.is_some()
+    }
+
+    fn bake_key(&self) -> Option<&Key> {
+        #[cfg(feature = "mcp")]
+        if let Some(pending) = &self.after_resize {
+            return Some(&pending.key);
+        }
+        self.running.as_ref().map(|job| &job.key)
     }
 
     fn start_manual(
@@ -804,7 +819,7 @@ impl State {
         gpu: Option<mesh::RayDevice>,
         preview: bool,
     ) -> Result<&'static str, String> {
-        if self.running.is_some() || self.picking.is_some() || self.clearing_cache.is_some() || doc.paint_busy {
+        if self.configuration_busy() || doc.paint_busy {
             return Err("Дождитесь завершения текущей операции".into());
         }
         let mut key = session.binding.and_then(|binding| Key::new(model, doc, binding, session.texture_size))
@@ -842,6 +857,12 @@ impl State {
     }
 
     fn cancel_running(&mut self) -> Option<usize> {
+        #[cfg(feature = "mcp")]
+        if let Some(pending) = self.after_resize.take() {
+            let key = &pending.key;
+            self.outcomes.insert((key.model, key.object, key.slot), mcp_bake::Outcome::Cancelled);
+            return Some(key.model);
+        }
         let job = self.running.take()?;
         let model = job.key.model;
         #[cfg(feature = "mcp")]
@@ -850,8 +871,8 @@ impl State {
     }
 
     pub(super) fn cancel_mesh_work(&mut self, model: usize) {
-        if self.running.as_ref().is_some_and(|job| job.key.model == model) {
-            self.running = None;
+        if self.bake_key().is_some_and(|key| key.model == model) {
+            self.cancel_running();
         }
         if self.picking.as_ref().is_some_and(|(index, _, _)| *index == model) {
             self.picking = None;
@@ -882,7 +903,11 @@ impl State {
         let task = AsyncComputeTaskPool::get().spawn(async move {
             disk.bake(objects, object, slot, size, &projection, &worker, gpu.as_ref())
         });
-        self.running = Some(Job { key, progress, task });
+        self.running = Some(Job {
+            key, progress, task,
+            #[cfg(feature = "mcp")]
+            reply: None,
+        });
     }
 
     fn automatic_key(
@@ -1214,10 +1239,14 @@ pub(in crate::editor::ui::model_viewer) fn update(
     {
         let job = state.running.take().unwrap();
         #[cfg(feature = "mcp")]
+        let mut job = job;
+        #[cfg(feature = "mcp")]
         state.outcomes.insert((job.key.model, job.key.object, job.key.slot), match &result {
             Ok((_, from_disk)) => mcp_bake::Outcome::Ready { from_disk: *from_disk },
             Err(error) => mcp_bake::Outcome::Failed(error.clone()),
         });
+        #[cfg(feature = "mcp")]
+        let failure = result.as_ref().err().cloned();
         match result {
             Ok((maps, from_disk)) => {
                 let status = if from_disk {
@@ -1263,7 +1292,23 @@ pub(in crate::editor::ui::model_viewer) fn update(
             }
             Err(error) => editor.status = format!("Не удалось запечь карты · {error}"),
         }
+        #[cfg(feature = "mcp")]
+        if let Some((set, reply)) = job.reply.take() {
+            let report = if let Some(error) = failure {
+                Err(error)
+            } else {
+                editing.documents.get(&job.key.model)
+                    .filter(|doc| doc.paint_target(set).is_some_and(|(object, slot)| {
+                        (object.id, slot) == (job.key.object, job.key.slot)
+                    }) && state.maps(job.key.model, doc, (job.key.object, job.key.slot), job.key.size).is_some())
+                    .ok_or_else(|| "The requested texture set changed during the bake".to_string())
+                    .and_then(|doc| mcp_bake::status(&state, job.key.model, doc, set))
+            };
+            reply(report);
+        }
     }
+    #[cfg(feature = "mcp")]
+    state.resume_after_resize(&mut editor, &mut editing, &mut paint, device.as_deref(), queue.as_deref());
     let active = editor
         .viewing_model
         .filter(|_| editor.pending.is_none() && editor.viewing_image.is_none())
@@ -1286,7 +1331,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     let settings = &editing.documents[&index].bake_settings;
     if session.bake_projection.saved() != *settings {
         session.bake_projection.restore(settings);
-        if state.running.as_ref().is_some_and(|job| job.key.model == index) {
+        if state.bake_key().is_some_and(|key| key.model == index) {
             state.cancel_running();
         }
         state.cache.retain(|(key, _)| key.model != index);
@@ -1344,7 +1389,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         _ => None,
     });
     // Apply a field edit before handling a bake button that took focus from that field.
-    if let Some((control, value)) = session.bake_option_edit.take() && state.running.is_none() {
+    if let Some((control, value)) = session.bake_option_edit.take() && state.bake_key().is_none() {
         control.set(&mut session.bake_projection, value);
         state.cache.retain(|(key, _)| key.model != index);
         session.revision += 1;
@@ -1362,7 +1407,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             let Some(binding) = session.binding else { continue };
             if session.panel != Panel::Maps || session.bake_view != Some(map) || !map.supports_fix()
                 || (doc.paint_busy && matches!(action, PaintAction::BakeFixTool(_)))
-                || state.running.is_some()
+                || state.bake_key().is_some()
                 || !state.maps(index, doc, binding, session.texture_size).is_some_and(|maps| maps.has_map(map))
             {
                 continue;
@@ -1429,7 +1474,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 | PaintAction::BakeCustomDuplicate(_)
                 | PaintAction::BakeCustomMove(..)
         ) {
-            if state.running.is_none() && state.picking.is_none() {
+            if state.bake_key().is_none() && state.picking.is_none() {
                 let doc = editing.documents.get_mut(&index).unwrap();
                 let before = doc.snapshot();
                 let name = if let PaintAction::BakeCustomRename(id) = action {
@@ -1485,7 +1530,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 session.revision += 1;
             }
             PaintAction::BakeCustomGizmo(id)
-                if state.running.is_none() && state.picking.is_none()
+                if state.bake_key().is_none() && state.picking.is_none()
                     && doc.custom_bakes.iter().any(|recipe| recipe.id == id
                         && (recipe.kind.has_direction() || recipe.kind == custom::Kind::Point)) =>
             {
@@ -1502,28 +1547,28 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 session.revision += 1;
             }
             PaintAction::BakeQuality(quality)
-                if state.running.is_none() && session.bake_projection.quality != quality =>
+                if state.bake_key().is_none() && session.bake_projection.quality != quality =>
             {
                 session.bake_projection.quality = quality;
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
             PaintAction::BakeIdSource(source)
-                if state.running.is_none() && session.bake_projection.id_source != source =>
+                if state.bake_key().is_none() && session.bake_projection.id_source != source =>
             {
                 session.bake_projection.id_source = source;
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
             PaintAction::BakeRayOptions(options)
-                if state.running.is_none() && session.bake_projection.rays != options.validated() =>
+                if state.bake_key().is_none() && session.bake_projection.rays != options.validated() =>
             {
                 session.bake_projection.rays = options.validated();
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
             PaintAction::BakeAutoEdgeReach | PaintAction::BakeResetSurface
-                if state.running.is_none() =>
+                if state.bake_key().is_none() =>
             {
                 let surface = &mut session.bake_projection.surface;
                 if action == PaintAction::BakeAutoEdgeReach {
@@ -1535,7 +1580,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 session.revision += 1;
             }
             PaintAction::BakeToggleMap(_) | PaintAction::BakeSelectAllMaps(_)
-                if state.running.is_none() =>
+                if state.bake_key().is_none() =>
             {
                 let selection = match action {
                     PaintAction::BakeToggleMap(map) => session.bake_projection.maps.toggle(map),
@@ -1569,7 +1614,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 }
                 session.revision += 1;
             }
-            PaintAction::BakeResetCagePaint if state.running.is_none() => {
+            PaintAction::BakeResetCagePaint if state.bake_key().is_none() => {
                 if let Some((object, _)) = session.binding
                     && session.cage_edits.remove(&object).is_some()
                 {
@@ -1588,7 +1633,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             }
             PaintAction::BakePickHigh | PaintAction::BakePickCage
                 if state.picking.is_none()
-                    && state.running.is_none()
+                    && state.bake_key().is_none()
                     && (action == PaintAction::BakePickHigh
                         || session.bake_projection.path.is_some()) =>
             {
@@ -1613,7 +1658,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             | PaintAction::BakePreferFrontFaces
             | PaintAction::BakeAverageNormals
             | PaintAction::BakeRange { .. }
-                if state.running.is_none() && state.picking.is_none() =>
+                if state.bake_key().is_none() && state.picking.is_none() =>
             {
                 match action {
                     PaintAction::BakeClearHigh => {
@@ -1651,7 +1696,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 state.cache.retain(|(key, _)| key.model != index);
                 session.revision += 1;
             }
-            PaintAction::BakeCancel if state.running.is_some() => {
+            PaintAction::BakeCancel if state.bake_key().is_some() => {
                 if let Some(model) = state.cancel_running() {
                     state.automatic.remove(&model);
                 }
@@ -1660,7 +1705,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 editor.status = "Запекание отменено".into();
             }
             PaintAction::BakeClearDiskCache
-                if state.running.is_none() && state.clearing_cache.is_none() =>
+                if state.bake_key().is_none() && state.clearing_cache.is_none() =>
             {
                 let disk = state.disk.clone();
                 state.clearing_cache = Some(
@@ -1669,8 +1714,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
                 editor.status = "Очистка дискового кэша запекания…".into();
             }
             PaintAction::BakeStart
-                if state.running.is_none() && state.picking.is_none()
-                    && state.clearing_cache.is_none() && !doc.paint_busy =>
+                if !state.configuration_busy() && !doc.paint_busy =>
             {
                 let gpu = state.ray_device(device.as_deref(), queue.as_deref());
                 if let Ok(status) = state.start_manual(index, doc, session, gpu, true) {
@@ -1698,9 +1742,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         doc.bake_settings = settings;
         doc.checkpoint(before);
     }
-    if state.running.is_none()
-        && state.picking.is_none()
-        && state.clearing_cache.is_none()
+    if !state.configuration_busy()
         && !doc.paint_busy
         && !session.busy
         && doc.bake_settings.high_poly.is_none()
@@ -1717,7 +1759,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         .binding
         .and_then(|key| state.maps(index, doc, key, session.texture_size))
         .cloned();
-    let busy = state.running.is_some();
+    let busy = state.bake_key().is_some();
     let picking = state.picking.is_some();
     let clearing = state.clearing_cache.is_some();
     if session.bake_ready != maps.is_some()

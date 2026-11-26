@@ -367,6 +367,8 @@ pub(in crate::editor) enum ShelfPlacement {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::editor) enum PreviewParameter {
     FieldOfView,
+    OrbitSpeed,
+    ZoomSpeed,
     Height,
     Emission,
     Occlusion,
@@ -377,6 +379,8 @@ impl PreviewParameter {
     fn label(self) -> &'static str {
         match self {
             Self::FieldOfView => "Угол обзора по вертикали, °",
+            Self::OrbitSpeed => "Скорость орбиты, ×",
+            Self::ZoomSpeed => "Скорость зума, ×",
             Self::Height => "Сила рельефа",
             Self::Emission => "Сила свечения",
             Self::Occlusion => "Сила AO, %",
@@ -387,6 +391,7 @@ impl PreviewParameter {
     fn min(self) -> f32 {
         match self {
             Self::FieldOfView => 10.,
+            Self::OrbitSpeed | Self::ZoomSpeed => navigation::Settings::MIN_SPEED,
             Self::UvWireOpacity => 5.,
             _ => 0.,
         }
@@ -395,16 +400,19 @@ impl PreviewParameter {
     fn max(self) -> f32 {
         match self {
             Self::FieldOfView => 90.,
+            Self::OrbitSpeed | Self::ZoomSpeed => navigation::Settings::MAX_SPEED,
             Self::Height => 8.,
             Self::Emission => 20.,
             Self::Occlusion | Self::UvWireOpacity => 100.,
         }
     }
 
-    fn value(self, doc: &crate::editor::model_document::Document) -> f32 {
+    fn value(self, doc: &crate::editor::model_document::Document, navigation: navigation::Settings) -> f32 {
         let preview = doc.paint_preview;
         match self {
             Self::FieldOfView => doc.model_camera.map_or(FOV, |camera| camera.fov).to_degrees(),
+            Self::OrbitSpeed => navigation.orbit_speed,
+            Self::ZoomSpeed => navigation.zoom_speed,
             Self::Height => preview.height_strength.unwrap_or(1.),
             Self::Emission => preview.emission_strength,
             Self::Occlusion => preview.ao_strength * 100.,
@@ -417,6 +425,8 @@ impl PreviewParameter {
 pub(in crate::editor) enum PreviewEdit {
     Value { model: usize, parameter: PreviewParameter, value: f32 },
     Reset { model: usize },
+    InvertScrollZoom,
+    ResetNavigation,
     AutomaticHeight,
     BakedNormal,
     UvWire,
@@ -612,6 +622,7 @@ pub(in crate::editor) enum PaintAction {
     Color(usize),
     Preset(usize),
     ShelfClearSearch,
+    ResizeShelf(bool),
     ShelfTypeMenu,
     ShelfType(Option<MaterialType>),
     AddMaterial(usize),
@@ -719,6 +730,8 @@ impl PaintAction {
             Self::PreviewMaterial(PreviewEdit::UvSeams3d) => "Подсветить UV-швы на видимой стороне 3D-модели.",
             Self::PreviewMaterial(PreviewEdit::Value { .. }) => "Изменить предпросмотр материала.",
             Self::PreviewMaterial(PreviewEdit::Reset { .. }) => "Вернуть стандартный угол камеры, сетку и настройки обработки изображения.",
+            Self::PreviewMaterial(PreviewEdit::InvertScrollZoom) => "Поменять направление колеса в 3D и UV.",
+            Self::PreviewMaterial(PreviewEdit::ResetNavigation) => "Вернуть стандартную скорость орбиты и зума и направление колеса.",
             Self::TraceSamples(_) => "Число отсчётов на пиксель. Дополнительные отсчёты уменьшают шум.",
             Self::TraceBounces(_) => "Предельное число отражений света.",
             Self::TraceGround => "Добавить плоскость под моделью для теней в трассированном виде.",
@@ -900,6 +913,8 @@ impl PaintAction {
             Self::Color(_) => "Выбрать цвет кисти.",
             Self::Preset(_) => "Взять цвет, шероховатость и металличность материала для кисти.",
             Self::ShelfClearSearch => "Очистить поиск ресурсов.",
+            Self::ResizeShelf(true) => "Увеличить карточки библиотеки.",
+            Self::ResizeShelf(false) => "Уменьшить карточки библиотеки.",
             Self::ShelfTypeMenu => "Фильтровать по типу материала.",
             Self::ShelfType(_) => "Показать материалы выбранного типа.",
             Self::AddMaterial(_) => "Добавить материал как слой заливки.",
@@ -2650,7 +2665,7 @@ impl Session {
             | PaintAction::DropMaterialOnSet(..)
             | PaintAction::ImportShelfMaterial | PaintAction::ExportShelfMaterial | PaintAction::ExportShelfPackage | PaintAction::SaveShelfMaterial | PaintAction::SaveShelfMask | PaintAction::ApplyShelfMaterial(_)
             | PaintAction::ApplyShelfMask(..) | PaintAction::ApplyGenerator(..)
-            | PaintAction::ShelfClearSearch | PaintAction::ShelfTypeMenu | PaintAction::ShelfType(_)
+            | PaintAction::ShelfClearSearch | PaintAction::ResizeShelf(_) | PaintAction::ShelfTypeMenu | PaintAction::ShelfType(_)
             | PaintAction::ShelfTextureMenu(_) | PaintAction::SmartRecipeMenu(_) => unreachable!(),
             PaintAction::OnlineProvider(_) | PaintAction::OnlineRefresh | PaintAction::OnlinePage(_)
             | PaintAction::OnlineResolution(_) | PaintAction::OnlineMaterial(..)
@@ -3465,9 +3480,11 @@ impl Session {
 pub(in crate::editor) struct PaintState {
     sessions: HashMap<usize, Session>,
     brush_defaults: brush_defaults::Store,
+    navigation: navigation::Preferences,
     last_painted_model: Option<usize>,
     tips: tips::Library,
     shelf: ShelfFilter,
+    shelf_size: ShelfSize,
     library: presets::Library,
     graph_shelf: graph_shelf::Library,
     online: online::Shelf,
@@ -3488,6 +3505,14 @@ pub(in crate::editor) struct PaintState {
 }
 
 impl PaintState {
+    pub(super) fn navigation_settings(&self) -> navigation::Settings {
+        self.navigation.settings
+    }
+
+    pub(super) fn set_visibility(&self, model: usize) -> Option<&sets::SetVisibility> {
+        self.sessions.get(&model).map(|session| &session.set_appearance.visibility)
+    }
+
     pub(super) fn view_channel(&self, model: usize) -> Option<usize> {
         self.sessions.get(&model)?.diagnostic_channel()
     }
@@ -3584,6 +3609,55 @@ impl PaintState {
         model.and_then(|model| self.sessions.get(&model))
             .is_none_or(|session| session.graph_catalogue().is_none()
                 && (session.graph_canvas_open() || session.viewport_layout(draft_preview) != View::Two))
+    }
+}
+
+struct ShelfSize {
+    pixels: u32,
+    path: Option<std::path::PathBuf>,
+}
+
+impl Default for ShelfSize {
+    fn default() -> Self {
+        let path = presets::directory()
+            .and_then(|folder| folder.parent().map(|root| root.join("paint-shelf-size.json")));
+        Self::open(path)
+    }
+}
+
+impl ShelfSize {
+    const DEFAULT: u32 = 84;
+    const MIN: u32 = 32;
+    const MAX: u32 = 128;
+
+    fn open(path: Option<std::path::PathBuf>) -> Self {
+        let pixels = path
+            .as_deref()
+            .and_then(|path| bevy_scene_format::read_limited(path, 128).ok())
+            .and_then(|data| serde_json::from_slice::<u32>(&data).ok())
+            .unwrap_or(Self::DEFAULT)
+            .clamp(Self::MIN, Self::MAX);
+        Self { pixels, path }
+    }
+
+    fn resize(&mut self, increase: bool) -> std::io::Result<()> {
+        let pixels = if increase {
+            (self.pixels + 16).min(Self::MAX)
+        } else {
+            self.pixels.saturating_sub(16).max(Self::MIN)
+        };
+        if pixels == self.pixels {
+            return Ok(());
+        }
+        self.pixels = pixels;
+        if let Some(path) = &self.path {
+            bevy_scene_format::atomic_write(
+                path,
+                &serde_json::to_vec(&pixels)?,
+                bevy_scene_format::Revision::read(path)?,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -4064,8 +4138,28 @@ pub(super) fn actions(
                 continue;
             }
             if let PaintAction::PreviewMaterial(edit) = action {
-                if !editor.browser_popup && !editor.hdri_library_open
-                    && let Some(doc) = editing.documents.get_mut(&index)
+                if editor.browser_popup || editor.hdri_library_open {
+                    continue;
+                }
+                let mut navigation = paint.navigation.settings;
+                match edit {
+                    PreviewEdit::InvertScrollZoom => navigation.invert_zoom = !navigation.invert_zoom,
+                    PreviewEdit::ResetNavigation => navigation = Default::default(),
+                    PreviewEdit::Value { model, parameter, value }
+                        if model == index && (parameter.min()..=parameter.max()).contains(&value) =>
+                    {
+                        match parameter {
+                            PreviewParameter::OrbitSpeed => navigation.orbit_speed = value,
+                            PreviewParameter::ZoomSpeed => navigation.zoom_speed = value,
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+                if let Err(error) = paint.navigation.save(navigation) {
+                    editor.status = format!("Не удалось сохранить настройки навигации · {error}");
+                }
+                if let Some(doc) = editing.documents.get_mut(&index)
                     && doc.can_store_paint_preview()
                 {
                     let previous = (doc.paint_preview, doc.paint_uv, doc.paint_post, doc.model_camera);
@@ -4083,6 +4177,7 @@ pub(super) fn actions(
                         {
                             match parameter {
                                 PreviewParameter::FieldOfView => viewer.set_paint_fov(index, doc, value.to_radians()),
+                                PreviewParameter::OrbitSpeed | PreviewParameter::ZoomSpeed => {}
                                 PreviewParameter::Height => doc.paint_preview.height_strength = Some(value),
                                 PreviewParameter::Emission => doc.paint_preview.emission_strength = value,
                                 PreviewParameter::Occlusion => doc.paint_preview.ao_strength = value / 100.,
@@ -4100,7 +4195,8 @@ pub(super) fn actions(
                             doc.paint_post = None;
                             viewer.set_paint_fov(index, doc, FOV);
                         }
-                        PreviewEdit::Value { .. } | PreviewEdit::Reset { .. } => {}
+                        PreviewEdit::Value { .. } | PreviewEdit::Reset { .. }
+                        | PreviewEdit::InvertScrollZoom | PreviewEdit::ResetNavigation => {}
                     }
                     if (doc.paint_preview, doc.paint_uv, doc.paint_post, doc.model_camera) != previous {
                         doc.ui_revision += 1;
@@ -4766,6 +4862,12 @@ pub(super) fn actions(
                 }
                 PaintAction::ShelfClearSearch => {
                     paint.shelf.clear = true;
+                    continue;
+                }
+                PaintAction::ResizeShelf(increase) => {
+                    if let Err(error) = paint.shelf_size.resize(increase) {
+                        editor.status = format!("Не удалось сохранить размер карточек · {error}");
+                    }
                     continue;
                 }
                 PaintAction::ShelfTypeMenu => {

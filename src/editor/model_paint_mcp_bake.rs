@@ -1,6 +1,7 @@
 //! MCP access to the same bake jobs, caches and report data used by the model viewer.
 use super::*;
 use bevy::ecs::system::SystemParam;
+use crate::editor::model_paint_data::RESOLUTIONS;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +30,8 @@ pub(in crate::editor) struct BakeArgs {
     quality: Option<Quality>,
     id_source: Option<IdSource>,
     maps: Option<Vec<BakeMap>>,
+    /// Resize the active texture set before baking. Uses the editor's supported set resolutions.
+    resolution: Option<u32>,
     /// GLB, OBJ or FBX path. Use an empty string to clear the high-poly source.
     high_poly: Option<String>,
     /// GLB, OBJ or FBX path. Use an empty string to clear the external cage.
@@ -47,6 +50,9 @@ pub(in crate::editor) struct BakeArgs {
     /// Show the first available bake map in the editor when ready.
     #[serde(default)]
     preview: bool,
+    /// Wait for the maps to be published and return the completed bake report.
+    #[serde(default)]
+    pub wait: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -170,6 +176,23 @@ pub(in crate::editor) struct McpBake<'w> {
     queue: Option<Res<'w, RenderQueue>>,
 }
 
+pub(super) struct BakeAfterResize {
+    pub key: Key,
+    set: usize,
+    size: u32,
+    settings: Settings,
+    preview: bool,
+    reply: Option<mcp_state::OutputReply>,
+}
+
+impl Drop for BakeAfterResize {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply(Err("Bake was cancelled before the resized set was ready".into()));
+        }
+    }
+}
+
 impl McpBake<'_> {
     pub(in crate::editor::ui::model_viewer::paint) fn material_preparation(
         &self, model: usize, doc: &Document, session: &Session,
@@ -217,7 +240,7 @@ impl McpBake<'_> {
         doc: &mut Document,
         session: &mut Session,
         args: BakeArgs,
-    ) -> Result<Value, String> {
+    ) -> Result<(usize, Value), String> {
         let state = self
             .state
             .as_deref_mut()
@@ -243,6 +266,27 @@ impl McpBake<'_> {
             return Err("Bake requires a loaded texture set with UVs on a visible object".into());
         }
         let settings = settings(&editor.project.asset_root, &doc.bake_settings, &args)?;
+        if let Some(size) = args.resolution {
+            if !RESOLUTIONS.contains(&size) {
+                return Err("Texture set resolution must be 512, 1024, 2048 or 4096".into());
+            }
+            if size != session.texture_size {
+                let action = PaintAction::Resolution(size);
+                if !session.available(action) || session.smart_loading || session.mesh_loading {
+                    return Err("Wait for the current paint operation to finish".into());
+                }
+                let key = Key::new(model, doc, (object.id, slot), session.texture_size)
+                    .ok_or("The active texture set is unavailable")?;
+                state.outcomes.remove(&(model, object.id, slot));
+                state.after_resize = Some(BakeAfterResize {
+                    key, set, size, settings, preview: args.preview, reply: None,
+                });
+                session.edit(action);
+                session.mark_resize_pending(doc);
+                editor.status = "Изменение разрешения перед запеканием…".into();
+                return Ok((set, status(state, model, doc, set)?));
+            }
+        }
         apply_settings(doc, session, settings);
         let gpu = state.ray_device(self.device.as_deref(), self.queue.as_deref());
         editor.status = state
@@ -251,7 +295,28 @@ impl McpBake<'_> {
         if args.preview {
             session.panel = Panel::Maps;
         }
-        status(state, model, doc, set)
+        Ok((set, status(state, model, doc, set)?))
+    }
+
+    pub(in crate::editor) fn respond(
+        &mut self, wait: bool, result: Result<(usize, Value), String>, reply: mcp_state::OutputReply,
+    ) {
+        match result {
+            Ok((set, report)) => {
+                if wait && let Some(state) = self.state.as_deref_mut() {
+                    if let Some(job) = state.after_resize.as_mut() {
+                        job.reply = Some(reply);
+                        return;
+                    }
+                    if let Some(job) = state.running.as_mut() {
+                        job.reply = Some((set, reply));
+                        return;
+                    }
+                }
+                reply(Ok(report));
+            }
+            Err(error) => reply(Err(error)),
+        }
     }
 
     pub(in crate::editor::ui::model_viewer::paint) fn cancel(
@@ -266,9 +331,7 @@ impl McpBake<'_> {
             .as_deref_mut()
             .ok_or("The bake engine is unavailable")?;
         let (object, slot) = doc.paint_target(set).ok_or("Unknown texture set")?;
-        if !state.running.as_ref().is_some_and(|job| {
-            (job.key.model, job.key.object, job.key.slot) == (model, object.id, slot)
-        }) {
+        if state.bake_key().is_none_or(|key| (key.model, key.object, key.slot) != (model, object.id, slot)) {
             return Err("There is no running bake for the requested texture set".into());
         }
         state.cancel_running();
@@ -289,6 +352,70 @@ impl McpBake<'_> {
             .as_deref()
             .ok_or("The bake engine is unavailable")?;
         status(state, model, doc, set)
+    }
+}
+
+impl State {
+    pub(super) fn resume_after_resize(
+        &mut self,
+        editor: &mut Editor,
+        editing: &mut editing::State,
+        paint: &mut PaintState,
+        device: Option<&RenderDevice>,
+        queue: Option<&RenderQueue>,
+    ) {
+        let Some(mut pending) = self.after_resize.take() else { return; };
+        let model = pending.key.model;
+        let binding = (pending.key.object, pending.key.slot);
+        let Some((doc, session)) = editing.documents.get_mut(&model).zip(paint.sessions.get_mut(&model))
+            .filter(|(doc, session)| doc.mode == Mode::Paint
+                && session.set == pending.set && session.binding == Some(binding)
+                && pending.key.matches_scene(doc))
+        else {
+            self.outcomes.insert((model, binding.0, binding.1), Outcome::Cancelled);
+            return;
+        };
+        if doc.paint_busy || doc.paint_pending || session.busy || session.resize_request.is_some() {
+            self.after_resize = Some(pending);
+            return;
+        }
+        let reply = pending.reply.take();
+        if session.texture_size != pending.size {
+            let error = "The texture set could not be resized for baking".to_string();
+            self.outcomes.insert((model, binding.0, binding.1), Outcome::Failed(error.clone()));
+            if let Some(reply) = reply {
+                reply(Err(error));
+            }
+            return;
+        }
+        apply_settings(doc, session, pending.settings.clone());
+        // The resize can publish maps resampled from the old resolution.
+        // Bake at the new resolution, with disk cache lookup in the bake worker.
+        self.cache.retain(|(key, _)| (key.model, key.object, key.slot, key.size)
+            != (model, binding.0, binding.1, pending.size));
+        let gpu = self.ray_device(device, queue);
+        match self.start_manual(model, doc, session, gpu, pending.preview) {
+            Ok(message) => {
+                editor.status = message.into();
+                if pending.preview {
+                    session.panel = Panel::Maps;
+                }
+                if let Some(reply) = reply {
+                    if let Some(job) = self.running.as_mut() {
+                        job.reply = Some((pending.set, reply));
+                    } else {
+                        reply(status(self, model, doc, pending.set));
+                    }
+                }
+            }
+            Err(error) => {
+                editor.status = error.clone();
+                self.outcomes.insert((model, binding.0, binding.1), Outcome::Failed(error.clone()));
+                if let Some(reply) = reply {
+                    reply(Err(error));
+                }
+            }
+        }
     }
 }
 
@@ -427,7 +554,7 @@ fn source_path(root: &Path, value: &str) -> Result<Option<PathBuf>, String> {
     Ok(Some(path))
 }
 
-fn status(state: &State, model: usize, doc: &Document, set: usize) -> Result<Value, String> {
+pub(super) fn status(state: &State, model: usize, doc: &Document, set: usize) -> Result<Value, String> {
     let (object, slot) = doc.paint_target(set).ok_or("Unknown texture set")?;
     let binding = (model, object.id, slot);
     let size = doc.paint_size(&object.materials[slot]);
@@ -435,9 +562,12 @@ fn status(state: &State, model: usize, doc: &Document, set: usize) -> Result<Val
         .running
         .as_ref()
         .filter(|job| (job.key.model, job.key.object, job.key.slot) == binding);
+    let resizing = state.after_resize.as_ref()
+        .filter(|job| (job.key.model, job.key.object, job.key.slot) == binding);
     let outcome = state.outcomes.get(&binding);
     let maps = state.maps(model, doc, (object.id, slot), size);
     let (phase, error, from_disk) = match (running, outcome, maps) {
+        _ if resizing.is_some() => ("resizing", None, None),
         (Some(_), _, _) => ("running", None, None),
         (_, Some(Outcome::Failed(error)), _) => ("failed", Some(error), None),
         (_, Some(Outcome::Cancelled), _) => ("cancelled", None, None),
@@ -460,9 +590,10 @@ fn status(state: &State, model: usize, doc: &Document, set: usize) -> Result<Val
         "model_id": model,
         "set": set,
         "resolution": size,
+        "requested_resolution": resizing.map(|job| job.size),
         "status": phase,
         "progress": running.and_then(|_| state.progress()),
-        "engine_busy": state.running.is_some(),
+        "engine_busy": state.bake_key().is_some(),
         "error": error,
         "from_disk_cache": from_disk,
         "maps": available,

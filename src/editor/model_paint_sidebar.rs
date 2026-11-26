@@ -714,6 +714,10 @@ mod tests {
         )
         .unwrap();
         let (mut app, window, _target) = fixture_project(project);
+        let profile = tempfile::tempdir().unwrap();
+        let size_file = profile.path().join("paint-shelf-size.json");
+        app.world_mut().resource_mut::<PaintState>().shelf_size =
+            ShelfSize::open(Some(size_file.clone()));
         app.world_mut().resource_mut::<Editor>().drawer = false;
         app.world_mut().write_message(Action::ViewModel(0));
         for _ in 0..240 {
@@ -774,6 +778,27 @@ mod tests {
                 frame(app);
             }
         };
+        let find_control = |app: &mut App, target| {
+            let world = app.world_mut();
+            world
+                .query::<(Entity, &Control)>()
+                .iter(world)
+                .find(|(_, control)| {
+                    matches!(control.action, Action::ModelView(ModelViewAction::Paint(action)) if action == target)
+                })
+                .unwrap()
+                .0
+        };
+        let resize = |app: &mut App, increase| {
+            let control = find_control(app, PaintAction::ResizeShelf(increase));
+            let point = rect(app, control).center();
+            move_pointer(app, window, point);
+            mouse(app, window, ButtonState::Pressed);
+            mouse(app, window, ButtonState::Released);
+            for _ in 0..6 {
+                frame(app);
+            }
+        };
         let (handle, shelf, home, overlay, properties) = {
             let state = app.world().resource::<State>();
             let shelf = state.shelf.as_ref().unwrap();
@@ -786,6 +811,13 @@ mod tests {
             )
         };
         let old_height = rect(&app, canvas).height();
+        let card = find_control(&mut app, PaintAction::Preset(0));
+        let default_width = rect(&app, card).width();
+        resize(&mut app, true);
+        let large_card = find_control(&mut app, PaintAction::Preset(0));
+        assert!((rect(&app, large_card).width() - default_width - 16.).abs() < 1.);
+        assert!(rect(&app, canvas).height() < old_height - 15.);
+        assert_eq!(ShelfSize::open(Some(size_file)).pixels, ShelfSize::DEFAULT + 16);
         let from = rect(&app, handle).center();
         let to = rect(&app, properties).center();
         drag(&mut app, from, to);
@@ -805,20 +837,9 @@ mod tests {
             "Gold"
         );
 
-        let card = {
-            let world = app.world_mut();
-            world
-                .query::<(Entity, &Control)>()
-                .iter(world)
-                .find(|(_, control)| {
-                    matches!(
-                        control.action,
-                        Action::ModelView(ModelViewAction::Paint(PaintAction::Preset(0)))
-                    )
-                })
-                .unwrap()
-                .0
-        };
+        resize(&mut app, false);
+        let card = find_control(&mut app, PaintAction::Preset(0));
+        assert!((rect(&app, card).width() - default_width).abs() < 1.);
         let from = rect(&app, card).center();
         let to = rect(&app, canvas).center();
         assert!(rect(&app, shelf).contains(from));

@@ -22,6 +22,8 @@ use bevy::{
         render_resource::TextureUsages,
         view::screenshot::{Screenshot, ScreenshotCaptured},
     },
+    tasks::AsyncComputeTaskPool,
+    ui::IsDefaultUiCamera,
     winit::{EventLoopProxyWrapper, WinitUserEvent},
 };
 use serde_json::{Value, json};
@@ -34,6 +36,7 @@ use types::*;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
 pub(super) enum Payload {
     Json(Value),
     Image {
@@ -79,6 +82,30 @@ fn encode_png(image: image::DynamicImage) -> Reply {
     })
 }
 
+fn screenshot_app(
+    commands: &mut Commands,
+    target: &RenderTarget,
+    replies: Vec<oneshot::Sender<Reply>>,
+) {
+    // Bevy accepts one screenshot per render target per frame.
+    let replies = Mutex::new(replies);
+    commands.spawn(Screenshot(target.clone())).observe(move |capture: On<ScreenshotCaptured>| {
+        let replies = std::mem::take(&mut *replies.lock().unwrap());
+        if replies.iter().all(oneshot::Sender::is_closed) {
+            return;
+        }
+        let image = capture.image.clone();
+        AsyncComputeTaskPool::get().spawn(async move {
+            let result = image.try_into_dynamic().map_err(|error| error.to_string()).and_then(encode_png);
+            for reply in replies {
+                if !reply.is_closed() {
+                    let _ = reply.send(result.clone());
+                }
+            }
+        }).detach();
+    });
+}
+
 struct Job {
     command: Command,
     reply: oneshot::Sender<Reply>,
@@ -95,6 +122,12 @@ struct PendingPaintHistory {
     work: mcp_state::PaintHistoryEdit,
 }
 
+struct PendingSurfaceSelection {
+    reply: oneshot::Sender<Reply>,
+    deadline: Instant,
+    work: mcp_state::SurfaceWait,
+}
+
 #[derive(Clone)]
 struct Bridge {
     sender: mpsc::SyncSender<Job>,
@@ -104,9 +137,11 @@ struct Bridge {
 impl Bridge {
     async fn request(&self, command: Command) -> Reply {
         let history_batch = matches!(&command, Command::PaintEdit(args) if args.is_history_batch());
-        let timeout = if matches!(command, Command::PaintImport(_)) {
+        let wait_for_surface = matches!(&command, Command::PaintSelectSurface(args) if args.wait);
+        let wait_for_bake = matches!(&command, Command::BakeStart(args) if args.wait);
+        let timeout = if matches!(command, Command::PaintImport(_)) || wait_for_bake {
             Duration::from_secs(30 * 60)
-        } else if history_batch || matches!(
+        } else if history_batch || wait_for_surface || matches!(
             command,
             Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_)
                 | Command::PaintExport(_) | Command::PaintReplaceMesh(_)
@@ -120,7 +155,7 @@ impl Bridge {
             .try_send(Job {
                 command,
                 reply,
-                deadline: Instant::now() + if history_batch { timeout } else { REQUEST_TIMEOUT },
+                deadline: Instant::now() + if history_batch || wait_for_surface { timeout } else { REQUEST_TIMEOUT },
             })
             .map_err(|_| "The editor is busy or has closed; retry after it is ready".to_string())?;
         (self.wake)();
@@ -196,16 +231,20 @@ fn process(
     drag: Option<Res<ui::AssetDrag>>,
     mouse: Option<Res<ButtonInput<MouseButton>>>,
     surface: Option<Res<viewport::Surface>>,
-    viewport_targets: Query<&RenderTarget, With<viewport::EditorCamera>>,
+    (viewport_targets, app_targets): (
+        Query<&RenderTarget, With<viewport::EditorCamera>>,
+        Query<(&Camera, &RenderTarget), With<IsDefaultUiCamera>>,
+    ),
     children: Query<&Children>,
     meshes: Query<(&Aabb, &GlobalTransform)>,
     transforms: Query<&GlobalTransform>,
     mut focus: Option<ResMut<InputFocus>>,
-    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint, mut pending_history, mut importing, mut browser, mut previews): (
+    (mut model_editing, mut paint, mut mesh_requests, real_time, mut paint_io, mut pending_paint, mut pending_history, mut importing, mut browser, mut previews, mut pending_surface): (
         Option<ResMut<editing::State>>, Option<ResMut<PaintState>>, Option<ResMut<mesh_tools::Requests>>,
         Res<Time<bevy::time::Real>>, ParamSet<(mcp_state::McpPaintInput, mcp_state::McpOutput, mcp_state::McpBake, mcp_state::McpPreview)>,
         Local<Option<PendingPaintEdit>>, Local<Option<PendingPaintHistory>>, Local<Option<paint_import::Pending>>,
         Option<ResMut<super::browser::Browser>>, Option<ResMut<super::thumbnails::Thumbnails>>,
+        Local<Option<PendingSurfaceSelection>>,
     ),
 ) {
     let Some(inbox) = inbox else { return };
@@ -234,6 +273,16 @@ fn process(
     if pending_history.as_ref().is_some_and(|pending| pending.job.reply.is_closed() || Instant::now() >= pending.job.deadline) {
         *pending_history = None;
     }
+    if pending_surface.as_ref().is_some_and(|pending| pending.reply.is_closed() || Instant::now() >= pending.deadline) {
+        *pending_surface = None;
+    }
+    if let Some(pending) = pending_surface.as_ref()
+        && let Some((editing, paint)) = model_editing.as_deref().zip(paint.as_deref())
+        && let Some(result) = pending.work.poll(&editor, editing, paint)
+    {
+        let pending = pending_surface.take().unwrap();
+        let _ = pending.reply.send(result.map(Payload::Json));
+    }
     if !input_busy(&editor, &pointer)
         && let Some(pending) = pending_history.as_mut()
         && let Some((editing, paint)) = model_editing.as_deref_mut().zip(paint.as_deref_mut())
@@ -250,6 +299,7 @@ fn process(
             Err(error) => { let _ = job.reply.send(Err(error)); }
         }
     }
+    let mut app_screenshots = Vec::new();
     for _ in 0..16 {
         let Some((job, prepared_edit)) = ready.take().or_else(|| {
             inbox.0.lock().ok().and_then(|receiver| receiver.try_recv().ok()).map(|job| (job, None))
@@ -334,6 +384,38 @@ fn process(
             }
             continue;
         }
+        if let Command::PaintSelectSurface(args) = job.command {
+            let result = if pending_surface.is_some() {
+                Err("Wait for the current surface selection to finish".into())
+            } else {
+                model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                    .ok_or_else(|| "This editor has no model paint workspace".to_string())
+                    .and_then(|(editing, paint)| {
+                        mcp_state::select_surface(&mut paint_io.p0(), &editor, editing, paint, args)
+                    })
+            };
+            match result {
+                Ok(mcp_state::SurfaceResponse::Wait(work)) => {
+                    *pending_surface = Some(PendingSurfaceSelection { reply: job.reply, deadline: job.deadline, work });
+                }
+                Ok(mcp_state::SurfaceResponse::Running(state)) => {
+                    let _ = job.reply.send(Ok(Payload::Json(state)));
+                }
+                Err(error) => { let _ = job.reply.send(Err(error)); }
+            }
+            continue;
+        }
+        if let Command::BakeStart(args) = job.command {
+            let wait = args.wait;
+            let mut input = paint_io.p2();
+            let result = model_editing.as_deref_mut().zip(paint.as_deref_mut())
+                .ok_or_else(|| "This editor has no model paint workspace".to_string())
+                .and_then(|(editing, paint)| mcp_state::start_bake(&mut input, &mut editor, editing, paint, args));
+            input.respond(wait, result, Box::new(move |result| {
+                let _ = job.reply.send(result.map(Payload::Json));
+            }));
+            continue;
+        }
         if matches!(job.command, Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_)
             | Command::PaintPresetExport(_) | Command::PaintExport(_))
         {
@@ -366,6 +448,10 @@ fn process(
                 Command::PaintRender(args) => mcp_state::render(&mut commands, &editor, args, reply),
                 _ => unreachable!(),
             }
+            continue;
+        }
+        if matches!(job.command, Command::ScreenshotApp) {
+            app_screenshots.push(job.reply);
             continue;
         }
         if matches!(job.command, Command::Capture) {
@@ -439,18 +525,10 @@ fn process(
             model_editing.as_deref_mut().zip(paint.as_deref_mut())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::fill(&mut paint_io.p0(), &editor, editing, paint, args))
-        } else if let Command::PaintSelectSurface(args) = job.command {
-            model_editing.as_deref_mut().zip(paint.as_deref_mut())
-                .ok_or_else(|| "This editor has no model paint workspace".to_string())
-                .and_then(|(editing, paint)| mcp_state::select_surface(&mut paint_io.p0(), &editor, editing, paint, args))
         } else if let Command::BakeStatus(args) = job.command {
             model_editing.as_deref().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
                 .and_then(|(editing, paint)| mcp_state::bake_status(&paint_io.p2(), &editor, editing, paint, args))
-        } else if let Command::BakeStart(args) = job.command {
-            model_editing.as_deref_mut().zip(paint.as_deref_mut())
-                .ok_or_else(|| "This editor has no model paint workspace".to_string())
-                .and_then(|(editing, paint)| mcp_state::start_bake(&mut paint_io.p2(), &mut editor, editing, paint, args))
         } else if let Command::BakeCancel(args) = job.command {
             model_editing.as_deref_mut().zip(paint.as_deref())
                 .ok_or_else(|| "This editor has no model paint workspace".to_string())
@@ -485,6 +563,18 @@ fn process(
             }
         }
         let _ = job.reply.send(result.map(Payload::Json));
+    }
+    if !app_screenshots.is_empty() {
+        if let Ok((camera, target)) = app_targets.single()
+            && camera.is_active
+            && !matches!(target, RenderTarget::None { .. })
+        {
+            screenshot_app(&mut commands, target, app_screenshots);
+        } else {
+            for reply in app_screenshots {
+                let _ = reply.send(Err("This editor has no rendered app window".into()));
+            }
+        }
     }
 }
 
@@ -856,7 +946,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }
-        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSurfaceParts(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
+        Command::Save | Command::Capture | Command::ScreenshotApp | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSurfaceParts(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
             Err("This operation requires the live editor".into())
         }
     }

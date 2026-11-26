@@ -44,7 +44,7 @@ impl ShelfPick {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct SetVisibility {
+pub(in crate::editor::ui::model_viewer) struct SetVisibility {
     hidden: Arc<BTreeSet<SetKey>>,
     pub revision: u64,
 }

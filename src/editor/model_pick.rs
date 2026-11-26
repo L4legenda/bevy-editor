@@ -1,5 +1,5 @@
 //! CPU BVH for model/component picking; rebuilt only when document geometry changes.
-use crate::editor::model_document::Document;
+use crate::editor::{model_document::{Document, Object}, model_mesh::Face};
 use bevy::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -64,14 +64,11 @@ impl Bvh {
                 if !shown(o.id, face.material) {
                     continue;
                 }
-                for t in o.geometry.triangles(face) {
+                for points in face_triangles(o, face) {
                     triangles.push(Triangle {
                         object: o.id,
                         face: i,
-                        points: t.map(|j| {
-                            o.transform
-                                .transform_point(o.geometry.positions[face.corners[j].vertex])
-                        }),
+                        points,
                     });
                 }
             }
@@ -316,6 +313,33 @@ impl Bvh {
         }
         result
     }
+}
+
+fn face_triangles<'a>(object: &'a Object, face: &'a Face) -> impl Iterator<Item = [Vec3; 3]> + 'a {
+    object.geometry.triangles(face).into_iter().map(move |triangle| {
+        triangle.map(|corner| {
+            object.transform.transform_point(object.geometry.positions[face.corners[corner].vertex])
+        })
+    })
+}
+
+pub(in crate::editor) fn nearest_on_objects(
+    objects: &[Object],
+    origin: Vec3,
+    direction: Vec3,
+    shown: impl Fn(usize, usize) -> bool,
+) -> Option<Vec3> {
+    let mut nearest = f32::INFINITY;
+    for object in objects.iter().filter(|object| !object.hidden) {
+        for face in object.geometry.faces.iter().filter(|face| shown(object.id, face.material)) {
+            for triangle in face_triangles(object, face) {
+                if let Some(distance) = intersect(origin, direction, triangle) {
+                    nearest = nearest.min(distance);
+                }
+            }
+        }
+    }
+    nearest.is_finite().then(|| origin + direction * nearest)
 }
 
 fn closest_point(point: Vec3, [a, b, c]: [Vec3; 3]) -> Vec3 {

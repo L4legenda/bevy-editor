@@ -64,6 +64,7 @@ pub(in crate::editor::ui::model_viewer) fn navigate(
         *drag = None;
         return;
     };
+    let zoom_scale = paint.navigation_settings().zoom_scale();
     let Some(session) = paint.sessions.get_mut(&index) else {
         return;
     };
@@ -155,7 +156,7 @@ pub(in crate::editor::ui::model_viewer) fn navigate(
             if scroll.delta.y != 0. {
                 session.uv_view.zoom_at(
                     (point - rect.center()) / size,
-                    (scroll.delta.y * rate).exp(),
+                    (scroll.delta.y * rate * zoom_scale).exp(),
                 );
             }
         }

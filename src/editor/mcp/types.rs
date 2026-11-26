@@ -142,6 +142,7 @@ pub(super) enum Command {
     Undo,
     Redo,
     Capture,
+    ScreenshotApp,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -169,7 +170,7 @@ impl Command {
         }
         !matches!(
             self,
-            Self::State | Self::PaintState | Self::PaintPresets | Self::PaintSurfaceParts(_) | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_) | Self::PaintRender(_)
+            Self::State | Self::PaintState | Self::PaintPresets | Self::PaintSurfaceParts(_) | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::ScreenshotApp | Self::BakeStatus(_) | Self::PaintCapture(_) | Self::PaintRender(_)
         )
     }
 }
