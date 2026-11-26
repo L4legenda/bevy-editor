@@ -111,6 +111,7 @@ pub(super) enum Command {
     PaintEdit(super::mcp_state::EditArgs),
     PaintStroke(super::mcp_state::StrokeArgs),
     PaintFill(super::mcp_state::FillArgs),
+    PaintSurfaceParts(super::mcp_state::SurfacePartsArgs),
     PaintSelectSurface(super::mcp_state::SurfaceArgs),
     PaintSave(super::mcp_state::SaveArgs),
     PaintPresetSave(super::mcp_state::SavePresetArgs),
@@ -155,7 +156,7 @@ pub(super) struct PaintOpenArgs {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(super) struct PaintImportArgs {
-    /// Absolute local path of a Material Painter .mpp project.
+    /// Absolute local path of a Material Painter .mpp or Substance 3D Painter .spp project.
     pub source: std::path::PathBuf,
     /// Existing directory relative to the current project's assets root. Defaults to that root.
     pub folder: Option<std::path::PathBuf>,
@@ -168,7 +169,7 @@ impl Command {
         }
         !matches!(
             self,
-            Self::State | Self::PaintState | Self::PaintPresets | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_) | Self::PaintRender(_)
+            Self::State | Self::PaintState | Self::PaintPresets | Self::PaintSurfaceParts(_) | Self::Scenes | Self::Objects(_) | Self::Assets(_) | Self::Capture | Self::BakeStatus(_) | Self::PaintCapture(_) | Self::PaintRender(_)
         )
     }
 }

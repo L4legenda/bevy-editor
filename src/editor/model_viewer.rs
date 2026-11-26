@@ -951,7 +951,7 @@ fn model_projection(camera: ModelCamera, radius: f32) -> Projection {
             p.far = (camera.distance + radius * 100.0).max(10000.0);
         }
         Projection::Orthographic(p) => {
-            let depth = (radius * 100.0).max(camera.distance * 2.0).max(0.000001);
+            let depth = model_orthographic_depth(camera, radius);
             p.near = -depth;
             p.far = depth;
         }
@@ -972,8 +972,12 @@ fn view_height(viewer: &Viewer, depth: f32) -> f32 {
 // Orthographic magnification is independent of eye distance. Keep the depth
 // slab on both sides of the eye, including when zoom puts it inside a model.
 fn orthographic_depth(viewer: &Viewer) -> f32 {
-    (viewer.radius * 100.0)
-        .max(viewer.distance * 2.0)
+    model_orthographic_depth(viewer.camera(), viewer.radius)
+}
+
+fn model_orthographic_depth(camera: ModelCamera, radius: f32) -> f32 {
+    (radius * 100.0)
+        .max(camera.distance * 2.0)
         .max(0.000001)
 }
 

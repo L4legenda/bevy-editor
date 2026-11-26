@@ -1,7 +1,7 @@
 //! Convert MCP points into the same queued strokes as pointer input.
 use super::*;
 use crate::editor::ui::model_viewer::paint::mcp_state::{
-    BrushValues, FillRegion, FillSource, PaintSpace, RasterOperation, RasterTarget, StrokeOptions,
+    BrushValues, FillRegion, FillSource, PaintSpace, RasterOperation, RasterTarget, RasterView, StrokeOptions,
     StrokeSample, SurfaceSeed,
 };
 use crate::editor::ui::model_viewer::paint::surface_selection::{self, Selection, Source};
@@ -18,6 +18,7 @@ pub(in crate::editor) struct McpPaintInput<'w, 's> {
 impl McpPaintInput<'_, '_> {
     pub(in crate::editor::ui::model_viewer::paint) fn surface_source(
         &self,
+        model: usize,
         session: &Session,
         seed: SurfaceSeed,
     ) -> Result<Source, String> {
@@ -30,18 +31,35 @@ impl McpPaintInput<'_, '_> {
                 }
                 Source::Point(point)
             }
-            SurfaceSeed::Viewport { position } => {
-                if session.view == View::Two {
-                    return Err("Open the 3D viewport before selecting from it".into());
-                }
-                let viewer = self.viewer.as_deref().ok_or("The model viewport is unavailable")?;
-                let rect = self.canvas.single().ok()
-                    .and_then(|(node, transform)| node_rect(node, transform))
-                    .ok_or("The 3D viewport has no visible canvas")?;
-                let (origin, direction) = camera_map(viewer, rect).ray(point(position, rect)?);
+            SurfaceSeed::Viewport { position, view } => {
+                let camera = self.viewport_camera(model, session, view)?;
+                let (origin, direction) = camera.ray(point(position, camera.rect)?);
                 Source::Ray(origin, direction)
             }
         })
+    }
+
+    fn viewport_camera(&self, model: usize, session: &Session, view: Option<RasterView>) -> Result<CameraMap, String> {
+        let viewer = self.viewer.as_deref().ok_or("The model viewport is unavailable")?;
+        if let Some(view) = view {
+            if !(16..=4096).contains(&view.width) || !(16..=4096).contains(&view.height) {
+                return Err("Request view width and height must be between 16 and 4096 pixels".into());
+            }
+            if viewer.model != Some(model) || !viewer.fitted || viewer.pending_document_camera {
+                return Err("Wait for the model camera to load".into());
+            }
+            let current = viewer.camera();
+            let camera = view.camera.map_or(Ok(current), |patch| patch.apply(current))?;
+            let rect = Rect::from_corners(Vec2::ZERO, Vec2::new(view.width as f32, view.height as f32));
+            return Ok(projection::model_camera_map(camera, viewer.radius, rect));
+        }
+        if session.view == View::Two {
+            return Err("Open the 3D viewport or supply a request view".into());
+        }
+        let rect = self.canvas.single().ok()
+            .and_then(|(node, transform)| node_rect(node, transform))
+            .ok_or("The 3D viewport has no visible canvas")?;
+        Ok(camera_map(viewer, rect))
     }
 
     pub(in crate::editor::ui::model_viewer::paint) fn submit_surface(
@@ -114,10 +132,16 @@ impl McpPaintInput<'_, '_> {
         values: BrushValues,
         operation: RasterOperation<'_>,
     ) -> Result<(), String> {
-        let viewer = self
-            .viewer
-            .as_deref()
-            .ok_or("The model viewport is unavailable")?;
+        let camera = if target.space == PaintSpace::Uv {
+            if target.view.is_some() {
+                return Err("A request view requires viewport coordinates".into());
+            }
+            let viewer = self.viewer.as_deref().ok_or("The model viewport is unavailable")?;
+            let rect = Rect::from_corners(Vec2::ZERO, Vec2::splat(session.texture_size as f32));
+            camera_map(viewer, rect)
+        } else {
+            self.viewport_camera(model, session, target.view)?
+        };
         let runtime = self
             .runtime
             .as_deref_mut()
@@ -136,19 +160,6 @@ impl McpPaintInput<'_, '_> {
             .get_mut(&key)
             .filter(|live| live.gpu.is_some() && live.work.is_some())
             .ok_or("Wait for the GPU paint workspace to be ready")?;
-        let uv = target.space == PaintSpace::Uv;
-        let rect = if uv {
-            Rect::from_corners(Vec2::ZERO, Vec2::splat(session.texture_size as f32))
-        } else {
-            if session.view == View::Two {
-                return Err("Open the 3D viewport before using viewport coordinates".into());
-            }
-            self.canvas
-                .single()
-                .ok()
-                .and_then(|(node, transform)| node_rect(node, transform))
-                .ok_or("The 3D viewport has no visible canvas")?
-        };
         queue_operation(
             live,
             doc,
@@ -157,7 +168,7 @@ impl McpPaintInput<'_, '_> {
             session,
             tips,
             self.images.as_deref_mut(),
-            camera_map(viewer, rect),
+            camera,
             target,
             values,
             operation,
@@ -224,6 +235,9 @@ fn queue_operation(
         session.hardness,
     )?;
     let opacity = brush_value(values.opacity_percent, Parameter::Opacity, session.opacity)?;
+    let stroke_opacity = values.stroke_opacity_percent
+        .map(|value| brush_value(Some(value), Parameter::Opacity, session.opacity))
+        .transpose()?;
     let spacing = brush_value(values.spacing_percent, Parameter::Spacing, session.spacing)?;
     let uv = target.space == PaintSpace::Uv;
     let mut style = StrokeStyle::from(&*session);
@@ -287,11 +301,11 @@ fn queue_operation(
     if let Some(value) = values.mask_value {
         brush.color = [value; 3];
     }
-    if brush.channel != 4 || brush.material.is_some() {
-        brush.opacity = opacity / 100.;
-    } else if values.opacity_percent.is_some() {
-        // In single-channel opacity mode this control is the value of the map.
+    if brush.channel == 4 && brush.material.is_none() && values.opacity_percent.is_some() {
         brush.color = [(opacity * 2.55).round() as u8; 3];
+        brush.opacity = stroke_opacity.unwrap_or(100.) / 100.;
+    } else {
+        brush.opacity = stroke_opacity.unwrap_or(opacity) / 100.;
     }
     let map = Arc::new(Mapping::for_camera(
         doc,

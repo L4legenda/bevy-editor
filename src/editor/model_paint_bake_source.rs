@@ -98,12 +98,12 @@ mod tests {
         .unwrap();
         assert_eq!(projection.source.triangles.len(), 2);
         let hit = projection
-            .sample(Vec3::new(0.75, 1., -0.025), Vec3::Z, Vec3::Z, None)
+            .sample(Vec3::new(0.75, 1., -0.025), Vec3::Z, Vec3::Z, None, 0)
             .unwrap();
         assert!(hit.ray_hit && (hit.height - 0.5).abs() < 1e-5);
         assert!(
             projection
-                .sample(Vec3::new(0.75, 2., 0.), Vec3::Z, Vec3::Z, None)
+                .sample(Vec3::new(0.75, 2., 0.), Vec3::Z, Vec3::Z, None, 0)
                 .is_none()
         );
         assert!(
@@ -158,12 +158,12 @@ mod tests {
                     .source
                     .triangles
                     .iter()
-                    .filter(|triangle| triangle.usage == SourceUse::Project)
+                    .filter(|triangle| triangle.usage.projectable())
                     .count(),
                 faces
             );
             let hit = projection
-                .sample(Vec3::new(0.4, 0.6, 0.), Vec3::Z, Vec3::Z, None)
+                .sample(Vec3::new(0.4, 0.6, 0.), Vec3::Z, Vec3::Z, None, 0)
                 .unwrap();
             assert!(hit.ray_hit && (hit.height - expected_height).abs() < 1e-5);
             assert!(hit.normal.abs_diff_eq(Vec3::Z, 1e-5));

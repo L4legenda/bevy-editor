@@ -11,6 +11,7 @@ pub(super) struct ProjectTriangle<'a> {
     pub geometric: Vec3,
     pub axes: (Vec3, Vec3),
     pub cage: Option<&'a CageTriangle>,
+    pub group: u32,
 }
 
 pub(super) struct Texel {
@@ -118,7 +119,7 @@ impl ProjectTriangle<'_> {
     pub fn center_probe(&self, projector: &Projection, weights: Vec3) -> Probe {
         let (point, direction, normal, cage) = self.ray(weights);
         Probe {
-            query: projector.query(point, direction, normal, cage, true),
+            query: projector.query(point, direction, normal, cage, true, self.group),
             distance: 0.,
         }
     }
@@ -143,7 +144,7 @@ impl ProjectTriangle<'_> {
             }
             let (point, direction, normal, cage) = self.ray(weights);
             probes.push(Probe {
-                query: projector.query(point, direction, normal, cage, false),
+                query: projector.query(point, direction, normal, cage, false, self.group),
                 distance: sample.distance,
             });
         }
@@ -169,9 +170,9 @@ impl ProjectTriangle<'_> {
             center: hit,
         };
         if pattern.grid == 1 {
-            return projector.sample(point, direction, normal, cage).map(single);
+            return projector.sample(point, direction, normal, cage, self.group).map(single);
         }
-        let center = projector.direct(point, direction, cage);
+        let center = projector.direct(point, direction, cage, self.group);
         let mut representative = center;
         let mut nearest = center.map_or(f32::INFINITY, |_| 0.);
         let mut sum = Vec3::ZERO;
@@ -186,7 +187,7 @@ impl ProjectTriangle<'_> {
             let result = if sample.offset == Vec2::ZERO {
                 center
             } else {
-                projector.direct(sample_point, sample_direction, sample_cage)
+                projector.direct(sample_point, sample_direction, sample_cage, self.group)
             };
             if let Some(hit) = result {
                 sum += tangent_normal(hit.normal, sample_normal, self.axes);
@@ -201,7 +202,7 @@ impl ProjectTriangle<'_> {
         }
         if count == 0 {
             return center
-                .or_else(|| projector.fill(point, direction, normal, cage))
+                .or_else(|| projector.fill(point, direction, normal, cage, self.group))
                 .map(single);
         }
         let center = representative.unwrap();

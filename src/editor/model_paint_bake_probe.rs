@@ -64,6 +64,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) struct Prepared {
     positions: Vec<Vec3>,
     directions: Vec<Vec3>,
     corner_normals: Option<Vec<Vec<Vec3>>>,
+    projection_groups: Vec<u32>,
     cage: Option<project::Cage>,
 }
 
@@ -107,7 +108,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
     let mut baseline = settings.clone();
     baseline.manual = None;
     let (source, cage) = if let Some(path) = settings.path.as_deref() {
-        let projector = project::Projection::load(path, &object.name, span, settings, progress)?;
+        let projector = project::Projection::load_for_object(path, object, span, settings, progress)?;
         let parts = projector.connected_parts(progress)?;
         let (cage, _) = projection_cage(
             &projector, object, &positions, &directions, span, &baseline, progress,
@@ -116,6 +117,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
     } else {
         (None, None)
     };
+    let projection_groups = source.as_ref().map_or_else(Vec::new, |(projector, _)| projector.face_groups(object));
     Ok(Prepared {
         object: object.clone(),
         span,
@@ -123,6 +125,7 @@ pub(in crate::editor::ui::model_viewer::paint::bake) fn prepare(
         positions,
         directions,
         corner_normals,
+        projection_groups,
         cage,
     })
 }
@@ -141,6 +144,7 @@ impl Prepared {
             positions,
             directions,
             corner_normals,
+            projection_groups,
             cage,
         } = self;
         let span = *span;
@@ -185,6 +189,7 @@ impl Prepared {
         let mut ordinal = 0;
         for (face_index, face) in mesh.faces.iter().enumerate().filter(|(_, face)| face.material == slot) {
             progress.check()?;
+            let group = projection_groups.get(face_index).copied().unwrap_or(0);
             let geo = to_world(mesh.normal(face));
             for triangle in mesh.triangles(face) {
                 let include = ordinal % stride == 0;
@@ -234,12 +239,12 @@ impl Prepared {
                             output.colors.push(colors[4]);
                             continue;
                         };
-                        let edge = projector.segment(point, direction, cage);
+                        let edge = projector.segment(point, direction, cage, group);
                         let (point, segment, shell_point) = if i == 0 || j == 0 || i + j == grid {
                             // UV texels are sampled in the interior. Avoid numerical misses when
                             // a diagnostic vertex falls exactly on the edge of both meshes.
                             let (point, direction, cage) = ray_at(w.lerp(Vec3::splat(1. / 3.), 1e-5));
-                            let segment = projector.segment(point, direction, cage);
+                            let segment = projector.segment(point, direction, cage, group);
                             (point, segment, edge.origin)
                         } else {
                             let origin = edge.origin;
@@ -253,6 +258,7 @@ impl Prepared {
                                     segment.outward,
                                     span.max(segment.front + segment.rear),
                                     span * 1e-6,
+                                    group,
                                 );
                                 let height = segment.front - distance;
                                 if nearest.is_some_and(|(own, _)| parts[own] != parts[hit]) {

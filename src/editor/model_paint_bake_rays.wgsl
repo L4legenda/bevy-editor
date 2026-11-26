@@ -92,6 +92,10 @@ fn triangle_at(index: u32) -> Triangle {
         bitcast<vec4<f32>>(triangles[first + 2u]), triangles[first + 3u]);
 }
 
+fn projection_matches(source: u32, group: u32) -> bool {
+    return source != 0u && (group == 0u || group == source);
+}
+
 fn trace_hit(origin: vec3<f32>, direction: vec3<f32>, limit: f32, ids: vec4<u32>, part_filter: u32, exit_at: f32) -> RayHit {
     let parallel = abs(direction) < vec3(1.0e-12);
     let inverse = vec3(1.0) / select(direction, vec3(1.0), parallel);
@@ -142,7 +146,7 @@ fn trace_hit(origin: vec3<f32>, direction: vec3<f32>, limit: f32, ids: vec4<u32>
                 if ((part_filter < 3u && same_face) || (part_filter == 1u && !same_part) || (part_filter == 2u && same_part)) {
                     continue;
                 }
-                if (part_filter >= 4u && triangle.ids.w == 0u) {
+                if (part_filter >= 4u && !projection_matches(triangle.ids.w, ids.x)) {
                     continue;
                 }
                 let back_facing = part_filter == 4u
@@ -550,7 +554,7 @@ struct Closest {
     point: vec3<f32>,
 }
 
-fn closest_surface(p: vec3<f32>, reach: f32) -> Closest {
+fn closest_surface(p: vec3<f32>, reach: f32, group: u32) -> Closest {
     var result = Closest(NONE, vec3<f32>(0.0));
     var best = reach * reach;
     var stack: array<u32, 64>;
@@ -573,7 +577,7 @@ fn closest_surface(p: vec3<f32>, reach: f32) -> Closest {
         } else {
             for (var i = node.links.z; i < node.links.w; i++) {
                 let triangle = triangle_at(i);
-                if (triangle.ids.w == 0u) {
+                if (!projection_matches(triangle.ids.w, group)) {
                     continue;
                 }
                 let point = nearest_on_triangle(p, triangle);
@@ -602,7 +606,8 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
     let origin = probe.geo.xyz;
     let limit = front + probe.geo.w;
     let prefer_front_faces = (probe.ids.w & 2u) != 0u;
-    let hit = trace_hit(origin, direction, limit, vec4<u32>(0u), select(5u, 4u, prefer_front_faces), -1.0);
+    let group = probe.ids.w >> 2u;
+    let hit = trace_hit(origin, direction, limit, vec4<u32>(group, 0u, 0u, 0u), select(5u, 4u, prefer_front_faces), -1.0);
     var face = NONE;
     var position = vec3<f32>(0.0);
     var height = 0.0;
@@ -612,7 +617,7 @@ fn project_queries(@builtin(global_invocation_id) global: vec3<u32>) {
         position = origin + direction * hit.distance;
         height = (front - hit.distance) / range;
     } else if ((probe.ids.w & 1u) != 0u) {
-        let closest = closest_surface(low, range * 4.0);
+        let closest = closest_surface(low, range * 4.0, group);
         if (closest.triangle != NONE) {
             face = triangle_at(closest.triangle).ids.y;
             position = closest.point;

@@ -1,5 +1,6 @@
 //! Lossless-container GLB updates: retain textures, materials, extras and untouched nodes.
 use super::Object;
+use crate::editor::model_mesh::SourcePart;
 use bevy::{gltf::gltf, prelude::*};
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +14,73 @@ use std::{
 mod paint_io;
 
 const ID_COLORS: &str = "bevy_editor_id_colors";
+const SOURCE_PARTS: &str = "bevy_editor_source_parts";
+
+pub(in crate::editor) fn read_source_parts(
+    source: &gltf::Document,
+    primitive: &gltf::Primitive,
+    bin: &[u8],
+    count: usize,
+) -> Result<Option<Vec<Option<Arc<SourcePart>>>>, String> {
+    let Some(raw) = primitive.extras().as_ref() else { return Ok(None) };
+    let extras: Value = serde_json::from_str(raw.get()).map_err(|error| error.to_string())?;
+    let Some(parts) = extras.get(SOURCE_PARTS) else { return Ok(None) };
+    let error = "Повреждены имена частей сетки в GLB";
+    let names = parts["names"].as_array().filter(|names| names.len() <= count).ok_or(error)?;
+    let source_ids = parts.get("source_ids").map(|ids| {
+        ids.as_array().filter(|ids| ids.len() == names.len()).ok_or(error)
+    }).transpose()?;
+    let names = names.iter().enumerate().map(|(index, name)| {
+        let name = name.as_str().ok_or(error)?;
+        let id = source_ids.and_then(|ids| ids.get(index)).filter(|id| !id.is_null())
+            .map(|id| id.as_u64().and_then(|id| u32::try_from(id).ok()).ok_or(error)).transpose()?;
+        if name.is_empty() && id.is_none() {
+            return Err(error);
+        }
+        Ok(Arc::new(SourcePart { name: name.into(), id }))
+    }).collect::<Result<Vec<_>, _>>()?;
+    let view = parts["view"].as_u64().and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| source.views().nth(index)).ok_or(error)?;
+    if view.buffer().index() != 0 || view.stride().is_some() || count.checked_mul(4) != Some(view.length()) {
+        return Err(error.into());
+    }
+    let end = view.offset().checked_add(view.length()).ok_or(error)?;
+    let data = bin.get(view.offset()..end).ok_or(error)?;
+    let parts = data.chunks_exact(4).map(|entry| {
+        let id = u32::from_le_bytes(entry.try_into().unwrap()) as usize;
+        if id == 0 { Ok(None) } else { names.get(id - 1).cloned().map(Some).ok_or(error) }
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(parts))
+}
+
+fn write_source_parts(
+    root: &mut Value, bin: &mut Vec<u8>, primitive: &mut Value, parts: &[Arc<SourcePart>], ids: &[u32],
+) -> Result<(), String> {
+    if parts.is_empty() {
+        if let Some(extras) = primitive.get_mut("extras").and_then(Value::as_object_mut) {
+            extras.remove(SOURCE_PARTS);
+        }
+        return Ok(());
+    }
+    if primitive["extras"].is_null() {
+        primitive["extras"] = json!({});
+    }
+    let extras = primitive["extras"].as_object_mut().ok_or("Некорректные дополнительные данные GLB")?;
+    align(bin, 0);
+    let start = bin.len();
+    for id in ids {
+        bin.extend_from_slice(&id.to_le_bytes());
+    }
+    let views = root["bufferViews"].as_array_mut().unwrap();
+    let names: Vec<_> = parts.iter().map(|part| part.as_str()).collect();
+    let mut metadata = json!({"view": views.len(), "names": names});
+    if parts.iter().any(|part| part.id.is_some()) {
+        metadata["source_ids"] = json!(parts.iter().map(|part| part.id).collect::<Vec<_>>());
+    }
+    extras.insert(SOURCE_PARTS.into(), metadata);
+    views.push(json!({"buffer": 0, "byteOffset": start, "byteLength": bin.len() - start}));
+    Ok(())
+}
 
 pub(in crate::editor) fn read_id_colors(
     source: &gltf::Document,
@@ -406,6 +474,7 @@ impl Glb {
                     paint_io::encode_fixes(&mut root, &mut bin, &mut primitive, &material.bake_fixes)?;
                 }
                 write_id_colors(&mut root, &mut bin, &mut primitive, &buffers.id_colors)?;
+                write_source_parts(&mut root, &mut bin, &mut primitive, &buffers.source_parts, &buffers.source_part_ids)?;
                 let map = primitive
                     .as_object_mut()
                     .ok_or("Некорректный примитив GLB")?;
@@ -593,3 +662,5 @@ fn append_vec<const N: usize>(
 #[cfg(test)]
 #[path = "model_glb_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(in crate::editor) use tests::import_geometry;

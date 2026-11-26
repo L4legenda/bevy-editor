@@ -232,11 +232,15 @@ impl Summary {
 }
 
 pub(super) fn convert(source: &Path, target: &Path) -> io::Result<(PathBuf, ImportDetails)> {
+    let (name, bytes, report) = prepare_conversion(source)?;
+    Ok((publish_project(target, &name, "SPP", &bytes)?, report))
+}
+
+pub(super) fn prepare_conversion(source: &Path) -> io::Result<(String, Vec<u8>, ImportDetails)> {
     let name = project_name(source);
     let (model, summary) = import(source, &name)?;
     let bytes = Glb::new_asset(&[model]).map_err(io::Error::other)?;
-    let file = publish_project(target, &name, "SPP", &bytes)?;
-    Ok((file, summary.details()))
+    Ok((name, bytes, summary.details()))
 }
 
 pub(super) fn project_name(source: &Path) -> String {

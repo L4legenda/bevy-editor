@@ -273,6 +273,69 @@ fn safe_stem(name: &str) -> String {
     }
 }
 
+fn file_name(stem: &str, format: Format) -> String {
+    format!("{stem}.{}", format.extension())
+}
+
+fn udim_suffix(tile: Option<u32>) -> String {
+    tile.map_or_else(String::new, |tile| format!(".{tile}"))
+}
+
+fn template_stem(stem: &str, template: Template) -> String {
+    if template == Template::Unreal { format!("T_{stem}") } else { stem.to_owned() }
+}
+
+fn custom_bake_stem(recipe: &custom::Recipe) -> String {
+    format!("{}_{:016x}", safe_stem(&recipe.name), recipe.id)
+}
+
+pub(super) struct PreviewFile {
+    pub name: String,
+    pub depth: Depth,
+    pub conditional: bool,
+}
+
+pub(super) fn preview_files(
+    doc: &Document,
+    selected: (usize, usize),
+    project: &str,
+    settings: prefs::Settings,
+    custom: Option<&recipe::Recipe>,
+    baked: Option<&bake::Maps>,
+) -> Vec<PreviewFile> {
+    let Some(SetName { stem, tile }) = set_names(doc).remove(&selected) else { return Vec::new() };
+    let template = settings.template;
+    let item = |stem: String, samples, conditional| PreviewFile {
+        name: file_name(&stem, settings.file.format),
+        depth: image_output::output_depth(samples, settings.file),
+        conditional,
+    };
+    if let Some(custom) = custom {
+        let names = recipe::Names { mesh: model_name(doc), project, set: &stem, tile, multiple_sets: false };
+        return custom.maps.iter().map(|map| {
+            item(names.stem(&map.name), Samples::Packed { srgb: 0, normal: false, force_16: map.force_16 }, false)
+        }).collect();
+    }
+    let suffix = udim_suffix(tile);
+    let mut files = template.maps().iter().map(|map| item(
+        format!("{}_{name}{suffix}", template_stem(&stem, template), name = map.name),
+        map.samples(template), map.skip_if_default.is_some(),
+    )).collect::<Vec<_>>();
+    if matches!(template, Template::Separate | Template::Baked) && let Some(baked) = baked {
+        for map in bake::BakeMap::ALL.into_iter().filter(|&map| baked.has_map(map)) {
+            files.push(item(format!("{stem}_{}{suffix}", map.export_name()), Samples::Data, false));
+        }
+        for recipe in doc.custom_bakes.iter().filter(|recipe| baked.has_map(bake::BakeMap::Custom(recipe.id))) {
+            files.push(item(format!("{stem}_{}{suffix}", custom_bake_stem(recipe)), Samples::Data, false));
+        }
+    }
+    files
+}
+
+fn model_name(doc: &Document) -> &str {
+    doc.source.path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Model")
+}
+
 struct ExportDirectory {
     path: PathBuf,
     files: Vec<PathBuf>,
@@ -315,7 +378,7 @@ impl ExportDirectory {
         samples: Samples,
     ) -> io::Result<()> {
         // Append the extension so a UDIM suffix remains part of the stem.
-        let name = format!("{name}.{}", self.options.format.extension());
+        let name = file_name(&name, self.options.format);
         let mut writer = self.file(&name)?;
         image_output::write(&mut writer, size, pixels, channels, samples, self.options)
             .map_err(io::Error::other)?;
@@ -330,7 +393,7 @@ impl ExportDirectory {
         channels: usize,
         samples: Samples,
     ) -> io::Result<()> {
-        let name = format!("{name}.{}", self.options.format.extension());
+        let name = file_name(&name, self.options.format);
         let mut writer = self.file(&name)?;
         image_output::write_float(&mut writer, size, pixels, channels, samples, self.options)
             .map_err(io::Error::other)?;
@@ -595,7 +658,7 @@ fn write_textures(
         }
         surface.bind_generators(&set.mesh, set.slot, set.uv_offset, set.transform);
         surface.bind_texture_fills(&set.mesh, set.slot, set.uv_offset, set.transform);
-        let suffix = set.tile.map_or_else(String::new, |tile| format!(".{tile}"));
+        let suffix = udim_suffix(set.tile);
         let limit = padding.limit(width);
         let sources = if limit == 0 || template == Template::Baked {
             Vec::new()
@@ -625,11 +688,7 @@ fn write_textures(
             continue;
         }
         if template != Template::Baked {
-            let stem = if template == Template::Unreal {
-                format!("T_{}", set.stem)
-            } else {
-                set.stem.clone()
-            };
+            let stem = template_stem(&set.stem, template);
             templates::write(
                 &mut output,
                 &stem,
@@ -673,7 +732,7 @@ fn write_textures(
             for recipe in set.custom_recipes.iter() {
                 let map = bake::BakeMap::Custom(recipe.id);
                 if maps.has_map(map) {
-                    let label = format!("{}_{:016x}", safe_stem(&recipe.name), recipe.id);
+                    let label = custom_bake_stem(recipe);
                     write_map(&label, map)?;
                 }
             }
@@ -1428,13 +1487,7 @@ pub(in crate::editor::ui::model_viewer) fn actions(
         } else {
             Job::Mesh(mesh::Snapshot::capture(doc))
         };
-        let model = doc
-            .source
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("Model")
-            .to_owned();
+        let model = model_name(doc).to_owned();
         let start_directory = preferences.folder().map(Path::to_owned);
         let project = editor.project.title.clone();
         let (sender, receiver) = mpsc::channel();

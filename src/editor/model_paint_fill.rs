@@ -8,6 +8,7 @@ type Edge = (usize, usize, usize);
 const UV_GRID: usize = 32;
 
 struct Face {
+    source_object: usize,
     triangles: Vec<usize>,
     edges: Vec<(Edge, [Vec3; 2])>,
 }
@@ -85,6 +86,7 @@ impl Topology {
     ) -> Self {
         let mut faces = HashMap::new();
         let mut borders: HashMap<_, Vec<_>> = HashMap::new();
+        let mut source_objects = HashMap::new();
         for object in objects.iter().filter(|object| !object.hidden) {
             let point = |v: usize| {
                 object
@@ -96,10 +98,12 @@ impl Topology {
                     continue;
                 }
                 let id = (object.id, face);
+                let next = source_objects.len();
+                let source_object = *source_objects.entry((object.id, polygon.source_identity())).or_insert(next);
                 let edges = polygon
                     .edges()
                     .map(|(a, b)| {
-                        let edge = edge(object.id, a, b);
+                        let edge = edge(source_object, a, b);
                         borders.entry(edge).or_default().push(id);
                         (edge, [point(a), point(b)])
                     })
@@ -107,6 +111,7 @@ impl Topology {
                 faces.insert(
                     id,
                     Face {
+                        source_object,
                         triangles: Vec::new(),
                         edges,
                     },
@@ -123,19 +128,16 @@ impl Topology {
         let quantize = |uv: Vec2| (uv * 100_000.).round().as_ivec2().to_array();
         for (index, (triangle, data)) in triangles.iter().zip(attributes).enumerate() {
             let object = triangle.object;
-            faces
-                .get_mut(&(object, triangle.face))
-                .unwrap()
-                .triangles
-                .push(index);
-            by_object.entry(object).or_default().push(index);
+            let face = faces.get_mut(&(object, triangle.face)).unwrap();
+            face.triangles.push(index);
+            by_object.entry(face.source_object).or_default().push(index);
             sets.entry((object, data.slot)).or_default().push(index);
             let [a, b, c] = data.points;
             normals.push((b - a).cross(c - a).normalize_or_zero());
             for i in 0..3 {
                 let j = (i + 1) % 3;
                 let (a, b) = (data.vertices[i], data.vertices[j]);
-                let key = edge(object, a, b);
+                let key = edge(face.source_object, a, b);
                 surface_edges.entry(key).or_default().push(index);
                 let (u, v) = (quantize(data.uv[i]), quantize(data.uv[j]));
                 let uv_pair = if a <= b { (u, v) } else { (v, u) };
@@ -176,7 +178,8 @@ impl Topology {
                         length(a).total_cmp(&length(b))
                     })
                     .unwrap();
-                edge(t.object, data.vertices[i], data.vertices[(i + 1) % 3])
+                let source_object = faces[&(t.object, t.face)].source_object;
+                edge(source_object, data.vertices[i], data.vertices[(i + 1) % 3])
             })
             .collect();
         let mut partners = vec![None; triangles.len()];
@@ -218,6 +221,7 @@ impl Topology {
             loop_quads.insert(
                 owners[i],
                 Face {
+                    source_object: left.source_object,
                     triangles: vec![i, j],
                     edges,
                 },
@@ -333,7 +337,7 @@ impl Topology {
                 seen.into_iter().collect()
             }
             FillMode::Part => self.parts.of(index).to_vec(),
-            FillMode::Object => self.objects[&id.0].clone(),
+            FillMode::Object => self.objects[&self.faces[&id].source_object].clone(),
             FillMode::UvIsland => self.islands.of(index).to_vec(),
             FillMode::Set => self.sets[&(id.0, data[index].slot)].clone(),
         }
@@ -519,7 +523,7 @@ mod tests {
             })
             .collect();
         let split = super::super::SurfaceTrace::prepare_fill(&[triangulated]);
-        let trace = super::super::SurfaceTrace::prepare_fill(&[object]);
+        let trace = super::super::SurfaceTrace::prepare_fill(&[object.clone()]);
         let topology = trace.topology.as_ref().unwrap();
         let point = Vec3::new(0.99, 0.5, 0.);
         let select = |mode, angle: f32| {
@@ -551,5 +555,20 @@ mod tests {
             .unwrap();
         assert!(index < 2);
         assert!(world.abs_diff_eq(Vec3::new(0.4, 0.55, 0.), 1e-5));
+
+        let mut imported = object;
+        let body = std::sync::Arc::new(crate::editor::model_mesh::SourcePart { name: "Panel".into(), id: Some(0) });
+        let cover = std::sync::Arc::new(crate::editor::model_mesh::SourcePart { name: "Panel".into(), id: Some(1) });
+        for (index, face) in imported.geometry.faces.iter_mut().enumerate() {
+            let name = if index == 2 { &cover } else { &body };
+            for corner in &mut face.corners {
+                corner.source_part = Some(name.clone());
+            }
+        }
+        let trace = super::super::SurfaceTrace::prepare_fill(&[imported]);
+        let topology = trace.topology.as_ref().unwrap();
+        assert_eq!(topology.select(2, point, FillMode::Part, 0.9, &trace.attributes), [0, 1, 2, 3]);
+        assert_eq!(topology.select(2, point, FillMode::Object, 0.9, &trace.attributes), [0, 1, 2, 3, 6, 7]);
+        assert_eq!(topology.select(4, point, FillMode::Object, 0.9, &trace.attributes), [4, 5]);
     }
 }

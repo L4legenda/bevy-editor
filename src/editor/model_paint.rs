@@ -257,7 +257,7 @@ impl Parameter {
         match self {
             Self::Size => "Размер",
             Self::Flow => "Поток, %",
-            Self::Opacity => "Сила, %",
+            Self::Opacity => "Непрозрачность мазка, %",
             Self::Hardness => "Жёсткость, %",
             Self::Spacing => "Шаг, %",
             Self::Stabilizer => "Стабилизация, px",

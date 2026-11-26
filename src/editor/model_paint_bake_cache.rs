@@ -222,11 +222,18 @@ fn key(
             hash.floats(position.to_array());
         }
         hash.number(geometry.faces.len() as u64);
-        for face in &geometry.faces {
+        for (index, face) in geometry.faces.iter().enumerate() {
             progress.check().ok()?;
             hash.number(face.material as u64);
             hash.number(u8::from(face.smooth));
             hash.number(face.corners.len() as u64);
+            if (settings.cage.is_some() || (settings.path.is_some() && settings.match_names))
+                && let Some(part) = face.source_part()
+            {
+                hash.bytes(b"source part");
+                hash.number(index as u64);
+                hash.bytes(part.as_bytes());
+            }
             for corner in &face.corners {
                 hash.number(corner.vertex as u64);
                 hash.floats(corner.uv.to_array());

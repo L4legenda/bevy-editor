@@ -448,6 +448,88 @@ impl BuiltinPreview {
     }
 }
 
+fn builtin_projection(
+    mut projection: ProjectionSettings, doc: &Document, map: BakeMap, include_inputs: bool,
+) -> ProjectionSettings {
+    if include_inputs {
+        projection.custom = doc.custom_bakes.clone();
+    } else {
+        projection.maps = MapSelection::MINIMUM.toggle(map);
+        projection.custom = Arc::default();
+    }
+    projection
+}
+
+#[cfg(feature = "mcp")]
+pub(in crate::editor::ui::model_viewer::paint) fn progress<'a>(
+    baked: &'a super::State, model: usize, doc: &Document, session: &Session, map: BakeMap,
+) -> (&'static str, Option<u32>, Option<&'a str>) {
+    let unavailable = ("unavailable", None, None);
+    let pending = ("pending", None, None);
+    let Some(binding) = session.binding.filter(|&(object, slot)| {
+        !session.bake_picking && session.set_appearance.visibility.shown(object, slot)
+    }) else {
+        return unavailable;
+    };
+    let Some(target) = doc.objects.iter().find(|object| object.id == binding.0 && !object.hidden) else {
+        return unavailable;
+    };
+    let full = || baked.maps(model, doc, binding, session.texture_size)
+        .is_some_and(|maps| maps.has_map(map));
+    let baked_status = ("baked", Some(session.texture_size), None);
+    let mut projection = projection_for(session, target);
+    let (displayed, current, error) = if let BakeMap::Custom(id) = map {
+        let Some(recipe) = doc.custom_bakes.iter().find(|recipe| recipe.id == id) else {
+            return unavailable;
+        };
+        let live = &baked.live;
+        let quality = projection.quality;
+        projection.quality = Quality::Draft;
+        projection.maps = MapSelection::ALL;
+        let active = live.geometry.as_ref().filter(|scene| {
+            (scene.key.model, scene.key.object, scene.key.slot) == (model, binding.0, binding.1)
+                && scene.key.matches_geometry(doc) && scene.settings == projection
+        }).zip(live.wanted.as_ref()).filter(|(_, (wanted, size, wanted_quality, _))| {
+            wanted.same_bake(recipe) && *size == session.texture_size && *wanted_quality == quality
+        });
+        let Some((scene, _)) = active else {
+            return if full() { baked_status } else { pending };
+        };
+        let shown = live.scoped_preview(model, doc, binding, id);
+        if full() && shown.is_none() {
+            return baked_status;
+        }
+        (shown.map(|item| item.size), shown.is_some_and(|item| item.recipe.same_bake(recipe)),
+            scene.error.as_deref().or_else(|| live.failed.as_ref()
+                .filter(|(failed, _)| failed.same_bake(recipe)).map(|(_, error)| error.as_str())))
+    } else {
+        if full() {
+            return baked_status;
+        }
+        if !projection.maps.contains(map) || (map.requires_high_poly() && projection.path.is_none()) {
+            return unavailable;
+        }
+        let include_inputs = session.live_mask_map().is_some();
+        let projection = builtin_projection(projection, doc, map, include_inputs);
+        let Some(preview) = baked.builtin_live.as_ref().filter(|preview| {
+            preview.map == map && preview.key.size == session.texture_size
+                && preview.matches_target(model, doc, binding)
+                && preview.include_inputs == include_inputs && preview.settings == projection
+        }) else {
+            return pending;
+        };
+        (preview.shown.as_ref().map(|(size, ..)| *size), preview.shown_current, preview.error.as_deref())
+    };
+    let status = if error.is_some() {
+        "failed"
+    } else if current {
+        "ready"
+    } else {
+        "pending"
+    };
+    (status, displayed, error)
+}
+
 pub(in crate::editor::ui::model_viewer) fn update(
     editor: Res<Editor>,
     editing: Res<editing::State>,
@@ -496,12 +578,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
             return;
         }
         let include_inputs = session.live_mask_map().is_some();
-        if include_inputs {
-            projection.custom = doc.custom_bakes.clone();
-        } else {
-            projection.maps = MapSelection::MINIMUM.toggle(map);
-            projection.custom = Arc::default();
-        }
+        let projection = builtin_projection(projection, doc, map, include_inputs);
         if baked.builtin_live.as_ref().is_none_or(|preview| {
             (!include_inputs && preview.map != map) || preview.key.size != session.texture_size || preview.settings != projection
                 || preview.include_inputs != include_inputs

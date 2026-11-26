@@ -63,7 +63,17 @@ impl Template {
 
     pub(super) fn maps(self) -> &'static [Map<'static>] {
         match self {
-            Self::Separate | Self::Baked | Self::Custom(_) => &[],
+            Self::Separate => const { &[
+                BASE,
+                packed("Opacity", &[OPACITY]),
+                ROUGHNESS,
+                METALLIC,
+                packed("SpecularLevel", &[Layer(7, 0)]),
+                HEIGHT,
+                NORMAL,
+                packed("Emissive", &[Layer(5, 0), Layer(5, 1), Layer(5, 2)]),
+            ] },
+            Self::Baked | Self::Custom(_) => &[],
             Self::Unreal => {
                 const {
                     &[
@@ -259,28 +269,7 @@ pub(super) fn write(
     padding: Padding,
     template: Template,
 ) -> io::Result<()> {
-    let separate = [
-        BASE,
-        packed("Opacity", &[OPACITY]),
-        ROUGHNESS,
-        METALLIC,
-        packed("SpecularLevel", &[Layer(7, 0)]),
-        HEIGHT,
-        NORMAL,
-        packed("Emissive", &[Layer(5, 0), Layer(5, 1), Layer(5, 2)]),
-    ];
-    let maps = if template == Template::Separate {
-        &separate[..]
-    } else {
-        template.maps()
-    };
-    for map in maps {
-        let samples = match map.components {
-            [Normal(..), ..] => Samples::Normal,
-            [Layer(3, 0)] if template != Template::Separate => Samples::Height,
-            [Layer(0 | 5, _), ..] | [Diffuse(_), ..] | [Specular(_), ..] => Samples::Color,
-            _ => Samples::Data,
-        };
+    for map in template.maps() {
         write_map(
             output,
             format!("{stem}_{name}{suffix}", name = map.name),
@@ -289,11 +278,22 @@ pub(super) fn write(
             baked,
             sources,
             padding,
-            samples,
+            map.samples(template),
             template != Template::Separate,
         )?;
     }
     Ok(())
+}
+
+impl Map<'_> {
+    pub(super) fn samples(self, template: Template) -> Samples {
+        match self.components {
+            [Normal(..), ..] => Samples::Normal,
+            [Layer(3, 0)] if template != Template::Separate => Samples::Height,
+            [Layer(0 | 5, _), ..] | [Diffuse(_), ..] | [Specular(_), ..] => Samples::Color,
+            _ => Samples::Data,
+        }
+    }
 }
 
 pub(super) fn write_map(

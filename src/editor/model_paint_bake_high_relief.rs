@@ -4,7 +4,7 @@ use super::super::{
     relief::{Edges, Parameters, Sample, Segment, Segments, add_contours, hard_fold},
     root,
 };
-use super::{Hit, Progress, Projection, SourceTriangle, SourceUse, fit::position_key};
+use super::{Hit, Progress, Projection, SourceTriangle, fit::position_key};
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,7 +124,7 @@ impl HighRelief {
             edges.reserve_exact(
                 triangles
                     .iter()
-                    .filter(|triangle| triangle.usage == SourceUse::Project)
+                    .filter(|triangle| triangle.usage.projectable())
                     .count()
                     * 3,
             );
@@ -134,7 +134,7 @@ impl HighRelief {
             if face % 4096 == 0 {
                 progress.check()?;
             }
-            if triangle.usage != SourceUse::Project {
+            if !triangle.usage.projectable() {
                 if include_details {
                     corner_groups.push([NO_GROUP; 3]);
                 }
@@ -217,7 +217,7 @@ impl HighRelief {
             if face % 4096 == 0 {
                 progress.check()?;
             }
-            if triangle.usage == SourceUse::Project {
+            if triangle.usage.projectable() {
                 let part_bounds = bounds.entry(parts[face]).or_default();
                 for &point in &triangle.points {
                     part_bounds.add(point);
@@ -276,7 +276,7 @@ impl HighRelief {
             if face % 4096 == 0 {
                 progress.check()?;
             }
-            if triangle.usage != SourceUse::Project {
+            if !triangle.usage.projectable() {
                 continue;
             }
             add_contours(&mut curves, parts[face], triangle.points, *values, threshold);

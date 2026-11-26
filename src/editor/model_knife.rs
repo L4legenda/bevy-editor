@@ -88,6 +88,7 @@ impl<'a> Surface<'a> {
                 color: a.color * u + b.color * v + c.color * w,
                 id_color: a.id_color.zip(b.id_color).zip(c.id_color)
                     .map(|((a, b), c)| a * u + b * v + c * w),
+                source_part: super::common_source_part([a, b, c].into_iter()).cloned(),
                 source_normal,
             },
         ))

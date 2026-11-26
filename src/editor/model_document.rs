@@ -1,6 +1,6 @@
 //! Editable model state and transactions. Scene documents never share these meshes.
 use super::{
-    model_mesh::{BevelOptions, Corner, Edge, Element, Face, Geometry, Selection},
+    model_mesh::{BevelOptions, Corner, Edge, Element, Face, Geometry, Selection, SourcePart},
     ui::model_viewer::paint::DocumentPost,
 };
 use bevy::{
@@ -137,6 +137,12 @@ pub(super) struct Object {
     pub materials: Vec<MaterialSlot>,
     pub hidden: bool,
 }
+impl Object {
+    pub fn bake_source_name(&self) -> &str {
+        self.geometry.uniform_source_part().unwrap_or(&self.name)
+    }
+}
+
 impl PartialEq for Object {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -1131,7 +1137,7 @@ pub(super) fn from_mesh(
     geometry: &mut Geometry,
     material: usize,
 ) -> Result<(), String> {
-    from_mesh_with_topology(mesh, geometry, material, None, None)
+    from_mesh_with_topology(mesh, geometry, material, None, None, None)
 }
 
 pub(super) fn from_mesh_with_topology(
@@ -1140,6 +1146,7 @@ pub(super) fn from_mesh_with_topology(
     material: usize,
     polygons: Option<&serde_json::Value>,
     id_colors: Option<&[Option<Vec3>]>,
+    source_parts: Option<&[Option<Arc<SourcePart>>]>,
 ) -> Result<(), String> {
     let Some(VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute(Mesh::ATTRIBUTE_POSITION)
@@ -1171,6 +1178,7 @@ pub(super) fn from_mesh_with_topology(
         uv1.map(Vec::len),
         colors.map(Vec::len),
         id_colors.map(<[_]>::len),
+        source_parts.map(<[_]>::len),
     ]
     .into_iter()
     .flatten()
@@ -1254,6 +1262,7 @@ pub(super) fn from_mesh_with_topology(
                         || colors.filter(|_| use_visible_colors).map(|values| Vec4::from_array(values[i]).truncate()),
                         |values| values[i],
                     ),
+                    source_part: source_parts.and_then(|parts| parts[i].clone()),
                     source_normal: normals
                         .map(|v| Vec3::from_array(v[i]).normalize_or_zero())
                         .filter(|n| n.length_squared() > 0.0),

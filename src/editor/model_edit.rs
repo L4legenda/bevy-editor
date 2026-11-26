@@ -673,6 +673,9 @@ pub(super) fn initialize(
                     let id_colors = document::glb::read_id_colors(
                         ctx.gltf, &primitive, ctx.blob, data.count_vertices(),
                     )?;
+                    let source_parts = document::glb::read_source_parts(
+                        ctx.gltf, &primitive, ctx.blob, data.count_vertices(),
+                    )?;
                     document::from_mesh_with_topology(
                         &data,
                         &mut geometry,
@@ -680,6 +683,7 @@ pub(super) fn initialize(
                         (topology["version"].as_u64() == Some(1))
                             .then(|| &topology["primitives"][i]),
                         id_colors.as_deref(),
+                        source_parts.as_deref(),
                     )?;
                     let material = if let Some(handle) =
                         loaded.primitives.get(i).and_then(|p| p.material.as_ref())

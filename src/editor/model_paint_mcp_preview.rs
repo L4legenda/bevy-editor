@@ -30,6 +30,8 @@ pub(in crate::editor) struct ViewArgs {
     orthographic: Option<bool>,
     layout: Option<View>,
     preview: Option<MapPreview>,
+    /// Preview mesh maps or their effect on the material before a full bake.
+    live_preview: Option<LivePreview>,
     path_trace: Option<bool>,
     /// Sampling and ground settings for the live path-traced viewport.
     trace_settings: Option<TracePatch>,
@@ -210,6 +212,69 @@ enum MapPreview {
     Baked { map: bake::BakeMap },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum LivePreview {
+    Off,
+    Map { map: bake::BakeMap },
+    Material { map: Option<bake::BakeMap> },
+}
+
+impl LivePreview {
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    fn validate(self, doc: &Document, session: &Session) -> Result<(), String> {
+        let map = match self {
+            Self::Off => return Ok(()),
+            Self::Map { map } => map,
+            Self::Material { map } => map.unwrap_or(bake::BakeMap::WorldNormal),
+        };
+        if session.bake_picking {
+            return Err("Finish picking the bake source first".into());
+        }
+        let (object, slot) = session.binding.ok_or("Select a texture set for live preview")?;
+        let target = doc.objects.iter()
+            .find(|target| target.id == object && !target.hidden)
+            .filter(|_| session.set_appearance.visibility.shown(object, slot))
+            .ok_or("Select a visible texture set for live preview")?;
+        if !engine::projection::has_uv(target, slot) {
+            return Err("Live preview requires UVs on the active texture set".into());
+        }
+        let available = match map {
+            bake::BakeMap::Custom(id) => doc.custom_bakes.iter().any(|recipe| recipe.id == id),
+            map => session.bake_projection.maps.contains(map)
+                && (!map.requires_high_poly() || session.bake_projection.path.is_some()),
+        };
+        if !available {
+            return Err("The requested map is not enabled or its bake source is missing".into());
+        }
+        Ok(())
+    }
+
+    fn apply(self, session: &mut Session) {
+        if self.enabled() {
+            session.edit(PaintAction::Panel(Panel::Maps));
+            session.preview_3d = Preview3d::Material;
+            session.bake_inspect_cage = false;
+            session.bake_paint_cage = false;
+            session.bake_custom_gizmo = None;
+            session.bake_fix = None;
+        }
+        session.bake_live = self.enabled();
+        session.bake_live_masks = matches!(self, Self::Material { .. });
+        session.bake_on_model = matches!(self, Self::Map { .. });
+        session.bake_view = match self {
+            Self::Off => None,
+            Self::Map { map } => Some(map),
+            Self::Material { map } => map,
+        };
+        session.revision += 1;
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
@@ -252,6 +317,34 @@ impl McpPreview<'_> {
             |trace| trace.progress(index, doc, session),
         )
     }
+
+    pub(super) fn live_progress(&self, index: usize, doc: &Document, session: &Session) -> Value {
+        live_progress(self.bake.as_deref(), index, doc, session)
+    }
+}
+
+fn live_progress(baked: Option<&bake::State>, model: usize, doc: &Document, session: &Session) -> Value {
+    if doc.mode != Mode::Paint || !session.bake_live || session.panel != Panel::Maps {
+        return json!({"mode": "off", "status": "off"});
+    }
+    let (mode, map) = if let Some(map) = session.live_mask_map() {
+        ("material", map)
+    } else if let Some(map) = session.bake_view.filter(|_| session.bake_on_model || session.view != View::Three) {
+        ("map", map)
+    } else {
+        return json!({"mode": "off", "status": "off"});
+    };
+    let (status, resolution, error) = baked.map_or(("unavailable", None, None), |baked| {
+        bake::live::progress(baked, model, doc, session, map)
+    });
+    let mut response = json!({"mode": mode, "map": session.bake_view, "status": status,
+        "resolution": resolution, "error": error});
+    if mode == "material" {
+        response["material_ready"] = json!(baked.is_some_and(|baked| {
+            baked.masks.material(model, doc, session).is_some()
+        }));
+    }
+    response
 }
 
 fn active_model(editor: &Editor, model: usize) -> Result<usize, String> {
@@ -307,6 +400,13 @@ pub(in crate::editor) fn set_view(
         return Err("This model cannot store the requested preview settings".into());
     }
     let preview = args.preview.as_ref().map(preview_mode).transpose()?;
+    let enable_live = args.live_preview.is_some_and(LivePreview::enabled);
+    if enable_live && (preview.is_some() || args.path_trace == Some(true)) {
+        return Err("Live preview cannot be enabled together with preview or path tracing".into());
+    }
+    if let Some(live) = args.live_preview {
+        live.validate(doc, session)?;
+    }
     if preview.is_some_and(|mode| !session.available(PaintAction::Preview3d(mode))) {
         return Err("The requested map is not available for the active texture set".into());
     }
@@ -371,12 +471,19 @@ pub(in crate::editor) fn set_view(
         session.trace_settings = trace;
         session.revision += 1;
     }
-    if let Some(path_trace) = args
-        .path_trace
+    if let Some(path_trace) = args.path_trace
+        .or_else(|| enable_live.then_some(false))
         .filter(|&enable| enable != session.path_trace)
     {
         session.edit(PaintAction::PathTrace);
         debug_assert_eq!(session.path_trace, path_trace);
+    }
+    if let Some(live) = args.live_preview {
+        live.apply(session);
+    } else if args.path_trace == Some(true) && (session.live_mask_map().is_some()
+        || (session.bake_live && session.showing_bake()))
+    {
+        LivePreview::Off.apply(session);
     }
     if let Some(mode) = preview {
         session.edit(PaintAction::Preview3d(mode));
@@ -390,6 +497,7 @@ pub(in crate::editor) fn set_view(
         "fov_degrees": camera.fov.to_degrees(), "orthographic": camera.orthographic},
         "channel": session.diagnostic_channel().and_then(|index| mcp_state::CHANNEL_KEYS.get(index)),
         "bake_map": session.diagnostic_bake(),
+        "live_preview": live_progress(input.bake.as_deref(), model, doc, session),
         "wireframe": uv.show_wire_3d, "uv_overlay": {"show_wire": uv.show_wire,
             "wire_opacity": uv.wire_opacity, "show_seams_2d": uv.show_seams_2d, "show_seams_3d": uv.show_seams_3d},
         "material": material,
@@ -399,10 +507,10 @@ pub(in crate::editor) fn set_view(
     )
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-struct CameraPatch {
+pub(super) struct CameraPatch {
     center: Option<[f32; 3]>,
     distance: Option<f32>,
     yaw_degrees: Option<f32>,
@@ -423,7 +531,7 @@ fn camera_patch(previous: ModelCamera, args: &ViewArgs) -> Result<ModelCamera, S
 }
 
 impl CameraPatch {
-    fn apply(&self, previous: ModelCamera) -> Result<ModelCamera, String> {
+    pub(super) fn apply(&self, previous: ModelCamera) -> Result<ModelCamera, String> {
         let camera = ModelCamera {
             center: self.center.unwrap_or(previous.center),
             distance: self.distance.unwrap_or(previous.distance),

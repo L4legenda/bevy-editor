@@ -37,7 +37,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
     );
     let client = ().serve(transport).await.unwrap();
     let tools = client.list_tools(None).await.unwrap();
-    assert_eq!(tools.tools.len(), 39);
+    assert_eq!(tools.tools.len(), 40);
     for name in [
         "get_editor_state",
         "get_paint_state",
@@ -46,6 +46,7 @@ async fn sdk_client_discovers_tools_and_changes_the_live_app_over_http() {
         "edit_paint",
         "paint_stroke",
         "poly_fill",
+        "list_paint_surface_parts",
         "select_surface",
         "save_model",
         "save_paint_preset",
@@ -575,15 +576,8 @@ impl Drop for StdioClient {
     }
 }
 
-#[test]
-#[ignore = "requires GPU and a built bevy-editor-mcp binary; tests the complete stdio paint workflow"]
-fn gpu_stdio_paint_workflow_saves_and_exports() {
-    use crate::editor::{
-        model_document::{Mode, glb::Glb},
-        model_mesh::{Corner, Face, Geometry},
-        selection_outline::render_tests::frame,
-        tests::lighting_ui_render::fixture_project,
-    };
+fn stdio_paint_app() -> (Scratch, App, server::RunningServer, StdioClient) {
+    use crate::editor::tests::lighting_ui_render::fixture_project;
     use std::{fs, path::Path};
 
     let scratch = Scratch::new();
@@ -625,6 +619,76 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     }));
     assert_eq!(initialized["serverInfo"]["name"], "bevy-editor");
     client.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    (scratch, app, server, client)
+}
+
+#[test]
+#[ignore = "requires GPU and a built bevy-editor-mcp binary; opens imported SPP and MPP projects"]
+fn gpu_stdio_imports_paint_projects_in_both_formats() {
+    use crate::editor::{model_document::glb::Glb, model_paint_spp::fixture};
+    use std::{fs, path::Path};
+
+    let (scratch, mut app, _server, mut client) = stdio_paint_app();
+    let models = scratch.0.join("assets/models");
+    let original = fs::read(models.join("block.glb")).unwrap();
+    fs::write(models.join("Sample_SPP.glb"), &original).unwrap();
+    let source = scratch.0.join("Sample.SPP");
+    let cache = format!("texture-cache/4242/1/{}", subcraft_spp::document::channel_bits::ROUGHNESS);
+    let spp = fixture::hdf5_file(&[
+        ("paint/scene.assbin", fixture::assbin_quad()),
+        ("paint/document.bin", fixture::document(0)),
+        (&cache, fixture::cache_blob(4, 2, &[120, 255].repeat(8))),
+    ]);
+    fs::write(&source, &spp).unwrap();
+    let broken = scratch.0.join("Broken.spp");
+    fs::write(&broken, b"broken").unwrap();
+    let failed = client.request(&mut app, "tools/call", json!({
+        "name": "import_paint_project", "arguments": {"source": broken, "folder": "models"},
+    }));
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert!(!models.join("Broken_SPP.glb").exists());
+
+    let reply = client.tool(&mut app, "import_paint_project", json!({"source": source, "folder": "models"}));
+    let result = &reply["structuredContent"];
+    assert_eq!(result["status"], "opening");
+    assert_eq!(Path::new(result["asset"].as_str().unwrap()), Path::new("models/Sample_SPP_2.glb"));
+    assert!(result["report"]["warnings"].is_array());
+    assert_eq!(fs::read(&source).unwrap(), spp);
+    assert_eq!(fs::read(models.join("Sample_SPP.glb")).unwrap(), original);
+    let opened = Glb::load(&models.join("Sample_SPP_2.glb")).unwrap();
+    let surface = opened.paint_surface(&opened.json["meshes"][0]["primitives"][0]).unwrap().unwrap();
+    assert!(surface.stack.layers.iter().any(|layer| layer.name == "Rust"));
+    assert_eq!(surface.composite(1)[..4], [120, 120, 120, 255]);
+    let started = Instant::now();
+    loop {
+        let state = client.request(&mut app, "tools/call", json!({"name": "get_paint_state", "arguments": {}}));
+        if state["structuredContent"]["mode"] == "paint" {
+            assert_eq!(state["structuredContent"]["model_id"], result["model_id"]);
+            break;
+        }
+        assert!(started.elapsed() < REQUEST_TIMEOUT);
+    }
+
+    let source = scratch.0.join("Sample.mpp");
+    fs::write(&source, crate::editor::model_paint_mpp::mcp_fixture()).unwrap();
+    let reply = client.tool(&mut app, "import_paint_project", json!({"source": source, "folder": "models"}));
+    assert_eq!(Path::new(reply["structuredContent"]["asset"].as_str().unwrap()), Path::new("models/Sample_MPP.glb"));
+    assert!(fs::read_dir(&models).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".paint-import-")));
+    client.close();
+}
+
+#[test]
+#[ignore = "requires GPU and a built bevy-editor-mcp binary; tests the complete stdio paint workflow"]
+fn gpu_stdio_paint_workflow_saves_and_exports() {
+    use crate::editor::{
+        model_document::{Mode, glb::Glb},
+        model_mesh::{Corner, Face, Geometry},
+        selection_outline::render_tests::frame,
+    };
+    use std::{fs, path::Path};
+
+    let (scratch, mut app, server, mut client) = stdio_paint_app();
+    let project = app.world().resource::<Editor>().project.clone();
     let tools = client.request(&mut app, "tools/list", json!({}));
     for name in [
         "open_paint_model",
@@ -1418,7 +1482,7 @@ fn gpu_stdio_paint_workflow_saves_and_exports() {
     assert_eq!(resized["texture_sets"][0]["highlighted"], true);
     assert_eq!(resized["layers_bottom_to_top"][0]["name"], "Imported pigment");
     assert_eq!(fs::read(original_collision).unwrap(), block_bytes);
-    assert!(fs::read_dir(&models).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".mpp-import-")));
+    assert!(fs::read_dir(&models).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".paint-import-")));
 
     fs::write(models.join("fill-region.obj"), concat!(
         "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\n",

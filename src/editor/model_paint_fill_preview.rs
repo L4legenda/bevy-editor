@@ -58,7 +58,7 @@ pub(in crate::editor::ui::model_viewer) fn draw(
     pointer: Pointer,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
     texture: UvCanvas,
-    controls: Query<(&ComputedNode, &UiGlobalTransform), With<Control>>,
+    controls: VisibleControls,
     geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
     mut nodes: Query<(&mut Node, &mut UiTransform, &mut BackgroundColor)>,
     mut gizmos: Gizmos<ModelGizmos>,
@@ -123,9 +123,7 @@ pub(in crate::editor::ui::model_viewer) fn draw(
             || pointer
                 .keys
                 .any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
-            || controls
-                .iter()
-                .any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(point)))
+            || controls.contains(point)
         {
             return None;
         }

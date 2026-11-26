@@ -230,9 +230,20 @@ impl Layout {
         }
     }
 
-    fn activate(&mut self, tab: Tab) {
-        if let Some(Self::Group { active, .. }) = self.group(tab) {
+    fn activate(&mut self, tab: Tab) -> bool {
+        if let Some(Self::Group { active, .. }) = self.group(tab)
+            && *active != tab
+        {
             *active = tab;
+            return true;
+        }
+        false
+    }
+
+    fn active_beside(&self, tab: Tab) -> Option<Tab> {
+        match self {
+            Self::Group { tabs, active } => tabs.contains(&tab).then_some(*active),
+            Self::Split { children, .. } => children.iter().find_map(|child| child.active_beside(tab)),
         }
     }
 
@@ -393,6 +404,31 @@ mod tests {
     }
 
     #[test]
+    fn paint_dock_marks_the_left_or_right_gap_of_a_wrapped_tab() {
+        let layers = Tab::Panel(Panel::Layers);
+        let maps = Tab::Panel(Panel::Maps);
+        let sets = Tab::Panel(Panel::Sets);
+        let header = Rect::new(0., 0., 110., 60.);
+        let tabs = [
+            (layers, Rect::new(2., 0., 50., 29.)),
+            (maps, Rect::new(51., 0., 104., 29.)),
+            (sets, Rect::new(2., 30., 56., 59.)),
+        ];
+        for (cursor, before, x) in [
+            (Vec2::new(5., 14.), Some(layers), 2.),
+            (Vec2::new(45., 14.), Some(maps), 50.),
+            (Vec2::new(99., 14.), Some(sets), 104.),
+            (Vec2::new(46., 45.), None, 56.),
+        ] {
+            let (target, marker) = tab_insertion(tabs.into_iter(), header, cursor);
+            assert_eq!(target, before);
+            assert_eq!(marker.center().x, x);
+            assert_eq!(marker.width(), 3.);
+            assert!(marker.min.y <= cursor.y && marker.max.y >= cursor.y);
+        }
+    }
+
+    #[test]
     fn paint_sidebar_splits_merges_and_round_trips_unique_tabs() {
         let maps = Tab::Panel(Panel::Maps);
         let layers = Tab::Panel(Panel::Layers);
@@ -474,6 +510,8 @@ mod tests {
     #[test]
     #[ignore = "requires GPU; moves the actual model and UV views between groups"]
     fn gpu_paint_dock_moves_views_across_workspace_and_switches_modes() {
+        use crate::editor::model_mesh::{Corner, Face, Geometry};
+
         let project = crate::EditorProject::load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/legacy/project.json"),
@@ -502,15 +540,22 @@ mod tests {
         {
             let mut editing = app.world_mut().resource_mut::<editing::State>();
             let doc = editing.documents.get_mut(&0).unwrap();
-            for face in &mut doc.objects[0].geometry.faces {
-                for (corner, uv) in
-                    face.corners
-                        .iter_mut()
-                        .zip([Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y])
-                {
+            let positions = vec![Vec3::new(-1., -1., 0.), Vec3::new(1., -1., 0.),
+                Vec3::new(1., 1., 0.), Vec3::new(-1., 1., 0.)];
+            let corners = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().enumerate()
+                .map(|(index, uv)| {
+                    let mut corner = Corner::new(index);
                     corner.uv = uv;
-                }
-            }
+                    corner
+                }).collect();
+            doc.objects[0].geometry = Geometry {
+                positions,
+                faces: vec![Face { corners, material: 0, smooth: false }],
+                ..default()
+            }.into();
+            doc.objects[0].transform = Transform::IDENTITY;
+            doc.paint_default_size = 256;
+            doc.auto_bake_pending = false;
             doc.revision += 1;
         }
         app.world_mut()
@@ -519,6 +564,14 @@ mod tests {
             )));
         for _ in 0..8 {
             frame(&mut app);
+        }
+        {
+            let mut viewer = app.world_mut().resource_mut::<Viewer>();
+            viewer.center = Vec3::ZERO;
+            viewer.distance = 4.;
+            viewer.radius = 2.;
+            viewer.yaw = 0.;
+            viewer.pitch = 0.;
         }
 
         #[track_caller]
@@ -581,23 +634,34 @@ mod tests {
         };
         let point = rect(&app, canvas).center();
         assert!(rect(&app, model).contains(point));
-        let stroke = |app: &mut App, point| {
+        let stroke = |app: &mut App, point, view| {
             let undo = app.world().resource::<PaintState>().sessions[&0].undo.len();
             let recovery_edits = app.world().resource::<editing::State>().documents[&0].recovery_edits;
             move_pointer(app, window, point);
             mouse(app, window, ButtonState::Pressed);
             mouse(app, window, ButtonState::Released);
             super::super::tests::paint_ready(app);
+            let world = app.world_mut();
+            let obstructing = world.query_filtered::<(
+                Entity, &ComputedNode, &UiGlobalTransform, Option<&AccessibleLabel>,
+            ), With<Control>>().iter(world).filter_map(|(e, n, t, label)| {
+                engine::node_rect(n, t).filter(|r| r.contains(point)).map(|bounds| {
+                    let inside_clip = world.get::<bevy::ui::CalculatedClip>(e).is_none_or(|clip| {
+                        clip.contains_point(point / n.inverse_scale_factor())
+                    });
+                    (e, label.map(|label| label.0.clone()), bounds, inside_clip)
+                })
+            }).collect::<Vec<_>>();
             assert_eq!(
                 app.world().resource::<PaintState>().sessions[&0].undo.len(),
                 undo + 1,
-                "{}",
-                app.world().resource::<Editor>().status
+                "{view} stroke at {point}: {}, controls: {obstructing:?}",
+                app.world().resource::<Editor>().status,
             );
             assert_eq!(app.world().resource::<editing::State>().documents[&0].recovery_edits,
                 recovery_edits + 1);
         };
-        stroke(&mut app, point);
+        stroke(&mut app, point, "3D");
 
         let target = rect(&app, tab(&app, Tab::Properties)).center();
         let from = rect(&app, tab(&app, Tab::View2d)).center();
@@ -617,7 +681,7 @@ mod tests {
         let image = rect(&app, texture);
         let point = image.center() + Vec2::X * image.width() * 0.25;
         assert!(rect(&app, uv).contains(point));
-        stroke(&mut app, point);
+        stroke(&mut app, point, "UV");
         set_view(&mut app, View::Three);
         assert_eq!(app.world().get::<Node>(uv).unwrap().display, Display::None);
         let _ = rect(&app, properties);
@@ -980,6 +1044,22 @@ mod tests {
         }
         let saved: Layout = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(saved, Layout::default());
+
+        let cursor = rect(&app, tab(&app, maps)).center();
+        move_pointer(&mut app, window, cursor);
+        mouse(&mut app, window, ButtonState::Pressed);
+        mouse(&mut app, window, ButtonState::Released);
+        let saved = read_layout(&file, Workspace::Paint).unwrap();
+        assert_eq!(saved.active_beside(layers), Some(maps));
+        {
+            let mut state = app.world_mut().resource_mut::<State>();
+            state.layout = saved;
+            state.focus = None;
+            state.restore_active_tab = true;
+        }
+        app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap().panel = Panel::Layers;
+        frame(&mut app);
+        assert_eq!(app.world().resource::<PaintState>().sessions[&0].panel, Panel::Maps);
         std::fs::remove_dir_all(folder).unwrap();
     }
 }
@@ -988,6 +1068,31 @@ mod tests {
 enum Placement {
     Tabs { before: Option<Tab> },
     Edge(Side),
+}
+
+fn tab_insertion(
+    tabs: impl Iterator<Item = (Tab, Rect)>, header: Rect, cursor: Vec2,
+) -> (Option<Tab>, Rect) {
+    let tabs: Vec<_> = tabs.map(|(tab, bounds)| (tab, bounds.intersect(header)))
+        .filter(|(_, bounds)| bounds.size().min_element() > 0.).collect();
+    let distance = |bounds: Rect| {
+        let delta = (cursor - cursor.clamp(bounds.min, bounds.max)).abs();
+        (delta.y, delta.x)
+    };
+    let Some((i, &(tab, bounds))) = tabs.iter().enumerate().min_by(|(_, (_, a)), (_, (_, b))| {
+        let (ay, ax) = distance(*a);
+        let (by, bx) = distance(*b);
+        ay.total_cmp(&by).then_with(|| ax.total_cmp(&bx))
+    }) else {
+        return (None, header);
+    };
+    let (before, x) = if cursor.x <= bounds.center().x {
+        (Some(tab), bounds.min.x)
+    } else {
+        (tabs.get(i + 1).map(|(tab, _)| *tab), bounds.max.x)
+    };
+    let marker = Rect::from_corners(Vec2::new(x - 1.5, bounds.min.y), Vec2::new(x + 1.5, bounds.max.y));
+    (before, marker.intersect(header))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1066,6 +1171,7 @@ pub(in crate::editor) struct State {
     views: DockViews,
     rendered_views: DockViews,
     focus: Option<(usize, Panel)>,
+    restore_active_tab: bool,
     root: Entity,
     tree: Option<Entity>,
     bodies: Vec<Option<Entity>>,
@@ -1272,6 +1378,7 @@ fn make_state(
         views: DockViews::Both,
         rendered_views: DockViews::Both,
         focus: None,
+        restore_active_tab: matches!(workspace, Workspace::Paint),
         tree: None,
         preview: preview_zone,
         dock: DockNodes::default(),
@@ -1533,7 +1640,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
     mut graph_dock: ResMut<GraphDock>,
     editor: Res<Editor>,
     editing: Res<editing::State>,
-    paint: Res<PaintState>,
+    mut paint: ResMut<PaintState>,
     interface: Res<Interface>,
     drawer: Res<DrawerMotion>,
     mut actions: MessageReader<Action>,
@@ -1570,11 +1677,28 @@ pub(in crate::editor::ui::model_viewer) fn update(
         state.layout = Layout::default();
         state.drag = None;
     }
+    let mut preserve_saved_tab = false;
+    if state.restore_active_tab
+        && let Some(model) = active
+        && let Some(session) = paint.sessions.get(&model)
+        && std::mem::take(&mut state.restore_active_tab)
+        && !reset && explicit_focus.is_none() && session.panel == Panel::Layers
+    {
+        match state.layout.active_beside(Tab::Panel(Panel::Layers)) {
+            Some(Tab::Panel(panel)) if panel != Panel::Layers => {
+                paint.sessions.get_mut(&model).unwrap().edit(PaintAction::Panel(panel));
+            }
+            Some(Tab::Panel(_)) | None => {}
+            Some(_) => preserve_saved_tab = true,
+        }
+    }
     let focus = active.and_then(|model| Some((model, paint.sessions.get(&model)?.panel)));
     if let Some((_, panel)) = focus
+        && !preserve_saved_tab
         && (focus != state.focus || explicit_focus == Some(panel))
     {
-        state.layout.activate(Tab::Panel(panel));
+        let changed = state.layout.activate(Tab::Panel(panel));
+        persist |= changed && explicit_focus == Some(panel);
     }
     if focus != state.focus {
         state.drag = None;
@@ -1599,10 +1723,13 @@ pub(in crate::editor::ui::model_viewer) fn update(
     };
     if views != state.views || explicit_view {
         state.drag = None;
-        match views {
-            DockViews::Model => state.layout.activate(Tab::View3d),
-            DockViews::Uv => state.layout.activate(Tab::View2d),
-            _ => {}
+        let tab = match views {
+            DockViews::Model => Some(Tab::View3d),
+            DockViews::Uv => Some(Tab::View2d),
+            _ => None,
+        };
+        if let Some(tab) = tab {
+            state.layout.activate(tab);
         }
         state.views = views;
     }
@@ -1770,15 +1897,12 @@ fn update_dock(
                         };
                         let header = rect(group.header);
                         let (placement, area) = if header.is_some_and(|r| r.contains(cursor)) {
-                            let before = group
-                                .tabs
-                                .iter()
-                                .find(|(entity, candidate)| {
-                                    *candidate != tab
-                                        && rect(*entity).is_some_and(|r| r.contains(cursor))
-                                })
-                                .map(|&(_, t)| t);
-                            (Placement::Tabs { before }, header.unwrap())
+                            let (before, marker) = tab_insertion(
+                                group.tabs.iter().filter(|(_, candidate)| *candidate != tab)
+                                    .filter_map(|&(entity, tab)| rect(entity).map(|bounds| (tab, bounds))),
+                                header.unwrap(), cursor,
+                            );
+                            (Placement::Tabs { before }, marker)
                         } else {
                             let inner = Rect::from_center_size(frame.center(), frame.size() * 0.48);
                             if inner.contains(cursor) {
@@ -1800,7 +1924,7 @@ fn update_dock(
                     }
                 }
             } else if !matches!(tab, Tab::Panel(_)) && mouse.just_released(MouseButton::Left) {
-                state.layout.activate(tab);
+                persist |= state.layout.activate(tab);
             }
         }
         if !mouse.pressed(MouseButton::Left) {

@@ -4,8 +4,8 @@ use super::{
     editing::input::{Bvh, PickTriangle},
     sets::SetVisibility,
 };
-use crate::editor::model_document::Object;
-use bevy::prelude::*;
+use crate::editor::{model_document::Object, model_mesh::SourcePart};
+use bevy::{math::DVec3, prelude::*};
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,24 +58,52 @@ pub(super) struct Report {
 struct Triangle {
     world: [Vec3; 3],
     uv: Option<[Vec2; 3]>,
+    vertices: [IVec3; 3],
+    source_object: usize,
 }
 
-pub(super) fn apply(
-    stack: &mut Stack,
-    layer: usize,
-    size: u32,
-    objects: &[Object],
+fn weld_positions(positions: &[Vec3]) -> Vec<IVec3> {
+    let (min, max) = positions.iter().fold(
+        (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+        |(min, max), point| {
+            let point = point.as_dvec3();
+            (min.min(point), max.max(point))
+        },
+    );
+    let extent = max - min;
+    let center = min + extent * 0.5;
+    let factor = 2.0e4 / extent.max_element().max(f64::MIN_POSITIVE.sqrt());
+    positions.iter().map(|point| {
+        ((point.as_dvec3() - center) * factor).round().as_ivec3()
+    }).collect()
+}
+
+struct Group<'a> {
+    object: &'a Object,
+    source: Option<&'a SourcePart>,
+}
+
+fn geometry<'a>(
+    objects: &'a [Object],
     target: (usize, usize),
     visibility: &SetVisibility,
-    request: Selection,
-) -> Result<(Report, bool), String> {
+) -> (Vec<Triangle>, Vec<Group<'a>>) {
     let mut triangles = Vec::new();
+    let mut group_ids = HashMap::new();
+    let mut groups = Vec::new();
     for object in objects.iter().filter(|object| !object.hidden) {
+        let vertices = weld_positions(&object.geometry.positions);
         for face in &object.geometry.faces {
             if !visibility.shown(object.id, face.material) {
                 continue;
             }
             let active = (object.id, face.material) == target;
+            let source = face.source_identity();
+            let source_object = *group_ids.entry((object.id, source)).or_insert_with(|| {
+                let index = groups.len();
+                groups.push(Group { object, source });
+                index
+            });
             for triangle in object.geometry.triangles(face) {
                 let corners = triangle.map(|i| &face.corners[i]);
                 let world = corners.map(|corner| {
@@ -88,10 +116,28 @@ pub(super) fn apply(
                 }
                 let uv =
                     active.then(|| corners.map(|corner| corner.uv - object.uv_offset(target.1)));
-                triangles.push(Triangle { world, uv });
+                triangles.push(Triangle {
+                    world,
+                    uv,
+                    vertices: corners.map(|corner| vertices[corner.vertex]),
+                    source_object,
+                });
             }
         }
     }
+    (triangles, groups)
+}
+
+pub(super) fn apply(
+    stack: &mut Stack,
+    layer: usize,
+    size: u32,
+    objects: &[Object],
+    target: (usize, usize),
+    visibility: &SetVisibility,
+    request: Selection,
+) -> Result<(Report, bool), String> {
+    let (triangles, _) = geometry(objects, target, visibility);
     let selected = select(
         &triangles,
         request.source,
@@ -157,40 +203,15 @@ fn select(
     if triangles.is_empty() {
         return Err("There is no visible geometry to select".into());
     }
-    let mut vertices = HashMap::new();
-    let corners = triangles
-        .iter()
-        .map(|triangle| {
-            triangle.world.map(|p| {
-                let key = (p * 1.0e4).round().as_ivec3();
-                let next = vertices.len();
-                *vertices.entry(key).or_insert(next)
-            })
-        })
-        .collect::<Vec<_>>();
     if let Source::Parts(parts) = source {
-        let mut parents: Vec<_> = (0..vertices.len()).collect();
-        for &[a, b, c] in &corners {
-            let first = root(&mut parents, a);
-            for v in [b, c] {
-                let other = root(&mut parents, v);
-                parents[other] = first;
-            }
-        }
-        let mut indices = HashMap::new();
+        let (indices, count) = components(triangles);
         let parts = parts.into_iter().collect::<std::collections::HashSet<_>>();
-        let result = corners
-            .iter()
-            .map(|t| {
-                let next = indices.len();
-                parts.contains(indices.entry(root(&mut parents, t[0])).or_insert(next))
-            })
-            .collect();
-        if parts.iter().any(|part| *part >= indices.len()) {
-            return Err(format!("Select part indices below {}", indices.len()));
+        if parts.iter().any(|part| *part >= count) {
+            return Err(format!("Select part indices below {count}"));
         }
-        return Ok(result);
+        return Ok(indices.into_iter().map(|index| parts.contains(&index)).collect());
     }
+    let (corners, _) = vertex_indices(triangles);
     let bvh = Bvh::from_triangles(
         triangles
             .iter()
@@ -251,6 +272,72 @@ fn select(
         }
     }
     Ok(selected)
+}
+
+fn vertex_indices(triangles: &[Triangle]) -> (Vec<[usize; 3]>, usize) {
+    let mut vertices = HashMap::new();
+    let corners = triangles.iter().map(|triangle| {
+        triangle.vertices.map(|position| {
+            let next = vertices.len();
+            *vertices.entry((triangle.source_object, position)).or_insert(next)
+        })
+    }).collect();
+    (corners, vertices.len())
+}
+
+fn components(triangles: &[Triangle]) -> (Vec<usize>, usize) {
+    let (corners, count) = vertex_indices(triangles);
+    let mut parents: Vec<_> = (0..count).collect();
+    for &[a, b, c] in &corners {
+        let first = root(&mut parents, a);
+        for v in [b, c] {
+            let other = root(&mut parents, v);
+            parents[other] = first;
+        }
+    }
+    let mut parts = HashMap::new();
+    let indices = corners.into_iter().map(|[a, _, _]| {
+        let next = parts.len();
+        *parts.entry(root(&mut parents, a)).or_insert(next)
+    }).collect();
+    (indices, parts.len())
+}
+
+#[cfg(feature = "mcp")]
+pub(super) fn list_parts(
+    objects: &[Object], target: (usize, usize), visibility: &SetVisibility, offset: usize, limit: usize,
+) -> (Vec<serde_json::Value>, usize) {
+    use serde_json::json;
+
+    // Every triangle in a numbered part has the same source object.
+    let (triangles, groups) = geometry(objects, target, visibility);
+    let (indices, count) = components(&triangles);
+    let end = offset.saturating_add(limit).min(count);
+    let mut rows = vec![None; end.saturating_sub(offset)];
+    for (triangle, index) in triangles.iter().zip(indices) {
+        if let Some(row) = index.checked_sub(offset).and_then(|index| rows.get_mut(index)) {
+            let (group, triangles, active, bounds) = row.get_or_insert((
+                triangle.source_object, 0, 0, [triangle.world[0]; 2],
+            ));
+            debug_assert_eq!(*group, triangle.source_object);
+            *triangles += 1;
+            *active += usize::from(triangle.uv.is_some());
+            for point in triangle.world {
+                bounds[0] = bounds[0].min(point);
+                bounds[1] = bounds[1].max(point);
+            }
+        }
+    }
+    let parts = rows.into_iter().enumerate().filter_map(|(row, part)| {
+        let (group, triangles, active, bounds) = part?;
+        let group = &groups[group];
+        Some(json!({"index": offset + row, "object_id": group.object.id, "object_name": group.object.name,
+            "source_object_id": group.source.and_then(|source| source.id),
+            "source_object_name": group.source.map(SourcePart::as_str).filter(|name| !name.is_empty()),
+            "triangles": triangles, "triangles_in_active_set": active,
+            "bounds": bounds.map(|point| point.to_array())}))
+    }).collect();
+    (parts, count)
 }
 
 fn root(parents: &mut [usize], mut index: usize) -> usize {
@@ -315,19 +402,26 @@ fn raster(uv: [Vec2; 3], size: u32, pad: f32, mut write: impl FnMut(usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::{
+        model_mesh::{Corner, Face, Geometry, SourcePart},
+        model_paint_data::{Layer, LayerKind},
+    };
+
+    fn triangle(world: [Vec3; 3], uv: Option<[Vec2; 3]>) -> Triangle {
+        Triangle {
+            world,
+            uv,
+            vertices: world.map(|point| point.as_ivec3()),
+            source_object: 0,
+        }
+    }
 
     #[test]
     fn mesh_surface_selection_crosses_convex_folds_and_stops_at_concave_folds() {
         for (third, expected) in [(Vec3::Z, false), (Vec3::NEG_Z, true)] {
             let triangles = [
-                Triangle {
-                    world: [Vec3::ZERO, Vec3::X, Vec3::Y],
-                    uv: None,
-                },
-                Triangle {
-                    world: [Vec3::X, Vec3::ZERO, third],
-                    uv: None,
-                },
+                triangle([Vec3::ZERO, Vec3::X, Vec3::Y], None),
+                triangle([Vec3::X, Vec3::ZERO, third], None),
             ];
             let seed = || Source::Ray(Vec3::new(0.25, 0.25, 2.), Vec3::NEG_Z);
             assert_eq!(
@@ -348,17 +442,65 @@ mod tests {
     #[test]
     fn mesh_surface_selection_padding_respects_the_unselected_chart() {
         let triangles = [
-            Triangle {
-                world: [Vec3::ZERO, Vec3::X, Vec3::Y],
-                uv: Some([Vec2::ZERO, Vec2::X, Vec2::Y]),
-            },
-            Triangle {
-                world: [Vec3::X, Vec3::ONE, Vec3::Y],
-                uv: Some([Vec2::X, Vec2::ONE, Vec2::Y]),
-            },
+            triangle([Vec3::ZERO, Vec3::X, Vec3::Y], Some([Vec2::ZERO, Vec2::X, Vec2::Y])),
+            triangle([Vec3::X, Vec3::ONE, Vec3::Y], Some([Vec2::X, Vec2::ONE, Vec2::Y])),
         ];
         let owner = coverage(&triangles, &[true, false], 16);
         assert_eq!(owner[15], SELECTED);
         assert_eq!(owner[16 + 15], UNSELECTED);
+    }
+
+    #[test]
+    fn mesh_surface_selection_respects_source_objects_at_different_scales() {
+        let body = Arc::new(SourcePart { name: "Panel".into(), id: Some(0) });
+        let cover = Arc::new(SourcePart { name: "Panel".into(), id: Some(1) });
+        let faces = [[0, 1, 2], [3, 4, 5], [1, 6, 4]].into_iter().enumerate()
+            .map(|(index, vertices)| {
+                let part = if index < 2 { &body } else { &cover };
+                let corners = vertices.into_iter().zip([Vec2::ZERO, Vec2::X, Vec2::Y])
+                    .map(|(vertex, uv)| {
+                        let mut corner = Corner::new(vertex);
+                        corner.source_part = Some(part.clone());
+                        corner.uv = uv * 0.2 + Vec2::X * (index as f32 / 3.);
+                        corner
+                    }).collect();
+                Face { corners, material: 0, smooth: false }
+            }).collect();
+        let local_scale = 1.0e-6;
+        let mut object = Object {
+            id: 0, source_node: None, name: "Panels".into(),
+            geometry: Geometry {
+                positions: [Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::X,
+                    Vec3::new(1., 1., 0.), Vec3::Y, Vec3::X * 2.]
+                    .map(|point| point * local_scale).to_vec(),
+                faces,
+                ..default()
+            }.into(),
+            transform: Transform::IDENTITY, materials: Vec::new(), hidden: false,
+        };
+        let check = |object: &Object, source| {
+            let mut stack = Stack { layers: vec![Layer::new("Mask".into(), LayerKind::Paint)], selected: 0 };
+            let request = Selection { source, crease_angle: 30., stop_at: StopAt::Any, mode: MaskMode::Replace };
+            let (report, changed) = apply(&mut stack, 0, 64, std::slice::from_ref(object), (0, 0), &SetVisibility::default(), request).unwrap();
+            assert!(changed);
+            assert_eq!((report.selected, report.active_set, report.total), (2, 2, 3));
+            let pixels = &stack.layers[0].mask.as_ref().unwrap().pixels;
+            assert_eq!(pixels[(2 * 64 + 2) * 4], 255);
+            assert_eq!(pixels[(2 * 64 + 23) * 4], 255);
+            assert_eq!(pixels[(2 * 64 + 45) * 4], 0);
+        };
+        check(&object, Source::Parts(vec![0]));
+        #[cfg(feature = "mcp")]
+        {
+            let (parts, count) = list_parts(std::slice::from_ref(&object), (0, 0), &SetVisibility::default(), 1, 1);
+            assert_eq!(count, 2);
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0]["index"], 1);
+            assert_eq!(parts[0]["source_object_id"], 1);
+            assert_eq!(parts[0]["source_object_name"], "Panel");
+            assert_eq!(parts[0]["triangles"], 1);
+        }
+        object.transform = Transform::from_xyz(1.0e6, 0., 0.).with_scale(Vec3::splat(1. / local_scale));
+        check(&object, Source::Ray(Vec3::new(1.0e6 + 0.25, 0.25, 1.), Vec3::NEG_Z));
     }
 }

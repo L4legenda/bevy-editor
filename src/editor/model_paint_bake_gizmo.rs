@@ -112,7 +112,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
     text_inputs: Query<(), With<bevy::ui_widgets::TextInput>>,
     drawer: Res<DrawerMotion>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
-    controls: Query<(&ComputedNode, &UiGlobalTransform), With<Control>>,
+    controls: engine::VisibleControls,
     navigation: Option<Res<crate::editor::ui::navigation_gizmo::State>>,
     mut overlay: Gizmos<XrayGizmos>,
 ) {
@@ -203,13 +203,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
                 .is_some_and(|gizmo| gizmo.blocks_input())
             && !keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
             && !mouse.any_pressed([MouseButton::Right, MouseButton::Middle])
-            && !controls.iter().any(|(node, transform)| {
-                let scale = node.inverse_scale_factor();
-                let size = node.size() * scale;
-                size.min_element() > 0.
-                    && Rect::from_center_size(transform.affine().translation * scale, size)
-                        .contains(cursor)
-            })
+            && !controls.contains(cursor)
     });
     if mouse.just_pressed(MouseButton::Left)
         && let Some(cursor) = placement

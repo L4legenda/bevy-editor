@@ -10,7 +10,6 @@ use crate::editor::{
 use bevy::prelude::Vec3;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -26,6 +25,7 @@ impl Bake {
         path: &Path,
         object: &Object,
         mesh: &Value,
+        source_vertices: &[usize],
         bake: &Value,
         warnings: &mut Vec<String>,
     ) -> Self {
@@ -106,7 +106,7 @@ impl Bake {
         Self {
             settings,
             recipes,
-            cage: cage_edits(object, &bake["cage_paint"], warnings),
+            cage: cage_edits(object, source_vertices, &bake["cage_paint"], warnings),
         }
     }
 
@@ -279,34 +279,23 @@ fn custom_maps(
     recipes
 }
 
-fn cage_edits(object: &Object, value: &Value, warnings: &mut Vec<String>) -> Edits {
+fn cage_edits(object: &Object, source_vertices: &[usize], value: &Value, warnings: &mut Vec<String>) -> Edits {
     let Some(scales) = value.as_array() else {
         return Edits::new();
     };
     let mesh = &object.geometry;
-    if scales.len() != mesh.positions.len() || scales.iter().any(|scale| scale.as_f64().is_none()) {
+    if scales.len() != source_vertices.len() || scales.iter().any(|scale| scale.as_f64().is_none()) {
         warnings.push("Правки cage не соответствуют вершинам сетки MPP".into());
         return Edits::new();
     }
-    // GLB welds coincident vertices at UV seams, so store one multiplier per position.
-    let key = |point: Vec3| {
-        point
-            .to_array()
-            .map(|x| if x == 0. { 0 } else { x.to_bits() })
-    };
-    let mut groups = HashMap::new();
-    for (&point, scale) in mesh.positions.iter().zip(scales) {
-        let group = groups.entry(key(point)).or_insert((0., 0u32));
-        group.0 += scale.as_f64().unwrap_or(1.).clamp(0.05, 8.);
-        group.1 += 1;
+    // The source stores one multiplier per render vertex, including UV seams.
+    let mut groups = vec![(0., 0u32); mesh.positions.len()];
+    for (&vertex, scale) in source_vertices.iter().zip(scales) {
+        groups[vertex].0 += scale.as_f64().unwrap_or(1.).clamp(0.05, 8.);
+        groups[vertex].1 += 1;
     }
-    let values: Vec<_> = mesh
-        .positions
-        .iter()
-        .map(|&point| {
-            let (sum, count) = groups[&key(point)];
-            (sum / f64::from(count)) as f32
-        })
+    let values: Vec<_> = groups.into_iter()
+        .map(|(sum, count)| (sum / f64::from(count)) as f32)
         .collect();
     if values.iter().all(|&scale| scale == 1.) {
         return Edits::new();

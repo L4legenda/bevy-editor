@@ -1,4 +1,4 @@
-//! Prepare an MPP on a worker and publish it only while the request is live.
+//! Prepare a paint project on a worker and publish it only while the request is live.
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -13,14 +13,39 @@ use super::{
 use crate::editor::{
     browser::Browser,
     browser_files, model_paint_mpp,
-    model_paint_spp::{ImportDetails, project_output_name},
+    model_paint_spp::{self, ImportDetails, project_output_name},
     thumbnails::Thumbnails,
 };
 
 struct Staged {
     file: NamedTempFile,
     name: String,
+    format: Format,
     report: ImportDetails,
+}
+
+#[derive(Clone, Copy)]
+enum Format {
+    MaterialPainter,
+    SubstancePainter,
+}
+
+impl Format {
+    fn from_path(path: &Path) -> Result<Self, String> {
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        match extension {
+            Some(extension) if path.is_absolute() && extension.eq_ignore_ascii_case("mpp") => Ok(Self::MaterialPainter),
+            Some(extension) if path.is_absolute() && extension.eq_ignore_ascii_case("spp") => Ok(Self::SubstancePainter),
+            _ => Err("Choose an absolute path to a Material Painter .mpp or Substance 3D Painter .spp file".into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MaterialPainter => "MPP",
+            Self::SubstancePainter => "SPP",
+        }
+    }
 }
 
 pub(super) struct Pending {
@@ -36,14 +61,7 @@ pub(super) fn start(slot: &mut Option<Pending>, editor: &Editor, args: PaintImpo
         if slot.is_some() {
             return Err("Wait for the current paint project import to finish".into());
         }
-        if !args.source.is_absolute()
-            || !args
-                .source
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("mpp"))
-        {
-            return Err("Choose an absolute path to a Material Painter .mpp file".into());
-        }
+        let format = Format::from_path(&args.source)?;
         let folder = args.folder.unwrap_or_default();
         if !crate::editor::browser::discovers_models_in(&folder) {
             return Err("Choose a destination folder indexed by the project asset browser".into());
@@ -53,14 +71,17 @@ pub(super) fn start(slot: &mut Option<Pending>, editor: &Editor, args: PaintImpo
         let target = destination.clone();
         let task = IoTaskPool::get().spawn(async move {
             let source = args.source.canonicalize()?;
-            let (name, bytes, report) = model_paint_mpp::prepare_conversion(&source, &target)?;
+            let (name, bytes, report) = match format {
+                Format::MaterialPainter => model_paint_mpp::prepare_conversion(&source, &target)?,
+                Format::SubstancePainter => model_paint_spp::prepare_conversion(&source)?,
+            };
             let mut file = Builder::new()
-                .prefix(".mpp-import-")
+                .prefix(".paint-import-")
                 .suffix(".tmp")
                 .tempfile_in(&target)?;
             file.write_all(&bytes)?;
             file.as_file().sync_all()?;
-            Ok(Staged { file, name, report })
+            Ok(Staged { file, name, format, report })
         });
         Ok((folder, destination, task))
     })();
@@ -116,11 +137,11 @@ pub(super) fn poll(
                 .as_ref()
                 != Some(&pending.destination)
         {
-            return Err("The project or import destination changed while reading the MPP".into());
+            return Err("The project or import destination changed while reading the paint project".into());
         }
-        let Staged { file, name, report } = result.map_err(|error| error.to_string())?;
+        let Staged { file, name, format, report } = result.map_err(|error| error.to_string())?;
         let filename =
-            publish(file, &pending.destination, &name).map_err(|error| error.to_string())?;
+            publish(file, &pending.destination, &name, format).map_err(|error| error.to_string())?;
         browser.refresh(&mut editor.project);
         if let Some(previews) = previews {
             previews.extend(editor.project.catalog.len());
@@ -145,9 +166,9 @@ pub(super) fn poll(
     let _ = pending.job.reply.send(reply);
 }
 
-fn publish(mut file: NamedTempFile, target: &Path, name: &str) -> io::Result<String> {
+fn publish(mut file: NamedTempFile, target: &Path, name: &str, format: Format) -> io::Result<String> {
     for number in 1.. {
-        let filename = project_output_name(name, "MPP", number);
+        let filename = project_output_name(name, format.label(), number);
         match file.persist_noclobber(target.join(&filename)) {
             Ok(_) => return Ok(filename),
             Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => file = err.file,

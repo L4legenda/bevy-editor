@@ -121,7 +121,7 @@ impl EditorServer {
     }
 
     #[tool(
-        description = "Import a local Material Painter .mpp as a new editable GLB and open it in Painting mode",
+        description = "Import a local Material Painter .mpp or Substance 3D Painter .spp as a new editable GLB and open it in Painting mode",
         annotations(destructive_hint = false, idempotent_hint = false, open_world_hint = false)
     )]
     async fn import_paint_project(
@@ -189,6 +189,18 @@ impl EditorServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call(Command::PaintFill(args), context).await
+    }
+
+    #[tool(
+        description = "List connected visible paint mesh parts with select_surface indices, world bounds, source object names and active texture set coverage. Returns a topology token",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_paint_surface_parts(
+        &self,
+        Parameters(args): Parameters<super::mcp_state::SurfacePartsArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(Command::PaintSurfaceParts(args), context).await
     }
 
     #[tool(

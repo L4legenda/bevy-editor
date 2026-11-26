@@ -533,7 +533,8 @@ fn projection_cage(
         ));
     }
     let (cage, report) = if settings.auto_fit {
-        let (cage, report) = projector.fit_cage(positions, directions, scale, progress)?;
+        let groups = projector.vertex_groups(object);
+        let (cage, report) = projector.fit_cage(positions, directions, &groups, scale, progress)?;
         (Some(cage), Some(report))
     } else {
         (None, None)
@@ -953,6 +954,7 @@ struct PreparedScene {
     parts: Option<Parts>,
     positions: Vec<Vec3>,
     projection_normals: Vec<Vec3>,
+    projection_groups: Vec<u32>,
     cage: Option<project::Cage>,
     cage_fit: Option<FitReport>,
 }
@@ -1015,8 +1017,9 @@ fn prepare_scene(
     let projection = settings
         .path
         .as_ref()
-        .map(|path| project::Projection::load(path, &object.name, scale, settings, progress))
+        .map(|path| project::Projection::load_for_object(path, object, scale, settings, progress))
         .transpose()?;
+    let projection_groups = projection.as_ref().map_or_else(Vec::new, |projector| projector.face_groups(object));
     let low_scene = projection.is_none().then(|| Bvh::from_triangles(triangles));
     let parts = projection.is_none().then(|| Parts::build(object));
     let transform = object.transform;
@@ -1053,7 +1056,7 @@ fn prepare_scene(
         .unwrap_or_default();
     Ok(PreparedScene {
         bounds, scale, geometric, corner_normals, triangle_normals,
-        low_scene, projection, parts, positions, projection_normals, cage, cage_fit,
+        low_scene, projection, parts, positions, projection_normals, projection_groups, cage, cage_fit,
     })
 }
 
@@ -1101,7 +1104,7 @@ pub(super) fn bake_on_device(
     let flow = settings.custom.iter().any(|recipe| recipe.kind == crate::editor::model_paint_data::custom::Kind::Flow);
     let PreparedScene {
         bounds, scale, geometric, corner_normals, triangle_normals,
-        low_scene, projection, parts, positions, projection_normals, cage, cage_fit,
+        low_scene, projection, parts, positions, projection_normals, projection_groups, cage, cage_fit,
     } = prepare_scene(&objects, object, settings, flow, progress)?;
     let sampling = settings.sampling();
     let relief_params = relief::Parameters::new(bounds, scale, settings.surface);
@@ -1264,6 +1267,7 @@ pub(super) fn bake_on_device(
             geometric: geo,
             axes,
             cage: cage_triangle.as_ref(),
+            group: projection_groups.get(face).copied().unwrap_or(0),
         });
         let curvature = features
             .as_ref()
@@ -1680,7 +1684,7 @@ mod tests {
             ..Default::default()
         };
         let projection = project::Projection::load(&path, "Stacked", 2_f32.sqrt(), &settings, &progress).unwrap();
-        let hit = projection.sample(Vec3::new(0.5, 0., -0.5), Vec3::Y, Vec3::Y, None).unwrap();
+        let hit = projection.sample(Vec3::new(0.5, 0., -0.5), Vec3::Y, Vec3::Y, None, 0).unwrap();
         // The left box is encountered earlier along the ray but the right leaf wins the tie.
         assert!(hit.normal.z > 0.6 && hit.normal.x.abs() < 0.01);
         let objects = vec![quad(0, 0.)];
@@ -1859,9 +1863,11 @@ mod tests {
         )).unwrap();
         let settings = ProjectionSettings { path: Some(path.clone()), match_names: true, ..settings };
         let mut target = quad(0, 0.);
-        target.name = "Tray_low".into();
+        target.name = "Imported model".into();
+        let source_part = crate::editor::model_mesh::SourcePart::named("Tray_low");
         for corner in &mut target.geometry.faces[0].corners {
             corner.uv = corner.uv * 0.75 + Vec2::splat(0.125);
+            corner.source_part = Some(source_part.clone());
         }
         let low = vec![target];
         let cpu = bake_with_projection(low.clone(), 0, 0, 32, &settings, &Progress::default()).unwrap();
@@ -2076,6 +2082,113 @@ mod tests {
     }
 
     #[test]
+    fn baked_high_poly_filters_named_parts_in_one_texture_set() {
+        check_named_parts_in_one_set(None);
+    }
+
+    #[test]
+    #[ignore = "requires Bevy's native GPU device"]
+    fn gpu_filters_named_parts_in_one_texture_set() {
+        let (app, _, _) = crate::editor::tests::lighting_ui_render::fixture();
+        let device = RayDevice::new(
+            app.world().resource::<bevy::render::renderer::RenderDevice>(),
+            app.world().resource::<bevy::render::renderer::RenderQueue>(),
+        );
+        check_named_parts_in_one_set(Some(&device));
+    }
+
+    fn check_named_parts_in_one_set(device: Option<&RayDevice>) {
+        use crate::editor::model_document::{MaterialSlot, glb::{Glb, import_geometry}};
+        use crate::editor::model_paint_data::custom::{Kind, Recipe};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("high.obj");
+        let cage_path = directory.path().join("cage.obj");
+        let panels = |suffix: &str, low_y: f32, high_y: f32| format!(
+            "o HighPanel_{suffix}\nv 0 {high_y} 0\nv 1 {high_y} 0\nv 1 {high_y} -1\nv 0 {high_y} -1\nf 1 2 3 4\n\
+             o LowPanel_{suffix}\nv 0 {low_y} 0\nv 1 {low_y} 0\nv 1 {low_y} -1\nv 0 {low_y} -1\nf 5 6 7 8\n",
+        );
+        std::fs::write(&path, panels("high", 0.02, 0.05)).unwrap();
+        std::fs::write(&cage_path, panels("cage", 0.08, 0.08)).unwrap();
+        let mut low = quad(0, 0.);
+        low.name = "Combined".into();
+        low.materials.push(MaterialSlot {
+            material: default(), source: serde_json::json!({}), paint: None, authored: None,
+            bake_fixes: Default::default(),
+        });
+        let mut right = low.geometry.faces[0].clone();
+        let left_name = crate::editor::model_mesh::SourcePart::named("LowPanel_low");
+        let right_name = crate::editor::model_mesh::SourcePart::named("HighPanel_low");
+        for (left, right) in low.geometry.faces[0].corners.iter_mut().zip(&mut right.corners) {
+            left.uv.x *= 0.5;
+            left.source_part = Some(left_name.clone());
+            right.uv.x = right.uv.x * 0.5 + 0.5;
+            right.source_part = Some(right_name.clone());
+        }
+        low.geometry.faces.push(right);
+        let low_path = directory.path().join("low.glb");
+        std::fs::write(&low_path, Glb::new_asset(&[low.clone()]).unwrap()).unwrap();
+        low.geometry = import_geometry(&Glb::load(&low_path).unwrap()).unwrap().into();
+        assert!(low.geometry.faces.iter().all(|face| face.material == 0));
+
+        let mut recipe = Recipe::new(Kind::Point, &[]);
+        recipe.point = [4, 4, -4];
+        recipe.distance = 10;
+        let settings = ProjectionSettings {
+            path: Some(path), front: 8, rear: 8, match_names: true,
+            maps: MapSelection::MINIMUM.toggle(BakeMap::ProjectedHeight),
+            custom: vec![recipe.clone()].into(), ..default()
+        };
+        let progress = Progress::default();
+        let render = |model: &Object, settings: &ProjectionSettings| {
+            let cpu = bake_with_projection(vec![model.clone()], 0, 0, 16, settings, &progress).unwrap();
+            if let Some(device) = device {
+                let gpu = bake_on_device(vec![model.clone()], 0, 0, 16, settings, &progress, Some(device)).unwrap();
+                assert!(gpu.gpu_projection);
+                for map in [BakeMap::ProjectedHeight, BakeMap::ProjectionCoverage] {
+                    assert_eq!(cpu.rgba(map), gpu.rgba(map));
+                }
+                assert_eq!((cpu.hits, cpu.filled_misses), (gpu.hits, gpu.filled_misses));
+            }
+            cpu
+        };
+        let left = (8 * 16 + 4) * 4;
+        let right = (8 * 16 + 12) * 4;
+        let height = |maps: &Maps| {
+            let pixels = maps.rgba(BakeMap::ProjectedHeight);
+            (pixels[left], pixels[right])
+        };
+        let direct = render(&low, &settings);
+        let (near, far) = height(&direct);
+        assert!(direct.hits > 0 && near > 128 && far > near + 10);
+        let unfiltered = render(&low, &ProjectionSettings { match_names: false, ..settings.clone() });
+        assert_eq!(height(&unfiltered), (far, far));
+        let fill_settings = ProjectionSettings { front: 1, fill_misses: true, ..settings.clone() };
+        let filled = render(&low, &fill_settings);
+        assert_eq!(filled.hits, 0);
+        assert!(filled.filled_misses > 0);
+        let (near_fill, far_fill) = height(&filled);
+        assert!(near_fill > 128 && far_fill > near_fill + 10);
+        let authored = render(&low, &ProjectionSettings { cage: Some(cage_path), ..fill_settings.clone() });
+        assert!(authored.hits > 0 && height(&authored).0 < height(&authored).1);
+        let fitted = render(&low, &ProjectionSettings { auto_fit: true, fill_misses: false, ..fill_settings.clone() });
+        assert_eq!(fitted.hits, direct.hits);
+        let mut missing = low.clone();
+        for corner in &mut missing.geometry.faces[1].corners {
+            corner.source_part = Some(crate::editor::model_mesh::SourcePart::named("Missing_low"));
+        }
+        assert_eq!(height(&render(&missing, &settings)), (near, far));
+
+        let live = live::Scene::prepare(vec![low.clone()], 0, 0, &fill_settings, &progress).unwrap();
+        let (preview, used_gpu) = live.shade_on_device(&recipe, 16, fill_settings.quality, &progress, device).unwrap();
+        assert_eq!(used_gpu, device.is_some());
+        assert_ne!(preview[left], preview[right]);
+        let probe = probe::build(vec![low], 0, 0, &settings, &progress).unwrap();
+        let summary = probe.summary();
+        assert!(summary.contains("промахи 0%") && summary.contains("чужие части 0%"), "{summary}");
+    }
+
+    #[test]
     fn baked_high_poly_projects_named_glb_parts_in_world_space() {
         use crate::editor::model_document::{MaterialSlot, glb::Glb};
 
@@ -2114,6 +2227,17 @@ mod tests {
             bake_with_projection(vec![low.clone()], 0, 0, 16, settings, &Progress::default())
         };
         let named = bake(&settings);
+        let mut imported = low.clone();
+        imported.name = "Panels".into();
+        let part = crate::editor::model_mesh::SourcePart::named("Plate_low");
+        for corner in &mut imported.geometry.faces[0].corners {
+            corner.source_part = Some(part.clone());
+        }
+        let imported = bake_with_projection(vec![imported], 0, 0, 16, &settings, &Progress::default()).unwrap();
+        assert_eq!(
+            imported.rgba(BakeMap::ProjectedHeight),
+            named.as_ref().unwrap().rgba(BakeMap::ProjectedHeight),
+        );
         let live = live::Scene::prepare(vec![low.clone()], 0, 0, &settings, &Progress::default()).unwrap();
         let preview = live.shade(&recipe, 16, super::super::Quality::Draft, &Progress::default()).unwrap();
         settings.match_names = false;

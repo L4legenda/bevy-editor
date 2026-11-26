@@ -20,6 +20,7 @@ impl Projection {
         &self,
         positions: &[Vec3],
         normals: &[Vec3],
+        groups: &[Vec<u32>],
         scene_span: f32,
         progress: &Progress,
     ) -> Result<(Cage, FitReport), String> {
@@ -30,14 +31,21 @@ impl Projection {
 
         // Split vertices at UV seams or hard edges must move together.
         let mut welded = HashMap::<[u32; 3], (usize, Vec3)>::new();
+        let mut welded_groups = HashMap::<usize, Vec<u32>>::new();
         for (i, (&position, &normal)) in positions.iter().zip(normals).enumerate() {
             if i % 4096 == 0 {
                 progress.check()?;
             }
-            welded
-                .entry(position_key(position))
-                .or_insert((i, Vec3::ZERO))
-                .1 += normal;
+            let entry = welded.entry(position_key(position)).or_insert((i, Vec3::ZERO));
+            entry.1 += normal;
+            if let Some(groups) = groups.get(i) {
+                let entry = welded_groups.entry(entry.0).or_default();
+                for &group in groups {
+                    if !entry.contains(&group) {
+                        entry.push(group);
+                    }
+                }
+            }
         }
         let mut scales = vec![1.; positions.len()];
         let mut directions = vec![Vec3::ZERO; positions.len()];
@@ -57,30 +65,35 @@ impl Projection {
                 continue;
             };
             directions[i] = direction;
-            let Some((triangle, offset)) = self.closest_crossing(position, direction, reach, bias)
-            else {
-                report.unresolved += 1;
+            let groups = welded_groups.get(&i).map(Vec::as_slice).filter(|groups| !groups.is_empty()).unwrap_or(&[0]);
+            let mut fitted = false;
+            let mut missing = false;
+            let mut required = MIN_SCALE;
+            let mut allowed = max_scale;
+            for &group in groups {
+                let Some((triangle, offset)) = self.closest_crossing(position, direction, reach, bias, group) else {
+                    missing = true;
+                    continue;
+                };
+                fitted = true;
+                required = required.max(offset * MARGIN / self.front).max(-offset * MARGIN / self.rear);
+                // Start inside the gap when another connected part would be hit first.
+                let start = offset + bias;
+                if let Some((_, distance)) = self.source.bvh.cast_triangle_up_to(
+                    position + direction * start, direction, (reach - start).max(0.),
+                    |other| self.can_project(other, group) && parts[other.face] != parts[triangle],
+                ) {
+                    let bound = ((offset + (bias + distance) * 0.5) / self.front).clamp(MIN_SCALE, max_scale);
+                    allowed = allowed.min(bound);
+                }
+            }
+            report.unresolved += usize::from(missing || required > allowed);
+            if !fitted {
                 continue;
-            };
-
-            let required = (offset * MARGIN / self.front)
-                .max(-offset * MARGIN / self.rear)
-                .max(MIN_SCALE);
-            // Start inside the gap when another connected part would be hit first.
-            let start = offset + bias;
-            let blocker = self.source.bvh.cast_triangle_up_to(
-                position + direction * start,
-                direction,
-                (reach - start).max(0.),
-                |other| self.can_project(other) && parts[other.face] != parts[triangle],
-            );
-            let allowed = blocker.map_or(max_scale, |(_, distance)| {
-                ((offset + (bias + distance) * 0.5) / self.front).clamp(MIN_SCALE, max_scale)
-            });
+            }
             let scale = if required <= allowed {
                 1.0_f32.clamp(required, allowed)
             } else {
-                report.unresolved += 1;
                 allowed
             };
             report.raised += usize::from(scale > 1.001);
@@ -152,13 +165,13 @@ mod tests {
         let positions = [Vec3::ZERO; 2];
         let normals = [Vec3::new(0.2, 0., 1.), Vec3::new(-0.2, 0., 1.)];
         let (cage, report) = projection
-            .fit_cage(&positions, &normals, 1., &Progress::default())
+            .fit_cage(&positions, &normals, &[], 1., &Progress::default())
             .unwrap();
         assert_eq!(report.raised, 1);
         assert_eq!(report.unresolved, 0);
         assert!(
             projection
-                .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, None)
+                .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, None, 0)
                 .is_none()
         );
         let triangle = cage.triangle([0, 1, 0]);
@@ -167,7 +180,7 @@ mod tests {
         assert_eq!(first.offset, split.offset);
         assert_eq!(first.scale, split.scale);
         let hit = projection
-            .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, Some(first))
+            .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, Some(first), 0)
             .unwrap();
         assert!(hit.ray_hit && hit.height < -0.8);
     }
@@ -181,14 +194,14 @@ mod tests {
         // Disconnected surfaces in a single source object still count as separate parts.
         let projection = Projection::new(vec![panel(0.012, 0), panel(0.035, 0)], 1., &settings);
         let (cage, report) = projection
-            .fit_cage(&[Vec3::ZERO], &[Vec3::Z], 1., &Progress::default())
+            .fit_cage(&[Vec3::ZERO], &[Vec3::Z], &[], 1., &Progress::default())
             .unwrap();
         assert_eq!(report.lowered, 1);
         assert_eq!(report.unresolved, 0);
         let ray = cage.triangle([0; 3]).ray(Vec3::X);
         assert!((0.012..0.035).contains(&ray.offset.z));
         let hit = projection
-            .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, Some(ray))
+            .sample(Vec3::ZERO, Vec3::Z, Vec3::Z, Some(ray), 0)
             .unwrap();
         assert!(hit.ray_hit && (hit.height - 0.012 / ray.offset.z).abs() < 1e-5);
     }

@@ -471,6 +471,36 @@ pub(in crate::editor) struct SurfaceArgs {
     #[serde(default)]
     stop_at: surface_selection::StopAt,
     crease_angle: Option<f32>,
+    /// Optional token returned by list_paint_surface_parts. Rejects stale part indices.
+    topology: Option<SurfaceTopology>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+struct SurfaceTopology {
+    geometry_revision: u64,
+    visibility_revision: u64,
+}
+
+impl SurfaceTopology {
+    fn new(doc: &Document, session: &Session) -> Self {
+        Self {
+            geometry_revision: doc.revision,
+            visibility_revision: session.set_appearance.visibility.revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(in crate::editor) struct SurfacePartsArgs {
+    workspace: PaintWorkspace,
+    #[serde(default)]
+    offset: usize,
+    /// Number of results, 1–250. Defaults to 100.
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -479,7 +509,7 @@ pub(in crate::editor) struct SurfaceArgs {
 pub(super) enum SurfaceSeed {
     Parts { indices: Vec<usize> },
     Point { position: [f32; 3] },
-    Viewport { position: [f32; 2] },
+    Viewport { position: [f32; 2], view: Option<RasterView> },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -490,6 +520,18 @@ pub(super) struct RasterTarget {
     #[serde(default)]
     pub mask: bool,
     pub space: PaintSpace,
+    /// Use an independent 3D camera and pixel dimensions for this operation.
+    pub view: Option<RasterView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(super) struct RasterView {
+    pub width: u32,
+    pub height: u32,
+    /// Override camera fields for this request only.
+    pub camera: Option<mcp_preview::CameraPatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -515,7 +557,10 @@ pub(super) struct BrushValues {
     pub size_px: Option<f32>,
     pub flow_percent: Option<f32>,
     pub hardness_percent: Option<f32>,
+    /// Legacy opacity override. With only the opacity map active, this sets the map value.
     pub opacity_percent: Option<f32>,
+    /// Strength of the whole stroke or fill, independent of the map value.
+    pub stroke_opacity_percent: Option<f32>,
     pub spacing_percent: Option<f32>,
     pub erase: bool,
     pub mask_value: Option<u8>,
@@ -1092,6 +1137,7 @@ pub(in crate::editor) fn state(
     let mut response = snapshot(index, doc, session, &paint.tips);
     if let Some(session) = session {
         response["view"]["trace_progress"] = preview.trace_progress(index, doc, session);
+        response["view"]["live_preview"] = preview.live_progress(index, doc, session);
     }
     Ok(response)
 }
@@ -1370,7 +1416,10 @@ pub(in crate::editor) fn select_surface(
         return Err("The crease angle must be between 1 and 179 degrees".into());
     }
     let (index, doc, session) = bound_workspace(editor, editing, &mut paint.sessions, args.workspace)?;
-    let source = input.surface_source(session, args.source)?;
+    if args.topology.is_some_and(|topology| topology != SurfaceTopology::new(doc, session)) {
+        return Err("The surface topology changed; call list_paint_surface_parts again".into());
+    }
+    let source = input.surface_source(index, session, args.source)?;
     input.submit_surface(index, doc, session, args.layer, surface_selection::Selection {
         source,
         crease_angle,
@@ -1380,6 +1429,48 @@ pub(in crate::editor) fn select_surface(
     let mut result = snapshot(index, doc, Some(session), &paint.tips);
     result["surface_selection"] = json!({"status": "running"});
     Ok(result)
+}
+
+pub(in crate::editor) fn list_surface_parts(
+    editor: &Editor, editing: &editing::State, paint: &PaintState, args: SurfacePartsArgs, reply: OutputReply,
+) {
+    let snapshot = (|| {
+        let model_id = model_index(editor)?;
+        let workspace = args.workspace;
+        if model_id != workspace.model_id {
+            return Err("The active model changed; call get_paint_state again".into());
+        }
+        let doc = editing.documents.get(&model_id).filter(|doc| doc.mode == Mode::Paint)
+            .ok_or("Switch the model to Painting mode first")?;
+        let session = paint.sessions.get(&model_id).ok_or("Wait for Painting mode to load")?;
+        if session.set != workspace.set || workspace.revision.is_some_and(|rev| rev != session.revision) {
+            return Err("The paint workspace changed; call get_paint_state again".into());
+        }
+        let (object, slot) = doc.paint_target(workspace.set).ok_or("Unknown texture set")?;
+        let target = (object.id, slot);
+        if session.binding != Some(target) || session.mesh_loading {
+            return Err("Wait for the active texture set to load".into());
+        }
+        let limit = args.limit.unwrap_or(100);
+        if !(1..=250).contains(&limit) {
+            return Err("The surface part limit must be between 1 and 250".into());
+        }
+        Ok((doc.objects.clone(), target, session.set_appearance.visibility.clone(),
+            SurfaceTopology::new(doc, session), limit, session.revision))
+    })();
+    let (objects, target, visibility, topology, limit, revision) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(Err(error)),
+    };
+    bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+        let (parts, total) = surface_selection::list_parts(&objects, target, &visibility, args.offset, limit);
+        let next = args.offset.saturating_add(parts.len());
+        reply(Ok(json!({
+            "workspace": {"model_id": args.workspace.model_id, "set": args.workspace.set, "revision": revision},
+            "topology": topology, "parts": parts, "total": total,
+            "next_offset": (next < total).then_some(next),
+        })));
+    }).detach();
 }
 
 fn raster(
@@ -1888,6 +1979,8 @@ fn brush(session: &Session, tips: &tips::Library) -> Value {
         "size_px": session.size,
         "flow_percent": session.flow,
         "opacity_percent": session.opacity,
+        "stroke_opacity_percent": session.opacity,
+        "opacity_channel_percent": session.brush_alpha,
         "hardness_percent": session.hardness,
         "spacing_percent": session.spacing,
         "stabilizer": session.stabilizer,

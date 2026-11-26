@@ -110,17 +110,21 @@ pub(super) fn mapping(
     Mapping::for_camera(doc, object, slot, camera_map(viewer, rect), uv, visibility)
 }
 pub(super) fn camera_map(viewer: &Viewer, rect: Rect) -> CameraMap {
-    let pose = view_pose(viewer);
+    model_camera_map(viewer.camera(), viewer.radius, rect)
+}
+
+pub(super) fn model_camera_map(camera: ModelCamera, radius: f32, rect: Rect) -> CameraMap {
+    let pose = model_pose(camera);
     CameraMap {
         pose,
         inverse: pose.to_matrix().inverse(),
         rect,
         clip: rect,
-        ortho: viewer.orthographic,
-        fov: viewer.fov(),
-        height: view_height(viewer, viewer.distance),
-        depth: orthographic_depth(viewer),
-        epsilon: viewer.radius.max(0.001) * 0.0005,
+        ortho: camera.orthographic,
+        fov: camera.fov,
+        height: 2. * camera.distance.max(0.000001) * (camera.fov * 0.5).tan(),
+        depth: model_orthographic_depth(camera, radius),
+        epsilon: radius.max(0.001) * 0.0005,
     }
 }
 pub(in crate::editor::ui::model_viewer::paint) fn has_uv(object: &Object, slot: usize) -> bool {

@@ -1424,31 +1424,20 @@ fn brush_for_style(session: &Session, tips: &tips::Library, object: &Object, uv:
     let masking = session.editing_mask && session.has_mask();
     let channel = session.stroke_channels().trailing_zeros() as usize;
     let percent_byte = |value: f32| (value * 2.55).round() as u8;
-    let material = (!masking && session.multi_channel_brush).then(|| BrushMaterial {
+    let colors = [
+        session.brush_color(),
+        [percent_byte(session.roughness); 3],
+        [percent_byte(session.metallic); 3],
+        [percent_byte(session.brush_height); 3],
+        [percent_byte(session.brush_alpha); 3],
+        session.brush_emission.map(percent_byte),
+        [128, 128, 255],
+        [percent_byte(session.brush_specular); 3],
+    ];
+    let material = (!masking && session.multi_channel_brush).then_some(BrushMaterial {
         channels: session.brush_channels,
-        colors: [
-            session.brush_color(),
-            [percent_byte(session.roughness); 3],
-            [percent_byte(session.metallic); 3],
-            [percent_byte(session.brush_height); 3],
-            [percent_byte(session.brush_alpha); 3],
-            session.brush_emission.map(percent_byte),
-            [128, 128, 255],
-            [percent_byte(session.brush_specular); 3],
-        ],
+        colors,
     });
-    let scalar = match session.channel {
-        1 => session.roughness,
-        2 => session.metallic,
-        _ => session.opacity,
-    };
-    let color = if matches!(session.channel, 1 | 2 | 3 | 4 | 7) {
-        [(scalar * 2.55).round() as u8; 3]
-    } else if session.channel == 6 {
-        [128, 128, 255]
-    } else {
-        session.brush_color()
-    };
     let texture = style
         .grain
         .and_then(|i| tips.grains.get(i))
@@ -1486,16 +1475,12 @@ fn brush_for_style(session: &Session, tips: &tips::Library, object: &Object, uv:
                 session.mask_value
             }; 3]
         } else {
-            material.map_or(color, |material| material.colors[channel])
+            colors[channel]
         },
         radius: (session.size * 0.5).max(0.5),
         hardness: session.hardness / 100.,
         flow: session.flow / 100.,
-        opacity: if channel == 4 && material.is_none() {
-            1.
-        } else {
-            session.opacity / 100.
-        },
+        opacity: session.opacity / 100.,
         erase: erase
             && (!masking
                 || session.stack.layers[session.stack.selected]
@@ -1552,6 +1537,28 @@ pub(super) fn node_rect(node: &ComputedNode, transform: &UiGlobalTransform) -> O
 }
 
 #[derive(SystemParam)]
+pub(in crate::editor::ui::model_viewer) struct VisibleControls<'w, 's> {
+    controls: Query<'w, 's, (
+        &'static ComputedNode,
+        &'static UiGlobalTransform,
+        Option<&'static bevy::ui::CalculatedClip>,
+        Option<&'static InheritedVisibility>,
+    ), With<Control>>,
+}
+
+impl VisibleControls<'_, '_> {
+    pub(super) fn contains(&self, point: Vec2) -> bool {
+        self.controls.iter().any(|(node, transform, clip, visibility)| {
+            let physical = point / node.inverse_scale_factor();
+            !node.is_empty()
+                && visibility.is_none_or(|visibility| visibility.get())
+                && clip.is_none_or(|clip| clip.contains_point(physical))
+                && node.contains_point(*transform, physical)
+        })
+    }
+}
+
+#[derive(SystemParam)]
 pub(in crate::editor::ui::model_viewer) struct UvCanvas<'w, 's> {
     image: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<TextureCanvas>>,
     viewport: Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<TextureViewport>>,
@@ -1585,7 +1592,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
     inputs: Query<(), With<TextInput>>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
     texture: UvCanvas,
-    controls: Query<(&ComputedNode, &UiGlobalTransform), With<Control>>,
+    controls: VisibleControls,
     drawer: Res<DrawerMotion>,
     pointer: Res<PointerFrame>,
     baked: Res<bake::State>,
@@ -1654,6 +1661,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
         && !control
         && !mouse.pressed(MouseButton::Right)
         && !keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    let adjustment_point = if start_adjustment { cursor } else { pointer.pen_cursor().or(cursor) };
     if (start_adjustment || resize_by_key)
         && !blocked
         && !bake_read_only
@@ -1661,8 +1669,9 @@ pub(in crate::editor::ui::model_viewer) fn input(
         && runtime.gesture.is_none()
         && !runtime.fix.drawing()
         && !mouse.pressed(MouseButton::Left)
+        && !pointer.pen_down()
         && let Some(index) = active
-        && let Some(point) = cursor
+        && let Some(point) = adjustment_point
         && !drawer.covers(point, &window)
     {
         let session = paint.sessions.get_mut(&index).unwrap();
@@ -1673,7 +1682,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
         let over_model = session.view != View::Two
             && (!session.showing_bake() || session.showing_map_on_model())
             && canvas.single().ok().is_some_and(contains);
-        if (over_uv || over_model) && !controls.iter().any(contains) {
+        if (over_uv || over_model) && !controls.contains(point) {
             if start_adjustment {
                 runtime.brush_adjustment = Some(BrushAdjustment {
                     model: index,
@@ -1699,8 +1708,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
             if (model.is_some_and(|rect| rect.contains(*point))
                 || uv_view.is_some_and(|camera| camera.clip.contains(*point)))
                 && !drawer.covers(*point, &window)
-                && !controls.iter().any(|(node, transform)| node_rect(node, transform)
-                    .is_some_and(|rect| rect.contains(*point)))))
+                && !controls.contains(*point)))
         {
             editor.status = "Запечённая карта открыта для просмотра. Для рисования вернитесь к материалу или включите кисть исправлений.".into();
         }
@@ -1778,11 +1786,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
                 }
                 Sample::Down(point) => point,
             };
-            if drawer.covers(point, &window)
-                || controls.iter().any(|(node, transform)| {
-                    node_rect(node, transform).is_some_and(|rect| rect.contains(point))
-                })
-            {
+            if drawer.covers(point, &window) || controls.contains(point) {
                 continue;
             }
             let target = uv_view.filter(|camera| camera.clip.contains(point))
@@ -1800,7 +1804,6 @@ pub(in crate::editor::ui::model_viewer) fn input(
             brush.channel = 1;
             brush.material = None;
             brush.color = [(session.bake_fix_value as f32 * 2.55).round() as u8; 3];
-            brush.opacity = session.opacity / 100.;
             brush.erase = erase;
             brush.fill = false;
             brush.grain = None;
@@ -1838,7 +1841,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
             mouse: &mouse,
             can_start: &|point| {
                 !drawer.covers(point, &window)
-                    && !controls.iter().any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(point)))
+                    && !controls.contains(point)
             },
         };
         match path_editor::edit(live, session, &paint.tips, input) {
@@ -1913,10 +1916,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
                 point
             }
         };
-        let over_control = controls
-            .iter()
-            .any(|(n, t)| node_rect(n, t).is_some_and(|r| r.contains(cursor)));
-        if over_control || drawer.covers(cursor, &window) {
+        if controls.contains(cursor) || drawer.covers(cursor, &window) {
             continue;
         }
         let (uv, camera) = if let Some(camera) =
@@ -2136,7 +2136,7 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
     geometry: Query<(&ComputedNode, &UiGlobalTransform)>,
     canvases: Query<(Entity, Has<TextureCanvas>), Or<(With<Canvas>, With<TextureCanvas>)>>,
     texture: UvCanvas,
-    controls: Query<Entity, With<Control>>,
+    controls: VisibleControls,
     mut cursor: Query<(&mut Node, &mut Visibility), With<BrushCursor>>,
     pointer: Res<PointerFrame>,
     runtime: Res<Runtime>,
@@ -2199,14 +2199,7 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
                 .and_then(|(n, t)| node_rect(n, t))
                 .is_some_and(|r| r.contains(point))
         });
-        let control = controls.iter().any(|e| {
-            geometry
-                .get(e)
-                .ok()
-                .and_then(|(n, t)| node_rect(n, t))
-                .is_some_and(|r| r.contains(point))
-        });
-        if !over || control {
+        if !over || controls.contains(point) {
             return None;
         }
         let Some(overlay) = geometry

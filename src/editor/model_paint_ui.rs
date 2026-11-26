@@ -327,6 +327,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     fill_angle: Entity,
     path_options: Entity,
     multi_brush: Entity,
+    brush_values: [(usize, Entity); 4],
     three_title: Entity,
     three_label: Entity,
     stamps: [Option<(usize, u64, u64, usize, usize)>; 5],
@@ -802,6 +803,8 @@ fn title(commands: &mut Commands, parent: Entity, font: &Handle<Font>, value: &s
     e
 }
 const SHELF_HEIGHT: f32 = 219.;
+const TOOLBAR_BOTTOM: f32 = 88.;
+const PATH_TOOLBAR_HEIGHT: f32 = 40.;
 
 fn texture_decimal(parameter: Parameter) -> bool {
     matches!(parameter, Parameter::TextureTiling | Parameter::TextureOffsetU
@@ -1710,6 +1713,33 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     button(
         &mut commands, toolbar, font, "Экспорт карт…", PaintAction::ExportMaps(true),
     );
+    let path_options = surface(
+        &mut commands,
+        viewer.overlay,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            top: px(TOOLBAR_BOTTOM),
+            left: px(44),
+            right: px(0),
+            height: px(PATH_TOOLBAR_HEIGHT),
+            padding: UiRect::horizontal(px(10)),
+            border: UiRect::bottom(px(1)),
+            ..row(4.)
+        },
+        PANEL,
+    );
+    commands.entity(path_options).insert(ZIndex(40));
+    for (label, action) in [
+        ("Сгладить", PaintAction::PathSmooth),
+        ("Замкнуть", PaintAction::PathClosed),
+        ("По направлению", PaintAction::PathAlign),
+        ("Применить", PaintAction::PathApply),
+        ("Очистить", PaintAction::PathClear),
+    ] {
+        button(&mut commands, path_options, font, label, action);
+    }
+    number(&mut commands, path_options, font, Parameter::Spacing, true);
     let views = node(
         &mut commands,
         viewer.overlay,
@@ -1738,7 +1768,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
             display: Display::None,
             position_type: PositionType::Absolute,
             left: px(0),
-            top: px(88),
+            top: px(TOOLBAR_BOTTOM),
             bottom: px(0),
             width: px(44),
             padding: UiRect::axes(px(6), px(9)),
@@ -2127,19 +2157,6 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     number(&mut commands, fill_options, font, Parameter::FillPadding, false);
     let fill_angle = node(&mut commands, fill_options, column(0.));
     number(&mut commands, fill_angle, font, Parameter::FillAngle, false);
-    let path_options = node(
-        &mut commands, body,
-        Node { flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.) },
-    );
-    for (label, action) in [
-        ("Сгладить", PaintAction::PathSmooth),
-        ("Замкнуть", PaintAction::PathClosed),
-        ("По направлению", PaintAction::PathAlign),
-        ("Применить · Enter", PaintAction::PathApply),
-        ("Очистить · Esc", PaintAction::PathClear),
-    ] {
-        button(&mut commands, path_options, font, label, action);
-    }
     text(&mut commands, body, font, "КИСТЬ", 11., MUTED);
     let brush_name = text(&mut commands, body, font, "Кисть · круглая", 13., TEXT);
     for parameter in [
@@ -2228,12 +2245,18 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     for (index, name) in CHANNELS.iter().enumerate() {
         button(&mut commands, targets, font, name, PaintAction::BrushChannel(index));
     }
-    for field in [
-        Parameter::BrushHeight, Parameter::BrushAlpha, Parameter::BrushSpecular,
-        Parameter::BrushEmission(0), Parameter::BrushEmission(1), Parameter::BrushEmission(2),
-    ] {
-        number(&mut commands, multi_brush, font, field, false);
-    }
+    let brush_values = [
+        (3, &[Parameter::BrushHeight][..]),
+        (4, &[Parameter::BrushAlpha][..]),
+        (5, &[Parameter::BrushEmission(0), Parameter::BrushEmission(1), Parameter::BrushEmission(2)][..]),
+        (7, &[Parameter::BrushSpecular][..]),
+    ].map(|(channel, fields)| {
+        let controls = node(&mut commands, body, Node { display: Display::None, ..column(4.) });
+        for &field in fields {
+            number(&mut commands, controls, font, field, false);
+        }
+        (channel, controls)
+    });
     number(&mut commands, body, font, Parameter::Stabilizer, false);
     for parameter in [
         Parameter::BrushScatter,
@@ -2372,6 +2395,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         fill_angle,
         path_options,
         multi_brush,
+        brush_values,
         three_title,
         three_label,
         stamps: [None; 5],
@@ -2432,6 +2456,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     let graph_workspace = showing && !editor.browser_popup && !editor.hdri_library_open
         && editor.viewing_model.and_then(|i| paint.sessions.get(&i)).is_some_and(Session::graph_canvas_open);
     let custom_workspace = shader_workspace || graph_workspace;
+    let show_path_options = showing && !custom_workspace && editor.viewing_model
+        .and_then(|i| paint.sessions.get(&i))
+        .is_some_and(|session| session.tool == PaintTool::Path);
     let canvas_parent = if graph_workspace {
         ui.graph.preview
     } else if shader_workspace && maker.shows_model() {
@@ -2528,11 +2555,17 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             }
         }
     }
+    if let Ok(mut node) = nodes.get_mut(ui.path_options) {
+        let display = if show_path_options { Display::Flex } else { Display::None };
+        if node.display != display {
+            node.display = display;
+        }
+    }
     if let Ok(mut node) = nodes.get_mut(ui.content) {
         let padding = if showing {
             UiRect {
                 left: px(44),
-                top: px(88),
+                top: px(TOOLBAR_BOTTOM + if show_path_options { PATH_TOOLBAR_HEIGHT } else { 0. }),
                 bottom: px(if shelf_docked { 0. } else { SHELF_HEIGHT }),
                 right: px(0),
             }
@@ -2655,9 +2688,12 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     for (entity, visible) in [
         (ui.fill_options, session.tool == PaintTool::Fill),
         (ui.fill_angle, session.fill_mode == FillMode::Flat),
-        (ui.path_options, session.tool == PaintTool::Path),
         (ui.multi_brush, session.multi_channel_brush && !session.editing_mask),
-    ] {
+    ].into_iter().chain(ui.brush_values.map(|(channel, entity)| {
+        let active = !session.editing_mask && session.tool != PaintTool::Eraser
+            && (session.stroke_channels() & (1 << channel)) != 0;
+        (entity, active)
+    })) {
         if let Ok(mut node) = nodes.get_mut(entity) {
             let display = if visible { Display::Flex } else { Display::None };
             if node.display != display {
@@ -3667,6 +3703,20 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     button(&mut commands, stack, font, "Учитывать нормали high-poly", PaintAction::ExportBakedNormal);
                     number(&mut commands, stack, font, Parameter::ExportHeightStrength, false);
                     button(&mut commands, stack, font, "Открывать папку после экспорта", PaintAction::ExportRevealFolder);
+                    if let Some(binding) = session.binding {
+                        let recipe = match session.export_settings.template {
+                            export::Template::Custom(id) => export_preferences.recipe(id),
+                            _ => None,
+                        };
+                        let maps = baked.maps(index, doc, binding, session.texture_size).map(Arc::as_ref);
+                        let files = export::preview_files(doc, binding, &editor.project.title, session.export_settings, recipe, maps);
+                        text(&mut commands, stack, font, "Файлы выбранного набора", 11., MUTED);
+                        for file in files {
+                            let optional = if file.conditional { " · если канал изменён" } else { "" };
+                            text(&mut commands, stack, font,
+                                format!("{} · {}{optional}", file.name, file.depth.label()), 12., TEXT);
+                        }
+                    }
                 }
                 button(&mut commands, stack, font, "Экспорт сетки OBJ…", PaintAction::ExportMesh);
             }

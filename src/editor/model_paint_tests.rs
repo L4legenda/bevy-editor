@@ -2448,6 +2448,25 @@ fn gpu_paint_imported_camera_uses_its_fov_and_reopens_after_a_camera_only_save()
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(feature = "mcp")]
+fn request_live_paint_view(app: &mut App, settings: serde_json::Value) -> Result<serde_json::Value, String> {
+    use bevy::ecs::system::RunSystemOnce;
+    let args: mcp_state::PaintViewArgs = serde_json::from_value(settings).unwrap();
+    app.world_mut().run_system_once(move |mut input: mcp_state::McpPreview,
+        editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+        mcp_state::set_view(&mut input, &editor, &mut editing, &mut paint, args.clone())
+    }).unwrap()
+}
+
+#[cfg(feature = "mcp")]
+fn live_paint_state(app: &mut App) -> serde_json::Value {
+    use bevy::ecs::system::RunSystemOnce;
+    app.world_mut().run_system_once(|input: mcp_state::McpPreview, editor: Res<Editor>,
+        editing: Res<editing::State>, paint: Res<PaintState>| {
+        mcp_state::state(&editor, &editing, &paint, &input).unwrap()["view"]["live_preview"].clone()
+    }).unwrap()
+}
+
 #[test]
 #[ignore = "requires GPU; previews built-in mesh maps before a full bake"]
 fn gpu_builtin_maps_preview_without_full_bake() {
@@ -2509,9 +2528,27 @@ fn gpu_builtin_maps_preview_without_full_bake() {
         }
     };
     let ao = bake::BakeMap::Occlusion;
+    #[cfg(feature = "mcp")]
+    {
+        use serde_json::json;
+        let camera = request_live_paint_view(&mut app, json!({"model_id": 0})).unwrap()["camera"].clone();
+        let invalid = request_live_paint_view(&mut app, json!({"model_id": 0, "yaw_degrees": 123,
+            "live_preview": {"mode": "map", "map": "projected_normal"}}));
+        assert!(invalid.is_err());
+        assert_eq!(request_live_paint_view(&mut app, json!({"model_id": 0})).unwrap()["camera"], camera);
+        assert_eq!(live_paint_state(&mut app)["mode"], "off");
+        let started = request_live_paint_view(&mut app, json!({"model_id": 0,
+            "live_preview": {"mode": "map", "map": "occlusion"}})).unwrap();
+        assert_eq!(started["live_preview"]["status"], "pending");
+        assert_eq!(started["bake_map"], "occlusion");
+    }
+    #[cfg(not(feature = "mcp"))]
     paint_message(&mut app, PaintAction::BakePreview(Some(ao)));
     let (ao_image, ao_pixels) = wait_image(&mut app, ao);
     assert!(ao_pixels.chunks_exact(4).any(|p| p[3] == 255 && p[0] > 0));
+    #[cfg(feature = "mcp")]
+    assert_eq!(live_paint_state(&mut app), serde_json::json!({"mode": "map",
+        "map": "occlusion", "status": "ready", "resolution": 256, "error": null}));
     let normal = bake::BakeMap::WorldNormal;
     paint_message(&mut app, PaintAction::BakePreview(Some(normal)));
     let (normal_image, normal_pixels) = wait_image(&mut app, normal);
@@ -2675,8 +2712,17 @@ fn gpu_builtin_maps_preview_without_full_bake() {
     warm(&mut app, 8);
     paint_ready(&mut app);
     paint_message(&mut app, PaintAction::Panel(Panel::Maps));
-    paint_message(&mut app, PaintAction::BakePreview(Some(bake::BakeMap::Custom(point))));
-    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    #[cfg(feature = "mcp")]
+    {
+        let reply = request_live_paint_view(&mut app, serde_json::json!({"model_id": 0,
+            "live_preview": {"mode": "material", "map": bake::BakeMap::Custom(point)}})).unwrap();
+        assert_eq!(reply["live_preview"]["status"], "pending");
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        paint_message(&mut app, PaintAction::BakePreview(Some(bake::BakeMap::Custom(point))));
+        paint_message(&mut app, PaintAction::BakeLiveMasks);
+    }
     let wait_live_graph = |app: &mut App, prior| {
         let started = std::time::Instant::now();
         loop {
@@ -2690,6 +2736,14 @@ fn gpu_builtin_maps_preview_without_full_bake() {
         }
     };
     let digest = wait_live_graph(&mut app, None);
+    #[cfg(feature = "mcp")]
+    {
+        let live = live_paint_state(&mut app);
+        assert_eq!(live["mode"], "material");
+        assert_eq!(live["status"], "ready");
+        assert_eq!(live["resolution"], 256);
+        assert_eq!(live["material_ready"], true);
+    }
     let original_graph = paint_surface(&app);
     paint_message(&mut app, PaintAction::BakeCustomAdjust(point, custom::Field::X, 1));
     assert_ne!(wait_live_graph(&mut app, Some(digest)), digest);
@@ -2721,6 +2775,8 @@ fn gpu_builtin_maps_preview_without_full_bake() {
         }
         assert!(started.elapsed().as_secs() < 12);
     }
+    #[cfg(feature = "mcp")]
+    assert_eq!(live_paint_state(&mut app)["status"], "baked");
 }
 
 #[test]
@@ -2766,8 +2822,19 @@ fn gpu_live_bake_lights_the_unpainted_material() {
     }
     warm(&mut app, 12);
     paint_ready(&mut app);
-    paint_message(&mut app, PaintAction::Panel(Panel::Maps));
-    paint_message(&mut app, PaintAction::BakeLiveMasks);
+    #[cfg(feature = "mcp")]
+    {
+        let reply = request_live_paint_view(&mut app, serde_json::json!({"model_id": 0, "layout": "two",
+            "live_preview": {"mode": "material"}})).unwrap();
+        assert_eq!(reply["layout"], "two");
+        assert!(reply["live_preview"]["map"].is_null());
+        request_live_paint_view(&mut app, serde_json::json!({"model_id": 0, "layout": "split"})).unwrap();
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        paint_message(&mut app, PaintAction::Panel(Panel::Maps));
+        paint_message(&mut app, PaintAction::BakeLiveMasks);
+    }
     let start = std::time::Instant::now();
     loop {
         frame(&mut app);
@@ -2794,6 +2861,14 @@ fn gpu_live_bake_lights_the_unpainted_material() {
         }
         assert!(start.elapsed().as_secs() < 25, "{:?}", baked.live_status(bake::BakeMap::WorldNormal));
     }
+    #[cfg(feature = "mcp")]
+    {
+        let reply = request_live_paint_view(&mut app, serde_json::json!({"model_id": 0,
+            "live_preview": {"mode": "off"}})).unwrap();
+        assert_eq!(reply["live_preview"]["status"], "off");
+        frame(&mut app);
+    }
+    #[cfg(not(feature = "mcp"))]
     paint_message(&mut app, PaintAction::BakeLiveMasks);
     assert!(app.world().resource::<bake::State>().masks.mask_digest().is_none());
 }
@@ -7058,6 +7133,15 @@ fn gpu_texture_set_resolution_is_independent_and_saved() {
         &directory, "Block", capture(None), session.export_settings.padding,
         session.export_settings.width, session.export_settings.template, session.export_settings.file,
     ).unwrap();
+    let preview = {
+        let world = app.world_mut();
+        let mut labels = world.query::<&Text>();
+        labels.iter(world).find_map(|label| {
+            let (name, depth) = label.0.rsplit_once(" · ")?;
+            (name.contains("_ORM.") && depth == "16 бит").then(|| name.to_owned())
+        }).expect("The format panel previews the selected set's 16-bit ORM filename")
+    };
+    assert!(tiff.path.join(preview).is_file());
     for tile in [1001, 1013] {
         let orm = std::fs::read_dir(&tiff.path).unwrap().map(|entry| entry.unwrap().path())
             .find(|path| path.to_string_lossy().ends_with(&format!("_ORM.{tile}.tif"))).unwrap();
@@ -8027,7 +8111,7 @@ fn gpu_paint_shortcuts_switch_tools_and_views_without_editing_layers() {
 #[test]
 #[ignore = "requires GPU; exercises brush adjustment with real viewport input in 3D and UV"]
 fn gpu_paint_brush_adjusts_in_3d_and_uv_without_moving_camera() {
-    use bevy::input::mouse::MouseButtonInput;
+    use bevy::{input::{mouse::MouseButtonInput, touch::{TouchInput, TouchPhase}}, window::WindowEvent};
     let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
     app.world_mut().resource_mut::<Editor>().drawer = false;
     app.world_mut().write_message(Action::ViewModel(0));
@@ -8091,8 +8175,13 @@ fn gpu_paint_brush_adjusts_in_3d_and_uv_without_moving_camera() {
         }
         fill_modifier(&mut app, window, KeyCode::ControlLeft, Key::Control, ButtonState::Released);
     }
+    let uv_center = center::<engine::TextureCanvas>(&mut app);
+    move_pointer(&mut app, window, Vec2::splat(8.));
     app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap()
         .set_value(Parameter::Size, 790.);
+    app.world_mut().write_message(WindowEvent::TouchInput(TouchInput {
+        window, id: 1, phase: TouchPhase::Moved, position: uv_center, force: None,
+    }));
     fill_modifier(&mut app, window, KeyCode::BracketRight, Key::Character("]".into()), ButtonState::Pressed);
     assert_eq!(params(&app).0, 800.);
 }
@@ -8507,22 +8596,26 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
         let layer = app.world().resource::<PaintState>().sessions[&0].stack.selected;
         let workspace = json!({"model_id": 0, "set": 0});
-        let stroke_request = |app: &mut App, space, position: [f32; 2], color| {
+        let stroke_request = |app: &mut App, target: serde_json::Value, position: [f32; 2], mut brush: serde_json::Value| {
+            brush["size_px"] = json!(28.0);
+            brush["hardness_percent"] = json!(100.0);
             let args: mcp_state::StrokeArgs = serde_json::from_value(json!({
                 "workspace": workspace,
-                "target": {"layer": layer, "space": space},
+                "target": target,
                 "samples": [{"position": position, "pressure": 1.0}],
-                "brush": {"size_px": 28.0, "hardness_percent": 100.0, "channels": {"base_color": color}},
+                "brush": brush,
             })).unwrap();
             app.world_mut().run_system_once(move |mut input: mcp_state::McpPaintInput,
                 editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
                 mcp_state::stroke(&mut input, &editor, &mut editing, &mut paint, args.clone())
             }).unwrap()
         };
+        let uv_target = json!({"layer": layer, "space": "uv"});
+        let viewport_target = json!({"layer": layer, "space": "viewport"});
         let before_mcp = undo_len(&app);
-        assert!(stroke_request(&mut app, "uv", [-0.1, 0.5], [1, 2, 3]).is_err());
+        assert!(stroke_request(&mut app, uv_target.clone(), [-0.1, 0.5], json!({"channels": {"base_color": [1, 2, 3]}})).is_err());
         let screen_position = ((point - rect.min) / rect.size()).to_array();
-        let queued = stroke_request(&mut app, "viewport", screen_position, [17, 150, 240]).unwrap();
+        let queued = stroke_request(&mut app, viewport_target.clone(), screen_position, json!({"channels": {"base_color": [17, 150, 240]}})).unwrap();
         assert_eq!(queued["paint_busy"], true);
         paint_ready(&mut app);
         assert_eq!(undo_len(&app), before_mcp + 1);
@@ -8530,7 +8623,7 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         let pixels = surface.stack.layers[layer].channels[0].as_ref().unwrap();
         assert_eq!(&pixels[side..side + 4], &[17, 150, 240, 255]);
 
-        stroke_request(&mut app, "uv", [0.5, 0.5], [210, 60, 30]).unwrap();
+        stroke_request(&mut app, uv_target.clone(), [0.5, 0.5], json!({"channels": {"base_color": [210, 60, 30]}})).unwrap();
         paint_ready(&mut app);
         let surface = current(&app).unwrap();
         let pixels = surface.stack.layers[layer].channels[0].as_ref().unwrap();
@@ -8555,13 +8648,213 @@ fn gpu_paint_multi_channel_strokes_are_atomic_in_uv_and_3d() {
         assert_eq!(&pixels[side..side + 4], &[77, 77, 77, 255]);
         paint_message(&mut app, PaintAction::Undo);
         assert!(current(&app).unwrap().stack.layers[layer].channels[1].is_none());
+
+        {
+            let mut paint = app.world_mut().resource_mut::<PaintState>();
+            let session = paint.sessions.get_mut(&0).unwrap();
+            session.multi_channel_brush = false;
+            session.channel = 4;
+        }
+        stroke_request(&mut app, uv_target.clone(), [0.5, 0.5], json!({"opacity_percent": 25, "stroke_opacity_percent": 50})).unwrap();
+        paint_ready(&mut app);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[4].as_ref().unwrap();
+        assert_eq!(&pixels[center..center + 4], &[64, 64, 64, 128]);
+        paint_message(&mut app, PaintAction::Undo);
+        stroke_request(&mut app, uv_target, [0.5, 0.5], json!({"opacity_percent": 25})).unwrap();
+        paint_ready(&mut app);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[4].as_ref().unwrap();
+        assert_eq!(&pixels[center..center + 4], &[64, 64, 64, 255]);
+
+        paint_message(&mut app, PaintAction::View(View::Two));
+        let camera_before = app.world().resource::<Viewer>().camera();
+        let history_before = undo_len(&app);
+        let mut target = viewport_target;
+        target["view"] = json!({"width": 720, "height": 480,
+            "camera": {"center": [-0.5, 0.0, 0.0], "distance": 2.0,
+                "yaw_degrees": 0.0, "pitch_degrees": 0.0, "orthographic": true}});
+        let brush = json!({"channels": {"base_color": [2, 180, 44]}});
+        let mut invalid = target.clone();
+        invalid["view"]["width"] = json!(0);
+        assert!(stroke_request(&mut app, invalid, [0.5, 0.5], brush.clone()).is_err());
+        assert_eq!(undo_len(&app), history_before);
+        stroke_request(&mut app, target.clone(), [0.5, 0.5], brush).unwrap();
+        paint_ready(&mut app);
+        assert_eq!(undo_len(&app), history_before + 1);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[0].as_ref().unwrap();
+        let offset_pixel = (256 * 512 + 128) * 4;
+        assert_eq!(&pixels[offset_pixel..offset_pixel + 4], &[2, 180, 44, 255]);
+        assert_eq!(&pixels[center..center + 4], &[210, 60, 30, 255]);
+
+        let args: mcp_state::FillArgs = serde_json::from_value(json!({
+            "workspace": workspace, "target": target, "position": [0.5, 0.5],
+            "mode": "polygon", "brush": {"channels": {"roughness": 61}},
+        })).unwrap();
+        app.world_mut().run_system_once(move |mut input: mcp_state::McpPaintInput,
+            editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+            mcp_state::fill(&mut input, &editor, &mut editing, &mut paint, args.clone())
+        }).unwrap().unwrap();
+        paint_ready(&mut app);
+        let surface = current(&app).unwrap();
+        let pixels = surface.stack.layers[layer].channels[1].as_ref().unwrap();
+        assert_eq!(&pixels[center..center + 4], &[61, 61, 61, 255]);
+
+        let list_args: mcp_state::SurfacePartsArgs = serde_json::from_value(json!({
+            "workspace": workspace, "limit": 1,
+        })).unwrap();
+        let (reply, result) = std::sync::mpsc::channel();
+        app.world_mut().run_system_once(move |editor: Res<Editor>, editing: Res<editing::State>, paint: Res<PaintState>| {
+            let reply = reply.clone();
+            mcp_state::list_surface_parts(&editor, &editing, &paint, list_args.clone(),
+                Box::new(move |result| { reply.send(result).unwrap(); }));
+        }).unwrap();
+        let list = result.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(list["total"], 1);
+        assert_eq!(list["parts"][0]["index"], 0);
+        assert_eq!(list["parts"][0]["triangles_in_active_set"], 2);
+
+        let selection = json!({
+            "workspace": list["workspace"], "topology": list["topology"], "layer": layer,
+            "source": {"kind": "viewport", "position": [0.5, 0.5], "view": target["view"]},
+        });
+        let select = |app: &mut App, args| {
+            let args: mcp_state::SurfaceArgs = serde_json::from_value(args).unwrap();
+            app.world_mut().run_system_once(move |mut input: mcp_state::McpPaintInput,
+                editor: Res<Editor>, mut editing: ResMut<editing::State>, mut paint: ResMut<PaintState>| {
+                mcp_state::select_surface(&mut input, &editor, &mut editing, &mut paint, args.clone())
+            }).unwrap()
+        };
+        let before_selection = undo_len(&app);
+        let mut stale = selection.clone();
+        let revision = stale["topology"]["geometry_revision"].as_u64().unwrap();
+        stale["topology"]["geometry_revision"] = json!(revision + 1);
+        assert!(select(&mut app, stale).is_err());
+        assert_eq!(undo_len(&app), before_selection);
+        select(&mut app, selection).unwrap();
+        paint_ready(&mut app);
+        assert_eq!(undo_len(&app), before_selection + 1);
+        assert!(current(&app).unwrap().stack.layers[layer].mask.is_some());
+        assert_eq!(app.world().resource::<Viewer>().camera(), camera_before);
+        assert_eq!(app.world().resource::<PaintState>().sessions[&0].view, View::Two);
     }
+
+    paint_message(&mut app, PaintAction::View(View::Two));
+    paint_message(&mut app, PaintAction::Tool(PaintTool::Brush));
+    paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
+    {
+        let mut paint = app.world_mut().resource_mut::<PaintState>();
+        let session = paint.sessions.get_mut(&0).unwrap();
+        session.multi_channel_brush = false;
+        session.channel = 4;
+        session.set_value(Parameter::BrushAlpha, 25.);
+        session.set_value(Parameter::Opacity, 50.);
+    }
+    let point = uv_rect::<engine::TextureCanvas>(&mut app).center();
+    let opacity_pixel = |app: &App| {
+        let surface = current(app).unwrap();
+        let layer = &surface.stack.layers[surface.stack.selected];
+        layer.channels[4].as_ref().unwrap()[center..center + 4].to_vec()
+    };
+    stroke(&mut app, point);
+    assert_eq!(opacity_pixel(&app), [64, 64, 64, 128]);
+    paint_message(&mut app, PaintAction::Tool(PaintTool::Eraser));
+    stroke(&mut app, point);
+    assert_eq!(opacity_pixel(&app), [64, 64, 64, 64]);
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(opacity_pixel(&app), [64, 64, 64, 128]);
+}
+
+#[test]
+#[ignore = "requires GPU; verifies pen pressure and undo through the UV viewport"]
+fn gpu_pen_uses_pressure_in_uv_and_undoes_per_contact() {
+    use bevy::{
+        input::touch::{ForceTouch, TouchInput, TouchPhase},
+        window::WindowEvent,
+    };
+    use crate::editor::model_mesh::{Corner, Face, Geometry};
+
+    let (mut app, window, _) = crate::editor::tests::lighting_ui_render::fixture();
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    for _ in 0..240 {
+        frame(&mut app);
+        if app.world().resource::<editing::State>().documents.contains_key(&0) {
+            break;
+        }
+    }
+    {
+        let mut editing = app.world_mut().resource_mut::<editing::State>();
+        let doc = editing.documents.get_mut(&0).unwrap();
+        let corners = [Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y].into_iter().enumerate()
+            .map(|(vertex, uv)| {
+                let mut corner = Corner::new(vertex);
+                corner.uv = uv;
+                corner
+            }).collect();
+        doc.objects[0].geometry = Geometry {
+            positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y],
+            faces: vec![Face { corners, material: 0, smooth: false }],
+            ..default()
+        }.into();
+        doc.objects[0].transform = Transform::IDENTITY;
+        doc.paint_default_size = 512;
+        doc.auto_bake_pending = false;
+        doc.mode = Mode::Paint;
+        doc.revision += 1;
+    }
+    warm(&mut app, 6);
+    paint_ready(&mut app);
+    paint_message(&mut app, PaintAction::View(View::Two));
+    {
+        let mut paint = app.world_mut().resource_mut::<PaintState>();
+        let session = paint.sessions.get_mut(&0).unwrap();
+        session.size = 90.;
+        session.hardness = 100.;
+        session.pressure_flow = true;
+        session.pressure_size = true;
+    }
+    let uv = {
+        let world = app.world_mut();
+        let (node, transform) = world.query_filtered::<
+            (&ComputedNode, &UiGlobalTransform), With<engine::TextureCanvas>,
+        >().single(world).unwrap();
+        engine::node_rect(node, transform).unwrap()
+    };
+    let alpha = |app: &App, x: usize, y: usize| {
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        let surface = doc.objects[0].materials[0].paint.as_ref().unwrap();
+        assert_eq!(surface.size, 512);
+        let pixels = surface.stack.layers[surface.stack.selected].channels[0].as_ref().unwrap();
+        pixels[(y * surface.size as usize + x) * 4 + 3]
+    };
+    for (id, y, force) in [(41, 170, 0.25), (42, 342, 1.)] {
+        let position = uv.min + uv.size() * Vec2::new(0.5, (y as f32 + 0.5) / 512.);
+        for phase in [TouchPhase::Started, TouchPhase::Ended] {
+            app.world_mut().write_message(WindowEvent::TouchInput(TouchInput {
+                phase, position, window, id,
+                force: (phase == TouchPhase::Started).then_some(ForceTouch::Normalized(force)),
+            }));
+            frame(&mut app);
+        }
+        paint_ready(&mut app);
+    }
+    let wide_x = 256 + (32. * 512. / uv.width()).round() as usize;
+    assert!(alpha(&app, 256, 170).abs_diff(64) <= 1);
+    assert_eq!(alpha(&app, 256, 342), 255);
+    assert_eq!(alpha(&app, wide_x, 170), 0, "light pressure shrinks the stamp");
+    assert_eq!(alpha(&app, wide_x, 342), 255, "full pressure keeps the diameter");
+    paint_message(&mut app, PaintAction::Undo);
+    assert!(alpha(&app, 256, 170).abs_diff(64) <= 1);
+    assert_eq!(alpha(&app, 256, 342), 0, "undo removes exactly one pen contact");
 }
 
 #[test]
 #[ignore = "requires GPU; verifies all PBR channels, occlusion, opacity, erasing, fill and orthographic painting"]
 fn gpu_model_paint_channels_erase_and_occlusion() {
     use crate::editor::model_mesh::{Corner, Face, Geometry};
+    use bevy::input::mouse::MouseButtonInput;
     let project = crate::EditorProject::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
@@ -8647,7 +8940,11 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
             let s = paint.sessions.get_mut(&0).unwrap();
             s.channel = channel;
             s.color = 3;
-            s.opacity = if channel == 4 { 0. } else { 100. };
+            s.opacity = if channel == 4 { 50. } else { 100. };
+            s.brush_alpha = 25.;
+            s.brush_height = 75.;
+            s.brush_emission = [80., 15., 25.];
+            s.brush_specular = 100.;
             s.roughness = 80.;
             s.metallic = 60.;
             s.flow = 100.;
@@ -8728,16 +9025,36 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
         let front = (size / 2 * size + size / 4) * 4;
         let back = (size / 2 * size + size * 3 / 4) * 4;
         let expected = match channel {
-            0 | 5 => [164, 61, 68, 255],
+            0 => [164, 61, 68, 255],
             1 => [204, 204, 204, 255],
             2 => [153, 153, 153, 255],
-            4 => [0, 0, 0, 255],
+            3 => [191, 191, 191, 255],
+            4 => [64, 64, 64, 128],
+            5 => [204, 38, 64, 255],
             6 => [128, 128, 255, 255],
             _ => [255; 4],
         };
         assert_eq!(&p[front..front + 4], &expected, "GPU channel {channel}");
         assert_eq!(p[back + 3], 0, "GPU stroke must not paint the rear plane");
     }
+    paint_message(&mut app, PaintAction::Channel(4));
+    paint_click(&mut app, window, PaintAction::Tool(PaintTool::Eraser));
+    app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap().opacity = 50.;
+    move_pointer(&mut app, window, center);
+    mouse(&mut app, window, ButtonState::Pressed);
+    mouse(&mut app, window, ButtonState::Released);
+    paint_ready(&mut app);
+    let alpha = |app: &App| {
+        let doc = &app.world().resource::<editing::State>().documents[&0];
+        let surface = doc.objects[0].materials[0].paint.as_ref().unwrap();
+        let side = surface.size as usize;
+        let index = (side / 2 * side + side / 4) * 4;
+        surface.stack.layers[0].channels[4].as_ref().unwrap()[index..index + 4].to_vec()
+    };
+    assert_eq!(alpha(&app), [64, 64, 64, 64]);
+    paint_click(&mut app, window, PaintAction::Undo);
+    assert_eq!(alpha(&app), [64, 64, 64, 128]);
+    app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap().opacity = 100.;
     app.world_mut()
         .write_message(Action::ModelView(ModelViewAction::Paint(
             PaintAction::Channel(0),
@@ -8761,8 +9078,10 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
     assert_eq!(pixel(&app, 256, 512)[3], 0);
     paint_click(&mut app, window, PaintAction::Undo);
     assert_eq!(pixel(&app, 256, 512)[3], 255);
+    scroll_to_paint_control(&mut app, PaintAction::Color(4));
     paint_click(&mut app, window, PaintAction::Color(4));
     paint_click(&mut app, window, PaintAction::Tool(PaintTool::Fill));
+    scroll_to_paint_control(&mut app, PaintAction::FillMode(FillMode::Triangle));
     paint_click(&mut app, window, PaintAction::FillMode(FillMode::Triangle));
     let uv_rect = {
         let world = app.world_mut();
@@ -8853,6 +9172,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
         viewer.distance = 0.05;
     }
     paint_click(&mut app, window, PaintAction::Tool(PaintTool::Brush));
+    scroll_to_paint_control(&mut app, PaintAction::Color(3));
     paint_click(&mut app, window, PaintAction::Color(3));
     move_pointer(&mut app, window, center);
     mouse(&mut app, window, ButtonState::Pressed);
@@ -8917,7 +9237,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
         .get_mut(&0)
         .unwrap()
         .opacity = 100.;
-    let uv = {
+    let texture_canvas = |app: &mut App| {
         let w = app.world_mut();
         let (n, t) = w
             .query_filtered::<(&ComputedNode, &UiGlobalTransform), With<engine::TextureCanvas>>()
@@ -8928,6 +9248,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
             n.size() * n.inverse_scale_factor(),
         )
     };
+    let uv = texture_canvas(&mut app);
     for point in [center, uv.min + uv.size() * Vec2::new(0.25, 0.5)] {
         paint_click(&mut app, window, PaintAction::Add(LayerKind::Paint));
         move_pointer(&mut app, window, point);
@@ -8955,27 +9276,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
         );
     }
 
-    use bevy::{
-        input::touch::{ForceTouch, TouchInput, TouchPhase},
-        window::WindowEvent,
-    };
     paint_message(&mut app, PaintAction::BrushTip(None));
-    paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
-    paint_message(&mut app, PaintAction::PressureFlow);
-    for (id, y, force) in [(41, 0.33, 0.25), (42, 0.67, 1.)] {
-        let position = uv.min + uv.size() * Vec2::new(0.25, y);
-        for phase in [TouchPhase::Started, TouchPhase::Ended] {
-            app.world_mut()
-                .write_message(WindowEvent::TouchInput(TouchInput {
-                    phase,
-                    position,
-                    window,
-                    force: (phase == TouchPhase::Started).then_some(ForceTouch::Normalized(force)),
-                    id,
-                }));
-        }
-        paint_ready(&mut app);
-    }
     let brush_alpha = |app: &App, x: usize, y: usize| {
         let p = app.world().resource::<editing::State>().documents[&0].objects[0].materials[0]
             .paint
@@ -8983,31 +9284,16 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
             .unwrap();
         let pixels = p.stack.layers[p.stack.selected].channels[0]
             .as_ref()
-            .unwrap();
+            .unwrap_or_else(|| {
+                let session = &app.world().resource::<PaintState>().sessions[&0];
+                panic!(
+                    "missing color data for texel ({x}, {y}) on layer {} ({}), view {:?}, tool {:?}, symmetry {:?}",
+                    p.stack.selected, p.stack.layers[p.stack.selected].name,
+                    session.view, session.tool, session.symmetry,
+                )
+            });
         pixels[(y * p.size as usize + x) * 4 + 3]
     };
-    assert!(
-        brush_alpha(&app, 256, 337).abs_diff(64) <= 1,
-        "pen force controls per-stamp flow"
-    );
-    assert_eq!(brush_alpha(&app, 256, 686), 255);
-    assert_eq!(
-        brush_alpha(&app, 300, 337),
-        0,
-        "low pressure shrinks the stamp"
-    );
-    assert!(
-        brush_alpha(&app, 300, 686) > 200,
-        "full pressure keeps the normal diameter"
-    );
-    paint_message(&mut app, PaintAction::Undo);
-    assert!(brush_alpha(&app, 256, 337).abs_diff(64) <= 1);
-    assert_eq!(
-        brush_alpha(&app, 256, 686),
-        0,
-        "undo removes exactly one pen contact"
-    );
-
     paint_message(&mut app, PaintAction::Add(LayerKind::Paint));
     paint_message(&mut app, PaintAction::Symmetry(Symmetry::X));
     app.world_mut()
@@ -9201,6 +9487,7 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
     app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap()
         .set_value(Parameter::BrushSizeJitter, 0.);
     paint_click(&mut app, window, PaintAction::Tool(PaintTool::Path));
+    let uv = texture_canvas(&mut app);
     let uv_path_points = [Vec2::new(0.14, 0.35), Vec2::new(0.36, 0.35), Vec2::new(0.36, 0.55)]
         .map(|uv_point| uv.min + uv.size() * uv_point);
     for point in &uv_path_points[..2] {
@@ -9212,8 +9499,8 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
     mouse(&mut app, window, ButtonState::Pressed);
     move_pointer(&mut app, window, uv_path_points[2]);
     mouse(&mut app, window, ButtonState::Released);
-    // Winit also emits the aggregate event when the mouse takes over after a pen contact.
-    app.world_mut().write_message(WindowEvent::CursorMoved(bevy::window::CursorMoved {
+    // Winit emits aggregate cursor motion alongside the typed event.
+    app.world_mut().write_message(bevy::window::WindowEvent::CursorMoved(bevy::window::CursorMoved {
         window,
         position: uv_path_points[2],
         delta: None,
@@ -9247,17 +9534,40 @@ fn gpu_model_paint_channels_erase_and_occlusion() {
     fill_modifier(&mut app, window, KeyCode::Backspace, Key::Backspace, ButtonState::Released);
     assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_count, 1);
 
-    for point in [left, right] {
+    let model_view = labelled(&mut app, "3D-вид модели");
+    let viewer = app.world().resource::<Viewer>();
+    let path_ends = [-0.55, 0.55].map(|x| {
+        editing::input::project(viewer, model_view, Vec3::new(x, 0., 0.)).unwrap()
+    });
+    for point in path_ends {
         move_pointer(&mut app, window, point);
         mouse(&mut app, window, ButtonState::Pressed);
         mouse(&mut app, window, ButtonState::Released);
     }
     assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_count, 2);
+    let apply = paint_button_rect(&mut app, PaintAction::PathApply);
+    assert!(apply.max.y <= model_view.min.y, "the path toolbar is above the viewport");
+    app.world_mut().resource_mut::<PaintState>().sessions.get_mut(&0).unwrap().opacity = 50.;
     paint_click(&mut app, window, PaintAction::PathApply);
-    assert_eq!(brush_alpha(&app, 256, 512), 255, "3D control points apply on the model");
-    paint_message(&mut app, PaintAction::PathClear);
+    assert_eq!(brush_alpha(&app, 256, 512), 128, "3D control points apply on the model");
+    paint_click(&mut app, window, PaintAction::PathApply);
+    assert_eq!(brush_alpha(&app, 256, 512), 192, "reapplying uses the same path as a new stroke");
+    paint_message(&mut app, PaintAction::Undo);
+    assert_eq!(brush_alpha(&app, 256, 512), 128);
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_count, 2);
+    move_pointer(&mut app, window, path_ends[1]);
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(MouseButtonInput {
+            window,
+            button: MouseButton::Right,
+            state,
+        });
+        frame(&mut app);
+    }
+    assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_count, 1);
+    paint_click(&mut app, window, PaintAction::PathClear);
     assert_eq!(app.world().resource::<PaintState>().sessions[&0].path_count, 0);
-    assert_eq!(brush_alpha(&app, 256, 512), 255);
+    assert_eq!(brush_alpha(&app, 256, 512), 128);
 }
 #[test]
 #[ignore = "GPU throughput benchmark on 40k triangles; no readback during the held stroke"]

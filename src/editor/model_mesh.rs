@@ -1,6 +1,7 @@
 //! Polygon topology for model documents, independent of rendering and ECS entities.
 use bevy::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 #[path = "model_edge_tools.rs"]
 mod edge_tools;
@@ -55,6 +56,23 @@ impl Edge {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct SourcePart {
+    pub name: String,
+    pub id: Option<u32>,
+}
+
+impl SourcePart {
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    #[cfg(test)]
+    pub fn named(name: &str) -> Arc<Self> {
+        Arc::new(Self { name: name.into(), id: None })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Corner {
     pub vertex: usize,
@@ -63,6 +81,7 @@ pub(super) struct Corner {
     pub color: Vec4,
     // Source for ID baking. MPP can supply this without a visible vertex color.
     pub id_color: Option<Vec3>,
+    pub source_part: Option<Arc<SourcePart>>,
     pub source_normal: Option<Vec3>,
 }
 impl Corner {
@@ -73,6 +92,7 @@ impl Corner {
             uv1: Vec2::ZERO,
             color: Vec4::ONE,
             id_color: None,
+            source_part: None,
             source_normal: None,
         }
     }
@@ -83,6 +103,7 @@ impl Corner {
             uv1: self.uv1.lerp(other.uv1, t),
             color: self.color.lerp(other.color, t),
             id_color: self.id_color.zip(other.id_color).map(|(a, b)| a.lerp(b, t)),
+            source_part: common_source_part([self, other].into_iter()).cloned(),
             source_normal: None,
         }
     }
@@ -95,6 +116,14 @@ pub(super) struct Face {
     pub smooth: bool,
 }
 impl Face {
+    pub fn source_part(&self) -> Option<&str> {
+        self.source_identity().map(SourcePart::as_str).filter(|name| !name.is_empty())
+    }
+
+    pub fn source_identity(&self) -> Option<&SourcePart> {
+        common_source_part(self.corners.iter()).map(Arc::as_ref)
+    }
+
     pub fn edges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
         self.corners
             .iter()
@@ -119,6 +148,8 @@ pub(super) struct Buffers {
     pub uv1: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
     pub id_colors: Vec<Option<Vec3>>,
+    pub source_parts: Vec<Arc<SourcePart>>,
+    pub source_part_ids: Vec<u32>,
     pub indices: Vec<u32>,
     pub polygons: Vec<Vec<u32>>,
 }
@@ -319,6 +350,11 @@ impl Selection {
 }
 
 impl Geometry {
+    pub fn uniform_source_part(&self) -> Option<&str> {
+        common_source_part(self.faces.iter().flat_map(|face| &face.corners))
+            .map(|part| part.as_str()).filter(|name| !name.is_empty())
+    }
+
     pub(super) fn vertex_components(&self) -> Vec<usize> {
         fn root(parents: &mut [usize], mut vertex: usize) -> usize {
             while parents[vertex] != vertex {
@@ -1043,6 +1079,7 @@ impl Geometry {
                     color: corners.iter().map(|c| c.color).sum::<Vec4>() / count,
                     id_color: corners.iter().map(|c| c.id_color).sum::<Option<Vec3>>()
                         .map(|color| color / count),
+                    source_part: common_source_part(corners.iter()).cloned(),
                 };
                 for j in 0..corners.len() {
                     polygons.push(vec![
@@ -1141,6 +1178,7 @@ impl Geometry {
                     let a = fa.corners.iter().find(|c| c.vertex == v).unwrap();
                     let b = fb.corners.iter().find(|c| c.vertex == v).unwrap();
                     a.uv != b.uv || a.uv1 != b.uv1 || a.color != b.color || a.id_color != b.id_color
+                        || a.source_part != b.source_part
                 })
                 || (quads_only
                     && (fa.corners.len() != 3
@@ -1737,7 +1775,8 @@ impl Geometry {
     pub fn buffers(&self) -> BTreeMap<usize, Buffers> {
         let normals = self.smooth_normals();
         let mut output: BTreeMap<usize, Buffers> = BTreeMap::new();
-        let mut maps: BTreeMap<usize, HashMap<[u32; 16], u32>> = BTreeMap::new();
+        let mut maps: BTreeMap<usize, HashMap<[u32; 17], u32>> = BTreeMap::new();
+        let mut source_parts = BTreeMap::<usize, HashMap<&SourcePart, u32>>::new();
         for f in &self.faces {
             let normal = self.normal(f).normalize_or_zero();
             let mut polygon = vec![0; f.corners.len()];
@@ -1746,6 +1785,14 @@ impl Geometry {
                     let c = &f.corners[i];
                     let n = Self::corner_normal(f, c, normal, &normals);
                     let [r, g, b] = c.id_color.unwrap_or_default().to_array().map(f32::to_bits);
+                    let buffers = output.entry(f.material).or_default();
+                    let source_part = c.source_part.as_ref().map_or(0, |part| {
+                        *source_parts.entry(f.material).or_default().entry(part.as_ref())
+                            .or_insert_with(|| {
+                                buffers.source_parts.push(part.clone());
+                                buffers.source_parts.len() as u32
+                            })
+                    });
                     let key = [
                         c.vertex as u32,
                         n.x.to_bits(),
@@ -1760,8 +1807,8 @@ impl Geometry {
                         c.color.z.to_bits(),
                         c.color.w.to_bits(),
                         r, g, b, u32::from(c.id_color.is_some()),
+                        source_part,
                     ];
-                    let buffers = output.entry(f.material).or_default();
                     let index = *maps
                         .entry(f.material)
                         .or_default()
@@ -1779,6 +1826,12 @@ impl Geometry {
                             if !buffers.id_colors.is_empty() || c.id_color.is_some() {
                                 buffers.id_colors.push(c.id_color);
                             }
+                            if buffers.source_part_ids.is_empty() && source_part != 0 {
+                                buffers.source_part_ids.resize(index as usize, 0);
+                            }
+                            if !buffers.source_part_ids.is_empty() || source_part != 0 {
+                                buffers.source_part_ids.push(source_part);
+                            }
                             index
                         });
                     buffers.indices.push(index);
@@ -1789,6 +1842,11 @@ impl Geometry {
         }
         output
     }
+}
+
+fn common_source_part<'a>(mut corners: impl Iterator<Item = &'a Corner>) -> Option<&'a Arc<SourcePart>> {
+    let first = corners.next()?.source_part.as_ref()?;
+    corners.all(|corner| corner.source_part.as_ref() == Some(first)).then_some(first)
 }
 
 #[cfg(test)]

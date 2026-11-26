@@ -114,7 +114,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
     time: Res<Time>,
     drawer: Res<DrawerMotion>,
     canvas: Query<(&ComputedNode, &UiGlobalTransform), With<Canvas>>,
-    controls: Query<(&ComputedNode, &UiGlobalTransform), With<Control>>,
+    controls: engine::VisibleControls,
     mut gizmos: Gizmos<XrayGizmos>,
 ) {
     let cancelled = keys.just_pressed(KeyCode::Escape);
@@ -202,15 +202,7 @@ pub(in crate::editor::ui::model_viewer) fn input(
     if drawer.covers(cursor, &window)
         || keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
         || mouse.any_pressed([MouseButton::Right, MouseButton::Middle])
-        || controls.iter().any(|(node, transform)| {
-            let size = node.size() * node.inverse_scale_factor();
-            size.min_element() > 0.
-                && Rect::from_center_size(
-                    transform.affine().translation * node.inverse_scale_factor(),
-                    size,
-                )
-                .contains(cursor)
-        })
+        || controls.contains(cursor)
     {
         return;
     }

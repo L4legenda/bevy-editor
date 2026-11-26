@@ -975,7 +975,7 @@ fn model_glb_saved_cube_reopens_with_six_editable_quads() {
     fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
 
-fn import_geometry(source: &Glb) -> Result<Geometry, String> {
+pub(in crate::editor) fn import_geometry(source: &Glb) -> Result<Geometry, String> {
     use crate::editor::model_document::from_mesh_with_topology;
     let parsed = bevy::gltf::gltf::Gltf::from_slice(source.data()).unwrap();
     let mesh = parsed.nodes().find_map(|node| node.mesh()).unwrap();
@@ -1010,6 +1010,7 @@ fn import_geometry(source: &Glb) -> Result<Geometry, String> {
             mesh.insert_indices(bevy::mesh::Indices::U32(indices.into_u32().collect()));
         }
         let id_colors = read_id_colors(&parsed.document, &primitive, blob, mesh.count_vertices())?;
+        let source_parts = read_source_parts(&parsed.document, &primitive, blob, mesh.count_vertices())?;
         from_mesh_with_topology(
             &mesh,
             &mut geometry,
@@ -1017,6 +1018,7 @@ fn import_geometry(source: &Glb) -> Result<Geometry, String> {
             (topology["version"].as_u64() == Some(1))
                 .then(|| &topology["primitives"][primitive.index()]),
             id_colors.as_deref(),
+            source_parts.as_deref(),
         )?;
     }
     if topology["version"].as_u64() == Some(1) {
@@ -1046,6 +1048,53 @@ fn id_colors_survive_glb_reopen_and_subdivision_without_tinting_vertices() {
         assert_eq!(corner.color, Vec4::ONE);
         assert!(corner.id_color.unwrap().abs_diff_eq(color, f32::EPSILON));
     }
+    fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn source_parts_survive_glb_reopen_and_subdivision_with_one_material() {
+    use crate::editor::model_mesh::{Element, Selection, SourcePart};
+
+    let (source, mut object) = fixture();
+    object.source_node = None;
+    let left = SourcePart::named("Створка_low");
+    let right = SourcePart::named("Right_low");
+    let face = |vertices: &[usize], name: &Arc<SourcePart>| Face {
+        corners: vertices.iter().map(|&vertex| {
+            let mut corner = Corner::new(vertex);
+            corner.source_part = Some(name.clone());
+            corner
+        }).collect(),
+        material: 0,
+        smooth: false,
+    };
+    object.geometry = Geometry {
+        positions: vec![Vec3::ZERO, Vec3::X, Vec3::X + Vec3::Y, Vec3::Y, Vec3::new(2., 0., 0.)],
+        faces: vec![face(&[0, 1, 2, 3], &left), face(&[2, 1, 4], &right)],
+        ..default()
+    }.into();
+    fs::write(&source.path, Glb::new_asset(&[object]).unwrap()).unwrap();
+    let reopened = Glb::load(&source.path).unwrap();
+    assert_eq!(reopened.json["meshes"][0]["primitives"].as_array().unwrap().len(), 1);
+    let mut mesh = import_geometry(&reopened).unwrap();
+    assert_eq!(mesh.positions.len(), 5);
+    let mut selection = Selection { kind: Element::Face, ..default() };
+    selection.faces.insert(0);
+    mesh.subdivide(&mut selection).unwrap();
+    let mut count_left = 0;
+    let mut count_right = 0;
+    for face in &mesh.faces {
+        let part = face.corners[0].source_part.as_ref().unwrap();
+        assert!(face.corners.iter().all(|corner| corner.source_part.as_ref() == Some(part)));
+        assert_eq!(face.material, 0);
+        if part == &left {
+            count_left += 1;
+        } else {
+            assert_eq!(part, &right);
+            count_right += 1;
+        }
+    }
+    assert_eq!((count_left, count_right), (4, 1));
     fs::remove_dir_all(source.path.parent().unwrap()).unwrap();
 }
 

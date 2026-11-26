@@ -333,9 +333,10 @@ impl Batch {
                 u32::try_from(triangle.object).ok()?,
                 face,
                 part as u32,
-                u32::from(
-                    matches!(parts, PartsOfScene::High(_, projector) if projector.accepts_projection(triangle)),
-                ),
+                match parts {
+                    PartsOfScene::High(_, projector) => projector.projection_group(triangle),
+                    _ => 0,
+                },
             ];
             let [a, b, c] = triangle.points.map(packed_vector);
             triangle_data.extend_from_slice(&[a, b, c, ids.map(u32::to_le_bytes)]);
@@ -633,7 +634,7 @@ impl ProjectBatch {
                     q.normal.x.to_bits(),
                     q.normal.y.to_bits(),
                     q.normal.z.to_bits(),
-                    u32::from(q.fill) | (u32::from(q.prefer_front_faces) << 1),
+                    u32::from(q.fill) | (u32::from(q.prefer_front_faces) << 1) | (q.segment.group << 2),
                 ],
             );
         }

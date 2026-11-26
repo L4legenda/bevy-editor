@@ -1,7 +1,8 @@
 //! Projects high-poly source geometry onto the low-poly UV raster.
 use super::super::{IdSource, ProjectionFormat, material_id_color};
 use super::{Progress, ProjectionSettings, triangle_id_color};
-use crate::editor::model_document::glb::read_id_colors;
+use crate::editor::model_document::{Object, glb::{read_id_colors, read_source_parts}};
+use crate::editor::model_mesh::Face;
 use crate::editor::ui::model_viewer::editing::input::{Bvh, PickTriangle};
 use bevy::{gltf::gltf, prelude::*};
 use std::{
@@ -35,12 +36,25 @@ struct SourceTriangle {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceUse {
     Omit,
-    Project,
+    Project(u32),
     Occluder,
 }
+impl SourceUse {
+    fn projection_group(self) -> u32 {
+        match self {
+            Self::Project(group) => group,
+            _ => 0,
+        }
+    }
+
+    fn projectable(self) -> bool {
+        self.projection_group() != 0
+    }
+}
+
 impl From<bool> for SourceUse {
     fn from(included: bool) -> Self {
-        if included { Self::Project } else { Self::Omit }
+        if included { Self::Project(1) } else { Self::Omit }
     }
 }
 
@@ -54,7 +68,7 @@ impl SourceTriangle {
             part,
             material: None,
             color: None,
-            usage: SourceUse::Project,
+            usage: SourceUse::Project(1),
         })
     }
 
@@ -75,16 +89,20 @@ struct SourceGeometry {
     triangles: Vec<SourceTriangle>,
     material_colors: HashMap<Option<u32>, [u8; 3]>,
     relief: Mutex<high_relief::Cache>,
+    groups: HashMap<String, u32>,
+    grouped: bool,
 }
 
 #[derive(PartialEq, Eq)]
 struct SourceKey {
     hash: blake3::Hash,
-    match_name: Option<String>,
+    match_names: Vec<String>,
 }
 
 const CACHED_SOURCES: usize = 4;
 const CACHED_TRIANGLES: usize = 1_000_000;
+// The GPU stores the group in the high 30 bits of the query flags.
+const UNMATCHED_SOURCE_GROUP: u32 = u32::MAX >> 2;
 static SOURCES: Mutex<VecDeque<(SourceKey, Arc<SourceGeometry>)>> = Mutex::new(VecDeque::new());
 
 pub(super) struct Projection {
@@ -102,6 +120,7 @@ pub(super) struct Segment {
     pub front: f32,
     pub rear: f32,
     pub range: f32,
+    pub group: u32,
 }
 
 pub(super) struct Query {
@@ -134,6 +153,7 @@ impl Projection {
     ) -> Result<Option<Cage>, String> {
         Cage::apply_paint(base, directions, overrides, [self.front, self.rear], span, progress)
     }
+    #[cfg(test)]
     pub(super) fn load(
         path: &Path,
         name: &str,
@@ -141,20 +161,38 @@ impl Projection {
         settings: &ProjectionSettings,
         progress: &Progress,
     ) -> Result<Self, String> {
-        let match_name = settings.match_names.then(|| base_name(name));
+        let names = settings.match_names.then(|| base_name(name)).into_iter().collect();
+        Self::load_filtered(path, name, names, scale, settings, progress)
+    }
+
+    pub(super) fn load_for_object(
+        path: &Path, object: &Object, scale: f32, settings: &ProjectionSettings, progress: &Progress,
+    ) -> Result<Self, String> {
+        let name = object.bake_source_name();
+        let names = if settings.match_names { part_names(object, progress)? } else { Vec::new() };
+        Self::load_filtered(path, name, names, scale, settings, progress)
+    }
+
+    fn load_filtered(
+        path: &Path, name: &str, match_names: Vec<String>, scale: f32,
+        settings: &ProjectionSettings, progress: &Progress,
+    ) -> Result<Self, String> {
+        if match_names.len() >= UNMATCHED_SOURCE_GROUP as usize {
+            return Err("Слишком много именованных частей сетки".into());
+        }
         #[cfg(test)]
         let key = if progress.fresh_high_source {
             None
         } else {
             super::super::disk::source_hash(path, progress).map(|hash| SourceKey {
                 hash,
-                match_name: match_name.clone(),
+                match_names: match_names.clone(),
             })
         };
         #[cfg(not(test))]
         let key = super::super::disk::source_hash(path, progress).map(|hash| SourceKey {
             hash,
-            match_name: match_name.clone(),
+            match_names: match_names.clone(),
         });
         progress.check()?;
         if let Some(key) = &key {
@@ -173,24 +211,32 @@ impl Projection {
                 return Ok(projection);
             }
         }
-        let triangles = read_triangles(
+        let mut groups: HashMap<_, _> = match_names.into_iter().enumerate()
+            .map(|(index, name)| (name, index as u32 + 1)).collect();
+        let grouped = groups.len() > 1;
+        let mut triangles = read_triangles(
             path,
             |name| {
-                if match_name
-                    .as_deref()
-                    .is_none_or(|expected| base_name(name) == expected)
-                {
-                    SourceUse::Project
+                if groups.is_empty() {
+                    SourceUse::Project(1)
                 } else {
-                    SourceUse::Occluder
+                    groups.get(&base_name(name)).copied().map_or(SourceUse::Occluder, SourceUse::Project)
                 }
             },
             progress,
         )?;
-        if !triangles
-            .iter()
-            .any(|triangle| triangle.usage == SourceUse::Project)
-        {
+        let matched: BTreeSet<_> = triangles.iter().map(|triangle| triangle.usage.projection_group()).collect();
+        let expected_count = groups.len();
+        groups.retain(|_, group| matched.contains(group));
+        if grouped && groups.len() < expected_count {
+            // A low-poly part without a name match can project onto the whole source.
+            for triangle in &mut triangles {
+                if !triangle.usage.projectable() {
+                    triangle.usage = SourceUse::Project(UNMATCHED_SOURCE_GROUP);
+                }
+            }
+        }
+        if !triangles.iter().any(|triangle| triangle.usage.projectable()) {
             return Err(if settings.match_names {
                 format!("В high-poly нет треугольников для «{name}» · проверьте имена объектов")
             } else {
@@ -198,7 +244,7 @@ impl Projection {
             });
         }
         progress.check()?;
-        let projection = Self::new(triangles, scale, settings);
+        let projection = Self::new_grouped(triangles, groups, grouped, scale, settings);
         if let Some(key) = key {
             let current = super::super::disk::source_hash(path, progress);
             progress.check()?;
@@ -233,7 +279,15 @@ impl Projection {
         Ok(projection)
     }
 
+    #[cfg(test)]
     fn new(triangles: Vec<SourceTriangle>, scale: f32, settings: &ProjectionSettings) -> Self {
+        Self::new_grouped(triangles, HashMap::new(), false, scale, settings)
+    }
+
+    fn new_grouped(
+        triangles: Vec<SourceTriangle>, groups: HashMap<String, u32>, grouped: bool,
+        scale: f32, settings: &ProjectionSettings,
+    ) -> Self {
         let materials: BTreeSet<_> = triangles.iter().map(|triangle| triangle.material).collect();
         let material_colors = if materials.len() > 1 {
             materials.into_iter().enumerate()
@@ -259,6 +313,8 @@ impl Projection {
                 triangles,
                 material_colors,
                 relief: Mutex::default(),
+                groups,
+                grouped,
             }),
             scale,
             settings,
@@ -296,12 +352,42 @@ impl Projection {
         self.source.triangles[triangle].normals
     }
 
-    fn can_project(&self, triangle: &PickTriangle) -> bool {
-        self.source.triangles[triangle.face].usage == SourceUse::Project
+    pub(super) fn face_groups(&self, object: &Object) -> Vec<u32> {
+        if !self.source.grouped {
+            return Vec::new();
+        }
+        let mut by_name = HashMap::new();
+        object.geometry.faces.iter().map(|face| {
+            let name = part_name(object, face);
+            *by_name.entry(name).or_insert_with(|| {
+                self.source.groups.get(&base_name(name)).copied().unwrap_or(0)
+            })
+        }).collect()
     }
 
-    pub(super) fn accepts_projection(&self, triangle: &PickTriangle) -> bool {
-        self.can_project(triangle)
+    pub(super) fn projection_group(&self, triangle: &PickTriangle) -> u32 {
+        self.source.triangles[triangle.face].usage.projection_group()
+    }
+
+    pub(super) fn vertex_groups(&self, object: &Object) -> Vec<Vec<u32>> {
+        if !self.source.grouped {
+            return Vec::new();
+        }
+        let mut groups = vec![Vec::new(); object.geometry.positions.len()];
+        for (face, group) in object.geometry.faces.iter().zip(self.face_groups(object)) {
+            for corner in &face.corners {
+                let entry = &mut groups[corner.vertex];
+                if !entry.contains(&group) {
+                    entry.push(group);
+                }
+            }
+        }
+        groups
+    }
+
+    fn can_project(&self, triangle: &PickTriangle, group: u32) -> bool {
+        let source = self.projection_group(triangle);
+        source != 0 && (group == 0 || group == source)
     }
 
     pub(super) fn query(
@@ -311,9 +397,10 @@ impl Projection {
         normal: Vec3,
         cage: Option<CageRay>,
         fill: bool,
+        group: u32,
     ) -> Query {
         Query {
-            segment: self.segment(point, direction, cage),
+            segment: self.segment(point, direction, cage, group),
             point,
             normal,
             fill: fill && self.fill_misses,
@@ -321,7 +408,7 @@ impl Projection {
         }
     }
 
-    pub(super) fn segment(&self, point: Vec3, direction: Vec3, cage: Option<CageRay>) -> Segment {
+    pub(super) fn segment(&self, point: Vec3, direction: Vec3, cage: Option<CageRay>, group: u32) -> Segment {
         let CageRay {
             offset,
             reach,
@@ -339,6 +426,7 @@ impl Projection {
             front: offset.length(),
             rear: self.rear * scale,
             range: reach.max(self.rear * max_scale),
+            group,
         }
     }
 
@@ -348,6 +436,7 @@ impl Projection {
             outward,
             front,
             rear,
+            group,
             ..
         } = *segment;
         let nearest = |filter_backfaces: bool| {
@@ -355,7 +444,7 @@ impl Projection {
                 .bvh
                 .cast_triangle_up_to(origin, -outward, front + rear, |triangle| {
                     let [a, b, c] = triangle.points;
-                    self.can_project(triangle)
+                    self.can_project(triangle, group)
                         && (!filter_backfaces || (b - a).cross(c - a).dot(outward) > 0.)
                 })
         };
@@ -372,13 +461,14 @@ impl Projection {
         direction: Vec3,
         reach: f32,
         bias: f32,
+        group: u32,
     ) -> Option<(usize, f32)> {
         let crossing = |sign: f32| {
             let ray = direction * sign;
             self.source
                 .bvh
                 .cast_triangle_up_to(position - ray * bias, ray, reach + bias, |triangle| {
-                    self.can_project(triangle)
+                    self.can_project(triangle, group)
                 })
                 .map(|(triangle, distance)| (triangle, (distance - bias) * sign))
         };
@@ -394,9 +484,10 @@ impl Projection {
         direction: Vec3,
         low_normal: Vec3,
         cage: Option<CageRay>,
+        group: u32,
     ) -> Option<Hit> {
-        self.direct(point, direction, cage)
-            .or_else(|| self.fill(point, direction, low_normal, cage))
+        self.direct(point, direction, cage, group)
+            .or_else(|| self.fill(point, direction, low_normal, cage, group))
     }
 
     pub(super) fn direct(
@@ -404,8 +495,9 @@ impl Projection {
         point: Vec3,
         direction: Vec3,
         cage: Option<CageRay>,
+        group: u32,
     ) -> Option<Hit> {
-        let segment = self.segment(point, direction, cage);
+        let segment = self.segment(point, direction, cage, group);
         let (face, distance) = self.cast(&segment)?;
         Some(self.hit(
             face,
@@ -421,15 +513,16 @@ impl Projection {
         direction: Vec3,
         normal: Vec3,
         cage: Option<CageRay>,
+        group: u32,
     ) -> Option<Hit> {
         if !self.fill_misses {
             return None;
         }
-        let range = self.segment(point, direction, cage).range;
+        let range = self.segment(point, direction, cage, group).range;
         let (face, hit) = self
             .source
             .bvh
-            .nearest_surface_where(point, range * 4., |triangle| self.can_project(triangle))?;
+            .nearest_surface_where(point, range * 4., |triangle| self.can_project(triangle, group))?;
         Some(self.hit(face, hit, (hit - point).dot(normal) / range, false))
     }
 
@@ -489,15 +582,14 @@ fn glb_triangles(
         .ok_or("В high-poly нет сцены")?;
     let mut triangles = Vec::new();
     let mut nodes: Vec<_> = scene.nodes().map(|node| (node, Mat4::IDENTITY)).collect();
+    let mut next_part = source.nodes().count();
     while let Some((node, parent)) = nodes.pop() {
         progress.check()?;
         let transform = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
         nodes.extend(node.children().map(|child| (child, transform)));
         let Some(mesh) = node.mesh() else { continue };
-        let usage = usage(node.name().or_else(|| mesh.name()).unwrap_or_default());
-        if usage == SourceUse::Omit {
-            continue;
-        }
+        let node_usage = usage(node.name().or_else(|| mesh.name()).unwrap_or_default());
+        let mut named_parts = HashMap::new();
         let matrix = Mat3::from_mat4(transform);
         let determinant = matrix.determinant();
         if !determinant.is_finite() || determinant == 0. {
@@ -527,6 +619,10 @@ fn glb_triangles(
                 .map(|n| normal_matrix * Vec3::from(n))
                 .collect();
             let id_colors = read_id_colors(&source.document, &primitive, blob, points.len())?;
+            let source_parts = read_source_parts(&source.document, &primitive, blob, points.len())?;
+            if source_parts.is_none() && node_usage == SourceUse::Omit {
+                continue;
+            }
             let visible_colors = if id_colors.is_none() {
                 reader.read_colors(0).map(|colors| colors.into_rgba_f32().collect::<Vec<_>>())
                     .filter(|colors| !editor_topology || colors.iter().any(|rgba| *rgba != [1.; 4]))
@@ -552,6 +648,22 @@ fn glb_triangles(
                 let [Some(a), Some(b), Some(c)] = ids.map(|i| points.get(i).copied()) else {
                     return Err("В high-poly есть недействительный индекс вершины".into());
                 };
+                let (part, usage) = if let Some(names) = &source_parts
+                    && let Some(name) = names[ids[0]].as_ref()
+                    && !name.as_str().is_empty()
+                    && ids[1..].iter().all(|&i| names[i].as_ref() == Some(name))
+                {
+                    *named_parts.entry(name.name.clone()).or_insert_with(|| {
+                        let part = next_part;
+                        next_part += 1;
+                        (part, usage(name.as_str()))
+                    })
+                } else {
+                    (node.index(), node_usage)
+                };
+                if usage == SourceUse::Omit {
+                    continue;
+                }
                 let color = triangle_id_color(ids.map(|i| {
                     id_colors.as_ref().and_then(|colors| colors[i]).or_else(|| {
                         visible_colors.as_ref().and_then(|colors| colors.get(i))
@@ -562,7 +674,7 @@ fn glb_triangles(
                     SourceTriangle::new(
                         [a, b, c],
                         ids.map(|i| normals.get(i).copied().unwrap_or_default()),
-                        node.index(),
+                        part,
                     )
                     .map(|triangle| triangle.with_usage(usage).with_id(material, color)),
                 );
@@ -570,6 +682,20 @@ fn glb_triangles(
         }
     }
     Ok(triangles)
+}
+
+fn part_name<'a>(object: &'a Object, face: &'a Face) -> &'a str {
+    face.source_part().unwrap_or(&object.name)
+}
+
+fn part_names(object: &Object, progress: &Progress) -> Result<Vec<String>, String> {
+    let mut names = BTreeSet::new();
+    for face in &object.geometry.faces {
+        progress.check()?;
+        names.insert(part_name(object, face));
+    }
+    let names: BTreeSet<_> = names.into_iter().map(base_name).collect();
+    Ok(names.into_iter().collect())
 }
 
 fn base_name(name: &str) -> String {

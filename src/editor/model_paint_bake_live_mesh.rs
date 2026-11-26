@@ -209,6 +209,7 @@ impl Scene {
                         geo,
                     ),
                     cage: cage.as_ref(),
+                    group: scene.projection_groups.get(triangle.face).copied().unwrap_or(0),
                 });
             let width = two_texel_width(points, uv);
             for y in raster.lo.y..raster.hi.y {

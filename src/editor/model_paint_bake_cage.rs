@@ -1,5 +1,5 @@
 //! Binds an authored cage to the corresponding low-poly vertices.
-use super::{Progress, SourceTriangle, base_name, read_triangles};
+use super::{Progress, SourceTriangle, SourceUse, base_name, part_name, part_names, read_triangles};
 use crate::editor::model_document::Object;
 use bevy::prelude::*;
 use std::{collections::HashMap, path::Path};
@@ -45,7 +45,9 @@ impl Cage {
         positions: &[Vec3],
         progress: &Progress,
     ) -> Result<Self, String> {
-        let expected = base_name(&object.name);
+        let name = object.bake_source_name();
+        let expected: HashMap<_, _> = part_names(object, progress)?.into_iter().enumerate()
+            .map(|(index, name)| (name, index as u32 + 1)).collect();
         let mut triangles = read_triangles(
             path,
             |name| {
@@ -54,11 +56,12 @@ impl Cage {
                     .into_iter()
                     .find_map(|suffix| name.strip_suffix(suffix))
                     .unwrap_or(&name);
-                (base_name(name) == expected).into()
+                expected.get(&base_name(name)).copied().map_or(SourceUse::Omit, SourceUse::Project)
             },
             progress,
         )?;
-        if triangles.is_empty() {
+        let matched = !triangles.is_empty();
+        if !matched {
             // A cage for a single object can be exported with any object name.
             triangles = read_triangles(path, |_| true.into(), progress)?;
             if let Some(first) = triangles.first()
@@ -66,7 +69,7 @@ impl Cage {
             {
                 return Err(format!(
                     "В оболочке нет детали для «{}» · проверьте имена объектов",
-                    object.name
+                    name
                 ));
             }
         }
@@ -75,14 +78,21 @@ impl Cage {
         let mirrored =
             object.transform.scale.x * object.transform.scale.y * object.transform.scale.z < 0.;
         let mut faces = Vec::new();
+        let mut names = HashMap::new();
         for face in &mesh.faces {
             progress.check()?;
+            let group = if matched && expected.len() > 1 {
+                let name = part_name(object, face);
+                *names.entry(name).or_insert_with(|| expected[&base_name(name)])
+            } else {
+                0
+            };
             for triangle in mesh.triangles(face) {
                 let mut vertices = triangle.map(|i| face.corners[i].vertex);
                 if mirrored {
                     vertices.swap(1, 2);
                 }
-                faces.push((face.material, vertices));
+                faces.push((group, face.material, vertices));
             }
         }
         if triangles.len() != faces.len() {
@@ -93,19 +103,27 @@ impl Cage {
             ));
         }
 
+        if matched && expected.len() > 1 {
+            faces.sort_by_key(|(group, _, _)| *group);
+            triangles.sort_by_key(|triangle| triangle.usage.projection_group());
+            if faces.iter().zip(&triangles).any(|((group, _, _), triangle)| *group != triangle.usage.projection_group()) {
+                return Err("Число треугольников оболочки не совпадает по именованным частям".into());
+            }
+        }
+
         let ordered = bind(
-            faces.iter().map(|(_, vertices)| *vertices),
+            faces.iter().map(|(_, _, vertices)| *vertices),
             &triangles,
             positions,
             progress,
         )?;
-        let offsets = if faces.is_sorted_by_key(|(material, _)| *material) {
+        let offsets = if faces.is_sorted_by_key(|(group, material, _)| (*group, *material)) {
             ordered
         } else {
             // GLB export writes a primitive per material. Try that order too.
-            faces.sort_by_key(|(material, _)| *material);
+            faces.sort_by_key(|(group, material, _)| (*group, *material));
             let grouped = bind(
-                faces.into_iter().map(|(_, vertices)| vertices),
+                faces.into_iter().map(|(_, _, vertices)| vertices),
                 &triangles,
                 positions,
                 progress,

@@ -534,7 +534,7 @@ pub(super) struct Names<'a> {
 }
 
 impl Names<'_> {
-    fn stem(&self, pattern: &str) -> String {
+    pub(super) fn stem(&self, pattern: &str) -> String {
         let name = if self.multiple_sets && !pattern.contains("$set") {
             if pattern.contains("$mesh") {
                 pattern.replace("$mesh", "$mesh_$set")

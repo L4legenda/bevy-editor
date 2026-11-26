@@ -98,10 +98,12 @@ struct Bridge {
 
 impl Bridge {
     async fn request(&self, command: Command) -> Reply {
-        let timeout = if matches!(
+        let timeout = if matches!(command, Command::PaintImport(_)) {
+            Duration::from_secs(30 * 60)
+        } else if matches!(
             command,
             Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_)
-                | Command::PaintExport(_) | Command::PaintReplaceMesh(_) | Command::PaintImport(_)
+                | Command::PaintExport(_) | Command::PaintReplaceMesh(_)
         ) {
             Duration::from_secs(300)
         } else {
@@ -282,6 +284,16 @@ fn process(
                 mesh_requests.as_deref_mut(),
             ) {
                 mcp_state::replace_mesh(requests, &editor, editing, paint, args, Box::new(MeshReply(job.reply)));
+            } else {
+                let _ = job.reply.send(Err("This editor has no model paint workspace".into()));
+            }
+            continue;
+        }
+        if let Command::PaintSurfaceParts(args) = job.command {
+            if let Some((editing, paint)) = model_editing.as_deref().zip(paint.as_deref()) {
+                mcp_state::list_surface_parts(&editor, editing, paint, args, Box::new(move |result| {
+                    let _ = job.reply.send(result.map(Payload::Json));
+                }));
             } else {
                 let _ = job.reply.send(Err("This editor has no model paint workspace".into()));
             }
@@ -809,7 +821,7 @@ fn execute(editor: &mut Editor, command: Command) -> Result<Value, String> {
             if editor.selection.is_some_and(|target| editor.pose(target).is_none() && target != Selection::Environment) { editor.select(None); }
             Ok(state(editor))
         }
-        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
+        Command::Save | Command::Capture | Command::PaintState | Command::PaintOpen(_) | Command::PaintImport(_) | Command::PaintReplaceMesh(_) | Command::PaintPresets | Command::PaintEdit(_) | Command::PaintStroke(_) | Command::PaintFill(_) | Command::PaintSurfaceParts(_) | Command::PaintSelectSurface(_) | Command::PaintSave(_) | Command::PaintPresetSave(_) | Command::PaintPresetImport(_) | Command::PaintPresetExport(_) | Command::PaintExport(_) | Command::BakeStatus(_) | Command::BakeStart(_) | Command::BakeCancel(_) | Command::BakeLevels(_) | Command::PaintView(_) | Command::CagePreview(_) | Command::PaintCapture(_) | Command::PaintRender(_) => {
             Err("This operation requires the live editor".into())
         }
     }

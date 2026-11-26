@@ -1,7 +1,7 @@
 //! Import Material Painter's MPP manifest and compressed layer data into an editable GLB.
 use super::{
     model_document::{MaterialSlot, ModelCamera, Object, PaintPreview, PaintUv, MODEL_CAMERA_EXTRA, PAINT_PREVIEW_EXTRA, PAINT_UV_EXTRA, PAINT_POST_EXTRA, PAINT_SET_EXTRA, PREVIEW_SHADER_EXTRA, glb::Glb},
-    model_mesh::{Corner, Face, Geometry},
+    model_mesh::{Corner, Face, Geometry, SourcePart},
     model_paint_data::{Blend, CHANNEL_COUNT, Layer, LayerKind, MAX_LAYERS, Stack, Surface, solid},
     model_paint_spp::{ImportDetails, project_name, publish_project},
     ui::model_viewer::paint::{
@@ -188,7 +188,8 @@ fn geometry(
     sets: &[TextureSet<'_>],
     materials: &[MaterialSlot],
     colors: Option<&[u8]>,
-) -> Result<(Geometry, usize)> {
+    source_parts: Option<&[Arc<SourcePart>]>,
+) -> Result<(Geometry, usize, Vec<usize>)> {
     let center =
         Vec3::from_array(serde_json::from_value(mesh["center"].clone()).unwrap_or([0.; 3]));
     let scale = mesh["scale"].as_f64().unwrap_or(1.) as f32;
@@ -197,6 +198,7 @@ fn geometry(
     }
     let mut mesh = Geometry::default();
     let mut attributes = Vec::new();
+    let mut shared = HashMap::new();
     // The 48-byte vertex stores position, normal, UV and tangent in little-endian f32.
     for vertex in vertices.chunks_exact(48) {
         let value = |i: usize| f32::from_le_bytes(vertex[i * 4..i * 4 + 4].try_into().unwrap());
@@ -206,8 +208,14 @@ fn geometry(
         if !position.is_finite() || !normal.is_finite() || !uv.is_finite() {
             return Err("Недопустимые координаты сетки MPP".into());
         }
-        mesh.positions.push(position);
-        attributes.push((normal.try_normalize(), uv));
+        // MPP splits render vertices where UVs, normals or tangents change.
+        let key = position.to_array().map(|value| if value == 0. { 0 } else { value.to_bits() });
+        let vertex = *shared.entry(key).or_insert_with(|| {
+            let vertex = mesh.positions.len();
+            mesh.positions.push(position);
+            vertex
+        });
+        attributes.push((vertex, normal.try_normalize(), uv));
     }
     for (material, set) in sets.iter().enumerate() {
         let first = mesh.faces.len();
@@ -218,7 +226,8 @@ fn geometry(
             .chunks_exact(12)
             .enumerate()
         {
-            let offset_bytes = (set.triangles.start + ordinal) * 3;
+            let triangle_index = set.triangles.start + ordinal;
+            let offset_bytes = triangle_index * 3;
             let id_color = colors.map(|colors| {
                 Vec3::from_array(std::array::from_fn(|channel| {
                     f32::from(colors[offset_bytes + channel]) / 255.
@@ -227,13 +236,14 @@ fn geometry(
             let mut corners = Vec::with_capacity(3);
             for index in triangle.chunks_exact(4) {
                 let index = u32::from_le_bytes(index.try_into().unwrap()) as usize;
-                let &(normal, uv) = attributes
+                let &(vertex, normal, uv) = attributes
                     .get(index)
                     .ok_or("Индекс вершины MPP вне сетки")?;
-                let mut corner = Corner::new(index);
+                let mut corner = Corner::new(vertex);
                 corner.uv = uv + offset;
                 corner.source_normal = normal;
                 corner.id_color = id_color;
+                corner.source_part = source_parts.map(|parts| parts[triangle_index].clone());
                 corners.push(corner);
             }
             let face = Face {
@@ -257,7 +267,32 @@ fn geometry(
     }
     mesh.validate().map_err(message)?;
     let skipped = indices.len() / 12 - mesh.faces.len();
-    Ok((mesh, skipped))
+    let source_vertices = attributes.into_iter().map(|(vertex, _, _)| vertex).collect();
+    Ok((mesh, skipped, source_vertices))
+}
+
+fn read_source_parts(
+    archive: &mut Archive, mesh: &Value, triangle_count: usize,
+) -> Result<Option<Vec<Arc<SourcePart>>>> {
+    let Some(objects) = mesh["objects"].as_array().filter(|objects| !objects.is_empty()) else {
+        return Ok(None);
+    };
+    if mesh["tri_object"].is_null() {
+        return Ok(None);
+    }
+    let error = "Некорректные имена частей сетки MPP";
+    let names = objects.iter().enumerate().map(|(id, name)| {
+        let name = name.as_str().ok_or(error)?;
+        let id = u32::try_from(id).map_err(|_| error)?;
+        let name = if name.trim().is_empty() { String::new() } else { name.to_owned() };
+        Ok::<_, &str>(Arc::new(SourcePart { name, id: Some(id) }))
+    }).collect::<std::result::Result<Vec<_>, _>>()?;
+    let data = archive.read(&mesh["tri_object"], Some(triangle_count * 4), MAX_BLOB)?;
+    let parts = data.chunks_exact(4).map(|entry| {
+        let id = u32::from_le_bytes(entry.try_into().unwrap()) as usize;
+        names.get(id).cloned().ok_or(error)
+    }).collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(parts))
 }
 
 fn reserve(remaining: &mut usize, bytes: usize) -> Result<()> {
@@ -265,6 +300,40 @@ fn reserve(remaining: &mut usize, bytes: usize) -> Result<()> {
         .checked_sub(bytes)
         .ok_or("Текстуры MPP превышают доступный бюджет импорта")?;
     Ok(())
+}
+
+#[derive(Default)]
+struct UniformPlanes(HashMap<(u32, [u8; 4]), Arc<Vec<u8>>>);
+
+impl UniformPlanes {
+    fn get(&mut self, size: u32, rgba: [u8; 4], remaining: &mut usize) -> Result<Arc<Vec<u8>>> {
+        let key = (size, rgba);
+        if let Some(plane) = self.0.get(&key) {
+            return Ok(plane.clone());
+        }
+        reserve(remaining, size as usize * size as usize * 4)?;
+        let plane = solid(size, rgba);
+        self.0.insert(key, plane.clone());
+        Ok(plane)
+    }
+
+    fn base(&mut self, size: u32, remaining: &mut usize) -> Result<[Arc<Vec<u8>>; CHANNEL_COUNT]> {
+        let colors = [
+            [204, 204, 204, 255],
+            [128, 128, 128, 255],
+            [0, 0, 0, 255],
+            [128, 128, 128, 255],
+            [255; 4],
+            [0, 0, 0, 255],
+            [128, 128, 255, 255],
+            [128, 128, 128, 255],
+        ];
+        let mut base = std::array::from_fn(|_| Arc::default());
+        for (plane, rgba) in base.iter_mut().zip(colors) {
+            *plane = self.get(size, rgba, remaining)?;
+        }
+        Ok(base)
+    }
 }
 
 // These indices are part of Material Painter's project format, independent of Bevy's map order.
@@ -475,7 +544,7 @@ struct Layers<'a, 'b> {
     warnings: &'a mut Vec<String>,
     recipes: &'a [super::model_paint_data::custom::Recipe],
     size: u32,
-    planes: HashMap<[u8; 4], Arc<Vec<u8>>>,
+    planes: &'a mut UniformPlanes,
 }
 
 impl Layers<'_, '_> {
@@ -610,15 +679,7 @@ impl Layers<'_, '_> {
                         images,
                         opacity,
                         graph.as_deref(),
-                        |rgba| {
-                            if let Some(existing) = self.planes.get(&rgba) {
-                                return Ok(existing.clone());
-                            }
-                            reserve(self.remaining, layer_bytes)?;
-                            let pixels = solid(self.size, rgba);
-                            self.planes.insert(rgba, pixels.clone());
-                            Ok(pixels)
-                        },
+                        |rgba| self.planes.get(self.size, rgba, self.remaining),
                     )?;
                 }
                 LayerKind::Paint => {
@@ -642,12 +703,12 @@ impl Layers<'_, '_> {
             }
             layer.blend = blend(&row["blend"], layer.channels[3].is_some())?;
             if let Some(mask) = row.get("mask").filter(|v| !v.is_null()) {
-                reserve(self.remaining, layer_bytes)?;
                 let cached = !mask["paint"].is_null();
                 let mut pixels = if cached {
+                    reserve(self.remaining, layer_bytes)?;
                     texture(self.archive, &mask["paint"], self.size, None)?
                 } else {
-                    solid(self.size, [255, 0, 0, 255])
+                    self.planes.get(self.size, [255, 0, 0, 255], self.remaining)?
                 };
                 let graph = self.read_graph(&mask["graph"], name);
                 let output = (cached && graph.is_some())
@@ -778,13 +839,15 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
     let colors = (!mesh["tri_color"].is_null())
         .then(|| archive.read(&mesh["tri_color"], Some(indices.len() / 4), MAX_BLOB))
         .transpose()?;
-    let (geometry, skipped) = geometry(
+    let source_parts = read_source_parts(&mut archive, mesh, indices.len() / 12)?;
+    let (geometry, skipped, source_vertices) = geometry(
         mesh,
         &vertices,
         &indices,
         &sets,
         &materials,
         colors.as_deref(),
+        source_parts.as_deref(),
     )?;
     let mut object = Object {
         id: 0,
@@ -851,21 +914,19 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
             }
         }
     };
-    let bake = bake_metadata::Bake::read(path, &object, mesh, &manifest["bake"], &mut warnings);
+    let bake = bake_metadata::Bake::read(path, &object, mesh, &source_vertices, &manifest["bake"], &mut warnings);
     let mut layer_count = 0;
     let mut fix_count = 0;
     let mut level_count = 0;
     let legacy_gamma = manifest["version"].as_u64() == Some(1);
+    let mut planes = UniformPlanes::default();
     for (slot, set) in sets.iter().enumerate() {
         let size = set.row["resolution"].as_u64().unwrap_or(2048);
         if !(128..=4096).contains(&size) || !size.is_power_of_two() {
             return Err(format!("Неподдерживаемое разрешение набора MPP: {size}"));
         }
         let size = size as u32;
-        reserve(
-            &mut remaining,
-            size as usize * size as usize * 4 * CHANNEL_COUNT,
-        )?;
+        let base = planes.base(size, &mut remaining)?;
         let stack = Layers {
             archive: &mut archive,
             remaining: &mut remaining,
@@ -873,7 +934,7 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
             warnings: &mut warnings,
             recipes: &bake.recipes,
             size,
-            planes: HashMap::new(),
+            planes: &mut planes,
         }
         .read(set.row)?;
         layer_count += stack.layers.len();
@@ -889,17 +950,7 @@ fn import(path: &Path, name: &str) -> Result<Imported> {
         let mut surface = Surface {
             size,
             stack,
-            base: [
-                [204, 204, 204, 255],
-                [128, 128, 128, 255],
-                [0, 0, 0, 255],
-                [128, 128, 128, 255],
-                [255; 4],
-                [0, 0, 0, 255],
-                [128, 128, 255, 255],
-                [128, 128, 128, 255],
-            ]
-            .map(|rgba| solid(size, rgba)),
+            base,
             material: object.materials[slot].authored.as_deref().unwrap().clone(),
             baked: None,
         };
@@ -1003,6 +1054,31 @@ mod tests {
     use crate::editor::browser_files;
 
     #[test]
+    fn mpp_uniform_planes_share_only_matching_texels_and_resolution() {
+        let mut planes = UniformPlanes::default();
+        let plane_bytes = 128 * 128 * 4;
+        let mut remaining = 6 * plane_bytes;
+        let first = planes.base(128, &mut remaining).unwrap();
+        assert_eq!(remaining, plane_bytes);
+        assert!(Arc::ptr_eq(&first[1], &first[3]));
+        assert!(Arc::ptr_eq(&first[2], &first[5]));
+        assert!(!Arc::ptr_eq(&first[0], &first[4]));
+
+        let mut second = planes.base(128, &mut remaining).unwrap();
+        assert!(first.iter().zip(&second).all(|(a, b)| Arc::ptr_eq(a, b)));
+        Arc::make_mut(&mut second[0])[0] = 0;
+        assert_eq!(first[0][0], 204);
+
+        let color = [96, 128, 160, 255];
+        let fill = planes.get(128, color, &mut remaining).unwrap();
+        let repeated = planes.get(128, color, &mut remaining).unwrap();
+        assert!(Arc::ptr_eq(&fill, &repeated));
+        assert_eq!(remaining, 0);
+        assert!(planes.get(256, color, &mut remaining).is_err());
+        assert!(planes.get(128, [160, 96, 128, 255], &mut remaining).is_err());
+    }
+
+    #[test]
     fn mpp_camera_falls_back_when_saved_pose_is_invalid() {
         let mut warnings = Vec::new();
         assert!(import_camera(&json!({}), &json!({}), &mut warnings).is_none());
@@ -1023,6 +1099,59 @@ mod tests {
             file.extend(blob);
         }
         file
+    }
+
+    #[test]
+    fn mpp_import_connects_split_vertices_without_losing_corner_attributes() {
+        let directory = std::env::temp_dir().join(format!("bevy-mpp-seam-{}", bevy::asset::uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("Seam.mpp");
+        let vertices = [
+            ([0., 0., 0.], [0., 0.], [0., 0., 1.]),
+            ([1., 0., 0.], [0.4, 0.], [0., 0., 1.]),
+            ([0., 1., 0.], [0., 1.], [0., 0., 1.]),
+            ([0., 1., 0.], [0.6, 1.], [0., 1., 0.]),
+            ([1., 0., 0.], [0.6, 0.], [0., 1., 0.]),
+            ([1., 1., 1.], [1., 1.], [0., 1., 0.]),
+        ].into_iter().flat_map(|(position, uv, normal)| {
+            position.into_iter().chain(normal).chain(uv).chain([1., 0., 0., 1.]).flat_map(f32::to_le_bytes)
+        }).collect();
+        let indices = (0u32..6).flat_map(u32::to_le_bytes).collect();
+        let triangle_objects = [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect();
+        let manifest = json!({
+            "app": "Material Painter", "version": 3,
+            "mesh": {"vertices": 0, "indices": 1, "objects": ["Panel", "Panel"], "tri_object": 2},
+            "bake": {"cage_paint": [1., 0.5, 1., 1., 2., 1.]},
+            "texture_sets": [{"name": "Seam", "tris": [0, 2], "resolution": 128,
+                "layers_bottom_to_top": []}],
+        });
+        std::fs::write(&source, native_file(manifest, &[vertices, indices, triangle_objects])).unwrap();
+        let check = |mesh: &Geometry| {
+            assert_eq!(mesh.positions.len(), 4);
+            let left = &mesh.faces[0].corners[1];
+            let right = &mesh.faces[1].corners[1];
+            assert_eq!(left.vertex, right.vertex);
+            assert_eq!(left.uv, Vec2::new(0.4, 0.));
+            assert_eq!(right.uv, Vec2::new(0.6, 0.));
+            assert_eq!(left.source_normal, Some(Vec3::Z));
+            assert_eq!(right.source_normal, Some(Vec3::Y));
+            for (expected_id, face) in mesh.faces.iter().enumerate() {
+                assert_eq!(face.source_part(), Some("Panel"));
+                assert_eq!(face.source_identity().unwrap().id, Some(expected_id as u32));
+            }
+        };
+        let imported = import(&source, "Seam").unwrap();
+        check(&imported.object.geometry);
+        assert_eq!(*imported.bake.cage[&0].scales.values, [1., 1.25, 1., 1.]);
+        let (glb, _) = convert(&source, &directory).unwrap();
+        let glb = Glb::load(&directory.join(glb)).unwrap();
+        let mut reopened = imported.object;
+        reopened.geometry = super::super::model_document::glb::import_geometry(&glb).unwrap().into();
+        check(&reopened.geometry);
+        let cage = super::super::model_cage_data::read(&glb.json["nodes"][0], &reopened).unwrap();
+        let seam = reopened.geometry.faces[0].corners[1].vertex;
+        assert_eq!(cage.scales.values[seam], 1.25);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1121,7 +1250,8 @@ mod tests {
             "active_set": 1,
             "graphs": [{"id": 4, "graph": graph}, {"id": 5, "graph": preview}],
             "view": view,
-            "mesh": {"name": "Panels", "vertices": 0, "indices": 1, "center": [1, 2, 3], "scale": 2, "tri_color": 7},
+            "mesh": {"name": "Panels", "vertices": 0, "indices": 1, "center": [1, 2, 3],
+                "scale": 2, "tri_color": 7, "objects": ["Left_low", "Right_low"], "tri_object": 8},
             "bake": bake_settings,
             "texture_sets": [
                 {
@@ -1159,6 +1289,7 @@ mod tests {
                 bitmap.bytes,
                 [200, 128].repeat(texels),
                 vec![127, 10, 35, 25, 150, 220],
+                [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
             ],
         );
         std::fs::write(&source, &bytes).unwrap();
@@ -1246,6 +1377,13 @@ mod tests {
         let bin = scene.blob.as_deref().unwrap();
         let mesh = scene.meshes().next().unwrap();
         for (primitive, rgb) in mesh.primitives().zip([[127u8, 10, 35], [25, 150, 220]]) {
+            let expected_name = ["Left_low", "Right_low"][primitive.index()];
+            let parts = super::super::model_document::glb::read_source_parts(
+                &scene.document, &primitive, bin, 3,
+            ).unwrap().unwrap();
+            assert!(parts.iter().all(|part| part.as_ref().is_some_and(|part| {
+                part.as_str() == expected_name && part.id == Some(primitive.index() as u32)
+            })));
             let colors = super::super::model_document::glb::read_id_colors(
                 &scene.document,
                 &primitive,
@@ -1513,6 +1651,11 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let Imported { object, .. } = import(&source, "Native").unwrap();
+        let mut shared_bases = HashMap::new();
+        for surface in object.materials.iter().filter_map(|slot| slot.paint.as_ref()) {
+            let base = shared_bases.entry(surface.size).or_insert(&surface.base);
+            assert!(base.iter().zip(&surface.base).all(|(a, b)| Arc::ptr_eq(a, b)));
+        }
         if source
             .file_stem()
             .is_some_and(|stem| stem == "folder_graph")
