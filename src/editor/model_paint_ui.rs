@@ -328,6 +328,7 @@ pub(in crate::editor::ui::model_viewer) struct PaintUi {
     path_options: Entity,
     multi_brush: Entity,
     brush_values: [(usize, Entity); 4],
+    tool_sections: [(Entity, ToolMask); 4],
     three_title: Entity,
     three_label: Entity,
     stamps: [Option<(usize, u64, u64, usize, usize)>; 5],
@@ -722,9 +723,13 @@ fn mesh_replacement(
     session: &Session,
 ) {
     let action = PaintAction::MeshReplacement;
-    let title = if session.mesh_loading { "Загрузка сетки…" }
-        else if session.mesh_menu { "Замена сетки ▴" } else { "Замена сетки ▾" };
-    button(commands, parent, font, title, action(MeshCommand::Toggle));
+    let title = if session.mesh_loading { "Загрузка сетки…" } else { "Замена сетки" };
+    let toggle = button(commands, parent, font, title, action(MeshCommand::Toggle));
+    if !session.mesh_loading {
+        // The font has no ▾/▴ glyphs, so the disclosure arrow is drawn as an icon.
+        let glyph = if session.mesh_menu { icons::Glyph::ChevronUp } else { icons::Glyph::ChevronDown };
+        icons::spawn(commands, toggle, glyph, 12., MUTED);
+    }
     if !session.mesh_menu || session.mesh_loading {
         return;
     }
@@ -785,6 +790,155 @@ fn icon(
     commands.entity(e).insert(PaintButton(action));
     e
 }
+/// Tools a property section applies to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ToolMask(u8);
+
+impl ToolMask {
+    const BRUSH: Self = Self(1);
+    const ERASER: Self = Self(2);
+    const FILL: Self = Self(4);
+    const PICKER: Self = Self(8);
+    const PATH: Self = Self(16);
+    const ALL: Self = Self(31);
+
+    fn contains(self, tool: PaintTool) -> bool {
+        let bit = match tool {
+            PaintTool::Brush => Self::BRUSH,
+            PaintTool::Eraser => Self::ERASER,
+            PaintTool::Fill => Self::FILL,
+            PaintTool::Picker => Self::PICKER,
+            PaintTool::Path => Self::PATH,
+        };
+        self.0 & bit.0 != 0
+    }
+}
+
+impl std::ops::BitOr for ToolMask {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitAnd for ToolMask {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+
+impl std::ops::Not for ToolMask {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self(!self.0 & Self::ALL.0)
+    }
+}
+
+/// Collapsible group in the properties panel. Returns the container for its controls.
+fn section(
+    commands: &mut Commands,
+    parent: Entity,
+    font: &Handle<Font>,
+    label: &str,
+    open: bool,
+) -> Entity {
+    commands.entity(parent).entry::<Node>().and_modify(|mut node| {
+        node.width = percent(100);
+        node.flex_shrink = 0.;
+        node.padding = UiRect::top(px(8));
+        node.border = UiRect::top(px(1));
+    });
+    commands.entity(parent).insert(BorderColor::all(EDGE));
+    let header = commands.spawn((
+        Node {
+            width: percent(100),
+            height: px(24),
+            align_items: AlignItems::Center,
+            column_gap: px(6),
+            ..default()
+        },
+        BackgroundColor(Color::NONE),
+        AccessibleLabel(format!("{label}: свернуть или развернуть")),
+        ChildOf(parent),
+    )).id();
+    let open_icon = icons::spawn(commands, header, icons::Glyph::ChevronDown, 13., MUTED);
+    let closed_icon = icons::spawn(commands, header, icons::Glyph::ChevronRight, 13., MUTED);
+    let title = text(commands, header, font, &label.to_uppercase(), 11., MUTED);
+    for entity in [open_icon, closed_icon, title] {
+        commands.entity(entity).insert(Pickable::IGNORE);
+    }
+    let content = node(commands, parent, Node {
+        display: if open { Display::Flex } else { Display::None },
+        width: percent(100),
+        padding: UiRect::left(px(2)),
+        ..column(7.)
+    });
+    let display = |visible: bool| if visible { Display::Flex } else { Display::None };
+    commands.entity(open_icon).entry::<Node>().and_modify(move |mut node| node.display = display(open));
+    commands.entity(closed_icon).entry::<Node>().and_modify(move |mut node| node.display = display(!open));
+    commands.entity(header).observe(
+        move |mut event: On<PointerClick>, mut nodes: Query<&mut Node>| {
+            if event.button != PointerButton::Primary {
+                return;
+            }
+            event.propagate(false);
+            let Ok(mut body) = nodes.get_mut(content) else { return };
+            let open = body.display == Display::None;
+            body.display = display(open);
+            for (entity, visible) in [(open_icon, open), (closed_icon, !open)] {
+                if let Ok(mut node) = nodes.get_mut(entity) {
+                    node.display = display(visible);
+                }
+            }
+        },
+    ).observe(
+        |event: On<bevy::picking::events::PointerEnter>, mut colors: Query<&mut BackgroundColor>| {
+            if let Ok(mut color) = colors.get_mut(event.entity) {
+                color.0 = Color::srgba(1., 1., 1., 0.04);
+            }
+        },
+    ).observe(
+        |event: On<bevy::picking::events::PointerLeave>, mut colors: Query<&mut BackgroundColor>| {
+            if let Ok(mut color) = colors.get_mut(event.entity) {
+                color.0 = Color::NONE;
+            }
+        },
+    );
+    content
+}
+
+/// Command column at the start of a library row. It scrolls on its own so a long list
+/// (graph presets) never grows past the shelf and over the search bar.
+fn shelf_tools(commands: &mut Commands, shelf: Entity) -> Entity {
+    let frame = node(commands, shelf, Node {
+        height: percent(100),
+        min_width: px(170),
+        flex_shrink: 0.,
+        overflow: Overflow::scroll_y(),
+        padding: UiRect::right(px(4)),
+        ..column(0.)
+    });
+    commands.entity(frame).insert(Scroller);
+    // Inner column keeps its natural height, so the buttons scroll instead of squashing.
+    node(commands, frame, Node { width: percent(100), flex_shrink: 0., ..column(4.) })
+}
+
+fn toolbar_divider(commands: &mut Commands, parent: Entity) -> Entity {
+    commands.spawn((
+        Node {
+            width: px(1),
+            height: px(22),
+            margin: UiRect::horizontal(px(2)),
+            flex_shrink: 0.,
+            ..default()
+        },
+        BackgroundColor(EDGE),
+        Pickable::IGNORE,
+        ChildOf(parent),
+    )).id()
+}
+
 fn title(commands: &mut Commands, parent: Entity, font: &Handle<Font>, value: &str) -> Entity {
     let e = surface(
         commands,
@@ -1524,8 +1678,7 @@ fn layer_name(
     session: &Session,
     layer: &Layer,
 ) {
-    let line = node(commands, parent, row(4.));
-    text(commands, line, font, "Имя слоя", 11., MUTED);
+    let line = node(commands, parent, Node { width: percent(100), ..row(4.) });
     let field = commands.spawn((
         TextInput,
         EditableText::new(&layer.name),
@@ -1681,6 +1834,39 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ZIndex(90),
         Pickable::IGNORE,
         ChildOf(viewer.overlay),
+    )).with_child((
+        engine::BrushCursorCore,
+        Node {
+            position_type: PositionType::Absolute,
+            left: percent(25),
+            top: percent(25),
+            width: percent(50),
+            height: percent(50),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::MAX,
+            ..default()
+        },
+        BorderColor::all(Color::srgba(0.98, 0.88, 0.66, 0.45)),
+        Visibility::Hidden,
+        Pickable::IGNORE,
+    ));
+    commands.spawn((
+        engine::BrushCursorLabel,
+        Text::new(""),
+        super::super::super::font(font, 11.),
+        TextColor(TEXT),
+        TextLayout::no_wrap(),
+        Node {
+            position_type: PositionType::Absolute,
+            padding: UiRect::axes(px(6), px(2)),
+            border_radius: BorderRadius::all(px(4)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.06, 0.06, 0.07, 0.82)),
+        Visibility::Hidden,
+        ZIndex(91),
+        Pickable::IGNORE,
+        ChildOf(viewer.overlay),
     ));
     let original = nodes
         .iter()
@@ -1714,13 +1900,15 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     ] {
         number(&mut commands, toolbar, font, parameter, true);
     }
+    // Brush values stay on the left; document commands are pushed to the right edge
+    // so the bar reads as "tool options … file actions" instead of one long strip.
+    node(&mut commands, toolbar, Node { flex_grow: 1., min_width: px(8), ..default() });
+    button(&mut commands, toolbar, font, "Редактор графов", PaintAction::GraphPage(GraphPage::Home));
     button(
-        &mut commands,
-        toolbar,
-        font,
-        "Сбросить вид",
-        PaintAction::Reset,
+        &mut commands, toolbar, font, "Экспорт карт…", PaintAction::ExportMaps(true),
     );
+    toolbar_divider(&mut commands, toolbar);
+    button(&mut commands, toolbar, font, "Сохранить как…", PaintAction::SaveCopy);
     super::super::super::button(
         &mut commands,
         toolbar,
@@ -1728,11 +1916,6 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         "Сохранить",
         Action::ModelView(ModelViewAction::Edit(editing::EditAction::Save)),
         Look::Primary,
-    );
-    button(&mut commands, toolbar, font, "Сохранить как…", PaintAction::SaveCopy);
-    button(&mut commands, toolbar, font, "Редактор графов", PaintAction::GraphPage(GraphPage::Home));
-    button(
-        &mut commands, toolbar, font, "Экспорт карт…", PaintAction::ExportMaps(true),
     );
     let path_options = surface(
         &mut commands,
@@ -1751,6 +1934,8 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         PANEL,
     );
     commands.entity(path_options).insert(ZIndex(40));
+    let path_title = text(&mut commands, path_options, font, "Контур", 12., FOCUS);
+    commands.entity(path_title).entry::<Node>().and_modify(|mut node| node.margin.right = px(6));
     for (label, action) in [
         ("Сгладить", PaintAction::PathSmooth),
         ("Замкнуть", PaintAction::PathClosed),
@@ -1775,6 +1960,10 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         },
     );
     commands.entity(views).insert(ZIndex(40));
+    let reset_view = icon(&mut commands, views, icons::Glyph::Refresh, "Вернуть стандартную раскладку: 3D + 2D, слои, материалы", PaintAction::Reset);
+    commands.entity(reset_view).entry::<Node>().and_modify(|mut node| {
+        node.margin.right = px(6);
+    });
     for (name, view) in [
         ("3D + 2D", View::Split),
         ("3D", View::Three),
@@ -1830,13 +2019,16 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         PANEL,
     );
     commands.entity(workspace).insert(AccessibleLabel("Рабочая область рисования".into()));
+    let model_pane = node(&mut commands, workspace, pane());
+    // Statistics sit in the 3D view just above its caption instead of floating over the
+    // properties panel.
     let diagnostics_panel = surface(
         &mut commands,
-        workspace,
+        model_pane,
         Node {
             position_type: PositionType::Absolute,
-            right: px(8.),
-            bottom: px(5.),
+            left: px(8.),
+            bottom: px(58.),
             max_width: percent(100),
             padding: UiRect::axes(px(6.), px(3.)),
             border_radius: BorderRadius::all(px(4.)),
@@ -1847,7 +2039,6 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     commands.entity(diagnostics_panel).insert((Pickable::IGNORE, ZIndex(5)));
     let diagnostic_label = text(&mut commands, diagnostics_panel, font, "", 11., MUTED);
     commands.entity(diagnostic_label).insert((Pickable::IGNORE, AccessibleLabel("Статистика рисования".into())));
-    let model_pane = node(&mut commands, workspace, pane());
     let three_title = surface(
         &mut commands,
         model_pane,
@@ -1874,12 +2065,32 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     commands
         .entity(uv)
         .insert(AccessibleLabel("Рисование: 2D-вид UV".into()));
-    let uv_info = text(&mut commands, uv, font, "UV · 0–1", 11., MUTED);
-    commands.entity(uv_info).insert(TextLayout::default());
-    text(&mut commands, uv, font, "Колесо — масштаб · СКМ — панорама · F — вписать", 11., MUTED);
-    super::super::super::button(
+    // One tidy header row instead of three stacked lines of text above the canvas.
+    let uv_header = surface(
         &mut commands,
         uv,
+        Node {
+            width: percent(100),
+            min_height: px(32),
+            flex_shrink: 0.,
+            padding: UiRect::axes(px(10), px(3)),
+            border: UiRect::bottom(px(1)),
+            flex_wrap: FlexWrap::Wrap,
+            ..row(8.)
+        },
+        CHROME,
+    );
+    let uv_info = text(&mut commands, uv_header, font, "UV · 0–1", 11., MUTED);
+    commands.entity(uv_info).insert(TextLayout::default());
+    commands.entity(uv_info).entry::<Node>().and_modify(|mut node| {
+        node.flex_grow = 1.;
+        node.min_width = px(0);
+    });
+    let uv_hint = text(&mut commands, uv_header, font, "Колесо — масштаб · СКМ — панорама · F — вписать", 11., MUTED);
+    commands.entity(uv_hint).insert(TextColor(MUTED.with_alpha(0.7)));
+    super::super::super::button(
+        &mut commands,
+        uv_header,
         font,
         "Открыть UV-развёртку",
         Action::ModelView(ModelViewAction::Edit(editing::EditAction::Mode(Mode::Uv))),
@@ -2164,13 +2375,13 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     );
     commands.entity(body).insert(Scroller);
     let layer_name = text(&mut commands, body, font, "Слой 1", 14., TEXT);
-    text(&mut commands, body, font, "СЛОЙ", 11., MUTED);
     number(&mut commands, body, font, Parameter::LayerOpacity, false);
     let fill_options = node(&mut commands, body, column(5.));
-    text(&mut commands, fill_options, font, "Область заливки", 11., MUTED);
+    let fill_content = section(&mut commands, fill_options, font, "Заливка", true);
+    text(&mut commands, fill_content, font, "Область заливки", 11., MUTED);
     let fill_modes = node(
         &mut commands,
-        fill_options,
+        fill_content,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3.),
@@ -2180,43 +2391,27 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     for (label, mode) in FillMode::OPTIONS {
         button(&mut commands, fill_modes, font, label, PaintAction::FillMode(mode));
     }
-    button(&mut commands, fill_modes, font, "Лассо · Shift", PaintAction::FillLasso);
-    button(&mut commands, fill_modes, font, "Сквозь модель", PaintAction::FillThrough);
-    button(&mut commands, fill_modes, font, "Стирать · Ctrl", PaintAction::FillErase);
-    number(&mut commands, fill_options, font, Parameter::FillPadding, false);
-    let fill_angle = node(&mut commands, fill_options, column(0.));
-    number(&mut commands, fill_angle, font, Parameter::FillAngle, false);
-    text(&mut commands, body, font, "КИСТЬ", 11., MUTED);
-    let brush_name = text(&mut commands, body, font, "Кисть · круглая", 13., TEXT);
-    for parameter in [
-        Parameter::Size,
-        Parameter::Hardness,
-        Parameter::Flow,
-        Parameter::Opacity,
-        Parameter::Spacing,
-        Parameter::TipAngle,
-    ] {
-        number(&mut commands, body, font, parameter, false);
-    }
-    let defaults = node(
+    let fill_flags = node(
         &mut commands,
-        body,
-        Node { flex_wrap: FlexWrap::Wrap, ..row(4.) },
+        fill_content,
+        Node { flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.) },
     );
-    button(&mut commands, defaults, font, "Сохранить стартовые", PaintAction::SaveBrushDefaults);
-    button(&mut commands, defaults, font, "Вернуть стандартные", PaintAction::ResetBrushDefaults);
-    text(&mut commands, body, font, "ИСТОРИЯ И ВОССТАНОВЛЕНИЕ", 11., MUTED);
-    history_number(&mut commands, body, font, "Шагов отмены на набор", HistoryPreference::Undo,
-        "Введите число от 8 до 512 и нажмите Enter. Меньше шагов занимают меньше памяти.");
-    button(&mut commands, body, font, "Автокопии", PaintAction::ToggleRecovery);
-    history_number(&mut commands, body, font, "Правок между автокопиями", HistoryPreference::Recovery,
-        "Введите число от 1 до 500 и нажмите Enter. После паузы редактор сохраняет накопленные правки.");
-    text(&mut commands, body, font, "МАТЕРИАЛ", 11., MUTED);
+    button(&mut commands, fill_flags, font, "Лассо · Shift", PaintAction::FillLasso);
+    button(&mut commands, fill_flags, font, "Сквозь модель", PaintAction::FillThrough);
+    button(&mut commands, fill_flags, font, "Стирать · Ctrl", PaintAction::FillErase);
+    number(&mut commands, fill_content, font, Parameter::FillPadding, false);
+    let fill_angle = node(&mut commands, fill_content, column(0.));
+    number(&mut commands, fill_angle, font, Parameter::FillAngle, false);
+
+    // Colour and material come first: it is what people change most often while painting.
+    let color_section = node(&mut commands, body, column(5.));
+    let color = section(&mut commands, color_section, font, "Цвет и материал", true);
     let palette = node(
         &mut commands,
-        body,
+        color,
         Node {
             flex_wrap: FlexWrap::Wrap,
+            row_gap: px(4.),
             ..row(4.)
         },
     );
@@ -2251,23 +2446,24 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ));
     }
     for parameter in [Parameter::Roughness, Parameter::Metallic] {
-        number(&mut commands, body, font, parameter, false);
+        number(&mut commands, color, font, parameter, false);
     }
-    text(&mut commands, body, font, "КАНАЛ", 11., MUTED);
+    text(&mut commands, color, font, "Канал", 11., MUTED);
     let channel = node(
         &mut commands,
-        body,
+        color,
         Node {
             width: percent(100),
             flex_wrap: FlexWrap::Wrap,
+            row_gap: px(3.),
             ..row(3.)
         },
     );
     for (i, name) in CHANNELS.iter().enumerate() {
         button(&mut commands, channel, font, name, PaintAction::Channel(i));
     }
-    button(&mut commands, body, font, "Несколько каналов одним мазком", PaintAction::MultiChannelBrush);
-    let multi_brush = node(&mut commands, body, Node { display: Display::None, ..column(4.) });
+    button(&mut commands, color, font, "Несколько каналов одним мазком", PaintAction::MultiChannelBrush);
+    let multi_brush = node(&mut commands, color, Node { display: Display::None, ..column(4.) });
     let targets = node(&mut commands, multi_brush, Node {
         flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.)
     });
@@ -2280,36 +2476,40 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         (5, &[Parameter::BrushEmission(0), Parameter::BrushEmission(1), Parameter::BrushEmission(2)][..]),
         (7, &[Parameter::BrushSpecular][..]),
     ].map(|(channel, fields)| {
-        let controls = node(&mut commands, body, Node { display: Display::None, ..column(4.) });
+        let controls = node(&mut commands, color, Node { display: Display::None, ..column(4.) });
         for &field in fields {
             number(&mut commands, controls, font, field, false);
         }
         (channel, controls)
     });
-    number(&mut commands, body, font, Parameter::Stabilizer, false);
+
+    // Size, hardness, flow and opacity live in the top bar; only the rest is repeated here.
+    let brush_section = node(&mut commands, body, column(5.));
+    let brush = section(&mut commands, brush_section, font, "Кисть", true);
+    let brush_name = text(&mut commands, brush, font, "Кисть · круглая", 13., TEXT);
+    for parameter in [Parameter::Spacing, Parameter::TipAngle, Parameter::Stabilizer] {
+        number(&mut commands, brush, font, parameter, false);
+    }
+    let pen = node(&mut commands, brush, row(4.));
+    button(&mut commands, pen, font, "Нажим · размер", PaintAction::PressureSize);
+    button(&mut commands, pen, font, "Нажим · поток", PaintAction::PressureFlow);
+
+    let scatter_section = node(&mut commands, body, column(5.));
+    let scatter = section(&mut commands, scatter_section, font, "Разброс и зерно", false);
     for parameter in [
         Parameter::BrushScatter,
         Parameter::BrushSizeJitter,
         Parameter::BrushAngleJitter,
+        Parameter::GrainStrength,
+        Parameter::GrainScale,
+        Parameter::GrainAngle,
     ] {
-        number(&mut commands, body, font, parameter, false);
+        number(&mut commands, scatter, font, parameter, false);
     }
-    let pen = node(&mut commands, body, row(4.));
-    button(
-        &mut commands,
-        pen,
-        font,
-        "Нажим · размер",
-        PaintAction::PressureSize,
-    );
-    button(
-        &mut commands,
-        pen,
-        font,
-        "Нажим · поток",
-        PaintAction::PressureFlow,
-    );
-    let symmetry = node(&mut commands, body, row(4.));
+
+    let projection_section = node(&mut commands, body, column(5.));
+    let projection_body = section(&mut commands, projection_section, font, "Проекция и симметрия", false);
+    let symmetry = node(&mut commands, projection_body, row(4.));
     text(&mut commands, symmetry, font, "Симметрия", 12., MUTED);
     for (label, axis) in [
         ("Выкл.", Symmetry::Off),
@@ -2317,25 +2517,12 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Y", Symmetry::Y),
         ("Z", Symmetry::Z),
     ] {
-        button(
-            &mut commands,
-            symmetry,
-            font,
-            label,
-            PaintAction::Symmetry(axis),
-        );
+        button(&mut commands, symmetry, font, label, PaintAction::Symmetry(axis));
     }
-    for parameter in [
-        Parameter::GrainStrength,
-        Parameter::GrainScale,
-        Parameter::GrainAngle,
-    ] {
-        number(&mut commands, body, font, parameter, false);
-    }
-    text(&mut commands, body, font, "Проекция кисти", 11., MUTED);
+    text(&mut commands, projection_body, font, "Проекция кисти", 11., MUTED);
     let projection = node(
         &mut commands,
-        body,
+        projection_body,
         Node {
             flex_wrap: FlexWrap::Wrap,
             row_gap: px(3.),
@@ -2347,22 +2534,31 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         ("Поверхность", BrushProjection::Surface),
         ("UV", BrushProjection::Uv),
     ] {
-        button(
-            &mut commands,
-            projection,
-            font,
-            label,
-            PaintAction::BrushProjection(mode),
-        );
+        button(&mut commands, projection, font, label, PaintAction::BrushProjection(mode));
     }
-    button(
+    button(&mut commands, projection_body, font, "Сквозь геометрию", PaintAction::PaintThrough);
+    number(&mut commands, projection_body, font, Parameter::BrushAngleLimit, false);
+
+    let settings_section = node(&mut commands, body, column(5.));
+    let settings = section(&mut commands, settings_section, font, "Стартовые настройки и история", false);
+    let defaults = node(
         &mut commands,
-        body,
-        font,
-        "Сквозь геометрию",
-        PaintAction::PaintThrough,
+        settings,
+        Node { flex_wrap: FlexWrap::Wrap, row_gap: px(3.), ..row(4.) },
     );
-    number(&mut commands, body, font, Parameter::BrushAngleLimit, false);
+    button(&mut commands, defaults, font, "Сохранить стартовые", PaintAction::SaveBrushDefaults);
+    button(&mut commands, defaults, font, "Вернуть стандартные", PaintAction::ResetBrushDefaults);
+    history_number(&mut commands, settings, font, "Шагов отмены на набор", HistoryPreference::Undo,
+        "Введите число от 8 до 512 и нажмите Enter. Меньше шагов занимают меньше памяти.");
+    button(&mut commands, settings, font, "Автокопии", PaintAction::ToggleRecovery);
+    history_number(&mut commands, settings, font, "Правок между автокопиями", HistoryPreference::Recovery,
+        "Введите число от 1 до 500 и нажмите Enter. После паузы редактор сохраняет накопленные правки.");
+    let tool_sections = [
+        (color_section, ToolMask::ALL & !ToolMask::PICKER),
+        (brush_section, ToolMask::BRUSH | ToolMask::ERASER | ToolMask::PATH),
+        (scatter_section, ToolMask::BRUSH | ToolMask::ERASER),
+        (projection_section, ToolMask::BRUSH | ToolMask::ERASER | ToolMask::PATH),
+    ];
     let swatches = MATERIALS
         .iter()
         .map(|preset| images.add(sphere(preset.rgb(), preset.roughness * 100., preset.metallic * 100.)))
@@ -2425,6 +2621,7 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         path_options,
         multi_brush,
         brush_values,
+        tool_sections,
         three_title,
         three_label,
         stamps: [None; 5],
@@ -2726,7 +2923,9 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         (ui.fill_options, session.tool == PaintTool::Fill),
         (ui.fill_angle, session.fill_mode == FillMode::Flat),
         (ui.multi_brush, session.multi_channel_brush && !session.editing_mask),
-    ].into_iter().chain(ui.brush_values.map(|(channel, entity)| {
+    ].into_iter().chain(ui.tool_sections.map(|(entity, tools)| {
+        (entity, tools.contains(session.tool))
+    })).chain(ui.brush_values.map(|(channel, entity)| {
         let active = !session.editing_mask && session.tool != PaintTool::Eraser
             && (session.stroke_channels() & (1 << channel)) != 0;
         (entity, active)
@@ -3007,6 +3206,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     stack,
                     Node {
                         flex_wrap: FlexWrap::Wrap,
+                        row_gap: px(4.),
                         ..row(3.)
                     },
                 );
@@ -3025,6 +3225,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 ] {
                     icon(&mut commands, tools, glyph, name, PaintAction::Add(kind));
                 }
+                toolbar_divider(&mut commands, tools);
                 icon(
                     &mut commands,
                     tools,
@@ -3048,6 +3249,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                     "Удалить слой",
                     PaintAction::Remove,
                 );
+                toolbar_divider(&mut commands, tools);
                 for (action, glyph, verb, shortcut) in [
                     (PaintAction::Undo, icons::Glyph::Undo, "Отменить", "Ctrl+Z"),
                     (PaintAction::Redo, icons::Glyph::Redo, "Повторить", "Ctrl+Shift+Z"),
@@ -3062,20 +3264,30 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                         commands.entity(button).insert(Help(hint));
                     }
                 }
+                // Library/sharing commands are a separate, quieter row: they act on the whole
+                // material stack rather than on the selected layer.
+                let library = node(&mut commands, stack, Node {
+                    flex_wrap: FlexWrap::Wrap,
+                    row_gap: px(4.),
+                    ..row(3.)
+                });
+                text(&mut commands, library, font, "В библиотеку", 11., MUTED);
                 icon(
-                    &mut commands, tools, icons::Glyph::Plus,
+                    &mut commands, library, icons::Glyph::Plus,
                     "Сохранить материал в библиотеке", PaintAction::SaveShelfMaterial,
                 );
                 icon(
-                    &mut commands, tools, icons::Glyph::Mask,
+                    &mut commands, library, icons::Glyph::Mask,
                     "Сохранить маску в библиотеке", PaintAction::SaveShelfMask,
                 );
                 icon(
-                    &mut commands, tools, icons::Glyph::ArrowUp,
+                    &mut commands, library, icons::Glyph::ArrowUp,
                     "Экспортировать в .mpsmart", PaintAction::ExportShelfMaterial,
                 );
-                button(&mut commands, tools, font, "ZIP…", PaintAction::ExportShelfPackage);
-                button(&mut commands, tools, font, "Пакет CC0…", PaintAction::ShareCommunityMaterial);
+                let zip = button(&mut commands, library, font, "ZIP", PaintAction::ExportShelfPackage);
+                commands.entity(zip).insert(Help("Экспортировать материал в ZIP-пакет…".into()));
+                let cc0 = button(&mut commands, library, font, "CC0", PaintAction::ShareCommunityMaterial);
+                commands.entity(cc0).insert(Help("Подготовить пакет CC0 для сообщества…".into()));
                 if let Some(layer) = session.stack.layers.get(session.stack.selected) {
                     layer_name(&mut commands, stack, font, index, session, layer);
                 }
@@ -4507,7 +4719,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
             }
             Category::Smart => {
-                let tools = node(&mut commands, ui.shelf, column(4.));
+                let tools = shelf_tools(&mut commands, ui.shelf);
                 button(
                     &mut commands, tools, font, "Импорт .mpsmart или ZIP…", PaintAction::ImportShelfMaterial,
                 );
@@ -4517,7 +4729,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 if let Some(index) = shelf_filter.smart_recipe_menu
                     && let Some(preset) = SMART_MATERIALS.get(index)
                 {
-                    let menu = node(&mut commands, ui.shelf, column(4.));
+                    let menu = shelf_tools(&mut commands, ui.shelf);
                     text(&mut commands, menu, font, preset.name, 11., TEXT);
                     button(&mut commands, menu, font, "Добавить группой", PaintAction::AddSmartMaterial(index));
                     button(&mut commands, menu, font, "Добавить одним графом", PaintAction::AddSmartGraph(index));
@@ -4588,7 +4800,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
             }
             Category::Brushes => {
-                let tools = node(&mut commands, ui.shelf, column(4.));
+                let tools = shelf_tools(&mut commands, ui.shelf);
                 for (label, action) in [
                     ("Загрузить…", PaintAction::ImportBrushTip),
                     ("По направлению мазка", PaintAction::FollowStroke),
@@ -4612,7 +4824,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
             }
             Category::Textures => {
-                let tools = node(&mut commands, ui.shelf, column(4.));
+                let tools = shelf_tools(&mut commands, ui.shelf);
                 for (label, action) in [
                     ("Без зерна", PaintAction::Grain(None)),
                     ("Инверсия зерна", PaintAction::GrainInvert),
@@ -4676,7 +4888,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
                 }
             }
             Category::Graphs => {
-                let tools = node(&mut commands, ui.shelf, column(4.));
+                let tools = shelf_tools(&mut commands, ui.shelf);
                 button(&mut commands, tools, font, "Импорт .mpgraph или ZIP…", PaintAction::ImportGraphFile);
                 if session.smart_loading {
                     text(&mut commands, tools, font, "Расчёт материала…", 12., MUTED);

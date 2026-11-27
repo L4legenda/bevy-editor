@@ -259,7 +259,7 @@ impl Parameter {
         match self {
             Self::Size => "Размер",
             Self::Flow => "Поток, %",
-            Self::Opacity => "Непрозрачность мазка, %",
+            Self::Opacity => "Непрозрачность, %",
             Self::Hardness => "Жёсткость, %",
             Self::Spacing => "Шаг, %",
             Self::Stabilizer => "Стабилизация, px",
@@ -301,7 +301,7 @@ impl Parameter {
             Self::BrushAlpha => "Непрозрачность материала, %",
             Self::BrushSpecular => "Уровень блика, %",
             Self::BrushEmission(index) => ["Свечение R, %", "Свечение G, %", "Свечение B, %"][index],
-            Self::LayerOpacity => "Непрозрачность, %",
+            Self::LayerOpacity => "Непрозрачность слоя, %",
             Self::FilterValue(_, kind, value) => kind.controls()[value].0,
         }
     }

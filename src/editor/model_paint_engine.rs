@@ -28,6 +28,29 @@ pub(in crate::editor::ui::model_viewer) struct TextureCanvas;
 pub(in crate::editor::ui::model_viewer) struct TextureViewport;
 #[derive(Component)]
 pub(in crate::editor::ui::model_viewer) struct BrushCursor;
+/// Inner ring of the brush cursor: its diameter follows the brush hardness.
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct BrushCursorCore;
+/// Small readout next to the cursor: size/hardness while adjusting, or why painting is unavailable.
+#[derive(Component)]
+pub(in crate::editor::ui::model_viewer) struct BrushCursorLabel;
+const CURSOR_BRUSH: Color = Color::srgba(0.98, 0.88, 0.66, 0.95);
+const CURSOR_ERASER: Color = Color::srgba(0.98, 0.58, 0.58, 0.95);
+const CURSOR_BLOCKED: Color = Color::srgba(0.62, 0.62, 0.62, 0.7);
+/// How long the size readout stays visible after `[` / `]` or a slider change.
+const CURSOR_FEEDBACK_SECONDS: f64 = 0.9;
+#[derive(Default)]
+pub(in crate::editor::ui::model_viewer) struct CursorFeedback {
+    last: Option<(usize, f32, f32)>,
+    until: f64,
+}
+struct CursorPlacement {
+    corner: Vec2,
+    size: f32,
+    color: Color,
+    core: Option<f32>,
+    label: Option<String>,
+}
 #[derive(Resource, Default)]
 pub(in crate::editor::ui::model_viewer) struct Runtime {
     lives: HashMap<Key, Live>,
@@ -2193,13 +2216,20 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
     canvases: Query<(Entity, Has<TextureCanvas>), Or<(With<Canvas>, With<TextureCanvas>)>>,
     texture: UvCanvas,
     controls: VisibleControls,
-    mut cursor: Query<(&mut Node, &mut Visibility), With<BrushCursor>>,
+    (mut cursor, mut core, mut label, time, mut feedback): (
+        Query<(&mut Node, &mut Visibility, &mut BorderColor), (With<BrushCursor>, Without<BrushCursorCore>, Without<BrushCursorLabel>)>,
+        Query<(&mut Node, &mut Visibility, &mut BorderColor), (With<BrushCursorCore>, Without<BrushCursor>, Without<BrushCursorLabel>)>,
+        Query<(&mut Node, &mut Visibility, &mut Text), (With<BrushCursorLabel>, Without<BrushCursor>, Without<BrushCursorCore>)>,
+        Res<Time<bevy::time::Real>>,
+        Local<CursorFeedback>,
+    ),
     pointer: Res<PointerFrame>,
     runtime: Res<Runtime>,
 ) {
-    let Ok((mut node, mut visible)) = cursor.single_mut() else {
+    let Ok((mut node, mut visible, mut border)) = cursor.single_mut() else {
         return;
     };
+    let now = time.elapsed_secs_f64();
     let placement = (|| {
         let Some(index) = editor
             .viewing_model
@@ -2210,6 +2240,12 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
         let Some(session) = paint.sessions.get(&index) else {
             return None;
         };
+        // Flash the size readout whenever size or hardness changes outside the Ctrl+RMB gesture.
+        let values = (index, session.size, session.hardness);
+        if feedback.last.is_some_and(|last| last != values && last.0 == index) {
+            feedback.until = now + CURSOR_FEEDBACK_SECONDS;
+        }
+        feedback.last = Some(values);
         if session.paint_blocked_by_bake()
             || session.cage_brush_active() || session.custom_gizmo_active()
             || session.graph_canvas_open() || session.panel == Panel::Shader {
@@ -2269,18 +2305,99 @@ pub(in crate::editor::ui::model_viewer) fn cursor(
             .gesture
             .as_ref()
             .filter(|g| g.mapping.camera.clip.contains(point));
-        let size = if matches!(session.tool, PaintTool::Brush | PaintTool::Eraser) {
+        let brush_like = matches!(session.tool, PaintTool::Brush | PaintTool::Eraser);
+        let size = if brush_like {
             session.size * gesture.map_or(1., |g| g.path.first().radius)
         } else {
             10.
         };
-        let p = gesture.map_or(point, |g| g.path.lazy) - overlay.min - Vec2::splat(size * 0.5);
-        Some((p, size))
+        let no_layer = matches!(session.tool, PaintTool::Brush | PaintTool::Eraser | PaintTool::Fill)
+            && session.active_bake_fix().is_none()
+            && !session.can_paint_layer();
+        let color = if no_layer {
+            CURSOR_BLOCKED
+        } else if session.tool == PaintTool::Eraser {
+            CURSOR_ERASER
+        } else {
+            CURSOR_BRUSH
+        };
+        let hardness = (session.hardness / 100.).clamp(0., 1.);
+        let core = (brush_like && size >= 14. && hardness < 0.97).then_some(hardness.max(0.05));
+        let label = if no_layer {
+            Some("Выберите видимый слой краски".to_owned())
+        } else if adjustment.is_some() {
+            Some(format!("{:.0} px · жёсткость {:.0}%", session.size, session.hardness))
+        } else if brush_like && gesture.is_none() && now < feedback.until {
+            Some(format!("{:.0} px", session.size))
+        } else {
+            None
+        };
+        let center = gesture.map_or(point, |g| g.path.lazy) - overlay.min;
+        Some(CursorPlacement {
+            corner: center - Vec2::splat(size * 0.5),
+            size,
+            color,
+            core,
+            label,
+        })
     })();
-    let Some((p, size)) = placement else {
+    let label = label.single_mut().ok();
+    let Some(CursorPlacement { corner: p, size, color, core: hardness, label: text }) = placement else {
         visible.set_if_neq(Visibility::Hidden);
+        if let Some((_, mut label_visible, _)) = label {
+            label_visible.set_if_neq(Visibility::Hidden);
+        }
         return;
     };
+    border.set_if_neq(BorderColor::all(color));
+    if let Ok((mut core_node, mut core_visible, mut core_border)) = core.single_mut() {
+        match hardness {
+            Some(ratio) => {
+                let offset = percent((1. - ratio) * 50.);
+                let diameter = percent(ratio * 100.);
+                if core_node.left != offset {
+                    core_node.left = offset;
+                }
+                if core_node.top != offset {
+                    core_node.top = offset;
+                }
+                if core_node.width != diameter {
+                    core_node.width = diameter;
+                }
+                if core_node.height != diameter {
+                    core_node.height = diameter;
+                }
+                core_border.set_if_neq(BorderColor::all(color.with_alpha(0.45)));
+                core_visible.set_if_neq(Visibility::Inherited);
+            }
+            None => {
+                core_visible.set_if_neq(Visibility::Hidden);
+            }
+        }
+    }
+    if let Some((mut label_node, mut label_visible, mut label_text)) = label {
+        match text {
+            Some(value) => {
+                // Keep the readout just outside the ring, below and to the right of the cursor.
+                let offset = size * 0.5 * std::f32::consts::FRAC_1_SQRT_2 + 6.;
+                let left = px(p.x + size * 0.5 + offset);
+                let top = px(p.y + size * 0.5 + offset);
+                if label_node.left != left {
+                    label_node.left = left;
+                }
+                if label_node.top != top {
+                    label_node.top = top;
+                }
+                if label_text.0 != value {
+                    label_text.0 = value;
+                }
+                label_visible.set_if_neq(Visibility::Visible);
+            }
+            None => {
+                label_visible.set_if_neq(Visibility::Hidden);
+            }
+        }
+    }
     if node.left != px(p.x) {
         node.left = px(p.x);
     }
