@@ -223,10 +223,11 @@ pub(crate) fn pointer(
     lighting: Option<Res<LightingUi>>,
     viewer: Option<Res<ImageViewer>>,
     narrative: Option<Res<NarrativeUi>>,
-    (canvas, image_canvas, image_controls): (
+    (canvas, image_canvas, image_controls, transform_panel): (
         Query<(&ComputedNode, &UiGlobalTransform, Option<&CalculatedClip>)>,
         Query<Entity, With<ImageCanvas>>,
         Query<(&ComputedNode, &UiGlobalTransform), With<CanvasControl>>,
+        TransformPanelAreas,
     ),
 ) {
     drag.cancelled_this_frame = false;
@@ -359,6 +360,7 @@ pub(crate) fn pointer(
             })
             .or_else(|| {
                 (can_place(payload.entry, &browser, &editor)
+                    && !transform_panel_covers(&transform_panel, cursor)
                     && scene_target_contains(&editor, &window, &motion, cursor))
                 .then_some(DropTarget::Scene(cursor))
             });

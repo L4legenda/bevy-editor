@@ -178,6 +178,7 @@ pub(in crate::editor) fn update(
     mut ray: PlacementRay,
     mut roots: Query<(&mut Transform, &mut Visibility), With<PlacementGhost>>,
     numeric: Option<Res<ui::NumericInput>>,
+    transform_panel: ui::TransformPanelAreas,
     mut actions: MessageReader<Action>,
 ) {
     let mut released = None;
@@ -230,7 +231,9 @@ pub(in crate::editor) fn update(
             .map(|(_, cursor)| cursor)
             .or_else(|| drag.scene_cursor());
         let point = cursor.and_then(|cursor| {
-            if !ui::scene_input_rect(&window, &motion, &editor.sidebar).contains(cursor) {
+            if !ui::scene_input_rect(&window, &motion, &editor.sidebar).contains(cursor)
+                || ui::transform_panel_covers(&transform_panel, cursor)
+            {
                 return None;
             }
             if !editor.pilot
@@ -356,6 +359,7 @@ pub(in crate::editor) fn update(
                 && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor);
             if !ui::scene_input_rect(&window, &motion, &editor.sidebar).contains(cursor)
                 || over_preview
+                || ui::transform_panel_covers(&transform_panel, cursor)
             {
                 return None;
             }

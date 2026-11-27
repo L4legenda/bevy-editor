@@ -3,6 +3,195 @@ use super::*;
 use crate::editor::euler_degrees;
 use icons::Glyph;
 
+const TAB_WIDTH: f32 = 30.0;
+const INSET: f32 = 44.0;
+const WIDTH: f32 = 284.0;
+
+#[derive(Component)]
+pub(in crate::editor) struct PanelHit;
+
+pub(in crate::editor) type HitAreas<'w, 's> =
+    Query<'w, 's, (&'static ComputedNode, &'static UiGlobalTransform), With<PanelHit>>;
+
+pub(in crate::editor) fn covers(areas: &HitAreas, cursor: Vec2) -> bool {
+    areas.iter().any(|(node, transform)| {
+        !node.is_empty() && node.contains_point(*transform, cursor / node.inverse_scale_factor())
+    })
+}
+
+#[derive(Resource)]
+pub(in crate::editor) struct Panel {
+    tab: Entity,
+    arrow: Entity,
+    reveal: Entity,
+    card: Entity,
+    open: bool,
+    progress: f32,
+}
+
+#[cfg(test)]
+impl Panel {
+    pub(in crate::editor) fn at_rest(&self, open: bool) -> bool {
+        self.progress == f32::from(open)
+    }
+}
+
+pub(super) fn panel_available(editor: &Editor) -> bool {
+    editor.has_scene()
+        && editor.ready
+        && !editor.asset_viewer_open()
+        && !editor.pilot
+        && editor.pending.is_none()
+        && editor
+            .selection
+            .is_some_and(|target| editor.pose(target).is_some())
+}
+
+fn setup_panel(commands: &mut Commands, viewport: Entity) -> Entity {
+    let tab = control(
+        commands,
+        viewport,
+        Action::Inspector(InspectorAction::ToggleTransform),
+        Look::Tool,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            width: px(TAB_WIDTH),
+            height: px(32),
+            right: px(8),
+            justify_content: JustifyContent::Center,
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(6)),
+            ..row(0.0)
+        },
+    );
+    commands.entity(tab).insert((
+        PanelHit,
+        ZIndex(42),
+        AccessibleLabel("Панель трансформации · N".into()),
+    ));
+    let arrow = icons::themed(commands, tab, Glyph::ChevronLeft, 15.0);
+    let reveal = node(
+        commands,
+        viewport,
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            right: px(INSET),
+            overflow: Overflow::clip(),
+            ..default()
+        },
+    );
+    commands.entity(reveal).insert((PanelHit, ZIndex(41)));
+    let card = surface(
+        commands,
+        reveal,
+        Node {
+            width: px(WIDTH),
+            flex_shrink: 0.0,
+            padding: UiRect::all(px(10)),
+            border: UiRect::all(px(1)),
+            border_radius: BorderRadius::all(px(8)),
+            overflow: Overflow::scroll_y(),
+            ..column(7.0)
+        },
+        CHROME,
+    );
+    commands.entity(card).insert(Scroller);
+    commands.insert_resource(Panel {
+        tab,
+        arrow,
+        reveal,
+        card,
+        open: false,
+        progress: 0.0,
+    });
+    card
+}
+
+pub(in crate::editor) fn refresh_panel(
+    editor: Res<Editor>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    drawer: Res<DrawerMotion>,
+    mut panel: ResMut<Panel>,
+    mut actions: MessageReader<Action>,
+    mut nodes: Query<&mut Node>,
+    parents: Query<&ChildOf>,
+    mut focus: ResMut<InputFocus>,
+    time: Res<Time>,
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
+    mut commands: Commands,
+) {
+    let available = panel_available(&editor);
+    for action in actions.read() {
+        if available && matches!(action, Action::Inspector(InspectorAction::ToggleTransform)) {
+            panel.open = !panel.open;
+            icons::set_glyph(
+                &mut commands,
+                panel.arrow,
+                if panel.open {
+                    Glyph::ChevronRight
+                } else {
+                    Glyph::ChevronLeft
+                },
+            );
+        }
+    }
+    if (!available || !panel.open)
+        && focus.get().is_some_and(|entity| {
+            parents
+                .iter_ancestors(entity)
+                .any(|ancestor| ancestor == panel.card)
+        })
+    {
+        focus.clear();
+    }
+    let rect = viewport_rect(&window, &editor.sidebar);
+    let height = (rect.height() - drawer.visible_height).max(0.0);
+    let top = (navigation_gizmo::rect(rect).max.y - rect.min.y + 8.0).min((height - 48.0).max(8.0));
+    let height = (height - top - 8.0).max(0.0);
+    let available = available && height >= 32.0;
+    let open = available && panel.open;
+    let previous = panel.progress;
+    let step = time.delta_secs().min(0.05) / 0.18;
+    panel.progress = if available {
+        (previous + if open { step } else { -step }).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if panel.progress != previous || panel.progress != f32::from(open) {
+        redraw.write(bevy::window::RequestRedraw);
+    }
+    let width = (rect.width() - INSET - 8.0).clamp(0.0, WIDTH);
+    let t = panel.progress;
+    let revealed = width * t * t * (3.0 - 2.0 * t);
+    for (entity, visible) in [(panel.tab, available), (panel.reveal, revealed > 0.0)] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            let display = if visible {
+                Display::Flex
+            } else {
+                Display::None
+            };
+            if node.display != display {
+                node.display = display;
+            }
+            if node.top != px(top) {
+                node.top = px(top);
+            }
+        }
+    }
+    for (entity, width) in [(panel.reveal, revealed), (panel.card, width)] {
+        if let Ok(mut node) = nodes.get_mut(entity) {
+            if node.width != px(width) {
+                node.width = px(width);
+            }
+            if node.max_height != px(height) {
+                node.max_height = px(height);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::editor) enum TransformProperty {
     Position,
@@ -181,7 +370,6 @@ impl TransformProperty {
 }
 
 pub(super) struct Ui {
-    pub transforms: Entity,
     pub rotation_scope: Entity,
     pub scale_scope: Entity,
     pub camera_scope: Entity,
@@ -189,19 +377,25 @@ pub(super) struct Ui {
     pub space_label: Entity,
 }
 
-pub(super) fn setup(commands: &mut Commands, parent: Entity, font: &Handle<Font>) -> Ui {
-    let transforms = node(commands, parent, column(0.0));
-    let transform = inspector::section(
+pub(super) fn setup(
+    commands: &mut Commands,
+    viewport: Entity,
+    parent: Entity,
+    font: &Handle<Font>,
+) -> Ui {
+    let transforms = setup_panel(commands, viewport);
+    let header = node(
         commands,
         transforms,
-        font,
-        "Трансформация",
-        "transform trs",
-        true,
+        Node {
+            justify_content: JustifyContent::SpaceBetween,
+            ..row(6.0)
+        },
     );
+    text(commands, header, font, "Трансформация", 14.0, TEXT);
     let space = control(
         commands,
-        transform.header,
+        header,
         Action::LocalSpace,
         Look::Regular,
         Node {
@@ -223,14 +417,13 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font: &Handle<Font>
     let space_label = text(commands, space, font, "Мир", 11.0, MUTED);
     vector(
         commands,
-        transform.body,
+        transforms,
         font,
         TransformProperty::Position,
         "Позиция",
         "м",
-        "position location translation перемещение",
     );
-    let rotation_scope = node(commands, transform.body, column(0.0));
+    let rotation_scope = node(commands, transforms, column(0.0));
     vector(
         commands,
         rotation_scope,
@@ -238,9 +431,8 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font: &Handle<Font>
         TransformProperty::Rotation,
         "Поворот",
         "°",
-        "rotation euler угол вращение",
     );
-    let scale_scope = node(commands, transform.body, column(0.0));
+    let scale_scope = node(commands, transforms, column(0.0));
     vector(
         commands,
         scale_scope,
@@ -248,7 +440,6 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font: &Handle<Font>
         TransformProperty::Scale,
         "Масштаб",
         "",
-        "scale размер",
     );
 
     let camera_scope = node(commands, parent, column(0.0));
@@ -303,7 +494,6 @@ pub(super) fn setup(commands: &mut Commands, parent: Entity, font: &Handle<Font>
         button(commands, item, font, label, action, Look::Regular);
     }
     Ui {
-        transforms,
         rotation_scope,
         scale_scope,
         camera_scope,
@@ -370,10 +560,8 @@ fn vector(
     property: TransformProperty,
     label: &str,
     unit: &str,
-    terms: &str,
 ) {
     let property_row = node(commands, parent, column(2.0));
-    inspector::searchable(commands, property_row, &format!("{label} {terms}"));
     caption(commands, property_row, font, property, label, unit);
     let line = inspector::vector_row(commands, property_row);
     for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {

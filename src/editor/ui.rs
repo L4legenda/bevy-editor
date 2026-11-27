@@ -47,6 +47,12 @@ mod inspector_transform;
 #[path = "play_ui.rs"]
 mod play_ui;
 pub(super) use inspector::{InspectorAction, refresh as refresh_inspector};
+pub(super) use inspector_transform::refresh_panel as refresh_scene_transform;
+#[cfg(test)]
+pub(in crate::editor) use inspector_transform::Panel as SceneTransformPanel;
+pub(in crate::editor) use inspector_transform::{
+    HitAreas as TransformPanelAreas, covers as transform_panel_covers,
+};
 pub(super) use inspector_transform::TransformProperty;
 #[path = "scene_hierarchy_ui.rs"]
 mod scene_hierarchy_ui;
@@ -194,7 +200,6 @@ pub(super) struct Interface {
     hierarchy_info: scene_hierarchy_ui::Inspector,
     perspective: Entity,
     lens_label: Entity,
-    transforms: Entity,
     rotation_scope: Entity,
     scale_scope: Entity,
     camera_scope: Entity,
@@ -737,7 +742,7 @@ pub(super) fn setup(
         &font,
         &mut images,
     );
-    let transform_ui = inspector_transform::setup(&mut commands, scene_properties, &font);
+    let transform_ui = inspector_transform::setup(&mut commands, viewport, scene_properties, &font);
 
     let hierarchy_info =
         scene_hierarchy_ui::setup_inspector(&mut commands, scene_properties, &font);
@@ -812,7 +817,6 @@ pub(super) fn setup(
         hierarchy_info,
         perspective,
         lens_label: transform_ui.lens_label,
-        transforms: transform_ui.transforms,
         rotation_scope: transform_ui.rotation_scope,
         scale_scope: transform_ui.scale_scope,
         camera_scope: transform_ui.camera_scope,
@@ -1154,6 +1158,9 @@ fn available(editor: &Editor, browser: &Browser, action: Action) -> bool {
         Action::RevertProperty(property) => {
             editor.has_scene() && editor.ready && property.can_revert(editor)
         }
+        Action::Inspector(InspectorAction::ToggleTransform) => {
+            inspector_transform::panel_available(editor)
+        }
         Action::Delete => editor.has_scene() && editor.deletable_targets(),
         Action::Duplicate => editor.has_scene() && editor.batch_editable(),
         Action::SceneObject(action) => scene_objects::available(editor, action),
@@ -1168,6 +1175,7 @@ pub(super) fn input(
     mouse: Res<ButtonInput<MouseButton>>,
     mut focus: ResMut<InputFocus>,
     lighting: Option<Res<LightingUi>>,
+    transform_panel: TransformPanelAreas,
 ) {
     if editor.scene_object_popup {
         return;
@@ -1184,6 +1192,7 @@ pub(super) fn input(
     if mouse.any_just_pressed([MouseButton::Left, MouseButton::Right, MouseButton::Middle])
         && window.cursor_position().is_some_and(|cursor| {
             scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
+                && !transform_panel_covers(&transform_panel, cursor)
         })
     {
         focus.clear();
@@ -1688,6 +1697,14 @@ pub(super) fn shortcuts(
             }
         }
     } else if !editor.pilot && !mouse.pressed(MouseButton::Right) {
+        if !shift
+            && !keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight])
+            && keys.just_pressed(KeyCode::KeyN)
+            && inspector_transform::panel_available(&editor)
+        {
+            actions.write(Action::Inspector(InspectorAction::ToggleTransform));
+            return;
+        }
         if keys.just_pressed(KeyCode::F2)
             && let Some(target) = editor
                 .selection
@@ -2175,8 +2192,6 @@ pub(super) fn refresh(
                 && editor.viewing_image.is_none(),
         ),
         (interface.scene_properties, inspecting_scene),
-        (interface.transforms, inspecting_scene
-            && editor.selection.is_some_and(|target| editor.pose(target).is_some())),
         (interface.camera_scope, camera),
         (interface.field_error, numeric.error_message().is_some()),
         (interface.navigation_hint, !navigation_hint.is_empty()),

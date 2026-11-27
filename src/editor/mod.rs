@@ -1284,6 +1284,7 @@ impl Plugin for EditorPlugin {
             ui::refresh_inspector.after(ui::refresh_lighting_controls),
         );
         app.add_systems(Update, ui::lock_numeric_text.after(ui::refresh));
+        app.add_systems(Update, ui::refresh_scene_transform.after(ui::refresh));
         app.add_systems(Update, ui::scene_tree_drag::animate.after(ui::refresh));
         app.add_systems(
             PostUpdate,

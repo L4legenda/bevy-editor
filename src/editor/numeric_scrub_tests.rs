@@ -23,7 +23,7 @@ fn gpu_numeric_scrub_all_numeric_inputs_live_cancel_and_one_undo() {
         browser::Browser,
         model_primitives::Primitive,
         selection_outline::render_tests::{capture_when, frame},
-        tests::lighting_ui_render::{fixture, mouse, move_pointer},
+        tests::lighting_ui_render::{fixture, mouse, move_pointer, wait_transform_panel},
         ui::image_viewer::edit::ColorTarget,
         ui::model_viewer::editing::EditAction,
         ui::{ImageEditAction, ImageViewer, ModelEditingState, ModelViewAction},
@@ -124,6 +124,8 @@ fn gpu_numeric_scrub_all_numeric_inputs_live_cancel_and_one_undo() {
     let (mut app, window, target) = fixture();
     app.world_mut().resource_mut::<Editor>().drawer = false;
     send(&mut app, Action::Select(Selection::Camera(0)));
+    send(&mut app, Action::Inspector(crate::editor::ui::InspectorAction::ToggleTransform));
+    wait_transform_panel(&mut app, true);
     let field = {
         let world = app.world_mut();
         world

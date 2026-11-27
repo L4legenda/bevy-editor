@@ -256,9 +256,10 @@ pub(super) fn navigate(
     overlays: (
         Option<Res<ui::LightingUi>>,
         Option<ResMut<ui::navigation_gizmo::State>>,
+        ui::TransformPanelAreas,
     ),
 ) {
-    let (lighting, mut orientation) = overlays;
+    let (lighting, mut orientation, transform_panel) = overlays;
     let Ok((mut camera, mut target, mut pose, mut lens)) = camera.single_mut() else {
         return;
     };
@@ -355,6 +356,7 @@ pub(super) fn navigate(
         && !gizmo_blocked
         && window.cursor_position().is_some_and(|cursor| {
             ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
+                && !ui::transform_panel_covers(&transform_panel, cursor)
                 && !(preview_visible
                     && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor))
         });
@@ -886,6 +888,7 @@ pub(super) fn manipulate(
     asset_drag: Option<Res<ui::AssetDrag>>,
     lighting: Option<Res<ui::LightingUi>>,
     orientation: Option<Res<ui::navigation_gizmo::State>>,
+    transform_panel: ui::TransformPanelAreas,
     bounds: (
         Query<&Children>,
         Query<&GlobalTransform>,
@@ -1102,6 +1105,7 @@ pub(super) fn manipulate(
     }
     if !window.cursor_position().is_some_and(|cursor| {
         ui::scene_input_rect(&window, &drawer, &editor.sidebar).contains(cursor)
+            && !ui::transform_panel_covers(&transform_panel, cursor)
             && !(matches!(editor.selection, Some(Selection::Camera(_)))
                 && ui::camera_preview_rect(&window, &editor.sidebar).contains(cursor))
     }) {

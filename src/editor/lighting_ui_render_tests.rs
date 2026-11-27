@@ -820,7 +820,7 @@ fn gpu_space_toggle_rotates_the_rendered_gizmo_without_moving_the_object() {
 }
 
 #[test]
-#[ignore = "requires GPU; exercises filtering, folding and actual property editing in the 3D inspector"]
+#[ignore = "requires GPU; exercises the scene transform panel and inspector filtering"]
 fn gpu_scene_inspector_filters_and_reverts_properties() {
     use crate::editor::area_selection::Mode;
     use bevy::{input_focus::InputFocus, text::EditableText};
@@ -869,25 +869,43 @@ fn gpu_scene_inspector_filters_and_reverts_properties() {
         warm(app, 4);
     };
     send(&mut app, Action::Select(Selection::Model(mesh)));
+    assert!(!visible_field(&mut app, Field::Position(0)));
+    let viewport = ui::viewport_rect(
+        app.world().get::<Window>(window).unwrap(),
+        &app.world().resource::<Editor>().sidebar,
+    );
+    use bevy::input::keyboard::{Key, KeyboardInput};
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::KeyN,
+            logical_key: Key::Character("n".into()),
+            state,
+            text: None,
+            repeat: false,
+            window,
+        });
+        frame(&mut app);
+    }
+    wait_transform_panel(&mut app, true);
     click(&mut app, "Пространство координат инспектора");
     assert!(app.world().resource::<Editor>().local_space);
     click(&mut app, "Найти свойство");
     let search_rect = labeled_rect(&mut app, "Поиск свойств");
     assert!(visible_field(&mut app, Field::Position(0)));
 
-    click(&mut app, "Трансформация");
-    assert!(!visible_field(&mut app, Field::Position(0)));
     search(&mut app, "МАСШТАБ");
     assert!(visible_field(&mut app, Field::Scale(0)));
-    assert!(!visible_field(&mut app, Field::Position(0)));
+    assert!(visible_field(&mut app, Field::Position(0)));
     assert!(!visible_field(&mut app, Field::Lens));
     click(&mut app, "Очистить поиск свойств");
-    assert!(
-        !visible_field(&mut app, Field::Scale(0)),
-        "Clearing search restores the folded section"
+    click(&mut app, "Панель трансформации · N");
+    wait_transform_panel(&mut app, false);
+    click(&mut app, "Панель трансформации · N");
+    wait_transform_panel(&mut app, true);
+    assert_eq!(
+        ui::viewport_rect(app.world().get::<Window>(window).unwrap(), &app.world().resource::<Editor>().sidebar),
+        viewport
     );
-    click(&mut app, "Трансформация");
-    assert!(visible_field(&mut app, Field::Position(0)));
 
     let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/inspector-qa");
     std::fs::create_dir_all(&output).unwrap();
@@ -997,6 +1015,8 @@ fn gpu_scene_inspector_filters_and_reverts_properties() {
     }
 
     send(&mut app, Action::Select(Selection::Camera(0)));
+    click(&mut app, "Панель трансформации · N");
+    wait_transform_panel(&mut app, false);
     search(&mut app, "fov");
     assert!(visible_field(&mut app, Field::Lens));
     assert!(!visible_field(&mut app, Field::Position(0)));
@@ -1030,6 +1050,19 @@ fn gpu_scene_inspector_filters_and_reverts_properties() {
         &output.join("light-search.png"),
         ui_pixels,
     );
+}
+
+pub(in crate::editor) fn wait_transform_panel(app: &mut App, open: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        frame(app);
+        if app.world().resource::<ui::SceneTransformPanel>().at_rest(open)
+            && visible_field(app, Field::Position(0)) == open
+        {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "Scene transform panel did not finish sliding");
+    }
 }
 
 fn visible_field(app: &mut App, wanted: Field) -> bool {

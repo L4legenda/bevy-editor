@@ -5,6 +5,7 @@ use bevy::ui_widgets::SelectAllOnFocus;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::editor) enum InspectorAction {
+    ToggleTransform,
     Fold(Entity),
     ToggleSearch,
     ClearSearch,
@@ -234,7 +235,6 @@ pub(super) struct Group {
     pub root: Entity,
     pub button: Entity,
     pub title: Entity,
-    pub header: Entity,
     pub body: Entity,
 }
 
@@ -311,7 +311,6 @@ pub(super) fn section(
         root,
         button,
         title,
-        header,
         body,
     }
 }
