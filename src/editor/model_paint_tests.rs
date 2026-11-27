@@ -609,6 +609,9 @@ fn click(app: &mut App, window: Entity, action: impl Fn(Action) -> bool) {
 }
 fn paint_click(app: &mut App, window: Entity, action: PaintAction) {
     paint_ready(app);
+    if matches!(action, PaintAction::Category(_)) {
+        open_paint_library(app);
+    }
     click(
         app,
         window,
@@ -616,7 +619,17 @@ fn paint_click(app: &mut App, window: Entity, action: PaintAction) {
     );
     paint_ready(app);
 }
+fn open_paint_library(app: &mut App) {
+    if app.world().resource::<DrawerMotion>().paint_shelf_height == 0.0
+        && !app.world().resource::<sidebar::State>().shelf_in_sidebar()
+    {
+        app.world_mut().write_message(Action::TogglePaintLibrary);
+        warm(app, 20);
+    }
+}
+
 fn set_shelf_query(app: &mut App, value: &str) {
+    open_paint_library(app);
     let world = app.world_mut();
     let mut inputs = world.query::<(&AccessibleLabel, &mut bevy::text::EditableText)>();
     let (_, mut input) = inputs.iter_mut(world)
@@ -10044,6 +10057,7 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
             })
             .unwrap()
     };
+    open_paint_library(&mut app);
     let shelf = labelled(&mut app, "Рисование: библиотека ресурсов");
     let uv = labelled(&mut app, "Рисование: 2D-вид UV");
     let view = labelled(&mut app, "3D-вид модели");
@@ -10051,7 +10065,8 @@ fn gpu_model_paint_workspace_layout_keeps_model_and_scene_intact() {
         side.width() > 200. && shelf.height() > 150. && uv.width() > 200. && view.width() > 200.
     );
     assert!(view.max.x <= uv.min.x + 2. && uv.max.x <= side.min.x + 2.);
-    assert!(view.max.y <= shelf.min.y + 2. && uv.max.y <= shelf.min.y + 2.);
+    assert!(view.min.y < shelf.min.y && shelf.min.y < view.max.y);
+    assert!(uv.min.y < shelf.min.y && shelf.min.y < uv.max.y);
     let point = view.center();
     let (expected_focus, before_focus) = {
         let world = app.world();

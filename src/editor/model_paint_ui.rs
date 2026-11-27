@@ -287,6 +287,8 @@ fn layer_memory_hint(bytes: u64) -> String {
 
 #[derive(Resource)]
 pub(in crate::editor::ui::model_viewer) struct PaintUi {
+    library_open: bool,
+    library_motion: DrawerMotion,
     graph: graph_canvas::Canvas,
     roots: Vec<Entity>,
     original: Vec<Entity>,
@@ -2153,20 +2155,23 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     commands.entity(uv_seams).insert((UvSeams2d, ZIndex(1)));
     let shelf_home = surface(
         &mut commands,
-        viewer.overlay,
+        interface.root,
         Node {
             display: Display::None,
             position_type: PositionType::Absolute,
-            left: px(44),
+            left: px(0),
             right: px(0),
-            bottom: px(0),
+            bottom: px(FOOT - SHELF_HEIGHT),
             height: px(SHELF_HEIGHT),
+            overflow: Overflow::clip(),
+            padding: UiRect::top(px(drawer::GRIP_HEIGHT)),
             border: UiRect::top(px(1)),
             ..column(0.)
         },
         PANEL,
     );
-    commands.entity(shelf_home).insert(ZIndex(35));
+    commands.entity(shelf_home).insert(ZIndex(11));
+    drawer::library_resize_grip(&mut commands, shelf_home);
     let shelf_root = node(&mut commands, shelf_home, Node {
         width: percent(100), min_width: px(0), min_height: px(0), flex_grow: 1., ..column(0.)
     });
@@ -2577,8 +2582,10 @@ pub(in crate::editor::ui::model_viewer) fn setup(
     let graph = graph_canvas::Canvas::new(&mut commands, viewer.overlay, font);
     shader_maker::setup(&mut commands, viewer.overlay, font, &mut fonts);
     commands.insert_resource(PaintUi {
+        library_open: false,
+        library_motion: DrawerMotion::default(),
         graph,
-        roots: vec![toolbar, views, tool_rail, shelf_home],
+        roots: vec![toolbar, views, tool_rail],
         original,
         hidden: vec![],
         canvas: *canvas,
@@ -2635,6 +2642,70 @@ pub(in crate::editor::ui::model_viewer) fn setup(
         generator_swatches,
         showing: false,
     });
+}
+
+pub(in crate::editor::ui::model_viewer) fn animate_library(
+    mut actions: MessageReader<Action>,
+    mut editor: ResMut<Editor>,
+    editing: Res<editing::State>,
+    paint: Res<PaintState>,
+    mut ui: ResMut<PaintUi>,
+    mut sidebar: ResMut<sidebar::State>,
+    mut drawer: ResMut<DrawerMotion>,
+    size: Res<DrawerSize>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut focus: ResMut<InputFocus>,
+    parents: Query<&ChildOf>,
+    mut nodes: Query<&mut Node>,
+    time: Res<Time>,
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
+) {
+    let showing = editor.viewing_image.is_none()
+        && editor.pending.is_none()
+        && editing.mode(editor.viewing_model) == Mode::Paint;
+    let was_open = ui.library_open;
+    let toggle = actions.read().filter(|action| matches!(action, Action::TogglePaintLibrary)).count() % 2 == 1;
+    if showing && toggle && !editor.browser_popup && !editor.hdri_library_open {
+        if sidebar.shelf_in_sidebar() {
+            sidebar.undock_shelf();
+            ui.library_open = true;
+        } else {
+            ui.library_open = !ui.library_open;
+        }
+        if ui.library_open {
+            editor.drawer = false;
+        }
+    } else if !showing || editor.drawer {
+        ui.library_open = false;
+    }
+    if was_open && !ui.library_open && !sidebar.shelf_in_sidebar()
+        && focus.get().is_some_and(|entity| parents.iter_ancestors(entity).any(|parent| parent == ui.shelf_layout.root))
+    {
+        focus.clear();
+    }
+    let docked = sidebar.shelf_in_sidebar();
+    let default_height = SHELF_HEIGHT + (paint.shelf_size.pixels as f32 - ShelfSize::DEFAULT as f32).max(0.0);
+    let height = size.library_height(window.height(), default_height);
+    let previous = ui.library_motion.visible_height;
+    if showing && !docked {
+        let open = ui.library_open;
+        ui.library_motion.advance(open, time.delta_secs(), height);
+    } else {
+        ui.library_motion = DrawerMotion::default();
+    }
+    if drawer.paint_shelf_height != ui.library_motion.visible_height {
+        drawer.paint_shelf_height = ui.library_motion.visible_height;
+    }
+    let settled = ui.library_open && ui.library_motion.fully_open();
+    if drawer.paint_shelf_settled != settled {
+        drawer.paint_shelf_settled = settled;
+    }
+    if previous != drawer.paint_shelf_height || was_open != ui.library_open {
+        redraw.write(bevy::window::RequestRedraw);
+    }
+    if let Ok(panel) = nodes.get_mut(ui.shelf_layout.home) {
+        ui.library_motion.position_panel(panel, height);
+    }
 }
 
 pub(in crate::editor::ui::model_viewer) fn refresh(
@@ -2753,21 +2824,18 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         }
     }
     let shelf_docked = sidebar.shelf_in_sidebar();
-    let shelf_size = paint.shelf_size.pixels as f32;
-    let shelf_height = SHELF_HEIGHT + (shelf_size - ShelfSize::DEFAULT as f32).max(0.);
-    if let Ok(mut home) = nodes.get_mut(ui.shelf_layout.home) {
-        let height = px(shelf_height);
-        if home.height != height {
-            home.height = height;
-        }
+    if showing && ui.library_open && !shelf_docked {
+        commands.entity(interface.paint_library).try_insert(BackgroundColor(ACTIVE));
     }
+    let shelf_size = paint.shelf_size.pixels as f32;
+    let shelf_visible = if shelf_docked { sidebar.shelf_tab_visible() } else { ui.library_motion.visible_height > 0.0 };
     if ui.shelf_layout.docked != shelf_docked {
         ui.shelf_stamp = None;
     }
     let (menu, types, cards) = (ui.shelf_type_menu, ui.shelf_types, ui.shelf);
     ui.shelf_layout.arrange(shelf_docked, menu, types, cards, &mut nodes);
     if let Ok(mut root) = nodes.get_mut(ui.shelf_layout.root) {
-        let display = if showing && (!shelf_docked || sidebar.shelf_tab_visible()) {
+        let display = if showing && shelf_visible {
             Display::Flex
         } else {
             Display::None
@@ -2778,8 +2846,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
     }
     for &entity in &ui.roots {
         if let Ok(mut node) = nodes.get_mut(entity) {
-            let display = if showing && (entity != ui.shelf_layout.home || !shelf_docked)
-            {
+            let display = if showing {
                 Display::Flex
             } else {
                 Display::None
@@ -2800,7 +2867,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
             UiRect {
                 left: px(44),
                 top: px(TOOLBAR_BOTTOM + if show_path_options { PATH_TOOLBAR_HEIGHT } else { 0. }),
-                bottom: px(if shelf_docked { 0. } else { shelf_height }),
+                bottom: px(0.),
                 right: px(0),
             }
         } else {
@@ -4957,7 +5024,7 @@ pub(in crate::editor::ui::model_viewer) fn refresh(
         ui.shelf_stamp = Some(shelf_stamp);
     }
     ui.online_previews.update(matches!(session.category, Category::Online | Category::Downloaded)
-        && (!shelf_docked || sidebar.shelf_tab_visible())
+        && shelf_visible
         && !editor.browser_popup && !editor.hdri_library_open, &mut images);
     if session.category == Category::Smart && ui.shelf_preview_job.is_none() {
         let user = paint.library.entries().rev().find(|(i, entry)| {

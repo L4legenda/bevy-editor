@@ -161,6 +161,7 @@ enum Action {
     ToggleSceneTree,
     Snap,
     Drawer,
+    TogglePaintLibrary,
     Browse(usize),
     BrowseBack,
     BrowseForward,
@@ -415,6 +416,7 @@ impl Editor {
                 | Action::ToggleSceneTree
                 | Action::Inspector(_)
                 | Action::Drawer
+                | Action::TogglePaintLibrary
                 | Action::OpenBrowser
                 | Action::Browse(_)
                 | Action::BrowseBack

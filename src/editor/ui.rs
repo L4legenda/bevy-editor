@@ -181,6 +181,7 @@ pub(super) struct HorizontalScroller;
 pub(super) struct Interface {
     font: Handle<Font>,
     root: Entity,
+    paint_library: Entity,
     tabs: Entity,
     toolbar: Entity,
     tool_bar: Entity,
@@ -781,6 +782,16 @@ pub(super) fn setup(
     commands.entity(footer).insert(ZIndex(20));
     drawer::footer_toggle(&mut commands, footer, &font);
     generation::footer(&mut commands, footer, &font);
+    let paint_library = control(&mut commands, footer, Action::TogglePaintLibrary, Look::Regular, Node {
+        display: Display::None,
+        height: percent(100),
+        padding: UiRect::horizontal(px(10)),
+        flex_shrink: 0.0,
+        ..row(8.0)
+    });
+    commands.entity(paint_library).insert(AccessibleLabel("Библиотека".into()));
+    icons::themed(&mut commands, paint_library, icons::Glyph::Layers, 16.0);
+    text(&mut commands, paint_library, &font, "Библиотека", 13.0, TEXT);
     node(
         &mut commands,
         footer,
@@ -798,6 +809,7 @@ pub(super) fn setup(
     commands.insert_resource(Interface {
         font,
         root,
+        paint_library,
         tabs,
         toolbar,
         tool_bar,
@@ -2298,6 +2310,7 @@ pub(super) fn refresh(
                     .is_some()
             }),
             Action::BrowseClear => !browser.search.is_empty(),
+            Action::TogglePaintLibrary => painting && editor.viewing_image.is_none(),
             Action::Pilot | Action::Align => camera,
             Action::Play => play_ui::visible(&editor),
             Action::Delete => editor.deletable_targets(),

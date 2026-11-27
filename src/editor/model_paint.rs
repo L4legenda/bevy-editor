@@ -95,7 +95,7 @@ mod ui;
 pub(super) mod uv_seams;
 #[path = "model_paint_sets.rs"]
 pub(super) mod sets;
-pub(super) use ui::{ShaderMaker, decorate_shader_code, refresh, refresh_graph, refresh_shader_maker, setup};
+pub(super) use ui::{ShaderMaker, animate_library, decorate_shader_code, refresh, refresh_graph, refresh_shader_maker, setup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "mcp", derive(serde::Serialize), serde(rename_all = "snake_case"))]

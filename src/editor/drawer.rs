@@ -6,6 +6,7 @@ use crate::editor::{browser::Entry, image_previews::ImagePreviews, thumbnails::T
 #[path = "drawer_resize.rs"]
 mod resize;
 pub(crate) use resize::{DrawerSize, resize as resize_drawer};
+pub(super) use resize::GRIP_HEIGHT;
 
 #[path = "asset_drag.rs"]
 mod drag;
@@ -26,6 +27,8 @@ const CARD_HEIGHT: f32 = PREVIEW_HEIGHT + CAPTION_HEIGHT + CARD_BORDER * 2.0;
 pub(crate) struct DrawerMotion {
     progress: f32,
     pub visible_height: f32,
+    pub(super) paint_shelf_height: f32,
+    pub(super) paint_shelf_settled: bool,
     pub resizing: bool,
 }
 
@@ -34,24 +37,47 @@ impl DrawerMotion {
         rect.max.y = rect
             .max
             .y
-            .min(window_height - FOOT - self.visible_height)
+            .min(window_height - FOOT - self.visible_height.max(self.paint_shelf_height))
             .max(rect.min.y);
         rect
     }
 
     pub(crate) fn covers(&self, point: Vec2, window: &Window) -> bool {
-        self.visible_height > 0.0
+        Self::panel_covers(point, window, self.visible_height.max(self.paint_shelf_height))
+    }
+
+    pub(super) fn covers_files(&self, point: Vec2, window: &Window) -> bool {
+        Self::panel_covers(point, window, self.visible_height)
+    }
+
+    fn panel_covers(point: Vec2, window: &Window, height: f32) -> bool {
+        height > 0.0
             && point.x >= 0.0
             && point.x < window.width()
-            && point.y >= window.height() - FOOT - self.visible_height
+            && point.y >= window.height() - FOOT - height
             && point.y < window.height() - FOOT
     }
 
-    fn advance(&mut self, open: bool, delta: f32, height: f32) {
+    pub(super) fn advance(&mut self, open: bool, delta: f32, height: f32) {
         let direction = if open { 1.0 } else { -1.0 };
         self.progress = (self.progress + direction * delta / DURATION).clamp(0.0, 1.0);
         let eased = self.progress * self.progress * (3.0 - 2.0 * self.progress);
         self.visible_height = height * eased;
+    }
+
+    pub(super) fn fully_open(&self) -> bool {
+        self.progress >= 1.0
+    }
+
+    pub(super) fn position_panel(&self, mut panel: Mut<Node>, height: f32) {
+        let layout = (
+            px(height),
+            px(FOOT - height + self.visible_height),
+            if self.progress > 0.0 { Display::Flex } else { Display::None },
+        );
+        if (panel.height, panel.bottom, panel.display) != layout {
+            (panel.height, panel.bottom, panel.display) = layout;
+        }
     }
 }
 
@@ -140,6 +166,48 @@ pub(super) fn footer_toggle(commands: &mut Commands, parent: Entity, font: &Hand
     text(commands, toggle, font, "Ctrl+Space", 10.0, MUTED);
 }
 
+pub(super) fn library_resize_grip(commands: &mut Commands, panel: Entity) {
+    let grip = resize_grip(commands, panel, "Изменить высоту библиотеки");
+    commands.entity(grip).insert(resize::LibraryResizeGrip);
+}
+
+fn resize_grip(commands: &mut Commands, panel: Entity, label: &str) -> Entity {
+    let grip = surface(
+        commands,
+        panel,
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(0),
+            left: px(0),
+            right: px(0),
+            height: px(resize::GRIP_HEIGHT),
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            ..default()
+        },
+        Color::NONE,
+    );
+    commands.entity(grip).insert((
+        resize::ResizeGrip,
+        ZIndex(5),
+        AccessibleLabel(label.into()),
+    ));
+    let mark = surface(
+        commands,
+        grip,
+        Node {
+            width: px(38),
+            height: px(2),
+            border_radius: BorderRadius::MAX,
+            ..default()
+        },
+        EDGE,
+    );
+    commands.entity(mark).insert(Pickable::IGNORE);
+
+    grip
+}
+
 pub(super) fn setup(
     commands: &mut Commands,
     root: Entity,
@@ -175,38 +243,7 @@ pub(super) fn setup(
             ColorStop::auto(EDGE),
         ])));
 
-    let grip = surface(
-        commands,
-        panel,
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(0),
-            left: px(0),
-            right: px(0),
-            height: px(resize::GRIP_HEIGHT),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        Color::NONE,
-    );
-    commands.entity(grip).insert((
-        resize::ResizeGrip,
-        ZIndex(5),
-        AccessibleLabel("Изменить высоту файлового менеджера".into()),
-    ));
-    let mark = surface(
-        commands,
-        grip,
-        Node {
-            width: px(38),
-            height: px(2),
-            border_radius: BorderRadius::MAX,
-            ..default()
-        },
-        EDGE,
-    );
-    commands.entity(mark).insert(Pickable::IGNORE);
+    resize_grip(commands, panel, "Изменить высоту файлового менеджера");
 
     let toolbar = surface(
         commands,
@@ -480,22 +517,8 @@ pub(crate) fn animate(
 ) {
     let height = size.height(window.height());
     motion.advance(editor.drawer, time.delta_secs(), height);
-    if let Ok(mut panel) = nodes.get_mut(interface.panel) {
-        let display = if motion.progress > 0.0 {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        let bottom = px(FOOT - height + motion.visible_height);
-        if panel.height != px(height) {
-            panel.height = px(height);
-        }
-        if panel.bottom != bottom {
-            panel.bottom = bottom;
-        }
-        if panel.display != display {
-            panel.display = display;
-        }
+    if let Ok(panel) = nodes.get_mut(interface.panel) {
+        motion.position_panel(panel, height);
     }
 }
 

@@ -811,12 +811,21 @@ mod tests {
             )
         };
         let old_height = rect(&app, canvas).height();
+        assert_eq!(app.world().get::<Node>(home).unwrap().display, Display::None);
+        let toggle = app.world().resource::<Interface>().paint_library;
+        let point = rect(&app, toggle).center();
+        move_pointer(&mut app, window, point);
+        mouse(&mut app, window, ButtonState::Pressed);
+        mouse(&mut app, window, ButtonState::Released);
+        assert!(app.world().resource::<DrawerMotion>().paint_shelf_height < 219.0);
+        for _ in 0..20 { frame(&mut app); }
+        assert_eq!(app.world().get::<Node>(home).unwrap().bottom, px(FOOT));
         let card = find_control(&mut app, PaintAction::Preset(0));
         let default_width = rect(&app, card).width();
         resize(&mut app, true);
         let large_card = find_control(&mut app, PaintAction::Preset(0));
         assert!((rect(&app, large_card).width() - default_width - 16.).abs() < 1.);
-        assert!(rect(&app, canvas).height() < old_height - 15.);
+        assert!((rect(&app, canvas).height() - old_height).abs() < 1.);
         assert_eq!(ShelfSize::open(Some(size_file)).pixels, ShelfSize::DEFAULT + 16);
         let from = rect(&app, handle).center();
         let to = rect(&app, properties).center();
@@ -827,7 +836,7 @@ mod tests {
             app.world().get::<Node>(home).unwrap().display,
             Display::None
         );
-        assert!(rect(&app, canvas).height() > old_height + 170.);
+        assert!((rect(&app, canvas).height() - old_height).abs() < 1.);
         assert!(rect(&app, shelf).width() < 400.);
         assert_eq!(
             app.world()
@@ -871,6 +880,11 @@ mod tests {
                 .value(),
             "Gold"
         );
+        move_pointer(&mut app, window, point);
+        mouse(&mut app, window, ButtonState::Pressed);
+        mouse(&mut app, window, ButtonState::Released);
+        for _ in 0..20 { frame(&mut app); }
+        assert_eq!(app.world().get::<Node>(home).unwrap().display, Display::None);
     }
 
     #[test]
@@ -1281,6 +1295,10 @@ impl State {
 
     pub(super) fn shelf_in_sidebar(&self) -> bool {
         self.layout.contains(Tab::Shelf)
+    }
+
+    pub(super) fn undock_shelf(&mut self) {
+        self.layout = self.layout.clone().without(Tab::Shelf).unwrap_or_default();
     }
 
     pub(super) fn shelf_tab_visible(&self) -> bool {
@@ -1758,13 +1776,22 @@ pub(in crate::editor::ui::model_viewer) fn update(
     let cursor =
         (active.is_some() && window.focused && !editor.browser_popup && !editor.hdri_library_open)
             .then(|| window.cursor_position())
-            .flatten()
-            .filter(|&cursor| !drawer.covers(cursor, &window));
+            .flatten();
+    let dock_cursor = cursor.filter(|&point| !drawer.covers(point, &window));
+    let shelf_cursor = cursor.filter(|&point| {
+        !drawer.covers_files(point, &window)
+            && (matches!(state.drag, Some(Drag::Tab { tab: Tab::Shelf, .. }))
+                || state.shelf.as_ref().is_some_and(|shelf| {
+                    geometry.get(shelf.handle).ok()
+                        .and_then(|(node, transform)| engine::node_rect(node, transform))
+                        .is_some_and(|rect| rect.contains(point))
+                }))
+    });
     update_dock(
         &mut commands,
         &mut state,
         &interface.font,
-        cursor,
+        dock_cursor.or(shelf_cursor),
         &mouse,
         &geometry,
         &mut nodes,
@@ -1772,7 +1799,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         persist,
         reset,
     );
-    let shader_cursor = cursor.filter(|_| focus.is_some_and(|(_, panel)| panel == Panel::Shader));
+    let shader_cursor = dock_cursor.filter(|_| focus.is_some_and(|(_, panel)| panel == Panel::Shader));
     update_dock(
         &mut commands,
         &mut shader_dock.0,
@@ -1785,7 +1812,7 @@ pub(in crate::editor::ui::model_viewer) fn update(
         false,
         false,
     );
-    let graph_cursor = cursor.filter(|_| {
+    let graph_cursor = dock_cursor.filter(|_| {
         active
             .and_then(|model| paint.sessions.get(&model))
             .is_some_and(Session::graph_canvas_open)
@@ -1901,7 +1928,7 @@ fn update_dock(
                     .flatten();
                 if let Some(target) = home_target {
                     if mouse.just_released(MouseButton::Left) {
-                        state.layout = state.layout.clone().without(Tab::Shelf).unwrap_or_default();
+                        state.undock_shelf();
                         persist = true;
                     } else {
                         home_zone = Some(target);

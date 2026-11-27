@@ -10,6 +10,8 @@ pub(crate) struct DrawerSize {
     pub preferred_height: Option<f32>,
     pub dragging: bool,
     pub hover: bool,
+    library_height: Option<f32>,
+    resizing_library: bool,
     grab_offset: f32,
     cursor_owned: bool,
     previous_cursor: Option<CursorIcon>,
@@ -38,10 +40,20 @@ impl DrawerSize {
         self.preferred_height =
             Some((window_height - FOOT - pointer_y + self.grab_offset).clamp(min, max));
     }
+
+    pub(in crate::editor) fn library_height(&self, window_height: f32, default_height: f32) -> f32 {
+        let (_, max) = Self::bounds(window_height);
+        self.library_height
+            .unwrap_or(default_height)
+            .clamp(150.0_f32.min(max), max)
+    }
 }
 
 #[derive(Component)]
 pub(crate) struct ResizeGrip;
+
+#[derive(Component)]
+pub(in crate::editor) struct LibraryResizeGrip;
 
 pub(crate) fn resize(
     mut commands: Commands,
@@ -52,31 +64,29 @@ pub(crate) fn resize(
     mut size: ResMut<DrawerSize>,
     mut motion: ResMut<DrawerMotion>,
     mut focus: Option<ResMut<InputFocus>>,
-    mut grips: Query<&mut BackgroundColor, With<ResizeGrip>>,
+    mut grips: Query<(&mut BackgroundColor, Has<LibraryResizeGrip>), With<ResizeGrip>>,
 ) {
     let (window_entity, window, cursor_icon) = *window;
     let cursor = window.cursor_position();
-    let top = window.height() - FOOT - motion.visible_height;
+    let library = !editor.drawer && motion.paint_shelf_settled;
+    let height = if library {
+        motion.paint_shelf_height
+    } else {
+        motion.visible_height
+    };
+    let top = window.height() - FOOT - height;
     let color_picker = viewer
         .as_ref()
         .is_some_and(|viewer| viewer.edit.color_picker.is_some());
-    let settled = editor.pending.is_none()
+    let available = editor.pending.is_none()
         && !color_picker
         && !editor.hdri_library_open
         && !editor.browser_popup
-        && editor.drawer
-        && motion.progress >= 1.0
         && window.focused
         && !editor.sidebar.resizing();
+    let settled = available && (library || (editor.drawer && motion.progress >= 1.0));
 
-    if editor.pending.is_some()
-        || color_picker
-        || editor.hdri_library_open
-        || editor.browser_popup
-        || !editor.drawer
-        || !window.focused
-        || !mouse.pressed(MouseButton::Left)
-    {
+    if !settled || size.resizing_library != library || !mouse.pressed(MouseButton::Left) {
         size.dragging = false;
     }
     size.hover = settled
@@ -89,6 +99,7 @@ pub(crate) fn resize(
 
     if size.hover && mouse.just_pressed(MouseButton::Left) {
         size.dragging = true;
+        size.resizing_library = library;
         if let Some(cursor) = cursor {
             size.grab_offset = cursor.y - top;
         }
@@ -99,7 +110,13 @@ pub(crate) fn resize(
     if size.dragging
         && let Some(cursor) = cursor
     {
-        size.drag_to(cursor.y, window.height());
+        if library {
+            let requested = window.height() - FOOT - cursor.y + size.grab_offset;
+            let (_, max) = DrawerSize::bounds(window.height());
+            size.library_height = Some(requested.clamp(150.0_f32.min(max), max));
+        } else {
+            size.drag_to(cursor.y, window.height());
+        }
     }
     if motion.resizing != size.dragging {
         motion.resizing = size.dragging;
@@ -113,8 +130,12 @@ pub(crate) fn resize(
     } else {
         Color::NONE
     };
-    for mut background in &mut grips {
-        background.set_if_neq(BackgroundColor(color));
+    for (mut background, is_library) in &mut grips {
+        background.set_if_neq(BackgroundColor(if is_library == library {
+            color
+        } else {
+            Color::NONE
+        }));
     }
 
     if active {
@@ -179,17 +200,35 @@ mod tests {
 
     #[test]
     fn resize_system_captures_drags_and_releases_the_mouse() {
+        for library in [false, true] {
+            check_resize_drag(library);
+        }
+    }
+
+    fn check_resize_drag(library: bool) {
         let project = crate::project::EditorProject::load(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/legacy/project.json"),
         )
         .unwrap();
         let mut editor = Editor::new(project, crate::data::LevelEdits::default());
-        editor.drawer = true;
+        editor.drawer = !library;
         let size = DrawerSize::default();
-        let initial_height = size.height(760.0);
+        let panel_height = |size: &DrawerSize| {
+            if library {
+                size.library_height(760.0, 219.0)
+            } else {
+                size.height(760.0)
+            }
+        };
+        let initial_height = panel_height(&size);
         let mut motion = DrawerMotion::default();
-        motion.advance(true, DURATION, initial_height);
+        if library {
+            motion.paint_shelf_settled = true;
+            motion.paint_shelf_height = initial_height;
+        } else {
+            motion.advance(true, DURATION, initial_height);
+        }
         let grip_cursor = Vec2::new(400.0, 760.0 - FOOT - initial_height + 3.0);
         let mut window = Window {
             resolution: (1280, 760).into(),
@@ -217,6 +256,9 @@ mod tests {
             .world_mut()
             .spawn((ResizeGrip, BackgroundColor(Color::NONE)))
             .id();
+        if library {
+            app.world_mut().entity_mut(grip).insert(LibraryResizeGrip);
+        }
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .press(MouseButton::Left);
@@ -240,7 +282,16 @@ mod tests {
         app.update();
         assert!(app.world().resource::<DrawerSize>().dragging);
         assert!(
-            (app.world().resource::<DrawerSize>().height(760.0) - initial_height - 100.0).abs()
+            (panel_height(app.world().resource::<DrawerSize>()) - initial_height - 100.0).abs()
+                < 0.001
+        );
+        app.world_mut()
+            .get_mut::<Window>(window_entity)
+            .unwrap()
+            .set_cursor_position(Some(grip_cursor + Vec2::Y * 50.0));
+        app.update();
+        assert!(
+            (panel_height(app.world().resource::<DrawerSize>()) - initial_height + 50.0).abs()
                 < 0.001
         );
 

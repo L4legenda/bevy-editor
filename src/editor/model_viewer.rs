@@ -185,6 +185,12 @@ impl Plugin for ModelViewerPlugin {
             .add_systems(Update, paint::decorate_shader_code.after(paint::refresh_shader_maker))
             .add_systems(Last, editing::update_recovery)
             .add_systems(Update, paint::sidebar::update.after(paint::actions).before(paint::refresh))
+            .add_systems(Update, paint::animate_library
+                .after(super::resize_drawer)
+                .after(crate::editor::handle_actions)
+                .after(paint::sidebar::update)
+                .before(paint::refresh)
+                .before(paint::engine::input))
             .add_systems(
                 Update,
                 (
