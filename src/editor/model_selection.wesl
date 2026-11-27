@@ -3,13 +3,15 @@ import bevy_pbr::render::mesh_view_bindings::view;
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: vec4<f32>;
 
-fn overlay_depth(clip: vec4<f32>, perspective_bias: f32, pixels: f32) -> f32 {
+fn overlay_depth(clip: vec4<f32>) -> f32 {
+    // Treat the line as a thin layer on the surface. A fixed percentage of
+    // depth can lift several screen pixels of an occluded edge above a face.
+    let pixel_bias = 1.5 * params.x
+        / (abs(view.clip_from_view[1].y) * max(view.viewport.w, 1.0));
     if view.clip_from_view[3].w > 0.5 {
-        let world_pixel = 2.0 * params.x
-            / (abs(view.clip_from_view[1].y) * max(view.viewport.w, 1.0));
-        return min(clip.z + world_pixel * abs(view.clip_from_view[2].z) * pixels, clip.w);
+        return min(clip.z + pixel_bias * abs(view.clip_from_view[2].z), clip.w);
     }
-    return min(clip.z * perspective_bias, clip.w);
+    return min(clip.z / max(1.0 - pixel_bias, 0.5), clip.w);
 }
 
 @vertex
@@ -33,7 +35,7 @@ fn vertex(input: Vertex) -> VertexOutput {
             offset = vec2<f32>(-unit.y, unit.x) * v.uv.x * 2.0;
         }
         clip = vec4<f32>(clip.xy + offset * params.x * 2.0 / viewport * clip.w,
-            overlay_depth(clip, 1.012, 2.0), clip.w);
+            overlay_depth(clip), clip.w);
     }
     out.position = clip;
     return out;

@@ -1872,7 +1872,6 @@ fn gpu_model_selection_feedback_identifies_faces_edges_and_vertices() {
 #[test]
 #[ignore = "requires GPU; verifies continuous model edges at shallow slopes and different zoom levels"]
 fn gpu_model_wire_edges_remain_continuous_after_antialiasing() {
-    use bevy::gizmos::config::GizmoConfigStore;
     let project = EditorProject::load(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
     )
@@ -1913,78 +1912,125 @@ fn gpu_model_wire_edges_remain_continuous_after_antialiasing() {
             world(object.geometry.positions[edge.1]),
         )
     };
-    let width = app
-        .world()
-        .resource::<GizmoConfigStore>()
-        .config::<input::ModelGizmos>()
-        .0
-        .line
-        .width;
-    for (label, line_width) in [("thin-control", 1.25), ("solid", width)] {
-        app.world_mut()
-            .resource_mut::<GizmoConfigStore>()
-            .config_mut::<input::ModelGizmos>()
-            .0
-            .line
-            .width = line_width;
-        for (case, distance, yaw, pitch, ortho) in [
-            ("close", 1.7, 0.009, 0.4, false),
-            ("medium", 2.6, 0.009, 0.4, false),
-            ("distant", 5.0, 0.035, 0.4, false),
-            ("diagonal", 2.6, 0.48, 0.45, false),
-            ("ortho", 2.6, 0.009, 0.4, true),
-        ] {
-            {
-                let mut viewer = app.world_mut().resource_mut::<Viewer>();
-                viewer.center = Vec3::splat(0.5);
-                viewer.distance = distance;
-                viewer.yaw = yaw;
-                viewer.pitch = pitch;
-                viewer.orthographic = ortho;
+    for (case, distance, yaw, pitch, ortho) in [
+        ("close", 1.7, 0.009, 0.4, false),
+        ("medium", 2.6, 0.009, 0.4, false),
+        ("distant", 5.0, 0.035, 0.4, false),
+        ("diagonal", 2.6, 0.48, 0.45, false),
+        ("ortho", 2.6, 0.009, 0.4, true),
+    ] {
+        {
+            let mut viewer = app.world_mut().resource_mut::<Viewer>();
+            viewer.center = Vec3::splat(0.5);
+            viewer.distance = distance;
+            viewer.yaw = yaw;
+            viewer.pitch = pitch;
+            viewer.orthographic = ortho;
+        }
+        warm(&mut app, 6);
+        let image = capture_when(
+            &mut app,
+            &target,
+            &output.join(format!("solid-{case}.png")),
+            |_| true,
+        );
+        let rect = canvas_rect(&mut app);
+        let viewer = app.world().resource::<Viewer>();
+        let pa = input::project(viewer, rect, a).unwrap();
+        let pb = input::project(viewer, rect, b).unwrap();
+        let length = pa.distance(pb).ceil() as usize;
+        let normal = (pb - pa).normalize().perp();
+        let mut present = 0;
+        let mut gap = 0;
+        let mut longest_gap = 0;
+        let samples = length * 8 / 10;
+        for i in 0..samples {
+            let p = pa.lerp(pb, 0.1 + i as f32 / length as f32);
+            let dark = [-1.0, 0.0, 1.0].into_iter().any(|offset| {
+                let p = p + normal * offset;
+                let pixel = image.get_pixel(p.x.round() as u32, p.y.round() as u32).0;
+                pixel[0] < 145 && pixel[1] < 145 && pixel[2] < 145
+            });
+            if dark {
+                present += 1;
+                gap = 0;
+            } else {
+                gap += 1;
+                longest_gap = longest_gap.max(gap);
             }
-            warm(&mut app, 6);
-            let image = capture_when(
-                &mut app,
-                &target,
-                &output.join(format!("{label}-{case}.png")),
-                |_| true,
-            );
-            let rect = canvas_rect(&mut app);
-            let viewer = app.world().resource::<Viewer>();
-            let pa = input::project(viewer, rect, a).unwrap();
-            let pb = input::project(viewer, rect, b).unwrap();
-            let length = pa.distance(pb).ceil() as usize;
-            let normal = (pb - pa).normalize().perp();
-            let mut present = 0;
-            let mut gap = 0;
-            let mut longest_gap = 0;
-            let samples = length * 8 / 10;
-            for i in 0..samples {
-                let p = pa.lerp(pb, 0.1 + i as f32 / length as f32);
-                let dark = [-1.0, 0.0, 1.0].into_iter().any(|offset| {
-                    let p = p + normal * offset;
-                    let pixel = image.get_pixel(p.x.round() as u32, p.y.round() as u32).0;
-                    pixel[0] < 145 && pixel[1] < 145 && pixel[2] < 145
-                });
-                if dark {
-                    present += 1;
-                    gap = 0;
-                } else {
-                    gap += 1;
-                    longest_gap = longest_gap.max(gap);
-                }
-            }
-            eprintln!(
-                "{label}-{case}: dark coverage {present}/{samples}, longest gap {longest_gap}"
-            );
-            if label == "solid" {
+        }
+        eprintln!(
+            "{case}: dark coverage {present}/{samples}, longest gap {longest_gap}"
+        );
+        assert!(
+            present * 100 >= samples * 97,
+            "Visible edges must have continuous dark coverage: {case}"
+        );
+        assert!(
+            longest_gap <= 2,
+            "Visible edges must not have dashed gaps: {case}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires GPU; checks hidden wire segments near a surface"]
+fn gpu_model_wire_edges_do_not_leak_through_a_face() {
+    let project = EditorProject::load(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy/project.json"),
+    ).unwrap();
+    let (mut app, _, target) = fixture_project(project);
+    app.world_mut().resource_mut::<Editor>().drawer = false;
+    app.world_mut().write_message(Action::ViewModel(0));
+    model_ready(&mut app, 0);
+    send(&mut app, EditAction::Mode(Mode::Edit));
+    send(&mut app, EditAction::Element(Element::Edge));
+    send(&mut app, EditAction::Deselect);
+    let (center, a, b) = {
+        let mut state = app.world_mut().resource_mut::<State>();
+        let doc = state.documents.get_mut(&0).unwrap();
+        let object = doc.active_mut().unwrap();
+        let mesh = &mut object.geometry;
+        let face = mesh.faces.iter().find(|face| mesh.normal(face).z > 0.99).unwrap();
+        let center = face.corners.iter().map(|c| mesh.positions[c.vertex]).sum::<Vec3>()
+            / face.corners.len() as f32;
+        let a = center;
+        let b = center + Vec3::new(0.25, 0.0, -0.05);
+        let index = mesh.positions.len();
+        mesh.positions.extend([a, b]);
+        mesh.loose_edges.insert(Edge::new(index, index + 1));
+        let world = [center, a, b].map(|point| object.transform.transform_point(point));
+        doc.revision += 1;
+        (world[0], world[1], world[2])
+    };
+    let output = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/model-wire-qa");
+    std::fs::create_dir_all(&output).unwrap();
+    for ortho in [false, true] {
+        {
+            let mut viewer = app.world_mut().resource_mut::<Viewer>();
+            viewer.center = center;
+            viewer.distance = 3.6;
+            viewer.yaw = 0.;
+            viewer.pitch = 0.;
+            viewer.orthographic = ortho;
+        }
+        warm(&mut app, 8);
+        let image = capture_when(
+            &mut app, &target, &output.join(format!("hidden-{ortho}.png")), |_| true,
+        );
+        let rect = canvas_rect(&mut app);
+        let viewer = app.world().resource::<Viewer>();
+        let pa = input::project(viewer, rect, a).unwrap();
+        let pb = input::project(viewer, rect, b).unwrap();
+        let direction = (pb - pa).normalize();
+        let normal = direction.perp();
+        for i in 6..pa.distance(pb).floor() as usize {
+            for offset in [-1.0, 0.0, 1.0] {
+                let p = pa + direction * i as f32 + normal * offset;
+                let pixel = image.get_pixel(p.x.round() as u32, p.y.round() as u32).0;
                 assert!(
-                    present * 100 >= samples * 97,
-                    "Visible edges must have continuous dark coverage: {case}"
-                );
-                assert!(
-                    longest_gap <= 2,
-                    "Visible edges must not have dashed gaps: {case}"
+                    pixel[0] >= 145,
+                    "Hidden wire leaked {i} pixels into the face (orthographic: {ortho}): {pixel:?}"
                 );
             }
         }

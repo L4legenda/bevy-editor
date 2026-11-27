@@ -90,7 +90,7 @@ impl Material for FaceMaterial {
 const ORANGE: Vec3 = Vec3::new(1.0, 0.25, 0.018);
 const ACTIVE: Vec3 = Vec3::ONE;
 const CAGE: Vec3 = Vec3::new(0.012, 0.016, 0.022);
-const XRAY_EDGE: Vec3 = Vec3::new(0.015, 0.022, 0.033);
+const WIRE_EDGE: Vec3 = Vec3::new(0.015, 0.022, 0.033);
 const UV_SEAM: Vec3 = Vec3::new(1.0, 0.040, 0.013);
 
 pub(super) fn highlighted(selection: &MeshSelection, edge: Edge, faces: &[usize]) -> bool {
@@ -236,32 +236,31 @@ fn geometry(doc: &Document, state: &State, transforming: bool) -> FeedbackMesh {
     let active = doc
         .active()
         .filter(|object| doc.mode == Mode::Edit && !object.hidden);
-    if state.xray {
-        // Put cage and selection in the same depth-independent mesh. In particular
-        // a cage edge must never compete with its highlighted copy in a gizmo pass.
-        for object in doc.objects.iter().filter(|object| !object.hidden) {
-            let Some(rendered) = state.render_objects.get(&object.id) else {
+    // Use the same depth rule for the cage and its highlighted components.
+    for object in doc.objects.iter().filter(|object| {
+        !object.hidden && (state.xray || active.is_some_and(|active| active.id == object.id))
+    }) {
+        let Some(rendered) = state.render_objects.get(&object.id) else {
+            continue;
+        };
+        let mesh = &object.geometry;
+        let editing = active.is_some_and(|active| active.id == object.id);
+        let world = |vertex| object.transform.transform_point(mesh.positions[vertex]);
+        for (&edge, faces) in rendered.edges.iter() {
+            if editing && highlighted(&doc.selection, edge, faces) {
                 continue;
-            };
-            let mesh = &object.geometry;
-            let editing = active.is_some_and(|active| active.id == object.id);
-            let world = |vertex| object.transform.transform_point(mesh.positions[vertex]);
-            for (&edge, faces) in rendered.edges.iter() {
-                if editing && highlighted(&doc.selection, edge, faces) {
-                    continue;
-                }
-                let color = if editing && mesh.uv_seams.contains(&edge) {
-                    UV_SEAM
-                } else {
-                    XRAY_EDGE
-                };
-                result.edge(world(edge.0), world(edge.1), [color; 2]);
             }
-            if editing && doc.selection.kind == Element::Vertex {
-                for vertex in 0..mesh.positions.len() {
-                    if !doc.selection.vertices.contains(&vertex) {
-                        result.dot(world(vertex), CAGE);
-                    }
+            let color = if editing && mesh.uv_seams.contains(&edge) {
+                UV_SEAM
+            } else {
+                WIRE_EDGE
+            };
+            result.edge(world(edge.0), world(edge.1), [color; 2]);
+        }
+        if editing && doc.selection.kind == Element::Vertex {
+            for vertex in 0..mesh.positions.len() {
+                if !doc.selection.vertices.contains(&vertex) {
+                    result.dot(world(vertex), CAGE);
                 }
             }
         }

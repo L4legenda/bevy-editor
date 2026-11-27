@@ -1193,22 +1193,7 @@ pub(in crate::editor) fn draw(
             }
         }};
     }
-    macro_rules! dot {
-        ($p:expr) => {{
-            let p: Vec3 = $p;
-            let scale = view_height(
-                &viewer,
-                (p - pose.translation).dot(*pose.forward()).max(0.000001),
-            ) / rect.height();
-            let right = *pose.right() * scale * 1.5;
-            for y in [-1.0, 0.0, 1.0] {
-                let center = p + *pose.up() * scale * y;
-                line!(center - right, center + right, selection::BORDER);
-            }
-        }};
-    }
     let orange = selection::SELECTED;
-    let gray = Color::srgb(0.13, 0.16, 0.20);
     let step = world_per_pixel(&viewer, rect);
     if let Some(gesture) = state.gesture.as_ref().filter(|gesture| {
         Some(gesture.model) == editor.viewing_model && gesture.transform_tool().is_some()
@@ -1226,68 +1211,10 @@ pub(in crate::editor) fn draw(
         if object.hidden {
             continue;
         }
-        let Some(rendered) = state.render_objects.get(&object.id) else {
+        if !state.render_objects.contains_key(&object.id) {
             continue;
-        };
-        if !state.xray && doc.mode == Mode::Edit && doc.active == Some(object.id) {
-            let mesh = &object.geometry;
-            let chosen = doc.selection.selected_vertices(mesh);
-            let back_facing = rendered
-                .edges
-                .values()
-                .all(|faces| faces.len() == 2)
-                .then(|| {
-                    let inverse = object.transform.to_matrix().inverse();
-                    let eye = inverse.transform_point3(pose.translation);
-                    let toward_eye = inverse.transform_vector3(-*pose.forward());
-                    mesh.faces
-                        .iter()
-                        .map(|face| {
-                            let Some(corner) = face.corners.first() else {
-                                return false;
-                            };
-                            let view = if viewer.orthographic {
-                                toward_eye
-                            } else {
-                                eye - mesh.positions[corner.vertex]
-                            };
-                            mesh.normal(face).dot(view) < 0.0
-                        })
-                        .collect::<Vec<_>>()
-                });
-            for (e, faces) in rendered.edges.iter() {
-                // The line depth bias can pull a short piece of a rear edge
-                // through the surface at a corner. Keep silhouettes and the
-                // boundaries of open surfaces, but skip fully rear edges.
-                if back_facing
-                    .as_ref()
-                    .is_some_and(|back| faces.iter().all(|&face| back[face]))
-                    || selection::highlighted(&doc.selection, *e, faces)
-                {
-                    continue;
-                }
-                let a = object
-                    .transform
-                    .transform_point(mesh.positions[e.0]);
-                let b = object
-                    .transform
-                    .transform_point(mesh.positions[e.1]);
-                let color = if mesh.uv_seams.contains(e) {
-                    Color::srgb(1.0, 0.22, 0.12)
-                } else {
-                    gray
-                };
-                line!(a, b, color);
-            }
-            if doc.selection.kind == Element::Vertex {
-                for (i, p) in object.geometry.positions.iter().enumerate() {
-                    let p = object.transform.transform_point(*p);
-                    if !chosen.contains(&i) {
-                        dot!(p);
-                    }
-                }
-            }
-        } else if doc.mode == Mode::Object && doc.selected.contains(&object.id) {
+        }
+        if doc.mode == Mode::Object && doc.selected.contains(&object.id) {
             let mut min = Vec3::splat(f32::INFINITY);
             let mut max = Vec3::splat(f32::NEG_INFINITY);
             for p in &object.geometry.positions {
