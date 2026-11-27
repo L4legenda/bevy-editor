@@ -236,6 +236,7 @@ impl Plugin for ModelViewerPlugin {
                     navigate,
                     editing::initialize,
                     editing::input::input,
+                    editing::transform_cursor::update,
                     editing::render,
                     paint::sets::refresh,
                     editing::wireframe::sync,

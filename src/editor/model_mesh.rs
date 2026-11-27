@@ -722,10 +722,10 @@ impl Geometry {
         &mut self,
         selection: &mut Selection,
     ) -> Result<Vec<(usize, Vec3, Vec3)>, String> {
-        if selection.kind != Element::Face {
+        let selected = self.extrusion_faces(selection);
+        if selected.is_empty() && selection.kind != Element::Face {
             return self.extrude_elements(selection);
         }
-        let selected = selection.selected_faces(self);
         if selected.is_empty() {
             return Err("Для выдавливания выделите грани или замкнутую область".into());
         }
@@ -778,8 +778,29 @@ impl Geometry {
         for (vertex, _, _) in &mut motion {
             *vertex = compacted[vertex];
         }
-        self.select_faces(selection, selected);
+        selection.select_face_elements(self, selected);
         Ok(motion)
+    }
+    pub(super) fn extrusion_faces(&self, selection: &Selection) -> BTreeSet<usize> {
+        match selection.kind {
+            Element::Vertex if selection.vertices.len() < 3 => return BTreeSet::new(),
+            Element::Edge if selection.edges.len() < 3 => return BTreeSet::new(),
+            _ => {}
+        }
+        let faces = selection.selected_faces(self);
+        if selection.kind != Element::Face && !faces.is_empty() {
+            // A complete surface can be selected through its corners or edges.
+            // Mixed selections with extra loose elements still use strip extrusion.
+            let mut covered = Selection {
+                kind: selection.kind,
+                ..default()
+            };
+            covered.select_face_elements(self, faces.clone());
+            if covered.vertices != selection.vertices || covered.edges != selection.edges {
+                return BTreeSet::new();
+            }
+        }
+        faces
     }
     pub fn extrusion_edges(&self, selection: &Selection) -> BTreeSet<Edge> {
         match selection.kind {
@@ -806,16 +827,26 @@ impl Geometry {
         if vertices.is_empty() {
             return None;
         }
+        let region = if edges.is_empty() {
+            self.extrusion_faces(selection)
+        } else {
+            BTreeSet::new()
+        };
         let mut normals = self
             .faces
             .iter()
             .enumerate()
-            .filter(|(i, face)| match selection.kind {
-                Element::Face => selection.faces.contains(i),
-                Element::Edge => face
-                    .edges()
-                    .any(|(a, b)| selection.edges.contains(&Edge::new(a, b))),
-                Element::Vertex => face.corners.iter().any(|c| vertices.contains(&c.vertex)),
+            .filter(|(i, face)| {
+                if !region.is_empty() {
+                    return region.contains(i);
+                }
+                match selection.kind {
+                    Element::Face => selection.faces.contains(i),
+                    Element::Edge => face
+                        .edges()
+                        .any(|(a, b)| selection.edges.contains(&Edge::new(a, b))),
+                    Element::Vertex => face.corners.iter().any(|c| vertices.contains(&c.vertex)),
+                }
             })
             .map(|(_, face)| self.normal(face));
         let first = normals.next().unwrap_or(Vec3::ZERO);

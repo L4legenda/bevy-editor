@@ -289,6 +289,28 @@ fn model_mesh_extrude_and_inset_keep_closed_topology_and_materials() {
     }
 }
 #[test]
+fn extruding_a_face_selected_by_vertices_or_edges_keeps_the_cap() {
+    for kind in [Element::Vertex, Element::Edge] {
+        let mut mesh = cube();
+        let mut selection = Selection {
+            kind,
+            ..default()
+        };
+        selection.select_face_elements(&mesh, [3].into());
+
+        mesh.extrude(&mut selection, 0.5).unwrap();
+
+        closed(&mesh);
+        assert_eq!(mesh.faces.len(), 10);
+        assert_eq!(selection.kind, kind);
+        assert_eq!(selection.selected_faces(&mesh), [3].into());
+        assert!(
+            selection.selected_vertices(&mesh).iter().all(|&v| mesh.positions[v].y == 1.5)
+        );
+    }
+}
+
+#[test]
 fn model_mesh_subdivision_and_loop_cut_share_neighbor_vertices() {
     let mut mesh = cube();
     let mut selection = face(3);

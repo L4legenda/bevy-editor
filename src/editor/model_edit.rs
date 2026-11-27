@@ -25,6 +25,8 @@ use snapping::SnapTarget;
 pub(super) mod area;
 #[path = "model_edit_controls.rs"]
 pub(in crate::editor) mod controls;
+#[path = "model_transform_cursor.rs"]
+pub(super) mod transform_cursor;
 #[path = "model_edit_handles.rs"]
 pub(super) mod handles;
 #[path = "model_edit_input.rs"]

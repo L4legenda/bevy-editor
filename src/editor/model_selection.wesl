@@ -42,7 +42,8 @@ fn vertex(input: Vertex) -> VertexOutput {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if in.color.w < 0.25 {
-        return vec4<f32>(in.color.rgb, params.y);
+        let opacity = params.y * select(1.0, 1.8, in.color.w < -0.5);
+        return vec4<f32>(in.color.rgb, opacity);
     }
     let distance = select(length(in.uv) * 4.0, abs(in.uv.x) * 2.0, in.color.w > 0.75);
     let radius = select(2.55, 0.88, in.color.w > 0.75);

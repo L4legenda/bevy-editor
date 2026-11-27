@@ -42,6 +42,7 @@ pub(in crate::editor) struct Gesture {
 struct Extrusion {
     pivot: Vec3,
     direction: Vec3,
+    region: bool,
     edges: BTreeSet<Edge>,
     screen_motion: Option<Vec2>,
     vertices: Vec<(usize, Vec3, Vec3)>,
@@ -70,12 +71,13 @@ impl Gesture {
         }
     }
     pub(super) fn extrude(doc: &Document, model: usize, viewer: &Viewer) -> Option<Self> {
-        let edges = doc.active()?.geometry.extrusion_edges(&doc.selection);
-        let (pivot, direction) = extrusion_axis(doc, viewer, &edges)?;
+        let (region, edges) = extrusion_elements(doc)?;
+        let (pivot, direction) = extrusion_axis(doc, viewer, &edges, region)?;
         let mut gesture = Self::new(Tool::Move, doc.snapshot(), model, pivot);
         gesture.extrusion = Some(Extrusion {
             pivot,
             direction,
+            region,
             edges,
             screen_motion: None,
             vertices: Vec::new(),
@@ -98,6 +100,16 @@ impl Gesture {
 
     pub(super) fn is_preview_tool(&self) -> bool {
         self.is_beveling() || self.is_loop_cutting() || self.is_knifing()
+    }
+
+    pub(super) fn transform_tool(&self) -> Option<Tool> {
+        if self.is_preview_tool() {
+            return None;
+        }
+        match self.tool {
+            Tool::Universal | Tool::Move => Some(Tool::Move),
+            Tool::Rotate | Tool::Scale => Some(self.tool),
+        }
     }
 
     pub(in crate::editor) fn is_knifing(&self) -> bool {
@@ -203,10 +215,22 @@ fn plane_point(
     (denominator.abs() > 0.0001)
         .then(|| origin + direction * ((pivot - origin).dot(normal) / denominator))
 }
+fn extrusion_elements(doc: &Document) -> Option<(bool, BTreeSet<Edge>)> {
+    let mesh = &doc.active()?.geometry;
+    let region = !mesh.extrusion_faces(&doc.selection).is_empty();
+    let edges = if region {
+        BTreeSet::new()
+    } else {
+        mesh.extrusion_edges(&doc.selection)
+    };
+    Some((region, edges))
+}
+
 fn extrusion_axis(
     doc: &Document,
     viewer: &Viewer,
     edges: &BTreeSet<Edge>,
+    region: bool,
 ) -> Option<(Vec3, Vec3)> {
     let object = doc.active()?;
     let mesh = &object.geometry;
@@ -238,7 +262,7 @@ fn extrusion_axis(
     let obscured = screen_direction(direction).length_squared()
         <= direction.length_squared() * 0.0225
         || screen_clearance(direction) < 0.15;
-    let local_direction = if doc.selection.kind != Element::Face && obscured {
+    let local_direction = if !region && obscured {
         // Keep new vertices and strips visible in side and orthographic views.
         let inverse = transform.inverse();
         let up = *camera.up();
@@ -306,8 +330,8 @@ pub(super) fn extrusion_handle(
     viewer: &Viewer,
     rect: Rect,
 ) -> Option<(Vec3, Vec2, Vec2)> {
-    let edges = doc.active()?.geometry.extrusion_edges(&doc.selection);
-    let (pivot, direction) = extrusion_axis(doc, viewer, &edges)?;
+    let (region, edges) = extrusion_elements(doc)?;
+    let (pivot, direction) = extrusion_axis(doc, viewer, &edges, region)?;
     let center = project(viewer, rect, pivot)?;
     let offset = extrusion_motion(viewer, rect, pivot, direction).normalize_or_zero() * 54.0;
     let inside = rect.inflate(-13.0);
@@ -335,7 +359,7 @@ fn drag_extrusion(
     let delta = cursor - start;
     let constraint = gesture.axis.map(|index| axis(doc, index, false));
     // Faces follow their normals. Vertices and edges follow the cursor in the view plane.
-    let free_offset = if constraint.is_none() && gesture.base.selection.kind != Element::Face {
+    let free_offset = if constraint.is_none() && !extrusion.region {
         let pose = view_pose(viewer);
         let normal = *pose.forward();
         let pivot = extrusion.pivot;
@@ -1135,7 +1159,7 @@ pub(in crate::editor) fn draw(
     let Some(doc) = editor
         .viewing_model
         .and_then(|i| state.documents.get(&i))
-        .filter(|_| editor.pending.is_none())
+        .filter(|_| editor.pending.is_none() && editor.viewing_image.is_none())
     else {
         return;
     };
@@ -1186,6 +1210,18 @@ pub(in crate::editor) fn draw(
     let orange = selection::SELECTED;
     let gray = Color::srgb(0.13, 0.16, 0.20);
     let step = world_per_pixel(&viewer, rect);
+    if let Some(gesture) = state.gesture.as_ref().filter(|gesture| {
+        Some(gesture.model) == editor.viewing_model && gesture.transform_tool().is_some()
+    }) && let Some(index) = gesture.axis
+    {
+        let direction = axis(doc, index, state.local && !gesture.is_extruding());
+        let span = direction * step * rect.size().length();
+        overlay.line(
+            gesture.pivot - span,
+            gesture.pivot + span,
+            crate::editor::viewport::AXIS_COLORS[index],
+        );
+    }
     for object in &doc.objects {
         if object.hidden {
             continue;
@@ -1194,23 +1230,54 @@ pub(in crate::editor) fn draw(
             continue;
         };
         if !state.xray && doc.mode == Mode::Edit && doc.active == Some(object.id) {
-            let chosen = doc.selection.selected_vertices(&object.geometry);
+            let mesh = &object.geometry;
+            let chosen = doc.selection.selected_vertices(mesh);
+            let back_facing = rendered
+                .edges
+                .values()
+                .all(|faces| faces.len() == 2)
+                .then(|| {
+                    let inverse = object.transform.to_matrix().inverse();
+                    let eye = inverse.transform_point3(pose.translation);
+                    let toward_eye = inverse.transform_vector3(-*pose.forward());
+                    mesh.faces
+                        .iter()
+                        .map(|face| {
+                            let Some(corner) = face.corners.first() else {
+                                return false;
+                            };
+                            let view = if viewer.orthographic {
+                                toward_eye
+                            } else {
+                                eye - mesh.positions[corner.vertex]
+                            };
+                            mesh.normal(face).dot(view) < 0.0
+                        })
+                        .collect::<Vec<_>>()
+                });
             for (e, faces) in rendered.edges.iter() {
-                let selected = selection::highlighted(&doc.selection, *e, faces);
+                // The line depth bias can pull a short piece of a rear edge
+                // through the surface at a corner. Keep silhouettes and the
+                // boundaries of open surfaces, but skip fully rear edges.
+                if back_facing
+                    .as_ref()
+                    .is_some_and(|back| faces.iter().all(|&face| back[face]))
+                    || selection::highlighted(&doc.selection, *e, faces)
+                {
+                    continue;
+                }
                 let a = object
                     .transform
-                    .transform_point(object.geometry.positions[e.0]);
+                    .transform_point(mesh.positions[e.0]);
                 let b = object
                     .transform
-                    .transform_point(object.geometry.positions[e.1]);
-                if !selected {
-                    let color = if object.geometry.uv_seams.contains(e) {
-                        Color::srgb(1.0, 0.22, 0.12)
-                    } else {
-                        gray
-                    };
-                    line!(a, b, color);
-                }
+                    .transform_point(mesh.positions[e.1]);
+                let color = if mesh.uv_seams.contains(e) {
+                    Color::srgb(1.0, 0.22, 0.12)
+                } else {
+                    gray
+                };
+                line!(a, b, color);
             }
             if doc.selection.kind == Element::Vertex {
                 for (i, p) in object.geometry.positions.iter().enumerate() {

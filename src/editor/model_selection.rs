@@ -86,6 +86,7 @@ impl Material for FaceMaterial {
 }
 
 // Mesh colors store the tint in RGB and the primitive type in alpha.
+// A negative alpha marks a face fill during a transform.
 const ORANGE: Vec3 = Vec3::new(1.0, 0.25, 0.018);
 const ACTIVE: Vec3 = Vec3::ONE;
 const CAGE: Vec3 = Vec3::new(0.012, 0.016, 0.022);
@@ -151,7 +152,13 @@ impl FeedbackMesh {
     }
 }
 
-fn selection_geometry(result: &mut FeedbackMesh, doc: &Document, object: &Object, state: &State) {
+fn selection_geometry(
+    result: &mut FeedbackMesh,
+    doc: &Document,
+    object: &Object,
+    state: &State,
+    transforming: bool,
+) {
     let mesh = &object.geometry;
     let selection = &doc.selection;
     let active = selection.active();
@@ -163,13 +170,18 @@ fn selection_geometry(result: &mut FeedbackMesh, doc: &Document, object: &Object
         } else {
             ORANGE
         };
+        let fill = if transforming && selection.kind == Element::Face {
+            -1.0
+        } else {
+            0.0
+        };
         for triangle in mesh.triangles(face) {
             for corner in triangle {
                 result.push(
                     world(mesh.positions[face.corners[corner].vertex]),
                     Vec3::Z,
                     Vec2::ZERO,
-                    color.extend(0.),
+                    color.extend(fill),
                 );
             }
         }
@@ -219,7 +231,7 @@ fn selection_geometry(result: &mut FeedbackMesh, doc: &Document, object: &Object
     }
 }
 
-fn geometry(doc: &Document, state: &State) -> FeedbackMesh {
+fn geometry(doc: &Document, state: &State, transforming: bool) -> FeedbackMesh {
     let mut result = FeedbackMesh::default();
     let active = doc
         .active()
@@ -255,7 +267,7 @@ fn geometry(doc: &Document, state: &State) -> FeedbackMesh {
         }
     }
     if let Some(object) = active {
-        selection_geometry(&mut result, doc, object, state);
+        selection_geometry(&mut result, doc, object, state, transforming);
     }
     result
 }
@@ -265,7 +277,7 @@ pub(in crate::editor) struct Overlay {
     entity: Option<Entity>,
     mesh: Option<Handle<Mesh>>,
     materials: Option<[Handle<FaceMaterial>; 2]>,
-    stamp: Option<(Entity, u64, u64, Mode, bool)>,
+    stamp: Option<(Entity, u64, u64, Mode, bool, bool)>,
     geometry: bool,
     pixel_scale: f32,
 }
@@ -327,9 +339,14 @@ pub(in crate::editor) fn sync(
         overlay.stamp = None;
         return;
     };
-    let stamp = (root, doc.revision, doc.ui_revision, doc.mode, state.xray);
+    let transforming = state.gesture.as_ref().is_some_and(|gesture| {
+        Some(gesture.model) == editor.viewing_model && gesture.transform_tool().is_some()
+    });
+    let stamp = (
+        root, doc.revision, doc.ui_revision, doc.mode, state.xray, transforming,
+    );
     if overlay.stamp != Some(stamp) {
-        let feedback = geometry(doc, &state);
+        let feedback = geometry(doc, &state, transforming);
         overlay.geometry = !feedback.positions.is_empty();
         if overlay.geometry {
             let mesh = feedback.mesh();
